@@ -1,0 +1,5 @@
+scripts/qwen_exo/*.sh text eol=lf
+scripts/qwen_exo/*.py text eol=lf
+docker/QWEN-EXO-booster.Dockerfile text eol=lf
+python/qwen_exo_booster/*.py text eol=lf
+test/registered/qwen_exo/*.py text eol=lf
