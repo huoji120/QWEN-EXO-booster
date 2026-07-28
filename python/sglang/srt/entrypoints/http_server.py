@@ -373,6 +373,17 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
 
+
+    fast_api_app.state.qwen_exo_runtime = None
+    if server_args.enable_qwen_exo:
+        from qwen_exo_booster.runtime import QwenExoRuntime
+
+        qwen_exo_runtime = QwenExoRuntime.from_server_args(
+            server_args, _global_state.tokenizer_manager
+        )
+        await qwen_exo_runtime.start()
+        fast_api_app.state.qwen_exo_runtime = qwen_exo_runtime
+
     # Execute custom warmups
     if server_args.warmups is not None:
         await execute_warmups(
@@ -413,6 +424,12 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        qwen_exo_runtime = getattr(
+            fast_api_app.state, "qwen_exo_runtime", None
+        )
+        if qwen_exo_runtime is not None:
+            await qwen_exo_runtime.close()
+
         if sidecar is not None:
             try:
                 sidecar.stop()
@@ -453,6 +470,10 @@ app.include_router(v1_loads_router)
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 
 app.include_router(elastic_ep_router)
+
+from qwen_exo_booster.router import router as qwen_exo_router
+
+app.include_router(qwen_exo_router)
 
 
 def _anthropic_validation_message(raw_errors) -> str:
