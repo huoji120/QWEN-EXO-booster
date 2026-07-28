@@ -2862,6 +2862,57 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
+    # QWEN-EXO-booster
+    # -------------------------------------------------------------------------
+    enable_qwen_exo: A[
+        bool,
+        "Enable the QWEN-EXO-booster hybrid-memory runtime.",
+    ] = False
+    qwen_exo_state_dir: A[
+        str,
+        "Directory for QWEN-EXO authoritative runtime state and traces.",
+    ] = "./qwen-exo-data/state"
+    qwen_exo_knowledge_dir: A[
+        str,
+        "Directory containing the QWEN-EXO read-only knowledge sources.",
+    ] = "./qwen-exo-data/knowledge"
+    qwen_exo_max_internal_fanout: A[
+        int,
+        "Maximum scheduler-native child jobs owned by one user request.",
+    ] = 32
+    qwen_exo_max_internal_tokens: A[
+        int,
+        "Maximum generation tokens reserved for all internal child jobs of one request.",
+    ] = 4096
+    qwen_exo_enable_hybrid_prefix: A[
+        bool,
+        "Enable QWEN-EXO hybrid Full-Attention/GDN prefix lifecycle checks.",
+    ] = True
+    qwen_exo_enable_external_memory: A[
+        bool,
+        "Enable the isolated QWEN-EXO external knowledge-memory namespace.",
+    ] = True
+    qwen_exo_enable_reference_judge: A[
+        bool,
+        "Enable scheduler-native shared-prefix reference judge jobs.",
+    ] = True
+    qwen_exo_enable_capsule: A[
+        bool,
+        "Enable scheduler-native execution capsule update jobs.",
+    ] = True
+    qwen_exo_observer_mode: A[
+        str,
+        Arg(
+            help="QWEN-EXO in-flight observer mode.",
+            choices=["off", "shadow", "active"],
+        ),
+    ] = "shadow"
+    qwen_exo_enable_adaptive_refresh: A[
+        bool,
+        "Allow observer triggers to schedule active retrieval refresh jobs.",
+    ] = False
+
+    # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
     # -------------------------------------------------------------------------
     forward_hooks: A[
