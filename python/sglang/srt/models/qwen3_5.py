@@ -21,7 +21,29 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 import torch.nn as nn
 import triton
-
+from qwen_exo_booster.attention_signals import (
+    AttentionBatchMetadata,
+    AttentionSignalTracker,
+    inverse_qwen35_rope,
+)
+from qwen_exo_booster.score_bias import (
+    SCORE_BIAS_KERNEL_MAX_BLOCKS,
+)
+from qwen_exo_booster.latent_transplant import (
+    LATENT_TRANSPLANT_APPLIED_KEY,
+    LATENT_TRANSPLANT_DIAGNOSTICS_KEY,
+    LATENT_TRANSPLANT_STRENGTH_KEY,
+    LatentArtifactStore,
+    LatentCaptureAccumulator,
+    build_layer_addition,
+    pool_capture_layer,
+    select_latent_layers,
+)
+from qwen_exo_booster.activation_editor import (
+    ActivationEditorStore,
+    apply_activation_editor,
+)
+from sglang.kernels.ops.attention.score_mod import qwen_exo_block_bias_score_mod
 from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
@@ -688,6 +710,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 captured_last_layer_outputs=kwargs.get(
                     "captured_last_layer_outputs", None
                 ),
+                post_residual_addition=kwargs.get("post_residual_addition", None),
             )
         )
 
@@ -767,6 +790,73 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.rope_theta, rope_scaling = get_rope_config(config)
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+        server_args = get_server_args()
+        attention_layer_ids = [
+            index
+            for index, layer_type in enumerate(config.layers_block_type)
+            if layer_type == "attention"
+        ]
+        qwen_exo_observer_enabled = (
+            bool(getattr(server_args, "enable_qwen_exo", False))
+            and getattr(server_args, "qwen_exo_observer_mode", "off") != "off"
+            and bool(attention_layer_ids)
+            and layer_id == attention_layer_ids[-1]
+        )
+        self.qwen_exo_score_bias_enabled = (
+            bool(getattr(server_args, "enable_qwen_exo", False))
+            and getattr(server_args, "qwen_exo_score_bias_mode", "off") != "off"
+            and bool(attention_layer_ids)
+            and layer_id == attention_layer_ids[-1]
+        )
+        reduce_across_tp = None
+        gather_heads_across_tp = None
+        if self.attn_tp_size > 1:
+
+            def reduce_across_tp(value):
+                return (
+                    get_parallel().attn_tp_group.all_reduce(value) / self.attn_tp_size
+                )
+
+            def gather_heads_across_tp(value):
+                return get_parallel().attn_tp_group.all_gather(value, dim=0)
+
+        self.qwen_exo_signal_tracker = (
+            AttentionSignalTracker(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                reduce_across_tp=reduce_across_tp,
+                total_num_heads=self.total_num_heads,
+                gather_heads_across_tp=gather_heads_across_tp,
+                score_bias_max_blocks=min(
+                    int(getattr(server_args, "qwen_exo_score_bias_max_blocks", 8)),
+                    SCORE_BIAS_KERNEL_MAX_BLOCKS,
+                ),
+                score_bias_selected_blocks=int(
+                    getattr(server_args, "qwen_exo_score_bias_selected_blocks", 2)
+                ),
+                score_bias_query_window=int(
+                    getattr(server_args, "qwen_exo_score_bias_query_window", 8)
+                ),
+                score_bias_min_relevance=float(
+                    getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.0)
+                ),
+                score_bias_relevance_margin=float(
+                    getattr(server_args, "qwen_exo_score_bias_relevance_margin", 0.005)
+                ),
+                score_bias_anchor_bias=float(
+                    getattr(server_args, "qwen_exo_score_bias_anchor_bias", 0.0)
+                ),
+                score_bias_anchor_max_blocks=int(
+                    getattr(server_args, "qwen_exo_score_bias_anchor_max_blocks", 2)
+                ),
+                score_bias_anchor_drift_threshold=float(
+                    getattr(server_args, "qwen_exo_observer_q_drift_threshold", 0.35)
+                ),
+            )
+            if qwen_exo_observer_enabled
+            else None
+        )
 
         # If rope_scaling doesn't specify a scaling type, treat as no scaling
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
@@ -1013,6 +1103,306 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
         return q, k, v, gate
 
+    def _qwen_exo_inverse_rope(
+        self, value: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        return inverse_qwen35_rope(
+            value,
+            positions,
+            rotary=self.rotary_emb,
+            head_dim=self.head_dim,
+        )
+
+    def _qwen_exo_score_bias_attention(
+        self, q: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        if not self.qwen_exo_score_bias_enabled:
+            return None, None
+        tracker = self.qwen_exo_signal_tracker
+        if tracker is None:
+            return None, None
+        is_decode = forward_batch.forward_mode.is_decode()
+        if is_decode:
+            row_mask = forward_batch.qwen_exo_observe_mask
+            if row_mask is None:
+                if get_is_capture_mode():
+                    return None, None
+                row_mask = torch.tensor(
+                    tuple(forward_batch.qwen_exo_observe or ()),
+                    dtype=torch.bool,
+                    device=q.device,
+                )
+            score_info, aux = tracker.score_bias_decode_slots(
+                forward_batch.req_pool_indices, row_mask
+            )
+            forward_batch.qwen_exo_customized_info = {
+                **(getattr(forward_batch, "qwen_exo_customized_info", None) or {}),
+                **score_info,
+            }
+            return qwen_exo_block_bias_score_mod, [aux]
+        if get_is_capture_mode():
+            return None, None
+        blocks_by_request = forward_batch.qwen_exo_score_bias_blocks or ()
+        phases = forward_batch.qwen_exo_score_bias_phases or ()
+        if not phases or not any(phases):
+            return None, None
+        server_args = get_server_args()
+        batch_size = len(phases)
+        is_decode = False
+        max_blocks = min(
+            int(getattr(server_args, "qwen_exo_score_bias_max_blocks", 8)),
+            SCORE_BIAS_KERNEL_MAX_BLOCKS,
+        )
+        selected_limit = min(
+            int(getattr(server_args, "qwen_exo_score_bias_selected_blocks", 2)),
+            max_blocks,
+        )
+        shortlist_limit = min(4, max_blocks)
+        if max_blocks < 1 or selected_limit < 1:
+            return None, None
+        aux_len = 3 * max_blocks
+        aux = torch.zeros(
+            (max(int(q.shape[0]), batch_size), 1, aux_len),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        phase_signal = torch.tensor(
+            [int(phase) if is_decode else min(int(phase), 1) for phase in phases],
+            dtype=torch.float32,
+            device=q.device,
+        )
+        decode_signal = torch.full(
+            (batch_size,), float(is_decode), dtype=torch.float32, device=q.device
+        )
+        candidate_signal = torch.zeros(
+            (batch_size,), dtype=torch.float32, device=q.device
+        )
+        user_query_signal = torch.zeros(
+            (batch_size,), dtype=torch.float32, device=q.device
+        )
+        shortlist_signal = torch.zeros(
+            (batch_size,), dtype=torch.float32, device=q.device
+        )
+        shortlist_relevance_signal = torch.full(
+            (batch_size,), float("nan"), dtype=torch.float32, device=q.device
+        )
+        selected_signal = torch.zeros(
+            (batch_size,), dtype=torch.float32, device=q.device
+        )
+        relevance_signal = torch.full(
+            (batch_size,), float("nan"), dtype=torch.float32, device=q.device
+        )
+        bias_signal = torch.zeros((batch_size,), dtype=torch.float32, device=q.device)
+        consensus_signal = torch.zeros(
+            (batch_size,), dtype=torch.float32, device=q.device
+        )
+        extend_starts = getattr(forward_batch, "extend_start_loc", None)
+        extend_lengths = getattr(forward_batch, "extend_seq_lens", None)
+        any_active = False
+        for request_index, phase in enumerate(phases):
+            request_id = str(forward_batch.rids[request_index])
+            user_query_signal[request_index] = tracker.user_query_count(request_id)
+            blocks = (
+                blocks_by_request[request_index]
+                if request_index < len(blocks_by_request)
+                else None
+            )
+            candidate_signal[request_index] = len(blocks or ())
+            if not phase or not blocks:
+                continue
+            key_sketches = tuple(tuple(block["key_sketch"]) for block in blocks)
+            shortlist = tracker.shortlist_trajectory_keys(
+                request_id,
+                key_sketches,
+                limit=shortlist_limit,
+                min_score=float(
+                    getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.0)
+                ),
+                margin=float(
+                    getattr(
+                        server_args,
+                        "qwen_exo_score_bias_relevance_margin",
+                        0.005,
+                    )
+                ),
+            )
+            shortlist_signal[request_index] = len(shortlist)
+            if shortlist:
+                shortlist_relevance_signal[request_index] = max(
+                    float(item[1]) for item in shortlist
+                )
+            if not is_decode or not shortlist:
+                continue
+            ranked = tracker.rank_trajectory_keys(
+                request_id,
+                key_sketches,
+                limit=selected_limit,
+                query_window=int(
+                    getattr(server_args, "qwen_exo_score_bias_query_window", 8)
+                ),
+                min_score=float(
+                    getattr(server_args, "qwen_exo_score_bias_min_relevance", 0.0)
+                ),
+                margin=float(
+                    getattr(
+                        server_args,
+                        "qwen_exo_score_bias_relevance_margin",
+                        0.005,
+                    )
+                ),
+                allowed_indices=tuple(item[0] for item in shortlist),
+            )
+            if not ranked:
+                continue
+            request_bias = torch.zeros((aux_len,), dtype=aux.dtype, device=q.device)
+            output_slot = 0
+            for block_index, relevance, consensus in ranked:
+                block = blocks[block_index]
+                effective_score = float(block["score"]) * max(0.0, float(relevance))
+                if effective_score <= 0:
+                    continue
+                start = int(block["start"])
+                end = int(block["end"])
+                request_bias[output_slot * 3 : output_slot * 3 + 3] = (
+                    request_bias.new_tensor((start, end, effective_score))
+                )
+                output_slot += 1
+                relevance_signal[request_index] = max(
+                    (
+                        float(relevance_signal[request_index].item())
+                        if torch.isfinite(relevance_signal[request_index])
+                        else float("-inf")
+                    ),
+                    float(relevance),
+                )
+                bias_signal[request_index] = max(
+                    float(bias_signal[request_index].item()), effective_score
+                )
+                consensus_signal[request_index] = max(
+                    float(consensus_signal[request_index].item()), float(consensus)
+                )
+            selected_signal[request_index] = output_slot
+            if output_slot < 1 or int(phase) != 2:
+                continue
+            any_active = True
+            aux[request_index, 0, :].copy_(request_bias)
+            if extend_starts is not None and extend_lengths is not None:
+                start_value = extend_starts[request_index]
+                length_value = extend_lengths[request_index]
+                start = int(
+                    start_value.item() if hasattr(start_value, "item") else start_value
+                )
+                length = int(
+                    length_value.item()
+                    if hasattr(length_value, "item")
+                    else length_value
+                )
+                if length > 0 and start < aux.shape[0]:
+                    aux[start : min(start + length, aux.shape[0]), 0, :].copy_(
+                        request_bias
+                    )
+        score_info = {
+            "qwen_exo_score_bias_phase": phase_signal,
+            "qwen_exo_score_bias_is_decode": decode_signal,
+            "qwen_exo_score_bias_candidate_count": candidate_signal,
+            "qwen_exo_score_bias_user_query_count": user_query_signal,
+            "qwen_exo_score_bias_shortlist_count": shortlist_signal,
+            "qwen_exo_score_bias_shortlist_max_relevance": (shortlist_relevance_signal),
+            "qwen_exo_score_bias_selected_count": selected_signal,
+            "qwen_exo_score_bias_max_relevance": relevance_signal,
+            "qwen_exo_score_bias_would_apply_max": bias_signal,
+            "qwen_exo_score_bias_query_consensus": consensus_signal,
+        }
+        forward_batch.qwen_exo_customized_info = {
+            **(getattr(forward_batch, "qwen_exo_customized_info", None) or {}),
+            **score_info,
+        }
+        if not any_active:
+            return None, None
+        return qwen_exo_block_bias_score_mod, [aux]
+
+    def _observe_qwen_exo_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        tracker = self.qwen_exo_signal_tracker
+        if tracker is None:
+            return
+
+        observe_mask = tuple(forward_batch.qwen_exo_observe or ())
+        if forward_batch.forward_mode.is_decode():
+            row_mask = forward_batch.qwen_exo_observe_mask
+            if row_mask is None:
+                if get_is_capture_mode():
+                    return
+                row_mask = torch.tensor(observe_mask, dtype=torch.bool, device=q.device)
+            customized_info = tracker.observe_decode_slots(
+                self._qwen_exo_inverse_rope(q, positions),
+                forward_batch.req_pool_indices,
+                row_mask,
+            )
+            forward_batch.qwen_exo_customized_info = {
+                **(getattr(forward_batch, "qwen_exo_customized_info", None) or {}),
+                **customized_info,
+            }
+            return
+
+        if get_is_capture_mode() or not forward_batch.forward_mode.is_extend():
+            return
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        metadata = AttentionBatchMetadata(
+            is_decode=False,
+            is_extend=True,
+            contains_last_prefill_chunk=forward_batch.contains_last_prefill_chunk,
+            rids=tuple(str(value) for value in (forward_batch.rids or ())),
+            observe_mask=observe_mask,
+            final_prefill_mask=(
+                tuple(forward_batch.qwen_exo_final_prefill)
+                if forward_batch.qwen_exo_final_prefill is not None
+                else None
+            ),
+            memory_spans=tuple(forward_batch.qwen_exo_memory_spans or ()),
+            trajectory_spans=tuple(forward_batch.qwen_exo_trajectory_spans or ()),
+            user_query_spans=tuple(forward_batch.qwen_exo_user_query_spans or ()),
+            full_query_capture=tuple(forward_batch.qwen_exo_full_query_capture or ()),
+            anchor_spans=tuple(forward_batch.qwen_exo_score_bias_anchor_spans or ()),
+            persisted_user_queries=tuple(
+                forward_batch.qwen_exo_persisted_user_queries or ()
+            ),
+            extend_lens=(
+                tuple(int(value) for value in extend_lens)
+                if extend_lens is not None
+                else None
+            ),
+            prefix_lens=(
+                tuple(int(value) for value in prefix_lens)
+                if prefix_lens is not None
+                else None
+            ),
+        )
+        customized_info = None
+        if observe_mask and any(observe_mask):
+            customized_info = tracker.observe(
+                self._qwen_exo_inverse_rope(q, positions),
+                self._qwen_exo_inverse_rope(k, positions),
+                metadata,
+            )
+        tracker.prepare_decode_slots(
+            metadata,
+            forward_batch.req_pool_indices,
+            tuple(forward_batch.qwen_exo_score_bias_blocks or ()),
+            tuple(forward_batch.qwen_exo_score_bias_phases or ()),
+        )
+        if customized_info is not None:
+            forward_batch.qwen_exo_customized_info = {
+                **(getattr(forward_batch, "qwen_exo_customized_info", None) or {}),
+                **customized_info,
+            }
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -1046,7 +1436,21 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        self._observe_qwen_exo_attention(q, k, positions, forward_batch)
+        score_mod, score_bias_aux = self._qwen_exo_score_bias_attention(
+            q, forward_batch
+        )
+        if score_mod is None:
+            attn_output = self.attn(q, k, v, forward_batch)
+        else:
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                score_mod=score_mod,
+                aux_tensors=score_bias_aux,
+            )
 
         if self.attn_output_gate:
             if not _is_npu:
@@ -1073,6 +1477,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                post_residual_addition=kwargs.get("post_residual_addition", None),
             )
         )
 
@@ -1271,6 +1676,26 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+        server_args = get_server_args()
+        self.qwen_exo_latent_layers = select_latent_layers(config.layers_block_type)
+        qwen_exo_state_dir = str(
+            getattr(server_args, "qwen_exo_state_dir", "") or ""
+        ).strip()
+        self.qwen_exo_latent_store = (
+            LatentArtifactStore(
+                f"{qwen_exo_state_dir}/latent-transplant/artifacts",
+                hidden_size=config.hidden_size,
+                target_layers=self.qwen_exo_latent_layers,
+            )
+            if getattr(server_args, "enable_qwen_exo", False) and qwen_exo_state_dir
+            else None
+        )
+        self.qwen_exo_editor_store = (
+            ActivationEditorStore(f"{qwen_exo_state_dir}/activation-editors")
+            if getattr(server_args, "enable_qwen_exo", False) and qwen_exo_state_dir
+            else None
+        )
+        self.qwen_exo_latent_capture_accumulator = LatentCaptureAccumulator()
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1311,9 +1736,61 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        latent_specs = tuple(forward_batch.qwen_exo_latent_transplants or ())
+        extend_seq_lens = tuple(
+            int(length) for length in (forward_batch.extend_seq_lens_cpu or ())
+        )
+        latent_capture_active = bool(
+            forward_batch.forward_mode.is_extend()
+            and any(spec and spec.get("mode") == "capture" for spec in latent_specs)
+        )
+        latent_restore_active = bool(
+            forward_batch.forward_mode.is_extend()
+            and self.qwen_exo_latent_store is not None
+            and any(spec and spec.get("mode") == "active" for spec in latent_specs)
+        )
+        editor_specs = tuple(forward_batch.qwen_exo_activation_editors or ())
+        editor_active = bool(
+            forward_batch.forward_mode.is_extend()
+            and self.qwen_exo_editor_store is not None
+            and any(spec and spec.get("mode") == "active" for spec in editor_specs)
+        )
+        latent_captured: list[tuple[int, torch.Tensor]] = []
+        latent_applied: torch.Tensor | None = None
+        latent_strengths: torch.Tensor | None = None
+        latent_diagnostics: list[dict[str, object]] = []
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
+            capture_existing = getattr(layer, "_is_layer_to_capture", False)
+            capture_latent = (
+                latent_capture_active and layer_idx in self.qwen_exo_latent_layers
+            )
+            capture_buffer = [] if capture_existing or capture_latent else None
+            latent_addition = None
+            if (
+                latent_restore_active
+                and layer_idx in self.qwen_exo_latent_layers
+                and extend_seq_lens
+            ):
+                latent_addition, applied, strengths = build_layer_addition(
+                    self.qwen_exo_latent_store,
+                    layer_idx,
+                    hidden_states,
+                    latent_specs,
+                    extend_seq_lens,
+                    forward_batch.qwen_exo_final_prefill,
+                    residual=residual,
+                    diagnostics=latent_diagnostics,
+                )
+                latent_applied = (
+                    applied if latent_applied is None else latent_applied + applied
+                )
+                latent_strengths = (
+                    strengths
+                    if latent_strengths is None
+                    else torch.maximum(latent_strengths, strengths)
+                )
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -1322,12 +1799,31 @@ class Qwen3_5ForCausalLM(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     forward_batch=forward_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
+                    captured_last_layer_outputs=capture_buffer,
+                    post_residual_addition=latent_addition,
                 )
+            if capture_buffer:
+                captured = capture_buffer[0]
+                if capture_existing:
+                    aux_hidden_states.append(captured)
+                if capture_latent:
+                    latent_captured.append(
+                        (
+                            layer_idx,
+                            pool_capture_layer(captured, latent_specs, extend_seq_lens),
+                        )
+                    )
+            if editor_active:
+                edited = apply_activation_editor(
+                    self.qwen_exo_editor_store,
+                    hidden_states,
+                    editor_specs,
+                    extend_seq_lens,
+                    forward_batch.qwen_exo_final_prefill,
+                    layer_index=layer_idx,
+                )
+                if edited is not None:
+                    hidden_states = edited
 
             # Process deepstack embeddings if provided
             if (
@@ -1339,6 +1835,42 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
+
+        latent_info = (
+            self.qwen_exo_latent_capture_accumulator.update(
+                latent_captured,
+                latent_specs,
+                extend_seq_lens,
+                forward_batch.qwen_exo_final_prefill,
+                tuple(str(value) for value in (forward_batch.rids or ())),
+            )
+            if latent_capture_active and extend_seq_lens
+            else None
+        )
+        if latent_applied is not None and latent_applied.any():
+            latent_info = {
+                **(latent_info or {}),
+                LATENT_TRANSPLANT_APPLIED_KEY: latent_applied,
+                LATENT_TRANSPLANT_STRENGTH_KEY: latent_strengths,
+            }
+        if latent_diagnostics:
+            diagnostics_by_request = [
+                [
+                    row
+                    for row in latent_diagnostics
+                    if int(row.get("request_index", -1)) == request_index
+                ]
+                for request_index in range(len(latent_specs))
+            ]
+            latent_info = {
+                **(latent_info or {}),
+                LATENT_TRANSPLANT_DIAGNOSTICS_KEY: diagnostics_by_request,
+            }
+        if latent_info:
+            forward_batch.qwen_exo_customized_info = {
+                **(getattr(forward_batch, "qwen_exo_customized_info", None) or {}),
+                **latent_info,
+            }
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:

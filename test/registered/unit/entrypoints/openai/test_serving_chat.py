@@ -14,6 +14,7 @@ import json
 import unittest
 import uuid
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -149,6 +150,79 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
+
+    def test_convert_to_internal_request_binds_qwen_exo_cognition(self):
+        selection = SimpleNamespace(
+            token_ids=(91, 92),
+            page_id=7,
+            prefix_identity="cognition-prefix",
+            source_digest="c" * 64,
+            local_positions=(0, 1),
+            radix_namespace="qwen-exo:v1:cognition-prefix",
+        )
+        runtime = SimpleNamespace(
+            memory_pipeline=SimpleNamespace(
+                tensor_bank=SimpleNamespace(
+                    cognition_selection=lambda: selection,
+                )
+            )
+        )
+        self.fastapi_request.app = SimpleNamespace(
+            state=SimpleNamespace(qwen_exo_runtime=runtime)
+        )
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                [],
+                None,
+            )
+
+            adapted, _ = self.chat._convert_to_internal_request(
+                self.basic_req, self.fastapi_request
+            )
+
+        assert adapted.input_ids == [91, 92, 1, 2, 3]
+        assert adapted.extra_key == "qwen-exo:v1:cognition-prefix"
+        assert adapted.sampling_params["custom_params"][
+            "qwen_exo_native_bank_selection"
+        ] == {
+            "source_digest": "c" * 64,
+            "page_id": 7,
+            "local_positions": [0, 1],
+            "prefix_identity": "cognition-prefix",
+        }
+
+    def test_qwen_exo_cognition_prefix_converts_text_prompt(self):
+        selection = SimpleNamespace(
+            token_ids=(91, 92),
+            page_id=7,
+            prefix_identity="cognition-prefix",
+            source_digest="c" * 64,
+            local_positions=(0, 1),
+            radix_namespace="qwen-exo:v1:cognition-prefix",
+        )
+        runtime = SimpleNamespace(
+            memory_pipeline=SimpleNamespace(
+                tensor_bank=SimpleNamespace(
+                    cognition_selection=lambda: selection,
+                )
+            )
+        )
+        self.fastapi_request.app = SimpleNamespace(
+            state=SimpleNamespace(qwen_exo_runtime=runtime)
+        )
+        adapted = GenerateReqInput(text="Test prompt", sampling_params={})
+
+        adapted = self.chat._apply_qwen_exo_chat_native_prefix(
+            adapted, self.fastapi_request
+        )
+
+        assert adapted.text is None
+        assert adapted.input_ids == [91, 92, 1, 2, 3, 4, 5]
 
     def test_convert_to_internal_request_rejects_stream_return_prompt_token_ids(self):
         req = ChatCompletionRequest(

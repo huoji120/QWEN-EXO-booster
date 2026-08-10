@@ -57,9 +57,12 @@ _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
 
 
+_has_aot_moe_sum_reduce = False
+
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
+    _has_aot_moe_sum_reduce = hasattr(torch.ops.sgl_kernel, "moe_sum_reduce")
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
@@ -95,7 +98,16 @@ padding_size = get_moe_padding_size(_use_aiter)
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
-    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+    if num_tokens > 32 or is_batch_invariant_mode_enabled():
+        return False
+    # Torch 2.7's Inductor expects ``triton_key``.  Some pinned Triton wheels
+    # used by the Qwen-EXO image do not expose it, so do not enter the compile
+    # path that would fail on the first small decode batch.
+    try:
+        from triton.compiler.compiler import triton_key  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -771,6 +783,14 @@ def _fused_moe_kernel_sequence(
             # According to micro benchmark results, torch.compile can get better performance for small token.
             if _use_moe_sum_reduce_torch_compile(num_tokens):
                 moe_sum_reduce_torch_compile(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states,
+                    routed_scaling_factor,
+                )
+            elif _is_cuda and not _has_aot_moe_sum_reduce:
+                # sgl-kernel wheels predating moe_sum_reduce still provide all
+                # inputs needed by the source-equivalent Triton kernel.
+                moe_sum_reduce_triton(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                     routed_scaling_factor,

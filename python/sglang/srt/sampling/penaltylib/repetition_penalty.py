@@ -1,18 +1,47 @@
+import logging
+
 import torch
+from torch._dynamo.exc import BackendCompilerFailed
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 from sglang.srt.utils import get_compiler_backend, is_npu
 
+logger = logging.getLogger(__name__)
 _is_npu = is_npu()
+_use_compiled_scaling_penalties = not _is_npu
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def apply_scaling_penalties(logits, scaling_penalties):
+def _apply_scaling_penalties_eager(logits, scaling_penalties):
     logits[:] = torch.where(
         logits < 0,
         logits * scaling_penalties,
         logits / scaling_penalties,
     )
+
+
+_compiled_apply_scaling_penalties = torch.compile(
+    _apply_scaling_penalties_eager,
+    dynamic=True,
+    backend=get_compiler_backend(),
+    disable=_is_npu,
+)
+
+
+def apply_scaling_penalties(logits, scaling_penalties):
+    global _use_compiled_scaling_penalties
+
+    if _use_compiled_scaling_penalties:
+        try:
+            _compiled_apply_scaling_penalties(logits, scaling_penalties)
+            return
+        except BackendCompilerFailed:
+            logger.warning(
+                "Disabling compiled repetition penalties after backend failure",
+                exc_info=True,
+            )
+            _use_compiled_scaling_penalties = False
+
+    _apply_scaling_penalties_eager(logits, scaling_penalties)
 
 
 class BatchedRepetitionPenalizer(_BatchedPenalizer):

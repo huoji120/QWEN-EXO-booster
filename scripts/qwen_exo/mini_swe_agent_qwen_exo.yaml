@@ -1,0 +1,18 @@
+agent:
+  agent_class: qwen_exo_compacting_agent.CompactingInteractiveAgent
+  context_window_tokens: 102400
+  compaction_threshold: 0.70
+  compaction_keep_model_turns: 6
+  compaction_summary_chars: 16000
+  compaction_min_messages: 16
+  compaction_cooldown_model_turns: 4
+model:
+  model_kwargs:
+    drop_params: true
+    temperature: 0.8
+    top_p: 0.95
+    extra_body:
+      top_k: 40
+      min_p: 0.05
+      repetition_penalty: 1.1
+    max_output_tokens: 8192

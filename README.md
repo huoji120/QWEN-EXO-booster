@@ -12,6 +12,50 @@
 
 --------------------------------------------------------------------------------
 
+## QWEN-EXO-booster
+
+This fork adds a scheduler-native hybrid-memory runtime for verified
+**Qwen-series hybrid structures** on two RTX 4090 GPUs (`TP=2`). Qwen release
+names such as 3.5, 3.6, and 3.8 may share the `Qwen3_5*` runtime architecture
+shell, so compatibility is decided from `config.json` structure—not the model
+directory name or marketing version. The verified layouts are Dense 27B and
+MoE 35B-A3B. It keeps SGLang's continuous batching and paged
+Full-Attention KV cache, while treating Gated DeltaNet recurrent/conv state,
+external Markdown memory, internal judge/capsule jobs, and in-flight signals as
+one request-correlated system.
+
+- Chinese user workspace: `http://127.0.0.1:30000/qwen-exo/`
+- Chinese operations console: `http://127.0.0.1:30000/qwen-exo/admin`
+- OpenAI Responses API: `POST /v1/responses`
+- Runtime status and health: `GET /qwen-exo/status`, `GET /qwen-exo/health`
+- Redacted trace stream: `GET /qwen-exo/telemetry/stream`
+- Knowledge and PolicyData administration: `GET|PUT|DELETE /qwen-exo/knowledge/...`, `GET|PUT|DELETE /qwen-exo/policydata/...`
+- PolicyData injection: semantically gated native Full-Attention K/V + complete GDN state; no PolicyData request text
+- Architecture and contracts: [`docs/qwen_exo/ARCHITECTURE.md`](docs/qwen_exo/ARCHITECTURE.md)
+- Dual-4090 deployment: [`docs/qwen_exo/SERVER_27B_DEPLOYMENT.md`](docs/qwen_exo/SERVER_27B_DEPLOYMENT.md)
+- API and security: [`docs/qwen_exo/API.md`](docs/qwen_exo/API.md)
+- Implementation evidence: [`docs/qwen_exo/IMPLEMENTATION_PROGRESS.md`](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
+
+The QWEN-EXO surface is opt-in through `--enable-qwen-exo`; upstream SGLang
+behavior is unchanged when that flag is absent.
+
+```bash
+# Required: a local checkpoint with a verified Qwen hybrid runtime layout.
+export QWEN_EXO_MODEL_PATH=/path/to/qwen-checkpoint
+export QWEN_EXO_DATA_PATH=/path/to/qwen-exo-runtime
+
+bash ./scripts/qwen_exo/build_image.sh
+bash ./scripts/qwen_exo/launch_js4090.sh
+```
+
+With `QWEN_EXO_ENABLED=1` (the default), the launcher validates the checkpoint's
+actual `config.json` before touching the GPUs or starting Docker. A
+compatible-looking directory name cannot bypass the check; unsupported
+architectures and unverified tensor layouts fail with an actionable error.
+Set `QWEN_EXO_ENABLED=0` to preserve unrestricted upstream SGLang model
+compatibility. See the [deployment guide](docs/qwen_exo/SERVER_27B_DEPLOYMENT.md)
+for requirements, configuration, health checks, and verification commands.
+
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |

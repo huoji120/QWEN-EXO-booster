@@ -132,7 +132,6 @@ class SingletonCache:
 
 @dataclasses.dataclass
 class VisionAttentionMetadata:
-
     cu_seqlens: torch.Tensor
     seq_lens: torch.Tensor
     max_seqlen: int
@@ -775,7 +774,6 @@ class VisionAiterAttention(nn.Module):
 
 
 class VisionAscendAttention(nn.Module):
-
     def __init__(
         self,
         **kwargs,
@@ -1342,9 +1340,11 @@ class VisionAttention(nn.Module):
             # CPU-to-CUDA copy. The eager version is captured as part of the
             # graph, so its pointwise work is still replayed without launch
             # overhead.
+            server_args = get_server_args()
             rotary_fn = (
                 apply_rotary_pos_emb_native_eager
                 if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                or getattr(server_args, "enable_qwen_exo", False)
                 else apply_rotary_pos_emb
             )
             q, k = rotary_fn(q, k, cos, sin)
@@ -1369,7 +1369,6 @@ class VisionAttention(nn.Module):
         if self.qk_normalization and not self.qk_normalization_by_head_size:
             # jit kernel
             if can_use_jit_qk_norm(self.head_size, q.dtype):
-
                 # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
                 head_dim_for_norm = head * self.head_size
 

@@ -12,7 +12,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -80,6 +79,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    native_state_bank: object | None = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -156,12 +156,34 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
         )
 
+    def _maybe_export_native_state(self, req: Req) -> None:
+        if self.native_state_bank is None:
+            return
+        try:
+            self.native_state_bank.maybe_export(req)
+        except Exception as exc:
+            req.qwen_exo_bank_export_status = f"failed:{type(exc).__name__}"
+            logger.exception("QWEN-EXO native Bank export failed for %s", req.rid)
+
     def _maybe_collect_customized_info(
         self,
         i: int,
         req: Req,
         logits_output: LogitsProcessorOutput,
     ):
+        bank_cache_status = getattr(req, "qwen_exo_bank_cache_status", None)
+        bank_export_status = getattr(req, "qwen_exo_bank_export_status", None)
+        if bank_cache_status is not None or bank_export_status is not None:
+            if req.customized_info is None:
+                req.customized_info = {}
+            if bank_cache_status is not None:
+                req.customized_info.setdefault("qwen_exo_bank_cache_status", []).append(
+                    bank_cache_status
+                )
+            if bank_export_status is not None:
+                req.customized_info.setdefault(
+                    "qwen_exo_bank_export_status", []
+                ).append(bank_export_status)
         if logits_output is not None and logits_output.customized_info is not None:
             if req.customized_info is None:
                 req.customized_info = {}
@@ -172,7 +194,15 @@ class SchedulerBatchResultProcessor:
                 # tensor/array via a view reference.
                 elem = v[i]
                 if isinstance(elem, torch.Tensor):
-                    elem = elem.clone()
+                    if k.startswith("qwen_exo_"):
+                        copied = elem.detach().float().cpu()
+                        elem = (
+                            float(copied.item())
+                            if copied.numel() == 1
+                            else copied.reshape(-1).tolist()
+                        )
+                    else:
+                        elem = elem.clone()
                 elif hasattr(elem, "copy") and callable(elem.copy):
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
@@ -236,9 +266,17 @@ class SchedulerBatchResultProcessor:
 
                     req.update_finish_state()
                     if req.finished():
+                        self._maybe_export_native_state(req)
+                    if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not bool(
+                                getattr(req, "qwen_exo_native_bank_no_cache", False)
+                            ),
+                        )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -883,6 +921,7 @@ class SchedulerBatchResultProcessor:
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
+            self._maybe_export_native_state(req)
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
@@ -902,6 +941,9 @@ class SchedulerBatchResultProcessor:
                     req.mamba_lazy_is_insert
                     if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
+                )
+                is_insert = is_insert and not bool(
+                    getattr(req, "qwen_exo_native_bank_no_cache", False)
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 

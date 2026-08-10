@@ -6,6 +6,9 @@ import sys
 
 import torch
 
+EXPECTED_TORCH_CUDA = "12.6"
+MIN_DEVICE_MEMORY_BYTES = 48_000_000_000
+
 
 def main() -> int:
     report = {
@@ -21,8 +24,10 @@ def main() -> int:
         errors.append("CUDA is unavailable")
     if torch.cuda.device_count() != 2:
         errors.append(f"expected exactly 2 GPUs, found {torch.cuda.device_count()}")
-    if not str(torch.version.cuda or "").startswith("12."):
-        errors.append(f"expected a CUDA 12 runtime, found {torch.version.cuda!r}")
+    if str(torch.version.cuda or "") != EXPECTED_TORCH_CUDA:
+        errors.append(
+            f"expected CUDA {EXPECTED_TORCH_CUDA}, found {torch.version.cuda!r}"
+        )
 
     for index in range(torch.cuda.device_count()):
         properties = torch.cuda.get_device_properties(index)
@@ -36,13 +41,22 @@ def main() -> int:
         }
         report["devices"].append(device_report)
         if capability != (8, 9):
-            errors.append(f"GPU {index} expected SM89, found SM{capability[0]}{capability[1]}")
+            errors.append(
+                f"GPU {index} expected SM89, found SM{capability[0]}{capability[1]}"
+            )
         if not device_report["bf16_supported"]:
             errors.append(f"GPU {index} does not support BF16")
+        if properties.total_memory < MIN_DEVICE_MEMORY_BYTES:
+            errors.append(
+                f"GPU {index} requires at least {MIN_DEVICE_MEMORY_BYTES} bytes, "
+                f"found {properties.total_memory}"
+            )
 
         if torch.cuda.is_available():
             device = torch.device("cuda", index)
-            left = torch.arange(4096, dtype=torch.bfloat16, device=device).reshape(64, 64)
+            left = torch.arange(4096, dtype=torch.bfloat16, device=device).reshape(
+                64, 64
+            )
             result = left @ left.T
             if not torch.isfinite(result.float()).all().item():
                 errors.append(f"GPU {index} BF16 matmul returned non-finite values")

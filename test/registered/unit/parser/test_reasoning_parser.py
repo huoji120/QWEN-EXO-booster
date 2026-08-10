@@ -166,6 +166,99 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
 
+    def test_streaming_quoted_tool_example_stays_reasoning(self):
+        chunks = [
+            "<think>I need to wrap them in `",
+            "<tool_call>{...}</tool_call>`. More thought",
+            "</think>answer",
+        ]
+        reasoning = ""
+        normal = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk)
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+
+        self.assertEqual(
+            reasoning,
+            "I need to wrap them in `<tool_call>{...}</tool_call>`. More thought",
+        )
+        self.assertEqual(normal, "answer")
+
+    def test_streaming_quoted_complete_json_across_chunks_stays_reasoning(self):
+        chunks = [
+            "<think>Quote this call in `",
+            '<tool_call>{"name":"run","arguments":{}}</tool_call>`',
+            "</think>answer",
+        ]
+        reasoning = ""
+        normal = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk)
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+
+        self.assertEqual(
+            reasoning,
+            'Quote this call in `<tool_call>{"name":"run","arguments":{}}</tool_call>`',
+        )
+        self.assertEqual(normal, "answer")
+
+    def test_streaming_complete_json_tool_call_closes_reasoning(self):
+        chunks = [
+            "<think>decide ",
+            "<tool_call>",
+            '{"action":"run","arguments":',
+            '{"command":"pwd"}}</tool_call>',
+        ]
+        reasoning = ""
+        normal = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk)
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+
+        self.assertEqual(reasoning, "decide ")
+        self.assertEqual(
+            normal,
+            '<tool_call>{"action":"run","arguments":{"command":"pwd"}}</tool_call>',
+        )
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_tool_call_removes_late_think_end(self):
+        self.detector.parse_streaming_increment("<think>decide ")
+        result = self.detector.parse_streaming_increment(
+            '<tool_call>{"action":"run","arguments":{}}</tool_call></think>answer'
+        )
+
+        self.assertEqual(result.reasoning_text, "decide ")
+        self.assertEqual(
+            result.normal_text,
+            '<tool_call>{"action":"run","arguments":{}}</tool_call>answer',
+        )
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_qwen_coder_tool_call_closes_reasoning(self):
+        self.detector.parse_streaming_increment("<think>decide ")
+        result = self.detector.parse_streaming_increment(
+            "<tool_call><function=run></function></tool_call>"
+        )
+
+        self.assertEqual(result.reasoning_text, "decide ")
+        self.assertEqual(
+            result.normal_text,
+            "<tool_call><function=run></function></tool_call>",
+        )
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_incomplete_xml_tool_call_stays_reasoning(self):
+        self.detector.parse_streaming_increment("<think>decide ")
+        result = self.detector.parse_streaming_increment("<tool_call><function=run>")
+
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+        self.assertTrue(self.detector._in_reasoning)
+
 
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):

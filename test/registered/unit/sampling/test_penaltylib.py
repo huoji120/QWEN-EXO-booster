@@ -1,12 +1,7 @@
 """Unit tests for srt/sampling/penaltylib/ — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
-
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -22,7 +17,12 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib import repetition_penalty
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"
@@ -48,6 +48,41 @@ def _make_batch(reqs):
     batch.reqs = reqs
     batch.device = DEVICE
     return batch
+
+
+class TestApplyScalingPenalties(CustomTestCase):
+    def setUp(self):
+        self.original_use_compiled = repetition_penalty._use_compiled_scaling_penalties
+
+    def tearDown(self):
+        repetition_penalty._use_compiled_scaling_penalties = self.original_use_compiled
+
+    def test_backend_compile_failure_falls_back_once(self):
+        class CompilerFailure(Exception):
+            pass
+
+        compiled = MagicMock(side_effect=CompilerFailure("incompatible backend"))
+        repetition_penalty._use_compiled_scaling_penalties = True
+
+        with (
+            patch.object(repetition_penalty, "BackendCompilerFailed", CompilerFailure),
+            patch.object(
+                repetition_penalty,
+                "_compiled_apply_scaling_penalties",
+                compiled,
+            ),
+        ):
+            logits = torch.tensor([[-2.0, 4.0]])
+            penalties = torch.tensor([[2.0, 2.0]])
+            repetition_penalty.apply_scaling_penalties(logits, penalties)
+            self.assertTrue(torch.equal(logits, torch.tensor([[-4.0, 2.0]])))
+
+            second_logits = torch.tensor([[-1.0, 6.0]])
+            repetition_penalty.apply_scaling_penalties(second_logits, penalties)
+            self.assertTrue(torch.equal(second_logits, torch.tensor([[-2.0, 3.0]])))
+
+        compiled.assert_called_once()
+        self.assertFalse(repetition_penalty._use_compiled_scaling_penalties)
 
 
 # BatchedPenalizerOrchestrator

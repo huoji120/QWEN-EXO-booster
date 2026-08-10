@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f7f7f5" />
+    <meta
+      name="description"
+      content="QWEN EXO 模型推理、原生记忆与运维控制台"
+    />
+    <title>QWEN EXO 控制台</title>
+    <script>
+      (function () {
+        var languageMode =
+          localStorage.getItem("qwen-exo-language") || "browser";
+        var browserLanguage = (navigator.language || "").toLowerCase();
+        var detectedLanguage =
+          browserLanguage.indexOf("en") === 0 ? "en-US" : "zh-CN";
+        var language =
+          languageMode === "en-US" || languageMode === "zh-CN"
+            ? languageMode
+            : detectedLanguage;
+        document.documentElement.lang = language;
+        var mode = localStorage.getItem("qwen-exo-theme") || "system";
+        var dark =
+          mode === "dark" ||
+          (mode === "system" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.classList.add("dark");
+        document.documentElement.style.colorScheme = dark ? "dark" : "light";
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

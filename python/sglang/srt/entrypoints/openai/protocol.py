@@ -1544,6 +1544,11 @@ class ResponsesRequest(BaseModel):
             return part
 
         part_type = part.get("type")
+        if part_type == "output_text":
+            return {
+                "type": "input_text",
+                "text": str(part.get("text") or ""),
+            }
         if part_type != "input_image" or part.get("detail") is not None:
             return part
 
@@ -1633,6 +1638,19 @@ class PromptTokenUsageInfo(BaseModel):
     """Prompt token usage details."""
 
     cached_tokens: int = 0
+
+
+class ResponsesCompactRequest(BaseModel):
+    """OpenAI Responses ``POST /responses/compact`` request."""
+
+    model: Optional[str] = None
+    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]], None] = None
+    instructions: Optional[str] = None
+    previous_response_id: Optional[str] = None
+    prompt_cache_key: Optional[str] = None
+    request_id: str = Field(
+        default_factory=lambda: f"resp_compact_{uuid.uuid4().hex}"
+    )
 
 
 class ResponsesResponse(BaseModel):
@@ -1742,7 +1760,14 @@ class ResponsesResponse(BaseModel):
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
-                "effort": request.reasoning.effort if request.reasoning else None,
+                # OpenAI's response event schema represents an explicit
+                # no-reasoning request as a null effort, not the request-only
+                # "none" control value.
+                "effort": (
+                    request.reasoning.effort
+                    if request.reasoning and request.reasoning.effort != "none"
+                    else None
+                ),
                 "summary": None,  # unused
             },
             store=request.store,

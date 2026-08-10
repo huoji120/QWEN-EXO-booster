@@ -61,13 +61,16 @@ if _is_cuda or _is_musa:
     )
     from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
 
-    # Temporary
+    # Some images expose the Python wrapper before the matching torch op is
+    # registered. Treat that mixed-version install as unavailable so online
+    # FP8 quantization falls back to the compatible v1 kernel.
     try:
         from sgl_kernel import sgl_per_token_group_quant_8bit
 
+        if not hasattr(torch.ops.sgl_kernel, "sgl_per_token_group_quant_8bit"):
+            raise ImportError("sgl_kernel FP8 group quant op is not registered")
         enable_sgl_per_token_group_quant_8bit = True
     except ImportError:
-        from sgl_kernel import sgl_per_token_group_quant_fp8
 
         enable_sgl_per_token_group_quant_8bit = False
 
@@ -252,6 +255,54 @@ def _per_token_group_quant_8bit_colmajor(
     tl.store(y_s_ptr, y_s)
 
 
+def _run_per_token_group_quant_8bit_triton(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    bit8_min: float,
+    bit8_max: float,
+    *,
+    column_major_scales: bool,
+    scale_ue8m0: bool,
+) -> None:
+    rows = x.numel() // group_size
+    block = triton.next_power_of_2(group_size)
+    num_warps = min(max(block // 256, 1), 8)
+    if column_major_scales:
+        _per_token_group_quant_8bit_colmajor[(rows,)](
+            x,
+            x_q,
+            x_s,
+            group_size,
+            x.shape[1],
+            x_s.stride(1),
+            eps,
+            bit8_min=bit8_min,
+            bit8_max=bit8_max,
+            BLOCK=block,
+            num_warps=num_warps,
+            num_stages=1,
+            SCALE_UE8M0=scale_ue8m0,
+        )
+    else:
+        assert not scale_ue8m0
+        _per_token_group_quant_8bit[(rows,)](
+            x,
+            x_q,
+            x_s,
+            group_size,
+            group_size,
+            eps,
+            bit8_min=bit8_min,
+            bit8_max=bit8_max,
+            BLOCK=block,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+
+
 def _per_token_group_quant_8bit_raw(
     x: torch.Tensor,
     group_size: int,
@@ -304,44 +355,17 @@ def _per_token_group_quant_8bit_raw(
         scale_ue8m0=False,
     )
 
-    M = x.numel() // group_size
-    N = group_size
-
-    BLOCK = triton.next_power_of_2(N)
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK // 256, 1), 8)
-    num_stages = 1
-    if column_major_scales:
-        _per_token_group_quant_8bit_colmajor[(M,)](
-            x,
-            x_q,
-            x_s,
-            group_size,
-            x.shape[1],
-            x_s.stride(1),
-            eps,
-            bit8_min=bit8_min,
-            bit8_max=bit8_max,
-            BLOCK=BLOCK,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            SCALE_UE8M0=scale_ue8m0,
-        )
-    else:
-        assert not scale_ue8m0
-        _per_token_group_quant_8bit[(M,)](
-            x,
-            x_q,
-            x_s,
-            group_size,
-            N,
-            eps,
-            bit8_min=bit8_min,
-            bit8_max=bit8_max,
-            BLOCK=BLOCK,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
+    _run_per_token_group_quant_8bit_triton(
+        x,
+        x_q,
+        x_s,
+        group_size,
+        eps,
+        bit8_min,
+        bit8_max,
+        column_major_scales=column_major_scales,
+        scale_ue8m0=scale_ue8m0,
+    )
 
     if scale_ue8m0:
         from deep_gemm import transform_sf_into_required_layout
@@ -569,8 +593,16 @@ def _run_per_token_group_quant_8bit_kernel(
 
     if not enable_sgl_per_token_group_quant_8bit:
         assert not enable_v2
-        sgl_per_token_group_quant_fp8(
-            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        _run_per_token_group_quant_8bit_triton(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            column_major_scales=column_major_scales,
+            scale_ue8m0=scale_ue8m0,
         )
         return
 

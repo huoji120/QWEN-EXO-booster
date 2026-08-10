@@ -464,7 +464,6 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
 def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
-
     overrides: Dict[str, Any] = {}
 
     quant_method = get_quantization_config(hf_config)
@@ -613,7 +612,6 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         # use bf16 for mxfp4 triton kernels
         overrides["dtype"] = "bfloat16"
     if server_args.moe_runner_backend == "auto":
-
         if is_sm100_supported() and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
             logger.warning(
@@ -941,6 +939,11 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     "Qwen3_5ForConditionalGeneration",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
+    if (
+        getattr(server_args, "qwen_exo_score_bias_mode", "off") != "off"
+        and server_args.attention_backend is None
+    ):
+        return {"attention_backend": "triton", "page_size": 1}
     if not is_sm100_supported() or server_args.attention_backend is not None:
         return {}
     sm100_default_attn_backend = "triton"
@@ -970,7 +973,6 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("Qwen3VLForConditionalGeneration")
 def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
-
     if (
         is_hip()
         and envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
@@ -1500,7 +1502,6 @@ def _deepseek_v4_sm120_moe(view: Any) -> dict:
 
 @register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
-
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
         logger.warning(
             "Overlap scheduler is disabled when using sparse head for embedding model."
@@ -2055,7 +2056,6 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
 
 
 def _cutlass_moe_env_override(view: Any) -> dict:
-
     if envs.SGLANG_CUTLASS_MOE.get():
         logger.warning(
             "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
@@ -2076,7 +2076,6 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
-
     moe_a2a_backend = view.moe_a2a_backend
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(

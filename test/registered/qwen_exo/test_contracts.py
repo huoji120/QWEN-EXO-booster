@@ -1,7 +1,6 @@
 import time
 
 import pytest
-
 from qwen_exo_booster.contracts import (
     CancellationToken,
     ContractViolation,

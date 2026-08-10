@@ -43,7 +43,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
@@ -649,7 +648,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._handle_epd_disaggregation_encode_request(obj)
 
             # Log the request
-            self.request_logger.log_received_request(obj, self.tokenizer, request)
+            if not getattr(obj, "no_logs", False):
+                self.request_logger.log_received_request(obj, self.tokenizer, request)
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -1448,36 +1448,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """
         finish_reason = out["meta_info"]["finish_reason"]
 
-        if (
-            finish_reason.get("type") == "abort"
-            and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
-        ):
-            if not is_stream:
+        if finish_reason.get("type") != "abort":
+            return None
+
+        raw_status_code = finish_reason.get("status_code")
+        status_code = int(
+            raw_status_code
+            if raw_status_code is not None
+            else HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        if state.obj.rid in self.rid_to_state:
+            del self.rid_to_state[state.obj.rid]
+        if self.enable_lora and state.obj.lora_path:
+            await self.lora_registry.release(state.obj.lora_id)
+        if not is_stream:
+            if status_code == HTTPStatus.BAD_REQUEST:
                 raise ValueError(finish_reason["message"])
-            return out
-
-        if finish_reason.get("type") == "abort" and finish_reason.get(
-            "status_code"
-        ) in (
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-        ):
-            # Delete the key to prevent resending abort request to the scheduler and
-            # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
-                del self.rid_to_state[state.obj.rid]
-
-            # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
-            if not is_stream:
-                raise fastapi.HTTPException(
-                    status_code=finish_reason["status_code"],
-                    detail=finish_reason["message"],
-                )
-            return out
-
-        return None
+            detail = {
+                "message": finish_reason.get("message", "Scheduler request aborted"),
+                "code": finish_reason.get("code", "scheduler_abort"),
+            }
+            headers = None
+            if finish_reason.get("retry_after") is not None:
+                retry_after = int(finish_reason["retry_after"])
+                detail["retry_after"] = retry_after
+                headers = {"Retry-After": str(retry_after)}
+            raise fastapi.HTTPException(
+                status_code=status_code,
+                detail=detail,
+                headers=headers,
+            )
+        return out
 
     async def _wait_one_response(
         self,
@@ -1540,16 +1541,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
-                self.request_logger.log_finished_request(
-                    obj,
-                    out,
-                    request=request,
-                )
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
+                if not getattr(obj, "no_logs", False):
+                    self.request_logger.log_finished_request(
+                        obj,
+                        out,
+                        request=request,
+                    )
 
-                if self.request_metrics_exporter_manager.exporter_enabled():
+                if (
+                    not getattr(obj, "no_logs", False)
+                    and self.request_metrics_exporter_manager.exporter_enabled()
+                ):
                     asyncio.create_task(
                         self.request_metrics_exporter_manager.write_record(obj, out)
                     )
@@ -1570,9 +1575,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 yield out
             else:
                 if (
@@ -1771,9 +1776,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
+            (
+                success,
+                message,
+                num_paused_requests,
+            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
@@ -2180,9 +2187,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i)
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+            if (
+                self.dump_requests_folder
+                and state.finished
+                and state.obj.log_metrics
+                and not getattr(state.obj, "no_logs", False)
+            ):
                 self.dump_requests(state, out_dict)
-            if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+            if (
+                self.crash_dump_folder
+                and state.finished
+                and state.obj.log_metrics
+                and not getattr(state.obj, "no_logs", False)
+            ):
                 self.record_request_for_crash_dump(state, out_dict)
 
         # handle_loop awaits next recv immediately
@@ -2643,7 +2660,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Add unfinished requests from rid_to_state
             unfinished_requests = []
             for rid, state in self.rid_to_state.items():
-                if not state.finished:
+                if not state.finished and not getattr(state.obj, "no_logs", False):
                     state.time_stats.set_finished_time()
                     unfinished_requests.append(
                         (
@@ -2872,9 +2889,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[ScaleElasticEPReqOutput] = (
-            await self.scale_elastic_ep_communicator(obj)
-        )
+        responses: List[
+            ScaleElasticEPReqOutput
+        ] = await self.scale_elastic_ep_communicator(obj)
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = res.scale_phase

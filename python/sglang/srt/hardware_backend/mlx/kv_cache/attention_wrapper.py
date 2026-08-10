@@ -41,6 +41,7 @@ class BatchedDecodeContext:
     # MLX decode path so future AOT kernels can be added without growing this
     # context one field at a time.
     aot: MlxAOTKernelContext = field(default_factory=MlxAOTKernelContext)
+    qwen_exo: Any | None = None
 
     # Derived tensors/metadata, shared across all layers in one forward pass.
     offsets: mx.array = field(init=False)
@@ -76,6 +77,7 @@ class BatchedDecodeContext:
         req_to_token_pool: Any | None,
         attention_layer_indices: list[int] | None = None,
         attention_pool_index_by_layer: dict[int, int] | None = None,
+        qwen_exo: Any | None = None,
     ) -> BatchedDecodeContext:
         batch_size = len(req_ids)
         if attention_layer_indices is None:
@@ -92,6 +94,7 @@ class BatchedDecodeContext:
             seq_lens=seq_lens,
             attention_layer_caches=attention_layer_caches,
             attention_pool_index_by_layer=attention_pool_index_by_layer or {},
+            qwen_exo=qwen_exo,
             aot=MlxAOTKernelContext.from_decode(
                 aot_kernels=aot_kernels,
                 kv_pool=kv_pool,
@@ -103,11 +106,11 @@ class BatchedDecodeContext:
         )
 
 
-def set_context(ctx: Optional[BatchedDecodeContext]) -> None:
+def set_context(ctx: Any | None) -> None:
     _thread_local.batched_ctx = ctx
 
 
-def get_context() -> Optional[BatchedDecodeContext]:
+def get_context() -> Any | None:
     return getattr(_thread_local, "batched_ctx", None)
 
 
@@ -129,9 +132,42 @@ class MLXAttentionWrapper(nn.Module):
 
     def __call__(self, x: mx.array, mask: Any = None, cache: Any = None) -> mx.array:
         ctx = get_context()
-        if ctx is None:
-            return self._inner(x, mask=mask, cache=cache)
-        return self._batched_decode(x, ctx)
+        if isinstance(ctx, BatchedDecodeContext):
+            return self._batched_decode(x, ctx)
+        if (
+            ctx is not None
+            and bool(getattr(ctx, "is_prefill", False))
+            and ctx.observes_attention_layer(self._layer_idx)
+        ):
+            self._observe_prefill(x, ctx)
+        return self._inner(x, mask=mask, cache=cache)
+
+    def _observe_prefill(self, x: mx.array, ctx: Any) -> None:
+        inner = self._inner
+        batch, length, _ = x.shape
+        n_heads = get_num_heads(inner)
+        n_kv_heads = get_num_kv_heads(inner)
+        head_dim = get_head_dim(inner)
+        if n_heads is None or n_kv_heads is None or head_dim is None:
+            return
+        q_projection = inner.q_proj(x)
+        q_width = n_heads * head_dim
+        if q_projection.shape[-1] == 2 * q_width:
+            queries, _gate = mx.split(
+                q_projection.reshape(batch, length, n_heads, 2 * head_dim),
+                2,
+                axis=-1,
+            )
+        elif q_projection.shape[-1] == q_width:
+            queries = q_projection.reshape(batch, length, n_heads, head_dim)
+        else:
+            return
+        keys = inner.k_proj(x).reshape(batch, length, n_kv_heads, head_dim)
+        if hasattr(inner, "q_norm"):
+            queries = inner.q_norm(queries)
+        if hasattr(inner, "k_norm"):
+            keys = inner.k_norm(keys)
+        ctx.observe_attention(queries, keys, layer_idx=self._layer_idx)
 
     def _batched_decode(self, x: mx.array, ctx: BatchedDecodeContext) -> mx.array:
         inner = self._inner
@@ -174,10 +210,18 @@ class MLXAttentionWrapper(nn.Module):
             queries = inner.q_norm(queries)
         if hasattr(inner, "k_norm"):
             keys = inner.k_norm(keys)
+        raw_queries = queries
+        raw_keys = keys
 
         queries = queries.transpose(0, 2, 1, 3)
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
+        if ctx.qwen_exo is not None:
+            ctx.qwen_exo.observe_attention(
+                raw_queries,
+                raw_keys,
+                layer_idx=layer_idx,
+            )
 
         # Vectorized RoPE with per-batch offsets (cached on the context).
         offsets = ctx.offsets
@@ -234,6 +278,15 @@ class MLXAttentionWrapper(nn.Module):
                 mx.array(mx.finfo(queries.dtype).min, dtype=queries.dtype),
                 mx.array(0.0, dtype=queries.dtype),
             )
+        if ctx.qwen_exo is not None:
+            qwen_exo_bias = ctx.qwen_exo.attention_bias(
+                key_length=int(keys_b.shape[2]),
+                layer_idx=layer_idx,
+            )
+            if qwen_exo_bias is not None:
+                attn_mask = (
+                    qwen_exo_bias if attn_mask is None else attn_mask + qwen_exo_bias
+                )
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys_b, values_b, scale=inner.scale, mask=attn_mask

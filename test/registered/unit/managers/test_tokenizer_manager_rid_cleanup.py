@@ -250,6 +250,27 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         )
 
 
+class TestHandleAbortFinishReason(CustomTestCase):
+    def test_stream_abort_accepts_null_status_code(self):
+        tm = _make_tokenizer_manager()
+        state = _make_req_state("stream_cancel_rid")
+        tm.rid_to_state[state.obj.rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": None,
+                    "message": "Request cancelled",
+                }
+            }
+        }
+
+        result = asyncio.run(tm._handle_abort_finish_reason(out, state, True))
+
+        self.assertIs(result, out)
+        self.assertNotIn(state.obj.rid, tm.rid_to_state)
+
+
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""
 

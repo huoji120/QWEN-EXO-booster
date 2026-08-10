@@ -92,6 +92,31 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         seqs = [p["sequence_number"] for p in event_payloads(events)]
         self.assertEqual(seqs, list(range(len(seqs))))
 
+    def test_reasoning_effort_none_streams_with_null_response_effort(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            reasoning={"effort": "none"},
+        )
+        events = _StreamFixture(serving, request).run(
+            [_engine_chunk("OK", 1, finish=True)]
+        )
+        payloads = event_payloads(events)
+        created = next(item for item in payloads if item["type"] == "response.created")
+        completed = find_completed_event(events)
+
+        self.assertIsNone(created["response"]["reasoning"]["effort"])
+        self.assertIsNone(completed["response"]["reasoning"]["effort"])
+        self.assertFalse(
+            any(item["type"].startswith("response.reasoning_") for item in payloads)
+        )
+
     def test_required_tool_choice_emits_function_call_events(self):
         serving = make_serving()
         serving.reasoning_parser = None

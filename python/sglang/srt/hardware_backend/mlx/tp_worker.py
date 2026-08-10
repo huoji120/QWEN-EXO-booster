@@ -159,106 +159,22 @@ class MlxTpModelWorker(TpModelWorker):
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
-        """Run forward pass through the MLX model runner (greedy only)."""
-        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        """Run one MLX batch through the shared lazy launch/finalize path."""
 
-        forward_mode = batch.forward_mode
-        reqs = batch.reqs
-
-        if forward_mode.is_idle():
-            return GenerationBatchResult(
-                logits_output=LogitsProcessorOutput(next_token_logits=None),
-                can_run_cuda_graph=False,
-            )
-
-        self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
-
-        next_token_ids_list: list[int] = []
-
-        if forward_mode.is_extend():
-            # Ensure pool is up-to-date before pool-backed attention reads it
-            # for prefix-cached prefills.  Only runs on extend batches.
-            self._mlx_runner.flush_all_decode_kv()
-            input_ids_cpu = batch.input_ids.cpu().tolist()
-            out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
-            extend_seq_lens = batch.extend_lens
-
-            offset = 0  # into input_ids_cpu
-            slot_offset = 0  # into out_cache_loc_cpu
-            prefill_rids: list[tuple[str, int]] = []
-            extend_rids: list[tuple[str, int]] = []
-            decode_rids: list[str] = []
-            # Genuine decode steps mixed into this extend batch; see
-            # _route_extend_request.
-            decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
-
-            for i, req in enumerate(reqs):
-                seq_len = extend_seq_lens[i]
-                req_token_ids = input_ids_cpu[offset : offset + seq_len]
-                req_new_slots = out_cache_loc_cpu[slot_offset : slot_offset + seq_len]
-                offset += seq_len
-                slot_offset += seq_len
-
-                route = self._route_extend_request(req.rid, decoding_rids)
-                if route == "continuation":
-                    next_token = self._mlx_runner.extend(
-                        req.rid, req_token_ids, req_new_slots
-                    )
-                    extend_rids.append((req.rid, next_token))
-                elif route == "decode":
-                    decode_rids.append(req.rid)
-                else:  # "prefill"
-                    prefix_slot_ids = req.prefix_indices.tolist()
-                    full_token_ids = list(req.get_fill_ids())
-                    next_token = self._mlx_runner.prefill(
-                        req_id=req.rid,
-                        new_token_ids=req_token_ids,
-                        full_token_ids=full_token_ids,
-                        prefix_slot_ids=prefix_slot_ids,
-                        new_slot_ids=req_new_slots,
-                        req_pool_idx=req.req_pool_idx,
-                        req=req,
-                    )
-                    prefill_rids.append((req.rid, next_token))
-
-            # Batch decode all existing requests at once
-            if decode_rids:
-                decode_results = self._mlx_runner.decode_batch(decode_rids)
-                decode_map = dict(zip(decode_rids, decode_results))
-            else:
-                decode_map = {}
-
-            prefill_map = dict(prefill_rids)
-            extend_map = dict(extend_rids)
-
-            for req in reqs:
-                if req.rid in decode_map:
-                    next_token_ids_list.append(decode_map[req.rid])
-                elif req.rid in extend_map:
-                    next_token_ids_list.append(extend_map[req.rid])
-                else:
-                    next_token_ids_list.append(prefill_map[req.rid])
-
-        elif forward_mode.is_decode():
-            req_ids = [req.rid for req in reqs]
-            next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
-
-        else:
-            raise ValueError(
-                f"MLX runner does not support forward mode: {forward_mode}"
-            )
-
-        next_token_ids = torch.tensor(
-            next_token_ids_list, dtype=torch.long, device="cpu"
+        _lazy, prefills, extends, decode, mode = (
+            self.async_forward_batch_generation_mlx(batch)
+        )
+        return self.finalize_mlx_result(
+            prefills,
+            extends,
+            decode,
+            mode,
+            list(batch.reqs),
         )
 
-        return GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
-            next_token_ids=next_token_ids,
-            can_run_cuda_graph=False,
-        )
-
-    def async_forward_batch_generation_mlx(self, batch: ScheduleBatch) -> tuple[
+    def async_forward_batch_generation_mlx(
+        self, batch: ScheduleBatch
+    ) -> tuple[
         Union[mx.array, None],
         list[MlxPendingPrefill],
         list[MlxPendingExtend],
@@ -297,8 +213,15 @@ class MlxTpModelWorker(TpModelWorker):
 
         if forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]
-            pending_decode = self._mlx_runner.decode_batch_start(req_ids)
-            mx.async_eval(pending_decode.lazy_tokens)
+            pending_decode = self._mlx_runner.decode_batch_start(
+                req_ids,
+                reqs=list(reqs),
+            )
+            mx.async_eval(
+                pending_decode.lazy_tokens,
+                *self._mlx_runner.sampling_arrays(pending_decode.sampling),
+                *(pending_decode.customized_info or {}).values(),
+            )
             return pending_decode.lazy_tokens, [], [], pending_decode, "decode"
 
         if forward_mode.is_extend():
@@ -312,7 +235,9 @@ class MlxTpModelWorker(TpModelWorker):
             f"MLX async runner does not support forward mode: {forward_mode}"
         )
 
-    def _async_extend_batch(self, batch: ScheduleBatch) -> tuple[
+    def _async_extend_batch(
+        self, batch: ScheduleBatch
+    ) -> tuple[
         Union[mx.array, None],
         list[MlxPendingPrefill],
         list[MlxPendingExtend],
@@ -324,12 +249,15 @@ class MlxTpModelWorker(TpModelWorker):
         input_ids_cpu = batch.input_ids.cpu().tolist()
         out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
         extend_seq_lens = batch.extend_lens
+        logprob_starts = batch.extend_logprob_start_lens or list(extend_seq_lens)
+        final_prefill_flags = batch.qwen_exo_final_prefill or [True] * len(reqs)
 
         offset = 0
         slot_offset = 0
         pending_prefills: list[MlxPendingPrefill] = []
         pending_extends: list[MlxPendingExtend] = []
         mixed_decode_rids: list[str] = []
+        mixed_decode_reqs: list = []
         # Genuine decode steps mixed into this extend batch; see
         # _route_extend_request.
         decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
@@ -348,10 +276,14 @@ class MlxTpModelWorker(TpModelWorker):
                         req_id=req.rid,
                         new_token_ids=req_token_ids,
                         new_slot_ids=req_new_slots,
+                        req=req,
+                        logprob_start_len=int(logprob_starts[i]),
+                        final_prefill=bool(final_prefill_flags[i]),
                     )
                 )
             elif route == "decode":
                 mixed_decode_rids.append(req.rid)
+                mixed_decode_reqs.append(req)
             else:  # "prefill"
                 prefix_slot_ids = req.prefix_indices.tolist()
                 full_token_ids = list(req.get_fill_ids())
@@ -364,13 +296,16 @@ class MlxTpModelWorker(TpModelWorker):
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
                         req=req,
+                        logprob_start_len=int(logprob_starts[i]),
+                        final_prefill=bool(final_prefill_flags[i]),
                     )
                 )
 
         pending_mixed_decode: Optional[MlxPendingDecode] = None
         if mixed_decode_rids:
             pending_mixed_decode = self._mlx_runner.decode_batch_start(
-                mixed_decode_rids
+                mixed_decode_rids,
+                reqs=mixed_decode_reqs,
             )
 
         # Stack lazy tokens so the caller has a single handle to evaluate
@@ -390,12 +325,27 @@ class MlxTpModelWorker(TpModelWorker):
 
         for p in pending_prefills:
             async_args.extend(self._cache_state(p.cache))
+            async_args.extend(self._mlx_runner.sampling_arrays(p.sampling))
+            if p.input_token_logprobs is not None:
+                async_args.append(p.input_token_logprobs)
+            if p.customized_info is not None:
+                async_args.extend(p.customized_info.values())
         for e in pending_extends:
             async_args.extend(self._cache_state(self._mlx_runner._req_caches[e.req_id]))
+            async_args.extend(self._mlx_runner.sampling_arrays(e.sampling))
+            if e.input_token_logprobs is not None:
+                async_args.append(e.input_token_logprobs)
+            if e.customized_info is not None:
+                async_args.extend(e.customized_info.values())
         if pending_mixed_decode is not None:
             async_args.append(pending_mixed_decode.lazy_tokens)
+            async_args.extend(
+                self._mlx_runner.sampling_arrays(pending_mixed_decode.sampling)
+            )
             for c_list in pending_mixed_decode.caches:
                 async_args.extend(self._cache_state(c_list))
+            if pending_mixed_decode.customized_info is not None:
+                async_args.extend(pending_mixed_decode.customized_info.values())
 
         if async_args:
             mx.async_eval(*async_args)
@@ -460,8 +410,154 @@ class MlxTpModelWorker(TpModelWorker):
         prefill/extend lists are always absent for chained decodes.
         """
         pending = self._mlx_runner.decode_batch_start_chained(prev_pending)
-        mx.async_eval(pending.lazy_tokens)
+        mx.async_eval(
+            pending.lazy_tokens,
+            *self._mlx_runner.sampling_arrays(pending.sampling),
+            *(pending.customized_info or {}).values(),
+        )
         return pending.lazy_tokens, [], [], pending, "decode"
+
+    @staticmethod
+    def _mlx_logits_output(
+        reqs: list,
+        prefills: list[MlxPendingPrefill],
+        extends: list[MlxPendingExtend],
+        decode: Optional[MlxPendingDecode],
+    ):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        rows: dict[str, tuple[object, int]] = {}
+        for pending in prefills:
+            rows[pending.req_id] = (pending, 0)
+        for pending in extends:
+            rows[pending.req_id] = (pending, 0)
+        if decode is not None:
+            for row, rid in enumerate(decode.req_ids):
+                rows[rid] = (decode, row)
+
+        if not any(
+            getattr(pending, "sampling", None) is not None
+            for pending, _ in rows.values()
+        ):
+            return LogitsProcessorOutput(next_token_logits=None)
+
+        next_logprobs: list[float] = []
+        input_logprobs: list[float] = []
+        top_values: list[torch.Tensor] = []
+        top_indices: list[torch.Tensor] = []
+        requested_values: list[torch.Tensor] = []
+        requested_indices: list[list[int]] = []
+        any_top = False
+        customized_info: dict[str, torch.Tensor] = {}
+        customized_keys = {
+            key
+            for pending, _ in rows.values()
+            for key in (getattr(pending, "customized_info", None) or {})
+        }
+        for key in customized_keys:
+            row_tensors: list[torch.Tensor | None] = []
+            max_size = 1
+            scalar = True
+            for req in reqs:
+                pending, row = rows[req.rid]
+                value = (getattr(pending, "customized_info", None) or {}).get(key)
+                if value is None or int(value.shape[0]) <= row:
+                    row_tensors.append(None)
+                    continue
+                tensor = torch.tensor(value[row].tolist(), dtype=torch.float32)
+                scalar = scalar and tensor.ndim == 0
+                max_size = max(max_size, tensor.numel())
+                row_tensors.append(tensor.reshape(-1))
+            if scalar and all(
+                tensor is None or tensor.numel() == 1 for tensor in row_tensors
+            ):
+                customized_info[key] = torch.tensor(
+                    [
+                        float("nan") if tensor is None else float(tensor.item())
+                        for tensor in row_tensors
+                    ],
+                    dtype=torch.float32,
+                )
+            else:
+                padded = []
+                for tensor in row_tensors:
+                    if tensor is None:
+                        padded.append(torch.full((max_size,), float("nan")))
+                    elif tensor.numel() < max_size:
+                        padded.append(
+                            torch.cat(
+                                (
+                                    tensor,
+                                    torch.full(
+                                        (max_size - tensor.numel(),), float("nan")
+                                    ),
+                                )
+                            )
+                        )
+                    else:
+                        padded.append(tensor)
+                customized_info[key] = torch.stack(padded)
+        any_requested = False
+
+        for req in reqs:
+            pending, row = rows[req.rid]
+            sampling = pending.sampling
+            if sampling is None:
+                next_logprobs.append(float("nan"))
+                top_values.append(torch.empty(0, dtype=torch.float32))
+                top_indices.append(torch.empty(0, dtype=torch.int64))
+                requested_values.append(torch.empty(0, dtype=torch.float32))
+                requested_indices.append([])
+                continue
+            next_logprobs.append(float(sampling.token_logprobs[row].item()))
+            input_values = getattr(pending, "input_token_logprobs", None)
+            if input_values is not None:
+                raw_input = input_values.tolist()
+                input_logprobs.extend(
+                    float(value)
+                    for value in (
+                        raw_input if isinstance(raw_input, list) else [raw_input]
+                    )
+                )
+
+            values = sampling.top_logprobs_val[row]
+            indices = sampling.top_logprobs_idx[row]
+            any_top = any_top or values is not None
+            top_values.append(
+                torch.tensor(values.tolist(), dtype=torch.float32)
+                if values is not None
+                else torch.empty(0, dtype=torch.float32)
+            )
+            top_indices.append(
+                torch.tensor(indices.tolist(), dtype=torch.int64)
+                if indices is not None
+                else torch.empty(0, dtype=torch.int64)
+            )
+
+            requested = sampling.token_ids_logprobs_val[row]
+            requested_ids = sampling.token_ids_logprobs_idx[row]
+            any_requested = any_requested or requested is not None
+            requested_values.append(
+                torch.tensor(requested.tolist(), dtype=torch.float32)
+                if requested is not None
+                else torch.empty(0, dtype=torch.float32)
+            )
+            requested_indices.append(list(requested_ids or ()))
+
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_logprobs=torch.tensor(next_logprobs, dtype=torch.float32),
+            next_token_top_logprobs_val=top_values if any_top else None,
+            next_token_top_logprobs_idx=top_indices if any_top else None,
+            next_token_token_ids_logprobs_val=(
+                requested_values if any_requested else None
+            ),
+            next_token_token_ids_logprobs_idx=(
+                requested_indices if any_requested else None
+            ),
+            input_token_logprobs=torch.tensor(input_logprobs, dtype=torch.float32),
+            customized_info=customized_info or None,
+        )
 
     def finalize_mlx_result(
         self,
@@ -522,8 +618,9 @@ class MlxTpModelWorker(TpModelWorker):
             raise ValueError(f"Unknown MLX async mode: {mode}")
 
         next_token_ids = torch.tensor(next_tokens_list, dtype=torch.long, device="cpu")
+        logits_output = self._mlx_logits_output(reqs, prefills, extends, decode)
         return GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=False,
         )

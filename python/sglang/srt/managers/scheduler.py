@@ -20,12 +20,13 @@ import os
 import signal
 import sys
 import time
+import weakref
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -35,9 +36,18 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.cuda import Stream as CudaStream
-from torch.distributed import barrier
-
+from qwen_exo_booster.contracts import (
+    ContractViolation,
+    HybridLifecycleState,
+    HybridStateNamespace,
+    stable_digest,
+)
+from qwen_exo_booster.hybrid_state import (
+    HybridRequestPhase,
+    HybridRuntimePolicy,
+)
+from qwen_exo_booster.native_state_bank import NativeStateBankManager
+from qwen_exo_booster.scheduler_admission import SchedulerAdmission
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -228,7 +238,9 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -278,6 +290,8 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.cuda import Stream as CudaStream
+from torch.distributed import barrier
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -330,6 +344,11 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        self.qwen_exo_hybrid_policy = (
+            HybridRuntimePolicy.from_server_args(server_args)
+            if server_args.enable_qwen_exo
+            else None
+        )
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
@@ -978,6 +997,30 @@ class Scheduler(
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
+        self.qwen_exo_admission = (
+            SchedulerAdmission(
+                page_size=self.page_size,
+                consensus=self._qwen_exo_admission_consensus,
+            )
+            if self.server_args.enable_qwen_exo
+            else None
+        )
+        self._install_qwen_exo_cache_lifecycle()
+        if self.server_args.enable_qwen_exo:
+            if use_mlx():
+                from sglang.srt.hardware_backend.mlx.native_state_bank import (
+                    MlxNativeStateBankManager,
+                )
+
+                self.qwen_exo_native_state_bank = (
+                    MlxNativeStateBankManager.from_scheduler(self)
+                )
+            else:
+                self.qwen_exo_native_state_bank = NativeStateBankManager.from_scheduler(
+                    self
+                )
+        else:
+            self.qwen_exo_native_state_bank = None
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -1875,6 +1918,7 @@ class Scheduler(
             metrics_reporter=self.metrics_reporter,
             draft_worker=self.draft_worker,
             model_worker=self.model_worker,
+            native_state_bank=self.qwen_exo_native_state_bank,
             logprob_result_processor=SchedulerLogprobResultProcessor(
                 server_args=self.server_args, model_config=self.model_config
             ),
@@ -2391,9 +2435,14 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        if (
+            self.disaggregation_mode == DisaggregationMode.NULL
+            and self._abort_on_queued_limit(req)
+        ):
+            return
+        if not self._try_qwen_exo_admission(req, is_retracted=is_retracted):
+            return
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if self._abort_on_queued_limit(req):
-                return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
@@ -2411,6 +2460,739 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    @staticmethod
+    def _is_qwen_exo_user_request(req: Req) -> bool:
+        custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+        return custom_params.get("qwen_exo_kind") == "user"
+
+    def _qwen_exo_available_user_slots(self) -> int:
+        """Return logical user slots, excluding temporary internal children."""
+        active_user_rids: set[str] = set()
+
+        def collect(reqs: Iterable[Req]) -> None:
+            for active_req in reqs:
+                if (
+                    self._is_qwen_exo_user_request(active_req)
+                    and not active_req.finished()
+                ):
+                    active_user_rids.add(str(active_req.rid))
+
+        for batch in (
+            getattr(self, "running_batch", None),
+            getattr(self, "last_batch", None),
+        ):
+            if batch is not None:
+                collect(batch.reqs)
+        for batches_name in ("running_mbs", "mbs"):
+            for batch in getattr(self, batches_name, ()) or ():
+                if batch is not None:
+                    collect(batch.reqs)
+        chunked_req = getattr(self, "chunked_req", None)
+        if chunked_req is not None:
+            collect((chunked_req,))
+        admission = self.qwen_exo_admission
+
+        def has_pending_reservation(waiting_req: Req) -> bool:
+            reservation_id = getattr(
+                waiting_req, "qwen_exo_reservation_id", waiting_req.rid
+            )
+            return bool(
+                getattr(waiting_req, "qwen_exo_reservation_pending", False)
+                and admission is not None
+                and admission.is_reserved(reservation_id)
+            )
+
+        collect(
+            req
+            for req in getattr(self, "waiting_queue", ())
+            if not has_pending_reservation(req)
+        )
+        return max(0, int(self.max_running_requests) - len(active_user_rids))
+
+    def _qwen_exo_workspace_estimate_bytes(self, req: Req) -> int:
+        policy = self.qwen_exo_hybrid_policy
+        if policy is None:
+            return 0
+        chunk_rows = min(
+            max(1, len(req.origin_input_ids)),
+            int(policy.logprob_chunk_size),
+        )
+        vocab_size = int(self.model_config.vocab_size)
+        padded_vocab_size = ((vocab_size + 255) // 256) * 256
+        # The indexed gather is materialized before raw chunk logits are freed.
+        # Charge two full FP32 chunk-shaped tensors as the conservative peak.
+        return 2 * chunk_rows * padded_vocab_size * 4
+
+    def _qwen_exo_available_workspace_bytes(self) -> int | None:
+        policy = self.qwen_exo_hybrid_policy
+        scheduler_device = str(getattr(self, "device", "cpu")).split(":")[0]
+        if policy is None or scheduler_device != "cuda":
+            return None
+        if not torch.cuda.is_available():
+            return 0
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        except (AssertionError, RuntimeError):
+            return 0
+
+        # CUDA reports allocator-cached blocks as used even though PyTorch can
+        # reuse them immediately. Count only the unallocated part of the cache;
+        # live tensors remain excluded from workspace admission.
+        try:
+            reclaimable_bytes = max(
+                0,
+                int(torch.cuda.memory_reserved()) - int(torch.cuda.memory_allocated()),
+            )
+        except (AssertionError, RuntimeError):
+            reclaimable_bytes = 0
+
+        usable_bytes = min(int(total_bytes), int(free_bytes) + reclaimable_bytes)
+        return max(
+            0,
+            usable_bytes - policy.workspace_safety_reserve_bytes,
+        )
+
+    def _try_qwen_exo_admission(self, req: Req, *, is_retracted: bool) -> bool:
+        admission = self.qwen_exo_admission
+        custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+        if admission is None or "qwen_exo_kind" not in custom_params:
+            return True
+
+        mode = getattr(self.disaggregation_mode, "value", self.disaggregation_mode)
+        if mode != DisaggregationMode.NULL.value:
+            self._reject_qwen_exo_request(
+                req,
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                code="qwen_exo_disaggregation_unsupported",
+                message=(
+                    "QWEN-EXO requires disaggregation_mode=null; "
+                    f"scheduler is running in {mode!r} mode"
+                ),
+            )
+            return False
+
+        is_internal = custom_params.get("qwen_exo_kind") == "internal"
+        internal_parent_id = str(custom_params.get("qwen_exo_parent_request_id") or "")
+        if is_internal and not internal_parent_id:
+            self._reject_qwen_exo_request(
+                req,
+                status_code=HTTPStatus.BAD_REQUEST,
+                code="qwen_exo_internal_parent_invalid",
+                message="QWEN-EXO internal jobs require a parent request identity",
+            )
+            return False
+
+        if getattr(req, "finished_reason", None) is not None:
+            self._release_qwen_exo_hybrid_state(req)
+            return True
+
+        try:
+            self._ensure_qwen_exo_hybrid_state(req)
+        except Exception as exc:
+            self._reject_qwen_exo_request(
+                req,
+                status_code=HTTPStatus.BAD_REQUEST,
+                code="qwen_exo_hybrid_identity_invalid",
+                message=f"QWEN-EXO hybrid identity binding failed: {exc}",
+            )
+            return False
+
+        if is_retracted or getattr(req, "qwen_exo_admitted_once", False):
+            return True
+
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        estimate = admission.estimate(
+            prompt_tokens=len(req.origin_input_ids),
+            max_new_tokens=req.sampling_params.max_new_tokens,
+            needs_mamba=mamba_allocator is not None,
+            request_slots=0 if is_internal else 1,
+            workspace_bytes=self._qwen_exo_workspace_estimate_bytes(req),
+            additional_mamba_slots=(
+                1
+                if isinstance(custom_params.get("qwen_exo_native_bank_selection"), dict)
+                else 0
+            ),
+        )
+        tree_cache = getattr(self, "tree_cache", None)
+        evictable_kv_tokens = (
+            int(tree_cache.full_evictable_size())
+            if tree_cache is not None and hasattr(tree_cache, "full_evictable_size")
+            else 0
+        )
+        evictable_mamba_slots = (
+            int(tree_cache.mamba_evictable_size())
+            if tree_cache is not None and hasattr(tree_cache, "mamba_evictable_size")
+            else 0
+        )
+        reservation_id = (
+            f"internal:{internal_parent_id}:{req.rid}" if is_internal else req.rid
+        )
+        req.qwen_exo_reservation_id = reservation_id
+        decision = admission.reserve(
+            reservation_id,
+            estimate,
+            available_kv_tokens=(
+                self.token_to_kv_pool_allocator.available_size() + evictable_kv_tokens
+            ),
+            available_request_slots=self._qwen_exo_available_user_slots(),
+            available_mamba_slots=(
+                mamba_allocator.available_size() + evictable_mamba_slots
+                if mamba_allocator is not None
+                else None
+            ),
+            available_workspace_bytes=self._qwen_exo_available_workspace_bytes(),
+        )
+        if decision.admitted:
+            req.qwen_exo_admitted_once = True
+            req.qwen_exo_reservation_pending = True
+            return True
+        capacity_detail = ""
+        if decision.reason == "workspace_capacity":
+            capacity_detail = (
+                f"; required_workspace_bytes={decision.estimate.workspace_bytes}"
+                f"; available_workspace_bytes={decision.available_workspace_bytes}"
+            )
+        self._reject_qwen_exo_request(
+            req,
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+            code="qwen_exo_capacity_exhausted",
+            message=(
+                f"QWEN-EXO capacity admission failed: {decision.reason}"
+                f"{capacity_detail}"
+            ),
+            retry_after=1,
+        )
+        return False
+
+    def _reject_qwen_exo_request(
+        self,
+        req: Req,
+        *,
+        status_code: HTTPStatus,
+        code: str,
+        message: str,
+        retry_after: int | None = None,
+    ) -> None:
+        self._release_qwen_exo_reservation(req)
+        self._release_qwen_exo_hybrid_state(req)
+        finished_reason = {
+            "type": "abort",
+            "status_code": status_code,
+            "code": code,
+            "message": message,
+        }
+        if retry_after is not None:
+            finished_reason["retry_after"] = retry_after
+        req.time_stats.trace_ctx.abort(abort_info=finished_reason)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(finished_reason=finished_reason, rid=req.rid), req
+        )
+
+    def _ensure_qwen_exo_hybrid_state(self, req: Req) -> None:
+        policy = self.qwen_exo_hybrid_policy
+        if policy is None:
+            return
+        namespace = HybridStateNamespace.REQUEST_PREFIX
+        state = getattr(req, "qwen_exo_hybrid_state", None)
+        if state is not None and state.phase is not HybridRequestPhase.RELEASED:
+            policy.assert_request_binding(
+                state, request_id=req.rid, namespace=namespace
+            )
+            return
+
+        generation = int(getattr(req, "qwen_exo_hybrid_generation", -1)) + 1
+        model_fingerprint, tokenizer_fingerprint = (
+            self._qwen_exo_identity_fingerprints()
+        )
+        cache_namespace = stable_digest(
+            "qwen-exo-radix",
+            model_fingerprint,
+            tokenizer_fingerprint,
+            policy.dtype,
+            policy.tp_size,
+            policy.page_size,
+            policy.mamba_strategy,
+        )[:24]
+        namespace_marker = f"qwen-exo={cache_namespace}"
+        if req.extra_key:
+            if namespace_marker not in req.extra_key.split("|"):
+                req.extra_key = f"{req.extra_key}|{namespace_marker}"
+        else:
+            req.extra_key = namespace_marker
+        req.qwen_exo_hybrid_state = policy.new_request_state(
+            request_id=req.rid,
+            token_ids=req.origin_input_ids,
+            model_fingerprint=model_fingerprint,
+            tokenizer_fingerprint=tokenizer_fingerprint,
+            tp_rank=self.ps.tp_rank,
+            generation=generation,
+            namespace=namespace,
+        )
+        req.qwen_exo_hybrid_generation = generation
+
+    def _release_qwen_exo_reservation(self, req: Req) -> None:
+        admission = getattr(self, "qwen_exo_admission", None)
+        if admission is None:
+            return
+        if getattr(req, "qwen_exo_reservation_pending", False):
+            admission.release(getattr(req, "qwen_exo_reservation_id", req.rid))
+            req.qwen_exo_reservation_pending = False
+
+    def _install_qwen_exo_cache_lifecycle(self) -> None:
+        self._qwen_exo_cache_nodes = weakref.WeakValueDictionary()
+        if self.qwen_exo_hybrid_policy is None:
+            return
+        if not self.tree_cache.supports_mamba() or self.tree_cache.is_chunk_cache():
+            raise ValueError(
+                "QWEN-EXO hybrid-prefix lifecycle requires a Mamba radix cache"
+            )
+
+        original_evict = self.tree_cache.evict
+        original_reset = self.tree_cache.reset
+        original_split_node = self.tree_cache._split_node
+
+        def split_with_hybrid_state(key, child, split_len):
+            existing = getattr(child, "qwen_exo_hybrid_state", None)
+            new_parent = original_split_node(key, child, split_len)
+            if existing is not None:
+                self._reconcile_qwen_exo_split_state(
+                    new_parent=new_parent,
+                    child=child,
+                    existing=existing,
+                )
+            return new_parent
+
+        def evict_with_hybrid_reconcile(*args, **kwargs):
+            result = original_evict(*args, **kwargs)
+            self._reconcile_qwen_exo_cache_nodes()
+            return result
+
+        def reset_with_hybrid_reconcile(*args, **kwargs):
+            self._reconcile_qwen_exo_cache_nodes(force=True)
+            return original_reset(*args, **kwargs)
+
+        self.tree_cache.evict = evict_with_hybrid_reconcile
+        self.tree_cache.reset = reset_with_hybrid_reconcile
+        self.tree_cache._split_node = split_with_hybrid_state
+
+    def _reconcile_qwen_exo_cache_nodes(self, *, force: bool = False) -> None:
+        policy = self.qwen_exo_hybrid_policy
+        if policy is None:
+            return
+        for node in tuple(self._qwen_exo_cache_nodes.values()):
+            state = getattr(node, "qwen_exo_hybrid_state", None)
+            if state is None or state.phase is not HybridRequestPhase.CACHED:
+                continue
+            full_value, mamba_value = self._qwen_exo_node_values(node)
+            if force or full_value is None or mamba_value is None:
+                node.qwen_exo_hybrid_state = policy.evict_cached_state(state)
+
+    @staticmethod
+    def _qwen_exo_node_values(node: Any) -> tuple[Any, Any]:
+        component_data = getattr(node, "component_data", None)
+        if component_data is not None:
+            return component_data[0].value, component_data[2].value
+        return getattr(node, "value", None), getattr(node, "mamba_value", None)
+
+    @staticmethod
+    def _qwen_exo_node_token_ids(node: Any) -> array:
+        path = []
+        current = node
+        while current is not None and current.parent is not None:
+            path.append(current.key)
+            current = current.parent
+        token_ids = array("q")
+        for key in reversed(path):
+            token_ids.extend(int(token_id) for token_id in key.raw_token_ids())
+        return token_ids
+
+    def _qwen_exo_node_kv_indices(self, node: Any):
+        chunks = []
+        current = node
+        while current is not None and current.parent is not None:
+            full_value, _ = self._qwen_exo_node_values(current)
+            if full_value is None:
+                return None
+            chunks.append(full_value)
+            current = current.parent
+        if not chunks:
+            return None
+        chunks.reverse()
+        return torch.cat(chunks)
+
+    def _qwen_exo_state_for_cache_node(self, node: Any, template: Any):
+        policy = self.qwen_exo_hybrid_policy
+        token_ids = self._qwen_exo_node_token_ids(node)
+        kv_indices = self._qwen_exo_node_kv_indices(node)
+        if kv_indices is None or len(kv_indices) == 0:
+            raise RuntimeError("QWEN-EXO split node has no Full-Attention KV")
+        full_blocks = self._qwen_exo_unique_indices(
+            kv_indices[:: self.page_size] // self.page_size
+        )
+        _, mamba_value = self._qwen_exo_node_values(node)
+        mamba_slots = self._qwen_exo_unique_indices(mamba_value)
+        common = {
+            "request_id": template.handle.request_id,
+            "token_ids": token_ids,
+            "model_fingerprint": template.handle.model_fingerprint,
+            "tokenizer_fingerprint": template.handle.tokenizer_fingerprint,
+            "tp_rank": template.handle.tp_rank,
+            "generation": 0,
+            "namespace": template.handle.namespace,
+        }
+        if not mamba_slots:
+            return policy.new_evicted_prefix_state(**common)
+        return policy.new_cached_prefix_state(
+            **common,
+            full_kv_blocks=full_blocks,
+            recurrent_state_slots=mamba_slots,
+            conv_state_slots=mamba_slots,
+        )
+
+    def _reconcile_qwen_exo_split_state(
+        self, *, new_parent: Any, child: Any, existing: Any
+    ) -> None:
+        child_state = self._qwen_exo_state_for_cache_node(child, existing)
+        self.qwen_exo_hybrid_policy.assert_prefix_identity(existing, child_state)
+        if existing.phase is HybridRequestPhase.CACHED:
+            self.qwen_exo_hybrid_policy.assert_cached_reusable(existing, child_state)
+        parent_state = self._qwen_exo_state_for_cache_node(new_parent, existing)
+        child.qwen_exo_hybrid_state = child_state
+        new_parent.qwen_exo_hybrid_state = parent_state
+        self._qwen_exo_cache_nodes[child.id] = child
+        self._qwen_exo_cache_nodes[new_parent.id] = new_parent
+
+    def _qwen_exo_identity_fingerprints(self) -> tuple[str, str]:
+        return (
+            stable_digest(
+                self.server_args.model_path,
+                getattr(self.server_args, "revision", None),
+                self.server_args.dtype,
+            ),
+            stable_digest(
+                self.server_args.tokenizer_path,
+                getattr(self.server_args, "tokenizer_revision", None),
+                getattr(self.server_args, "tokenizer_mode", None),
+            ),
+        )
+
+    @staticmethod
+    def _qwen_exo_unique_indices(value: Any) -> tuple[int, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, torch.Tensor):
+            values = value.detach().reshape(-1).cpu().tolist()
+        else:
+            values = list(value) if isinstance(value, Iterable) else [value]
+        return tuple(dict.fromkeys(int(item) for item in values if int(item) >= 0))
+
+    def _qwen_exo_native_request_components(
+        self, req: Req
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        end = int(req.extend_range.end)
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :end]
+        full_blocks = self._qwen_exo_unique_indices(
+            kv_indices[:: self.page_size] // self.page_size
+        )
+        mamba_values = [req.mamba_pool_idx]
+        ping_pong = getattr(req, "mamba_ping_pong_track_buffer", None)
+        if ping_pong is not None:
+            mamba_values.append(ping_pong)
+        mamba_slots = self._qwen_exo_unique_indices(
+            torch.cat(
+                [value.reshape(-1) for value in mamba_values if value is not None]
+            )
+        )
+        if not full_blocks or not mamba_slots:
+            raise RuntimeError("QWEN-EXO native hybrid allocation is incomplete")
+        return full_blocks, mamba_slots
+
+    def _qwen_exo_cached_prefix_candidate(
+        self,
+        req: Req,
+        *,
+        node: Any,
+        token_ids: Iterable[int],
+        kv_indices: Any,
+    ):
+        policy = self.qwen_exo_hybrid_policy
+        model_fingerprint, tokenizer_fingerprint = (
+            self._qwen_exo_identity_fingerprints()
+        )
+        full_blocks = self._qwen_exo_unique_indices(
+            kv_indices[:: self.page_size] // self.page_size
+        )
+        _, mamba_value = self._qwen_exo_node_values(node)
+        mamba_slots = self._qwen_exo_unique_indices(mamba_value)
+        if not full_blocks or not mamba_slots:
+            raise RuntimeError("QWEN-EXO cached Full-Attention/GDN state is incomplete")
+        return policy.new_cached_prefix_state(
+            request_id=req.rid,
+            token_ids=token_ids,
+            model_fingerprint=model_fingerprint,
+            tokenizer_fingerprint=tokenizer_fingerprint,
+            tp_rank=self.ps.tp_rank,
+            generation=int(getattr(req, "qwen_exo_hybrid_generation", 0)),
+            full_kv_blocks=full_blocks,
+            recurrent_state_slots=mamba_slots,
+            conv_state_slots=mamba_slots,
+        )
+
+    def _persist_qwen_exo_cached_prefix(self, req: Req) -> None:
+        if self.qwen_exo_hybrid_policy is None or not hasattr(
+            req, "qwen_exo_hybrid_state"
+        ):
+            return
+        token_ids = (req.origin_input_ids + req.output_ids)[
+            : req.effective_kv_committed_len()
+        ]
+        match_result = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids, req.extra_key),
+                cow_mamba=False,
+                req=None,
+            )
+        )
+        kv_indices = match_result.device_indices
+        if len(kv_indices) == 0:
+            return
+        node = match_result.last_device_node
+        candidate = self._qwen_exo_cached_prefix_candidate(
+            req,
+            node=node,
+            token_ids=token_ids[: len(kv_indices)],
+            kv_indices=kv_indices,
+        )
+        existing = getattr(node, "qwen_exo_hybrid_state", None)
+        if existing is not None:
+            if existing.phase is HybridRequestPhase.CACHED:
+                try:
+                    self.qwen_exo_hybrid_policy.assert_cached_reusable(
+                        existing, candidate
+                    )
+                except ContractViolation:
+                    if not self._recover_qwen_exo_cached_metadata(
+                        node=node,
+                        token_ids=token_ids[: len(kv_indices)],
+                        kv_indices=kv_indices,
+                        candidate=candidate,
+                    ):
+                        raise
+            else:
+                self.qwen_exo_hybrid_policy.assert_prefix_identity(existing, candidate)
+        node.qwen_exo_hybrid_state = candidate
+        req.qwen_exo_hybrid_state = candidate
+        self._qwen_exo_cache_nodes[node.id] = node
+
+    def _recover_qwen_exo_cached_metadata(
+        self,
+        *,
+        node: Any,
+        token_ids: Iterable[int],
+        kv_indices: Any,
+        candidate: Any,
+    ) -> bool:
+        """Replace stale metadata only when native radix evidence is exact."""
+        token_path_matches = False
+        kv_path_matches = False
+        try:
+            node_token_ids = self._qwen_exo_node_token_ids(node)
+            token_path_matches = tuple(node_token_ids) == tuple(
+                int(token_id) for token_id in token_ids
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        try:
+            node_kv_indices = self._qwen_exo_node_kv_indices(node)
+            kv_path_matches = (
+                node_kv_indices is not None
+                and len(node_kv_indices) == len(kv_indices)
+                and torch.equal(node_kv_indices, kv_indices)
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        if not token_path_matches or not kv_path_matches:
+            return False
+        node.qwen_exo_hybrid_state = candidate
+        self._qwen_exo_cache_nodes[node.id] = node
+        return True
+
+    def _validate_qwen_exo_cached_reuse(self, req: Req) -> None:
+        if self.qwen_exo_hybrid_policy is None or len(req.prefix_indices) == 0:
+            return
+        node = req.last_node
+        candidate = self._qwen_exo_cached_prefix_candidate(
+            req,
+            node=node,
+            token_ids=req.full_untruncated_fill_ids[: len(req.prefix_indices)],
+            kv_indices=req.prefix_indices,
+        )
+        existing = getattr(node, "qwen_exo_hybrid_state", None)
+        if existing is None or existing.phase is HybridRequestPhase.EVICTED:
+            if existing is not None:
+                self.qwen_exo_hybrid_policy.assert_prefix_identity(existing, candidate)
+            if not self._recover_qwen_exo_cached_metadata(
+                node=node,
+                token_ids=req.full_untruncated_fill_ids[: len(req.prefix_indices)],
+                kv_indices=req.prefix_indices,
+                candidate=candidate,
+            ):
+                raise ContractViolation(
+                    "QWEN-EXO refused cached metadata recovery without exact "
+                    "native token and KV paths"
+                )
+            return
+        try:
+            self.qwen_exo_hybrid_policy.assert_cached_reusable(existing, candidate)
+        except ContractViolation:
+            if not self._recover_qwen_exo_cached_metadata(
+                node=node,
+                token_ids=req.full_untruncated_fill_ids[: len(req.prefix_indices)],
+                kv_indices=req.prefix_indices,
+                candidate=candidate,
+            ):
+                raise
+
+    @staticmethod
+    def _resume_qwen_exo_chunked_prefill(req: Req) -> None:
+        """Advance an owned chunk without treating it as a fresh radix reuse.
+
+        The native cache identity was validated while the request was waiting.
+        Later chunks advance that same request-local state, and the no-argument
+        ``init_next_round_input`` call does not rematch the radix tree.
+        """
+        req.init_next_round_input()
+
+    def _reject_qwen_exo_cached_reuse(self, req: Req, exc: Exception) -> None:
+        """Reject one fresh request after cleaning match-time Mamba state."""
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
+        if req.req_pool_idx is None and req.mamba_pool_idx is not None:
+            mamba_allocator = self.req_to_token_pool.mamba_allocator
+            mamba_allocator.free(req.mamba_pool_idx.unsqueeze(-1))
+            req.mamba_pool_idx = None
+            ping_pong = getattr(req, "mamba_ping_pong_track_buffer", None)
+            if ping_pong is not None:
+                ping_pong = ping_pong[ping_pong != -1]
+                if ping_pong.numel() > 0:
+                    mamba_allocator.free(ping_pong)
+                req.mamba_ping_pong_track_buffer = None
+                req.mamba_next_track_idx = None
+        self._reject_qwen_exo_request(
+            req,
+            status_code=HTTPStatus.BAD_REQUEST,
+            code="qwen_exo_cache_reuse_invalid",
+            message=f"QWEN-EXO cached prefix reuse validation failed: {exc}",
+        )
+
+    def _bind_qwen_exo_hybrid_state(self, req: Req) -> None:
+        policy = self.qwen_exo_hybrid_policy
+        state = getattr(req, "qwen_exo_hybrid_state", None)
+        if policy is None or state is None:
+            return
+        if req.req_pool_idx is None:
+            raise RuntimeError("QWEN-EXO native request-pool allocation is missing")
+        policy.assert_request_binding(
+            state,
+            request_id=req.rid,
+            namespace=HybridStateNamespace.REQUEST_PREFIX,
+        )
+        model_fingerprint, tokenizer_fingerprint = (
+            self._qwen_exo_identity_fingerprints()
+        )
+        state = policy.new_request_state(
+            request_id=req.rid,
+            token_ids=req.full_untruncated_fill_ids[: req.extend_range.end],
+            model_fingerprint=model_fingerprint,
+            tokenizer_fingerprint=tokenizer_fingerprint,
+            tp_rank=self.ps.tp_rank,
+            generation=int(req.qwen_exo_hybrid_generation),
+        )
+        full_blocks, mamba_slots = self._qwen_exo_native_request_components(req)
+        req.qwen_exo_hybrid_state = policy.bind_prefill(
+            state,
+            request_id=req.rid,
+            namespace=HybridStateNamespace.REQUEST_PREFIX,
+            native_req_pool_idx=int(req.req_pool_idx),
+            full_kv_blocks=full_blocks,
+            recurrent_state_slots=mamba_slots,
+            conv_state_slots=mamba_slots,
+        )
+
+    def _cache_qwen_exo_prefill_state(self, req: Req) -> None:
+        if self.qwen_exo_hybrid_policy is None:
+            return
+        self._persist_qwen_exo_cached_prefix(req)
+
+    def _advance_qwen_exo_decode_state(self, req: Req) -> None:
+        policy = self.qwen_exo_hybrid_policy
+        state = getattr(req, "qwen_exo_hybrid_state", None)
+        if policy is None or state is None or req.finished():
+            return
+        req.qwen_exo_hybrid_state = policy.begin_decode(
+            state,
+            request_id=req.rid,
+            namespace=HybridStateNamespace.REQUEST_PREFIX,
+        )
+
+    def _release_qwen_exo_hybrid_state(self, req: Req) -> None:
+        policy = getattr(self, "qwen_exo_hybrid_policy", None)
+        state = getattr(req, "qwen_exo_hybrid_state", None)
+        if (
+            policy is None
+            or state is None
+            or state.phase is HybridRequestPhase.RELEASED
+        ):
+            return
+        try:
+            released = policy.release_request_state(
+                state,
+                request_id=req.rid,
+                namespace=HybridStateNamespace.REQUEST_PREFIX,
+            )
+        except Exception:
+            handle = state.handle.transition(HybridLifecycleState.RELEASED)
+            released = type(state)(
+                handle=handle,
+                phase=HybridRequestPhase.RELEASED,
+                native_req_pool_idx=None,
+            )
+        req.qwen_exo_hybrid_state = released
+
+    def _release_finished_qwen_exo_states(self, reqs: Iterable[Req]) -> None:
+        for req in reqs:
+            if req.finished():
+                state = getattr(req, "qwen_exo_hybrid_state", None)
+                if state is not None and state.phase in {
+                    HybridRequestPhase.PREFILL,
+                    HybridRequestPhase.DECODE,
+                    HybridRequestPhase.CACHED,
+                }:
+                    self._persist_qwen_exo_cached_prefix(req)
+                self._release_qwen_exo_reservation(req)
+                self._release_qwen_exo_hybrid_state(req)
+
+    @staticmethod
+    def _qwen_exo_is_final_prefill(req: Req) -> bool:
+        extend_range = getattr(req, "extend_range", None)
+        fill_ids = getattr(req, "full_untruncated_fill_ids", None)
+        return (
+            extend_range is not None
+            and fill_ids is not None
+            and int(extend_range.end) >= len(fill_ids)
+        )
+
+    def _qwen_exo_admission_consensus(self, locally_admitted: bool) -> bool:
+        if self.tp_group.world_size <= 1:
+            return locally_admitted
+        accepted = torch.tensor(1 if locally_admitted else 0, dtype=torch.int32)
+        torch.distributed.all_reduce(
+            accepted,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_cpu_group,
+        )
+        return bool(accepted.item())
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2469,6 +3251,8 @@ class Scheduler(
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                self._release_qwen_exo_reservation(candidate_req)
+                self._release_qwen_exo_hybrid_state(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -2484,6 +3268,8 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        self._release_qwen_exo_reservation(req_to_abort)
+        self._release_qwen_exo_hybrid_state(req_to_abort)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2509,6 +3295,8 @@ class Scheduler(
                     ),
                     req,
                 )
+                self._release_qwen_exo_reservation(req)
+                self._release_qwen_exo_hybrid_state(req)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -2597,6 +3385,7 @@ class Scheduler(
 
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+        self._cache_qwen_exo_prefill_state(req)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
@@ -2634,6 +3423,7 @@ class Scheduler(
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._release_qwen_exo_hybrid_state(req)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -2727,6 +3517,8 @@ class Scheduler(
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
+                for req in ready_reqs:
+                    self._advance_qwen_exo_decode_state(req)
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
                 if running_batch.is_empty():
                     running_batch = new_batch
@@ -2749,6 +3541,7 @@ class Scheduler(
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
 
+            self._release_finished_qwen_exo_states(last_batch.reqs)
             # Filter batch
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
@@ -2757,6 +3550,8 @@ class Scheduler(
 
             # Merge the new batch into the running batch.
             if not last_batch.is_empty():
+                for req in last_batch.reqs:
+                    self._advance_qwen_exo_decode_state(req)
                 if running_batch.is_empty():
                     running_batch = last_batch
                 else:
@@ -2769,6 +3564,7 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if running_batch.is_prefill_only:
+            self._release_finished_qwen_exo_states(running_batch.reqs)
             running_batch.filter_batch()
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
@@ -2932,7 +3728,7 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+            self._resume_qwen_exo_chunked_prefill(self.chunked_req)
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2948,6 +3744,7 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
+        rejected_qwen_reqs: List[Req] = []
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
@@ -2966,9 +3763,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -2982,7 +3778,20 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
+            try:
+                if self.qwen_exo_native_state_bank is not None:
+                    self.qwen_exo_native_state_bank.ensure_prefix(req)
+            except RuntimeError as exc:
+                self._reject_qwen_exo_cached_reuse(req, exc)
+                rejected_qwen_reqs.append(req)
+                continue
             req.init_next_round_input(self.tree_cache)
+            try:
+                self._validate_qwen_exo_cached_reuse(req)
+            except (ContractViolation, RuntimeError) as exc:
+                self._reject_qwen_exo_cached_reuse(req, exc)
+                rejected_qwen_reqs.append(req)
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3022,6 +3831,11 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        if rejected_qwen_reqs:
+            rejected_set = set(rejected_qwen_reqs)
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in rejected_set
+            ]
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -3056,9 +3870,17 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
-        )
+        if self.qwen_exo_hybrid_policy is not None:
+            new_batch.qwen_exo_final_prefill = [
+                self._qwen_exo_is_final_prefill(req) for req in can_run_list
+            ]
+            new_batch.contains_last_prefill_chunk = all(
+                new_batch.qwen_exo_final_prefill
+            )
+        else:
+            new_batch.contains_last_prefill_chunk = (
+                self.chunked_req is None or len(can_run_list) != 1
+            )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
@@ -3067,7 +3889,17 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+            for req in can_run_list:
+                self._bind_qwen_exo_hybrid_state(req)
+        except Exception:
+            for req in can_run_list:
+                self._release_qwen_exo_reservation(req)
+                self._release_qwen_exo_hybrid_state(req)
+            raise
+        for req in can_run_list:
+            self._release_qwen_exo_reservation(req)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -3097,6 +3929,7 @@ class Scheduler(
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
+            self._release_finished_qwen_exo_states(running_batch.reqs)
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
@@ -3140,6 +3973,7 @@ class Scheduler(
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
+        self._release_finished_qwen_exo_states(batch.reqs)
 
         batch.filter_batch()
         if batch.is_empty():
@@ -3189,6 +4023,7 @@ class Scheduler(
                 )
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
+                self._release_qwen_exo_hybrid_state(req)
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
@@ -3212,6 +4047,8 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
+            for req in retracted_reqs:
+                self._release_qwen_exo_hybrid_state(req)
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
         else:
@@ -3579,6 +4416,8 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        self._release_finished_qwen_exo_states(batch.reqs)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
@@ -4045,6 +4884,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._release_qwen_exo_reservation(req)
+            self._release_qwen_exo_hybrid_state(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4088,6 +4929,7 @@ class Scheduler(
                     or getattr(req, "mamba_pool_idx", None) is not None
                 ):
                     release_kv_cache(req, self.tree_cache, is_insert=False)
+                self._release_qwen_exo_hybrid_state(req)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -4218,6 +5060,8 @@ class Scheduler(
                 hisparse_coordinator=self.hisparse_coordinator,
                 offload_kv=False,
             )
+            for req in retract_reqs:
+                self._release_qwen_exo_hybrid_state(req)
         self.running_batch.reqs = []
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:

@@ -24,8 +24,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers.activations import ACT2FN
-
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
@@ -79,6 +77,7 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
+from transformers.activations import ACT2FN
 
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
@@ -100,7 +99,6 @@ _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
 class Qwen3_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -174,7 +172,6 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
 
 class Qwen3_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -250,7 +247,6 @@ class Qwen3_VisionBlock(nn.Module):
 
 
 class Qwen3VLMoeVisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -310,7 +306,6 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
 
 
 class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
-
     def __init__(
         self,
         vision_config: Qwen3VLVisionConfig,
@@ -1063,7 +1058,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             loaded_params.add(name)
         return loaded_params
 
-    def _prepare_graph_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor) -> tuple[
+    def _prepare_graph_inputs(
+        self, x: torch.Tensor, grid_thw: torch.Tensor
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1101,7 +1098,6 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen3LLMModel(Qwen3Model):
-
     def __init__(
         self,
         *,
@@ -1111,8 +1107,8 @@ class Qwen3LLMModel(Qwen3Model):
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         if not self.pp_group.is_first_rank:
-            assert self.start_layer >= len(
-                config.vision_config.deepstack_visual_indexes
+            assert (
+                self.start_layer >= len(config.vision_config.deepstack_visual_indexes)
             ), "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
 
         self.hidden_size = config.hidden_size
@@ -1141,7 +1137,6 @@ class Qwen3LLMModel(Qwen3Model):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -1424,13 +1419,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
-                return self.logits_processor(
+                output = self.logits_processor(
                     input_ids,
                     hidden_states,
                     self.lm_head,
                     forward_batch,
                     aux_hidden_states,
                 )
+                qwen_exo_info = getattr(forward_batch, "qwen_exo_customized_info", None)
+                if qwen_exo_info:
+                    output.customized_info = {
+                        **(output.customized_info or {}),
+                        **qwen_exo_info,
+                    }
+                return output
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
