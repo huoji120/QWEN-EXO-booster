@@ -54,3 +54,31 @@ def relative_bias_score_mod(
         other=0.0,
     )
     return qk + bias
+
+
+@triton.jit
+def qwen_exo_block_bias_score_mod(
+    qk, q_pos, kv_pos, q_idx, head, mask, Aux0, aux0_stride_t, aux0_stride_h, aux0_len
+):
+    """Apply up to 32 aligned ``(start, end, score)`` token spans."""
+
+    bias = tl.zeros_like(qk)
+    safe_q_idx = tl.where(mask, q_idx, 0)
+    for slot in range(32):
+        base = safe_q_idx * aux0_stride_t + slot * 3
+        start = tl.load(
+            Aux0 + base, mask=mask & (slot * 3 < aux0_len), other=0
+        ).to(tl.int32)
+        end = tl.load(
+            Aux0 + base + 1,
+            mask=mask & (slot * 3 + 1 < aux0_len),
+            other=0,
+        ).to(tl.int32)
+        score = tl.load(
+            Aux0 + base + 2,
+            mask=mask & (slot * 3 + 2 < aux0_len),
+            other=0.0,
+        ).to(tl.float32)
+        applies = mask & (kv_pos >= start) & (kv_pos < end)
+        bias = tl.where(applies, tl.maximum(bias, score), bias)
+    return qk + bias

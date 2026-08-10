@@ -53,6 +53,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
+    GraphSlot,
+    PaddingPolicy,
     build_decode_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -121,6 +123,17 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 
     return ragged_verify_compact_enabled()
+
+
+def clone_cuda_graph_customized_info(customized_info):
+    """Detach replay outputs from static graph storage before the next replay."""
+
+    if customized_info is None:
+        return None
+    return {
+        key: value.clone() if isinstance(value, torch.Tensor) else value
+        for key, value in customized_info.items()
+    }
 
 
 def build_replay_fb_view(
@@ -265,9 +278,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if (
-                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
-                ):
+                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -397,6 +408,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dp_size=self.dp_size,
             source=self.buffers,
         )
+        if (
+            self.model_runner.server_args.enable_qwen_exo
+            and self.model_runner.server_args.qwen_exo_observer_mode != "off"
+        ):
+            self.buffer_registry.register_slot(
+                GraphSlot(
+                    "qwen_exo_observe_mask",
+                    lambda bs, _mt: (bs,),
+                    torch.bool,
+                    axis="bs",
+                    padding_policy=PaddingPolicy.ZERO,
+                )
+            )
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -703,6 +727,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
         )
         mrope_positions = _slot("mrope_positions")
+        qwen_exo_observe_mask = (
+            _slot("qwen_exo_observe_mask")
+            if registry.has_slot("qwen_exo_observe_mask")
+            else None
+        )
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
@@ -801,6 +830,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_cpu=global_num_tokens_cpu,
             mrope_positions=mrope_positions,
+            qwen_exo_observe_mask=qwen_exo_observe_mask,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
@@ -1023,7 +1053,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
-
         # If the required capture_hidden_mode changes, we need to recapture the graph
 
         # These are the different factors that can influence the capture_hidden_mode
@@ -1284,7 +1313,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
-                customized_info=output.customized_info,
+                customized_info=clone_cuda_graph_customized_info(
+                    output.customized_info
+                ),
             )
         else:
             assert isinstance(output, PPProxyTensors)
@@ -1301,7 +1332,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
-
                 capture_mode = (
                     CaptureHiddenMode.NULL
                     if self.model_runner.spec_algorithm.is_standalone()

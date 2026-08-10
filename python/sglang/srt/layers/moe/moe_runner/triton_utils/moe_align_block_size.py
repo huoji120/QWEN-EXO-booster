@@ -114,17 +114,37 @@ def moe_align_block_size(
             cumsum_buffer,
             True,
         )
-    # ===== END TO BE REFACTORED ====
     else:
-        sgl_moe_align_block_size(
-            topk_ids,
-            num_experts + 1,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            cumsum_buffer,
-            True,
-            ignore_invalid_expert,
-        )
+        try:
+            sgl_moe_align_block_size(
+                topk_ids,
+                num_experts + 1,
+                block_size,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+                cumsum_buffer,
+                True,
+                ignore_invalid_expert,
+            )
+        except RuntimeError as exc:
+            # Older sgl-kernel wheels expose the pre-ignore-invalid ABI. Fall
+            # back to the source-compatible JIT implementation instead of
+            # making a supported MoE model fail during its first prefill.
+            if "moe_align_block_size" not in str(exc):
+                raise
+            from sglang.jit_kernel.moe_align import (
+                moe_align_block_size as jit_moe_align_block_size,
+            )
+
+            jit_moe_align_block_size(
+                topk_ids,
+                num_experts + 1,
+                block_size,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+                cumsum_buffer,
+                True,
+            )
     return sorted_ids, expert_ids, num_tokens_post_pad

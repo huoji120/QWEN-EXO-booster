@@ -1,0 +1,57 @@
+[
+  {
+    "case_id": "frontend-accessible-visual-system",
+    "query": "Build a responsive product dashboard with semantic HTML, intentional typography and spacing tokens, accessible focus states, restrained surfaces, and no generic AI gradients or excessive glass cards.",
+    "gold_path": "frontend-visual-quality-guardrails.md"
+  },
+  {
+    "case_id": "python-api-propagation-surfaces",
+    "query": "A Python API default is changing. Trace the authoritative definition, public exports, wrappers, constructors, decorators, sync and async variants, serializers, generated factories, registries, and cache keys before editing.",
+    "gold_path": "python-change-surfaces.md"
+  },
+  {
+    "case_id": "repository-evidence-verification",
+    "query": "Before changing the repository, identify the public entry point and every caller, then prove behavior with a focused regression and the real command exit status rather than filenames, comments, or source inspection alone.",
+    "gold_path": "repository-evidence-and-change-verification.md"
+  },
+  {
+    "case_id": "threejs-architecture-assets",
+    "query": "Create a production Three.js module with one WebGLRenderer, Scene, PerspectiveCamera, OrbitControls, explicit canvas ownership, and a GLB glTF asset pipeline using Draco or Meshopt and KTX2 where supported.",
+    "gold_path": "threejs-architecture-and-assets.md"
+  },
+  {
+    "case_id": "threejs-lifecycle-cleanup",
+    "query": "Fix a Three.js GPU leak during React route changes by disposing geometries, materials, textures, render targets, controls, workers, listeners and animation frames, then diagnose repeated navigation with renderer.info.",
+    "gold_path": "threejs-lifecycle-and-verification.md"
+  },
+  {
+    "case_id": "threejs-performance-budget",
+    "query": "Optimize a Three.js scene for mobile frame time: cap device pixel ratio, reduce draw calls with InstancedMesh, bound shadow maps, control transparent overdraw, use LOD, and minimize post-processing passes.",
+    "gold_path": "threejs-performance-and-rendering.md"
+  },
+  {
+    "case_id": "wfp-appid-outbound-block",
+    "query": "Which Windows Filtering Platform management APIs and condition should block one executable's new IPv4 and IPv6 outbound connections? Use FwpmGetAppIdFromFileName0, FWPM_CONDITION_ALE_APP_ID, FWPM_LAYER_ALE_AUTH_CONNECT_V4 and V6, and DWORD error handling.",
+    "gold_path": "uploads/wfp-appid-ale-auth-connect-part-01.md"
+  },
+  {
+    "case_id": "wfp-persistent-query-delete",
+    "query": "Implement persistent WFP status and unblock across process restarts using fixed filter keys, FwpmFilterGetByKey0, FwpmFilterDeleteByKey0, and the correct FwpmFilterCreateEnumHandle0 and FwpmFilterEnum0 enumeration lifecycle.",
+    "gold_path": "uploads/wfp-appid-ale-auth-connect-part-02.md"
+  },
+  {
+    "case_id": "negative-clinical-anticoagulant-dose",
+    "query": "Choose an evidence-based apixaban dose for an elderly patient with atrial fibrillation, renal impairment, low body weight, and an upcoming invasive procedure.",
+    "expected_absent": true
+  },
+  {
+    "case_id": "negative-postgresql-logical-replication",
+    "query": "Design a zero-downtime PostgreSQL schema migration using logical replication slots, partition cutover, publication subscriptions, and replica identity settings.",
+    "expected_absent": true
+  },
+  {
+    "case_id": "negative-classical-poetry-prosody",
+    "query": "Analyze the regulated verse tonal pattern, rhyme category, parallel couplets, and historical allusions in a Tang dynasty poem.",
+    "expected_absent": true
+  }
+]

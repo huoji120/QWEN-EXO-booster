@@ -5,38 +5,31 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
+from collections.abc import Iterable
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Optional,
+    Union,
+)
 
 import jinja2
-import openai.types.responses as openai_responses_types
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse
-from openai.types.responses import (
-    ResponseOutputMessage,
-    ResponseOutputText,
-    ResponseReasoningItem,
-)
-from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from openai.types.responses.response_reasoning_item import (
-    Content as ResponseReasoningTextContent,
-)
-from openai.types.responses.response_reasoning_item import (
-    Summary as ResponseReasoningSummary,
-)
-from openai.types.responses.response_reasoning_summary_part_added_event import (
-    Part as ResponseReasoningSummaryAddedPart,
-)
-from openai.types.responses.response_reasoning_summary_part_done_event import (
-    Part as ResponseReasoningSummaryDonePart,
-)
 from openai_harmony import Message as OpenAIMessage
-
+from openai_harmony import Role
+from qwen_exo_booster.memory_span import locate_memory_span
+from qwen_exo_booster.pipeline import response_memory_metadata
 from sglang.srt.entrypoints.context import (
     ConversationContext,
     HarmonyContext,
@@ -73,11 +66,110 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
+import openai.types.responses as openai_responses_types
+from openai.types.responses import (
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponseReasoningItem,
+)
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_reasoning_item import (
+    Content as ResponseReasoningTextContent,
+)
+from openai.types.responses.response_reasoning_item import (
+    Summary as ResponseReasoningSummary,
+)
+from openai.types.responses.response_reasoning_summary_part_added_event import (
+    Part as ResponseReasoningSummaryAddedPart,
+)
+from openai.types.responses.response_reasoning_summary_part_done_event import (
+    Part as ResponseReasoningSummaryDonePart,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+_QWEN_EXO_SELF_CHECK_START = "<qwen_exo_self_check>"
+_QWEN_EXO_SELF_CHECK_END = "</qwen_exo_self_check>"
+
+
+class _QwenExoSelfAskSpillRouter:
+    """Keeps phase-two Self-Ask continuations in the reasoning channel."""
+
+    _QUESTION_PREFIX = "Self-question:"
+    _THINK_END = "</think>"
+
+    def __init__(self) -> None:
+        self._armed = False
+        self._in_self_ask = False
+        self._buffer = ""
+
+    def arm(self) -> None:
+        self._armed = True
+        self._in_self_ask = False
+        self._buffer = ""
+
+    @staticmethod
+    def _partial_token_suffix_length(text: str, token: str) -> int:
+        for size in range(min(len(text), len(token) - 1), 0, -1):
+            if text.endswith(token[:size]):
+                return size
+        return 0
+
+    def feed(self, text: str, *, final: bool = False) -> tuple[str, str]:
+        if not self._armed:
+            return "", str(text or "")
+        self._buffer += str(text or "")
+        reasoning_parts: list[str] = []
+        normal_text = ""
+
+        while self._buffer:
+            if self._in_self_ask:
+                end = self._buffer.find(self._THINK_END)
+                if end >= 0:
+                    reasoning_parts.append(self._buffer[:end])
+                    self._buffer = self._buffer[end + len(self._THINK_END) :]
+                    self._in_self_ask = False
+                    continue
+                keep = self._partial_token_suffix_length(self._buffer, self._THINK_END)
+                emit_end = len(self._buffer) - keep
+                if emit_end:
+                    reasoning_parts.append(self._buffer[:emit_end])
+                    self._buffer = self._buffer[emit_end:]
+                break
+
+            stripped = self._buffer.lstrip()
+            leading = self._buffer[: len(self._buffer) - len(stripped)]
+            if not stripped:
+                break
+            if self._QUESTION_PREFIX.startswith(stripped):
+                break
+            if stripped.startswith(self._QUESTION_PREFIX):
+                reasoning_parts.append(leading)
+                self._buffer = stripped
+                self._in_self_ask = True
+                continue
+            normal_text = self._buffer
+            self._buffer = ""
+            self._armed = False
+            break
+
+        if final and self._buffer:
+            stripped = self._buffer.lstrip()
+            if self._in_self_ask or (
+                stripped and self._QUESTION_PREFIX.startswith(stripped)
+            ):
+                reasoning_parts.append(self._buffer)
+            else:
+                normal_text += self._buffer
+            self._buffer = ""
+            self._armed = False
+            self._in_self_ask = False
+
+        return "".join(reasoning_parts), normal_text
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -141,6 +233,68 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
         return any(tool.type in tool_types for tool in (request.tools or []))
 
+    async def prevalidate_qwen_exo_request(
+        self, request: ResponsesRequest
+    ) -> ORJSONResponse | None:
+        if not self.tokenizer_manager:
+            return self.create_error_response("Model not loaded")
+        if request.tool_choice == "required" and not any(
+            tool.type == "function" for tool in (request.tools or [])
+        ):
+            return self.create_error_response(
+                'tool_choice="required" requires at least one tool with '
+                'type="function"; other built-in tool types cannot be forced.'
+            )
+        if not self.use_harmony and self._has_response_tool(
+            request,
+            "web_search",
+            "web_search_preview",
+            "code_interpreter",
+        ):
+            return self.create_error_response(
+                "Built-in web_search and code_interpreter tools are not "
+                "supported by the Qwen non-Harmony Responses path; use a "
+                "client-executed function tool instead."
+            )
+        if (
+            self.use_harmony
+            and self._has_response_tool(request, "web_search", "web_search_preview")
+            and not self.supports_browsing
+        ):
+            return self.create_error_response(
+                "web_search requires a browser backend before QWEN-EXO "
+                "memory preparation can run."
+            )
+        if (
+            isinstance(self.tool_server, MCPToolServer)
+            and (request.background or request.stream)
+            and self._has_response_tool(
+                request, "web_search", "web_search_preview", "code_interpreter"
+            )
+        ):
+            return self.create_error_response(
+                "MCP tool server is not supported in background or streaming mode"
+            )
+        previous_response_id = request.previous_response_id
+        if previous_response_id is not None:
+            if not previous_response_id.startswith("resp_"):
+                return self._make_invalid_id_error(previous_response_id)
+            async with self.response_store_lock:
+                previous_response = self.response_store.get(previous_response_id)
+                if previous_response is None:
+                    return self._make_not_found_error(previous_response_id)
+                if (
+                    previous_response.status != "completed"
+                    or previous_response_id not in self.msg_store
+                ):
+                    return self.create_error_response(
+                        "previous_response_id is not a completed, replayable response",
+                        err_type="response_not_replayable",
+                        status_code=HTTPStatus.CONFLICT,
+                        param="previous_response_id",
+                    )
+        return None
+
     # error helpers dedicated for v1/responses
     def create_error_response(
         self,
@@ -156,6 +310,108 @@ class OpenAIServingResponses(OpenAIServingChat):
             "code": status_code,
         }
         return ORJSONResponse(content={"error": nested_error}, status_code=status_code)
+
+    async def register_cancelled_response(
+        self, request: ResponsesRequest
+    ) -> ResponsesResponse:
+        response = ResponsesResponse.from_request(
+            request,
+            sampling_params={},
+            model_name=request.model,
+            created_time=int(time.time()),
+            output=[],
+            status="cancelled",
+            usage=None,
+        )
+        async with self.response_store_lock:
+            existing = self.response_store.get(request.request_id)
+            if existing is not None and existing.status == "cancelled":
+                return existing
+            self.response_store[request.request_id] = response
+        return response
+
+    async def register_in_progress_response(
+        self,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        *,
+        model_name: str,
+        created_time: int,
+    ) -> ResponsesResponse:
+        response = ResponsesResponse.from_request(
+            request,
+            sampling_params,
+            model_name=model_name,
+            created_time=created_time,
+            output=[],
+            status="in_progress",
+            usage=None,
+        )
+        async with self.response_store_lock:
+            existing = self.response_store.get(response.id)
+            if existing is not None and existing.status == "cancelled":
+                return existing
+            self.response_store[response.id] = response
+        return response
+
+    async def register_pending_cancelled_response(
+        self, response_id: str
+    ) -> ResponsesResponse:
+        response = ResponsesResponse(
+            id=str(response_id),
+            model=str(self.tokenizer_manager.served_model_name),
+            status="cancelled",
+            store=True,
+            metadata={},
+        )
+        async with self.response_store_lock:
+            existing = self.response_store.get(response.id)
+            if existing is not None:
+                return existing
+            self.response_store[response.id] = response
+        return response
+
+    async def register_compaction_response(
+        self,
+        *,
+        response_id: str,
+        model_name: str | None,
+        user_items: Iterable[dict[str, Any]],
+        summary: str,
+    ) -> ResponsesResponse:
+        summary = str(summary).strip()
+        if not summary:
+            raise ValueError("Compaction replay summary cannot be empty")
+        public_messages: list[ChatCompletionMessageParam] = []
+        for item in user_items:
+            normalized = self._normalize_response_message_for_chat(item)
+            if normalized is not None:
+                public_messages.append(normalized)  # type: ignore[arg-type]
+        output_text = ResponseOutputText(
+            text=summary,
+            annotations=[],
+            type="output_text",
+            logprobs=None,
+        )
+        output_message = ResponseOutputMessage(
+            id=f"msg_{random_uuid()}",
+            content=[output_text],
+            role="assistant",
+            status="completed",
+            type="message",
+        )
+        response = ResponsesResponse(
+            id=str(response_id),
+            model=str(model_name or self.tokenizer_manager.served_model_name),
+            output=[output_message],
+            status="completed",
+            store=True,
+            metadata={},
+        )
+        async with self.response_store_lock:
+            self.msg_store[response.id] = public_messages
+            self.response_store[response.id] = response
+        return response
 
     def create_streaming_error_response(
         self,
@@ -246,6 +502,302 @@ class OpenAIServingResponses(OpenAIServingChat):
         request_metadata = RequestResponseMetadata(request_id=request.request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
+        qwen_exo_runtime = (
+            getattr(raw_request.app.state, "qwen_exo_runtime", None)
+            if raw_request is not None
+            else None
+        )
+        qwen_exo_observe = (
+            qwen_exo_runtime is not None and qwen_exo_runtime.observer.mode != "off"
+        )
+        qwen_exo_score_bias = bool(
+            qwen_exo_runtime is not None
+            and getattr(qwen_exo_runtime, "score_bias_enabled", False)
+        )
+        memory_state = (
+            getattr(raw_request.state, "qwen_exo_memory_state", None)
+            if raw_request is not None
+            else None
+        )
+        if qwen_exo_runtime is not None:
+            context_len = int(self.tokenizer_manager.model_config.context_len)
+            output_cap = int(qwen_exo_runtime.max_output_tokens)
+            requested_output_tokens = int(request.max_output_tokens or output_cap)
+            reserved_output_tokens = max(
+                1, min(requested_output_tokens, output_cap)
+            ) + int(self.tokenizer_manager.num_reserved_tokens)
+
+            def rendered_length(prompts: list[Any]) -> int:
+                lengths = [
+                    (
+                        len(prompt)
+                        if isinstance(prompt, list)
+                        else (
+                            len(tokenizer.encode(prompt))
+                            if isinstance(prompt, str)
+                            else 0
+                        )
+                    )
+                    for prompt in prompts
+                ]
+                return max(lengths, default=0)
+
+            async def rebuild_without_private_state(current_request):
+                if self.use_harmony:
+                    rebuilt = self._make_request_with_harmony(
+                        current_request, prev_response
+                    )
+                    return (*rebuilt, None)
+                return await self._make_request(
+                    current_request, prev_response, tokenizer
+                )
+
+            has_multimodal_input = processed_messages is not None and any(
+                getattr(processed_messages, field, None)
+                for field in ("image_data", "video_data", "audio_data", "modalities")
+            )
+            rendered_prompt_tokens = rendered_length(engine_prompts) + len(
+                getattr(memory_state, "radix_prefix_token_ids", ()) or ()
+            )
+            over_context_budget = (
+                rendered_prompt_tokens + reserved_output_tokens > context_len
+            )
+            if (
+                memory_state is not None
+                and (
+                    memory_state.private_attachment is not None
+                    or memory_state.policy_attachment is not None
+                )
+                and (has_multimodal_input or over_context_budget)
+            ):
+                (
+                    request,
+                    memory_state,
+                ) = await qwen_exo_runtime.drop_memory_attachment_for_context(
+                    request,
+                    rendered_prompt_tokens=rendered_prompt_tokens,
+                    context_length=context_len,
+                    reserved_output_tokens=reserved_output_tokens,
+                    reason=(
+                        "multimodal_post_expansion_unknown"
+                        if has_multimodal_input
+                        else "context_capacity"
+                    ),
+                    include_policy=(
+                        has_multimodal_input or memory_state.private_attachment is None
+                    ),
+                )
+                raw_request.state.qwen_exo_memory_state = memory_state
+                raw_request.state.qwen_exo_memory = (
+                    memory_state.public_dict() if memory_state is not None else None
+                )
+                try:
+                    (
+                        messages,
+                        request_prompts,
+                        engine_prompts,
+                        processed_messages,
+                    ) = await rebuild_without_private_state(request)
+                except (
+                    ValueError,
+                    TypeError,
+                    RuntimeError,
+                    jinja2.TemplateError,
+                ) as exc:
+                    logger.exception("Error rebuilding prompt without QWEN-EXO memory")
+                    return self.create_error_response(f"{exc} {exc.__cause__}")
+
+            has_multimodal_input = processed_messages is not None and any(
+                getattr(processed_messages, field, None)
+                for field in ("image_data", "video_data", "audio_data", "modalities")
+            )
+            rendered_prompt_tokens = rendered_length(engine_prompts) + len(
+                getattr(memory_state, "radix_prefix_token_ids", ()) or ()
+            )
+            over_context_budget = (
+                rendered_prompt_tokens + reserved_output_tokens > context_len
+            )
+            if (
+                memory_state is not None
+                and memory_state.policy_attachment is not None
+                and (has_multimodal_input or over_context_budget)
+            ):
+                (
+                    request,
+                    memory_state,
+                ) = await qwen_exo_runtime.drop_memory_attachment_for_context(
+                    request,
+                    rendered_prompt_tokens=rendered_prompt_tokens,
+                    context_length=context_len,
+                    reserved_output_tokens=reserved_output_tokens,
+                    reason=(
+                        "multimodal_post_expansion_unknown"
+                        if has_multimodal_input
+                        else "context_capacity"
+                    ),
+                    include_policy=True,
+                )
+                raw_request.state.qwen_exo_memory_state = memory_state
+                raw_request.state.qwen_exo_memory = (
+                    memory_state.public_dict() if memory_state is not None else None
+                )
+                try:
+                    (
+                        messages,
+                        request_prompts,
+                        engine_prompts,
+                        processed_messages,
+                    ) = await rebuild_without_private_state(request)
+                except (
+                    ValueError,
+                    TypeError,
+                    RuntimeError,
+                    jinja2.TemplateError,
+                ) as exc:
+                    logger.exception(
+                        "Error rebuilding prompt without QWEN-EXO PolicyData"
+                    )
+                    return self.create_error_response(f"{exc} {exc.__cause__}")
+            has_multimodal_input = processed_messages is not None and any(
+                getattr(processed_messages, field, None)
+                for field in (
+                    "image_data",
+                    "video_data",
+                    "audio_data",
+                    "modalities",
+                )
+            )
+            rendered_prompt_tokens = rendered_length(engine_prompts)
+            over_context_budget = (
+                rendered_prompt_tokens + reserved_output_tokens > context_len
+            )
+            if qwen_exo_runtime.has_restored_capsule(request.request_id) and (
+                has_multimodal_input or over_context_budget
+            ):
+                request = qwen_exo_runtime.drop_restored_capsule_for_context(
+                    request,
+                    rendered_prompt_tokens=rendered_prompt_tokens,
+                    context_length=context_len,
+                    reserved_output_tokens=reserved_output_tokens,
+                    reason=(
+                        "multimodal_post_expansion_unknown"
+                        if has_multimodal_input
+                        else "context_capacity"
+                    ),
+                )
+                try:
+                    (
+                        messages,
+                        request_prompts,
+                        engine_prompts,
+                        processed_messages,
+                    ) = await rebuild_without_private_state(request)
+                except (
+                    ValueError,
+                    TypeError,
+                    RuntimeError,
+                    jinja2.TemplateError,
+                ) as exc:
+                    logger.exception("Error rebuilding prompt without QWEN-EXO capsule")
+                    return self.create_error_response(f"{exc} {exc.__cause__}")
+            has_multimodal_input = processed_messages is not None and any(
+                getattr(processed_messages, field, None)
+                for field in (
+                    "image_data",
+                    "video_data",
+                    "audio_data",
+                    "modalities",
+                )
+            )
+            rendered_prompt_tokens = rendered_length(engine_prompts)
+            over_context_budget = (
+                rendered_prompt_tokens + reserved_output_tokens > context_len
+            )
+            original_instructions = getattr(
+                raw_request.state,
+                "qwen_exo_original_instructions",
+                request.instructions,
+            )
+            original_extra_key = getattr(
+                raw_request.state,
+                "qwen_exo_original_extra_key",
+                request.extra_key,
+            )
+            has_remaining_private_context = (
+                request.instructions != original_instructions
+                or request.extra_key != original_extra_key
+            )
+            if has_remaining_private_context and (
+                has_multimodal_input or over_context_budget
+            ):
+                request = request.model_copy(
+                    update={
+                        "instructions": original_instructions,
+                        "extra_key": original_extra_key,
+                    }
+                )
+                qwen_exo_runtime.telemetry.emit(
+                    request.request_id,
+                    "private_context.dropped_context_budget",
+                    {
+                        "rendered_prompt_tokens": rendered_prompt_tokens,
+                        "context_length": context_len,
+                        "reserved_output_tokens": reserved_output_tokens,
+                        "reason": (
+                            "multimodal_post_expansion_unknown"
+                            if has_multimodal_input
+                            else "context_capacity"
+                        ),
+                    },
+                )
+                try:
+                    (
+                        messages,
+                        request_prompts,
+                        engine_prompts,
+                        processed_messages,
+                    ) = await rebuild_without_private_state(request)
+                except (
+                    ValueError,
+                    TypeError,
+                    RuntimeError,
+                    jinja2.TemplateError,
+                ) as exc:
+                    logger.exception(
+                        "Error rebuilding prompt without QWEN-EXO private context"
+                    )
+                    return self.create_error_response(f"{exc} {exc.__cause__}")
+
+        if qwen_exo_runtime is not None:
+            memory_diagnostics = response_memory_metadata(
+                memory_state,
+                fallback=(
+                    getattr(raw_request.state, "qwen_exo_memory", None)
+                    if raw_request is not None
+                    else None
+                ),
+                observer_mode=qwen_exo_runtime.observer.mode,
+            )
+            response_metadata = self._stringify_response_metadata(request.metadata)
+            encoded_memory_diagnostics = json.dumps(
+                memory_diagnostics,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            response_metadata["memory"] = encoded_memory_diagnostics
+            response_metadata["qwen_exo"] = encoded_memory_diagnostics
+            request = request.model_copy(update={"metadata": response_metadata})
+            public_instructions = (
+                getattr(
+                    raw_request.state,
+                    "qwen_exo_original_instructions",
+                    request.instructions,
+                )
+                if raw_request is not None
+                else request.instructions
+            )
+            request = request.model_copy(update={"instructions": public_instructions})
 
         if (
             self.tool_server is not None
@@ -286,6 +838,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                     assert len(tool_list) == 0
                     tool_sessions = {}
                 for i, engine_prompt in enumerate(engine_prompts):
+                    memory_state = (
+                        getattr(raw_request.state, "qwen_exo_memory_state", None)
+                        if raw_request is not None
+                        else None
+                    )
+                    native_prefix_ids = tuple(
+                        getattr(memory_state, "radix_prefix_token_ids", ()) or ()
+                    )
+                    if native_prefix_ids:
+                        rendered_ids = (
+                            tokenizer.encode(engine_prompt)
+                            if isinstance(engine_prompt, str)
+                            else list(engine_prompt)
+                        )
+                        engine_prompt = [*native_prefix_ids, *rendered_ids]
                     # Calculate default max tokens from context length minus prompt length
                     if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
@@ -305,6 +872,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     default_max_tokens = max(
                         context_len - prompt_length - num_reserved_tokens, 512
                     )  # Ensure minimum 512 tokens
+                    if qwen_exo_runtime is not None:
+                        default_max_tokens = min(
+                            default_max_tokens,
+                            int(qwen_exo_runtime.max_output_tokens),
+                        )
                     sampling_params = request.to_sampling_params(
                         default_max_tokens,
                         self.default_sampling_params,
@@ -319,6 +891,145 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    if qwen_exo_runtime is not None:
+                        custom_params = dict(sampling_params.get("custom_params") or {})
+                        custom_params["qwen_exo_kind"] = "user"
+                        if memory_state is not None:
+                            if native_prefix_ids:
+                                custom_params.update(
+                                    {
+                                        "qwen_exo_radix_prefix_page_id": (
+                                            memory_state.radix_prefix_page_id
+                                        ),
+                                        "qwen_exo_radix_prefix_identity": (
+                                            memory_state.radix_prefix_identity
+                                        ),
+                                        "qwen_exo_radix_prefix_tokens": len(
+                                            native_prefix_ids
+                                        ),
+                                    }
+                                )
+                                if (
+                                    memory_state.radix_prefix_source_digest
+                                    and memory_state.radix_prefix_local_positions
+                                ):
+                                    custom_params["qwen_exo_native_bank_selection"] = {
+                                        "source_digest": (
+                                            memory_state.radix_prefix_source_digest
+                                        ),
+                                        "page_id": memory_state.radix_prefix_page_id,
+                                        "local_positions": list(
+                                            memory_state.radix_prefix_local_positions
+                                        ),
+                                        "prefix_identity": (
+                                            memory_state.radix_prefix_identity
+                                        ),
+                                    }
+                            memory_span = locate_memory_span(
+                                engine_prompt,
+                                tokenizer,
+                                memory_state.private_attachment,
+                            )
+                            if memory_span is not None:
+                                custom_params.update(
+                                    {
+                                        "qwen_exo_memory_start": memory_span[0],
+                                        "qwen_exo_memory_length": memory_span[1],
+                                        "qwen_exo_memory_key": (
+                                            f"{memory_state.attachment_digest}:"
+                                            f"{memory_span[0]}:{memory_span[1]}"
+                                        ),
+                                    }
+                                )
+                            elif memory_state.private_attachment:
+                                qwen_exo_runtime.telemetry.emit(
+                                    request.request_id,
+                                    "observer.memory_span_unresolved",
+                                    {
+                                        "attachment_digest": memory_state.attachment_digest,
+                                        "attached_tokens": memory_state.attached_tokens,
+                                    },
+                                )
+                            if (
+                                native_prefix_ids
+                                and memory_state.radix_prefix_source_digest
+                                and memory_state.radix_prefix_local_positions
+                            ):
+                                custom_params.update(
+                                    {
+                                        "qwen_exo_memory_start": 0,
+                                        "qwen_exo_memory_length": len(
+                                            native_prefix_ids
+                                        ),
+                                        "qwen_exo_memory_key": (
+                                            "qwen-exo-native:"
+                                            f"{memory_state.radix_prefix_identity}"
+                                        ),
+                                    }
+                                )
+                        score_bias_builder = getattr(
+                            qwen_exo_runtime, "score_bias_payload", None
+                        )
+                        if callable(score_bias_builder):
+                            score_bias_prompt_ids = (
+                                list(engine_prompt)
+                                if isinstance(engine_prompt, list)
+                                else tokenizer.encode(
+                                    engine_prompt, add_special_tokens=False
+                                )
+                            )
+                            score_bias_blocks = score_bias_builder(
+                                request.request_id, score_bias_prompt_ids
+                            )
+                            if score_bias_blocks:
+                                custom_params["qwen_exo_score_bias_blocks"] = list(
+                                    score_bias_blocks
+                                )
+                        capture_builder = getattr(
+                            qwen_exo_runtime, "score_bias_capture_payload", None
+                        )
+                        if callable(capture_builder):
+                            trajectory_spans = capture_builder(
+                                request.request_id, score_bias_prompt_ids
+                            )
+                            if trajectory_spans:
+                                custom_params["qwen_exo_trajectory_spans"] = list(
+                                    trajectory_spans
+                                )
+                        query_builder = getattr(
+                            qwen_exo_runtime, "score_bias_user_query_payload", None
+                        )
+                        if callable(query_builder):
+                            user_query = query_builder(request, score_bias_prompt_ids)
+                            if user_query:
+                                custom_params["qwen_exo_score_bias_user_query"] = (
+                                    user_query
+                                )
+                        latent_builder = getattr(
+                            qwen_exo_runtime, "latent_transplant_payload", None
+                        )
+                        if callable(latent_builder):
+                            latent_transplant = latent_builder(request)
+                            if latent_transplant:
+                                custom_params["qwen_exo_latent_transplant"] = (
+                                    latent_transplant
+                                )
+                        editor_request = qwen_exo_runtime.activation_editor_request(
+                            custom_params.get("qwen_exo_activation_editor")
+                        )
+                        editor_spec = editor_request["spec"]
+                        if editor_spec is not None:
+                            custom_params["qwen_exo_activation_editor"] = editor_spec
+                        editor_cache_identity = str(editor_request["cache_identity"])
+                        sampling_params["custom_params"] = custom_params
+                    effective_extra_key = self._compute_extra_key(request)
+                    if qwen_exo_runtime is not None:
+                        editor_marker = f"qwen-exo-editor={editor_cache_identity}"
+                        effective_extra_key = (
+                            f"{effective_extra_key}|{editor_marker}"
+                            if effective_extra_key
+                            else editor_marker
+                        )
 
                     context: ConversationContext
                     if self.use_harmony:
@@ -361,8 +1072,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         stream=request.stream,
                         rid=request.request_id,
                         session_id=request.session_id,
-                        extra_key=self._compute_extra_key(request),
+                        extra_key=effective_extra_key,
                         background=request.background,
+                        return_logprob=qwen_exo_observe,
+                        logprob_start_len=0 if qwen_exo_score_bias else None,
+                        no_logs=qwen_exo_runtime is not None,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -373,7 +1087,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context,
                         raw_request=raw_request,
                         priority=request.priority,
+                        native_prefix_ids=native_prefix_ids,
                     )
+                    if qwen_exo_runtime is not None:
+                        generator = qwen_exo_runtime.track_generation(
+                            request.request_id, generator
+                        )
                     generators.append(generator)
             except ValueError as e:
                 return self.create_error_response(str(e))
@@ -383,42 +1102,68 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Store the input messages
             if request.store:
-                self.msg_store[request.request_id] = messages
-
-            if request.background:
-                created_time = int(time.time())
-                response = ResponsesResponse.from_request(
+                public_messages = (
+                    self._construct_input_messages_with_harmony(request, prev_response)
+                    if self.use_harmony
+                    else self._construct_input_messages(request, prev_response)
+                )
+                self.msg_store[request.request_id] = public_messages
+            created_time = int(time.time())
+            if request.store and not request.background:
+                pending_response = await self.register_in_progress_response(
                     request,
                     sampling_params,
                     model_name=model_name,
                     created_time=created_time,
-                    output=[],
-                    status="queued",
-                    usage=None,
                 )
-                async with self.response_store_lock:
-                    self.response_store[response.id] = response
+                if pending_response.status == "cancelled":
+                    self.tokenizer_manager.abort_request(rid=request.request_id)
+                    return pending_response
 
-                # Run the request in the background
-                task = asyncio.create_task(
-                    self._run_background_request(
+            if request.background:
+                created_time = int(time.time())
+                async with self.response_store_lock:
+                    dispatch_allowed = (
+                        qwen_exo_runtime is None
+                        or await qwen_exo_runtime.claim_pending_background_request(
+                            request.request_id
+                        )
+                    )
+                    response = ResponsesResponse.from_request(
                         request,
                         sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                        created_time,
-                    ),
-                    name=f"create_{response.id}",
-                )
+                        model_name=model_name,
+                        created_time=created_time,
+                        output=[],
+                        status="queued" if dispatch_allowed else "cancelled",
+                        usage=None,
+                    )
+                    self.response_store[response.id] = response
+                    if not dispatch_allowed:
+                        qwen_exo_runtime.acknowledge_request_cancellation(
+                            request.request_id
+                        )
+                        return response
 
-                # For cleanup
-                self.background_tasks[response.id] = task
-                task.add_done_callback(
-                    lambda _: self.background_tasks.pop(response.id, None)
-                )
+                    # Register the task while holding the store lock so cancel cannot
+                    # observe a queued response before its execution is cancellable.
+                    task = asyncio.create_task(
+                        self._run_background_request(
+                            request,
+                            sampling_params,
+                            result_generator,
+                            context,
+                            model_name,
+                            tokenizer,
+                            request_metadata,
+                            created_time,
+                        ),
+                        name=f"create_{response.id}",
+                    )
+                    self.background_tasks[response.id] = task
+                    task.add_done_callback(
+                        lambda _: self.background_tasks.pop(response.id, None)
+                    )
                 return response
 
             if request.stream:
@@ -431,6 +1176,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         model_name,
                         tokenizer,
                         request_metadata,
+                        created_time,
                     )
                 return self.responses_stream_generator_non_harmony(
                     request,
@@ -439,20 +1185,32 @@ class OpenAIServingResponses(OpenAIServingChat):
                     model_name,
                     tokenizer,
                     request_metadata,
+                    created_time,
                 )
             try:
-                result: Union[ORJSONResponse, ResponsesResponse] = (
-                    await self.responses_full_generator(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                    )
+                result: Union[
+                    ORJSONResponse, ResponsesResponse
+                ] = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time=created_time,
                 )
                 return result
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                response = self.create_error_response(
+                    str(detail.get("message", exc.detail)),
+                    err_type=str(detail.get("code", "scheduler_abort")),
+                    status_code=exc.status_code,
+                )
+                for key, value in (exc.headers or {}).items():
+                    response.headers[key] = value
+                return response
             except Exception as e:
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
@@ -590,6 +1348,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
+        if self.use_harmony and request.store:
+            assert isinstance(context, HarmonyContext)
+            self._store_public_harmony_messages(request, context)
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
@@ -659,6 +1420,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             return False
         return bool(config.default_enabled)
 
+    @staticmethod
+    def _partition_qwen_exo_self_ask_spill(text: str) -> tuple[str, str]:
+        router = _QwenExoSelfAskSpillRouter()
+        router.arm()
+        return router.feed(text, final=True)
+
     def _make_response_output_items(
         self,
         request: ResponsesRequest,
@@ -676,6 +1443,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
+            spill_reasoning, content = self._partition_qwen_exo_self_ask_spill(content)
+            if spill_reasoning:
+                reasoning_content = f"{reasoning_content or ''}{spill_reasoning}"
         else:
             reasoning_content = None
             content = final_output
@@ -864,6 +1634,22 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         return content_part
 
+    @staticmethod
+    def _strip_qwen_exo_self_checks(text: str) -> str:
+        remaining = str(text)
+        while True:
+            start = remaining.find(_QWEN_EXO_SELF_CHECK_START)
+            if start < 0:
+                break
+            end = remaining.find(_QWEN_EXO_SELF_CHECK_END, start)
+            if end < 0:
+                break
+            suffix_start = end + len(_QWEN_EXO_SELF_CHECK_END)
+            prefix = remaining[:start].rstrip()
+            suffix = remaining[suffix_start:].lstrip()
+            remaining = "\n".join(part for part in (prefix, suffix) if part)
+        return remaining.strip()
+
     @classmethod
     def _normalize_response_message_for_chat(cls, message: Any) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
@@ -908,10 +1694,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ],
             }
         if msg_type == "function_call_output":
+            output = message.get("output", "")
+            if isinstance(output, list):
+                output = [
+                    cls._normalize_response_content_part_for_chat(part)
+                    for part in output
+                ]
+            elif output is None or not str(output).strip():
+                output = "(tool returned no textual output)"
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": message.get("output", ""),
+                "content": output,
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
@@ -930,16 +1724,21 @@ class OpenAIServingResponses(OpenAIServingChat):
             text_parts = _collect(message.get("summary"))
             if not text_parts:
                 text_parts = _collect(message.get("content"))
-            if not text_parts:
+            reasoning_content = cls._strip_qwen_exo_self_checks("\n".join(text_parts))
+            if not reasoning_content:
                 return None
             return {
                 "role": "assistant",
-                "reasoning_content": "\n".join(text_parts),
+                "reasoning_content": reasoning_content,
             }
         if msg_type not in (None, "message"):
             raise ValueError(f"Unsupported Responses API input item type: {msg_type!r}")
 
         content = message.get("content")
+        if isinstance(content, Iterable) and not isinstance(
+            content, (str, bytes, dict, list)
+        ):
+            content = list(content)
         if not isinstance(content, list):
             return {
                 k: v
@@ -1057,9 +1856,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # Prepend the conversation history
         if prev_response is not None:
-            # Add the previous messages
             prev_msg = self.msg_store[prev_response.id]
-            messages.extend(prev_msg)
+            for message in prev_msg:
+                normalized = self._normalize_response_message_for_chat(message)
+                if normalized is not None:
+                    messages.append(normalized)
 
             for output_item in prev_response.output:
                 assistant_text = self._output_message_text(output_item)
@@ -1161,9 +1962,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]
                 del prev_msgs[prev_final_msg_idx + 1 :]
                 for msg in recent_turn_msgs:
-                    if (
-                        hasattr(msg, "channel") and msg.channel != "analysis"
-                    ):  # type: ignore[union-attr]
+                    if hasattr(msg, "channel") and msg.channel != "analysis":  # type: ignore[union-attr]
                         prev_msgs.append(msg)
             messages.extend(prev_msgs)
         # Append the new input.
@@ -1181,6 +1980,89 @@ class OpenAIServingResponses(OpenAIServingChat):
                     prev_outputs.append(response_msg)
         return messages
 
+    @staticmethod
+    def _stringify_response_metadata(
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, str]:
+        return {
+            str(key): (
+                value
+                if isinstance(value, str)
+                else json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            for key, value in (metadata or {}).items()
+        }
+
+    @staticmethod
+    def _public_response_error(
+        exc: Exception,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        if isinstance(exc, HTTPException):
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            status_code = int(exc.status_code)
+            message = str(detail.get("message", exc.detail))
+            internal_code = str(detail.get("code", "scheduler_abort"))
+            retry_after = detail.get("retry_after")
+        else:
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+            message = "Request failed"
+            internal_code = type(exc).__name__
+            retry_after = None
+        public_code = (
+            "rate_limit_exceeded"
+            if status_code == HTTPStatus.TOO_MANY_REQUESTS
+            else (
+                "invalid_prompt"
+                if status_code
+                in {
+                    HTTPStatus.BAD_REQUEST,
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                }
+                else "server_error"
+            )
+        )
+        diagnostics = {
+            "qwen_exo_error_code": internal_code,
+            "qwen_exo_error_status": str(status_code),
+        }
+        if retry_after is not None:
+            diagnostics["qwen_exo_retry_after"] = str(retry_after)
+        return {"message": message, "code": public_code}, diagnostics
+
+    def _store_public_harmony_messages(
+        self, request: ResponsesRequest, context: HarmonyContext
+    ) -> None:
+        public_initial_messages = list(self.msg_store.get(request.request_id, ()))
+        context_messages = context.messages
+        generated_messages = (
+            context_messages[context.num_init_messages :]
+            if context_messages is getattr(context, "_messages", None)
+            else context_messages
+        )
+        public_generated_messages = []
+        for message in generated_messages:
+            author = getattr(message, "author", None)
+            role = getattr(author, "role", None)
+            if role == Role.TOOL or (
+                role == Role.ASSISTANT
+                and (
+                    getattr(message, "recipient", None) is not None
+                    or getattr(message, "channel", None) == "final"
+                )
+            ):
+                public_generated_messages.append(message)
+        self.msg_store[request.request_id] = [
+            *public_initial_messages,
+            *public_generated_messages,
+        ]
+
     async def _run_background_request(
         self,
         request: ResponsesRequest,
@@ -1194,6 +2076,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         *args,
         **kwargs,
     ):
+        background_error = None
+        background_diagnostics: dict[str, str] = {}
         try:
             # Update the status to "in_progress"
             async with self.response_store_lock:
@@ -1213,9 +2097,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                 *args,
                 **kwargs,
             )
-        except Exception as e:
+        except HTTPException as exc:
+            background_error, background_diagnostics = self._public_response_error(exc)
+            response = self.create_error_response(
+                background_error["message"],
+                err_type=background_error["code"],
+                status_code=exc.status_code,
+            )
+        except Exception as exc:
             logger.exception("Background request failed for %s", request.request_id)
-            response = self.create_error_response(str(e))
+            background_error, background_diagnostics = self._public_response_error(exc)
+            response = self.create_error_response(
+                background_error["message"],
+                err_type=background_error["code"],
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
         if isinstance(response, ORJSONResponse):
             # If the request has failed, update the status to "failed"
@@ -1225,6 +2121,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 assert stored_response is not None
                 if stored_response.status not in ("completed", "cancelled"):
                     stored_response.status = "failed"
+                    stored_response.error = background_error
+                    stored_response.metadata = {
+                        **self._stringify_response_metadata(stored_response.metadata),
+                        **background_diagnostics,
+                    }
 
     async def retrieve_responses(
         self,
@@ -1253,10 +2154,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return self._make_not_found_error(response_id)
 
             prev_status = response.status
+            if prev_status == "cancelled":
+                return response
             if prev_status not in ("queued", "in_progress"):
                 return self.create_error_response(
                     err_type="invalid_request_error",
-                    message="Cannot cancel a synchronous response.",
+                    message="Cannot cancel a terminal response.",
                 )
 
             # Update the status to "cancelled"
@@ -1352,7 +2255,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         async for ctx in result_generator:
-
             # Only process context objects that implement the `is_expecting_start()` method,
             # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
             # Contexts without this method are skipped, as they do not represent a new turn
@@ -1848,6 +2750,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Items closed during the stream, in wire order. Feeds the final
         # ``response.completed`` snapshot and the stored response.
         emitted_items: list = []
+        self_ask_spill_router = _QwenExoSelfAskSpillRouter()
+        self_ask_spill_text = ""
 
         prompt_tokens = 0
         completion_tokens = 0
@@ -2053,6 +2957,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "reasoning_tokens", reasoning_tokens_meta
                 )
                 finish_reason = meta.get("finish_reason") or finish_reason
+                if meta.get("qwen_exo_self_ask_boundary"):
+                    self_ask_spill_router.arm()
 
                 text = chunk.get("text", "") or ""
                 if incremental:
@@ -2063,12 +2969,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not delta and finish_reason is None:
                     continue
 
+                # The reasoning parser owns state transitions. Only its
+                # post-reasoning normal delta may reach the tool parser.
                 if reasoning_parser_obj is not None:
                     reasoning_chunk, delta = reasoning_parser_obj.parse_stream_chunk(
                         delta
                     )
                 else:
                     reasoning_chunk = None
+                spill_reasoning, delta = self_ask_spill_router.feed(
+                    delta, final=bool(meta.get("finish_reason"))
+                )
+                if spill_reasoning:
+                    self_ask_spill_text += spill_reasoning
+                    reasoning_chunk = f"{reasoning_chunk or ''}{spill_reasoning}"
 
                 if reasoning_chunk:
                     if message_state["open"]:
@@ -2253,8 +3167,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 delta=call.parameters,
                             )
                         )
-        except Exception:
-            logger.exception("Error while streaming /v1/responses")
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                logger.info(
+                    "Streaming /v1/responses terminated with HTTP %s",
+                    exc.status_code,
+                )
+            else:
+                logger.exception("Error while streaming /v1/responses")
             failed = _sanitize_response_dict(
                 ResponsesResponse.from_request(
                     request,
@@ -2266,6 +3186,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     usage=None,
                 ).model_dump()
             )
+            public_error, error_diagnostics = self._public_response_error(exc)
+            failed["error"] = public_error
+            failed["metadata"] = {
+                **self._stringify_response_metadata(failed.get("metadata")),
+                **error_diagnostics,
+            }
             yield _send_event(
                 openai_responses_types.ResponseFailedEvent(
                     type="response.failed",
@@ -2284,12 +3210,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                 yield ev
 
         final_output_items = list(emitted_items)
+        reclassified_reasoning_tokens = (
+            len(
+                tokenizer.encode(
+                    self_ask_spill_text,
+                    add_special_tokens=False,
+                )
+            )
+            if self_ask_spill_text
+            else 0
+        )
+        total_reasoning_tokens = (
+            int(reasoning_tokens_meta) + reclassified_reasoning_tokens
+        )
 
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
-            reasoning_tokens=reasoning_tokens_meta,
+            reasoning_tokens=total_reasoning_tokens,
         )
         if self.enable_prompt_tokens_details and cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
@@ -2322,7 +3261,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 },
                 "output_tokens": usage_info.get("completion_tokens", 0),
                 "output_tokens_details": {
-                    "reasoning_tokens": reasoning_tokens_meta,
+                    "reasoning_tokens": total_reasoning_tokens,
                 },
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
@@ -2334,6 +3273,180 @@ class OpenAIServingResponses(OpenAIServingChat):
                 response=response_dict,
             )
         )
+
+    @staticmethod
+    def _copy_sampling_params(sampling_params: Any, **updates: Any) -> Any:
+        if isinstance(sampling_params, dict):
+            cloned = dict(sampling_params)
+            cloned.update(updates)
+            return cloned
+        cloned = copy.copy(sampling_params)
+        for key, value in updates.items():
+            setattr(cloned, key, value)
+        return cloned
+
+    @classmethod
+    def _sampling_params_with_reasoning_stop(
+        cls, sampling_params: Any, reasoning_end_token_id: int
+    ) -> Any:
+        current = (
+            sampling_params.get("stop_token_ids")
+            if isinstance(sampling_params, dict)
+            else getattr(sampling_params, "stop_token_ids", None)
+        ) or ()
+        stop_token_ids = list(dict.fromkeys([*current, reasoning_end_token_id]))
+        return cls._copy_sampling_params(sampling_params, stop_token_ids=stop_token_ids)
+
+    @classmethod
+    def _reasoning_phase_sampling_params(
+        cls,
+        sampling_params: Any,
+        reasoning_end_token_id: int,
+        max_reasoning_tokens: int,
+    ) -> tuple[Any, bool]:
+        configured_max = (
+            sampling_params.get("max_new_tokens")
+            if isinstance(sampling_params, dict)
+            else getattr(sampling_params, "max_new_tokens", None)
+        )
+        cap_applied = configured_max is None or int(configured_max) > int(
+            max_reasoning_tokens
+        )
+        phase_sampling = cls._sampling_params_with_reasoning_stop(
+            sampling_params, reasoning_end_token_id
+        )
+        if cap_applied:
+            phase_sampling = cls._copy_sampling_params(
+                phase_sampling, max_new_tokens=int(max_reasoning_tokens)
+            )
+        return phase_sampling, cap_applied
+
+    @staticmethod
+    def _forced_reasoning_boundary(
+        finish_reason: dict[str, Any],
+        *,
+        output_tokens: int,
+        max_reasoning_tokens: int,
+        cap_applied: bool,
+    ) -> bool:
+        return (
+            cap_applied
+            and finish_reason.get("type") == "length"
+            and int(output_tokens) >= int(max_reasoning_tokens)
+        )
+
+    @staticmethod
+    def _matched_reasoning_boundary(
+        finish_reason: dict[str, Any], reasoning_end_token_id: int
+    ) -> bool:
+        if finish_reason.get("type") != "stop":
+            return False
+        matched = finish_reason.get("matched")
+        return (
+            matched == reasoning_end_token_id
+            or str(matched) == str(reasoning_end_token_id)
+            or str(matched).strip() == "</think>"
+        )
+
+    def _request_prompt_token_ids(
+        self, adapted_request: GenerateReqInput
+    ) -> list[int] | None:
+        if adapted_request.input_ids is not None:
+            return list(adapted_request.input_ids)
+        if adapted_request.text is not None:
+            return list(
+                self.tokenizer_manager.tokenizer.encode(
+                    adapted_request.text, add_special_tokens=False
+                )
+            )
+        return None
+
+    @staticmethod
+    def _score_bias_logprob_start_len(
+        prompt_token_ids: list[int], trajectory_spans: Any
+    ) -> int:
+        prompt_length = len(prompt_token_ids)
+        starts = []
+        for span in trajectory_spans or ():
+            try:
+                start = int(span["start"])
+                end = int(span["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= start < end <= prompt_length:
+                starts.append(start)
+        return max(0, min(starts) - 1) if starts else prompt_length
+
+    @staticmethod
+    def _raise_for_generation_abort(finish_reason: dict[str, Any]) -> None:
+        if finish_reason.get("type") != "abort":
+            return
+        detail = {
+            "message": finish_reason.get("message", "Scheduler request aborted"),
+            "code": finish_reason.get("code", "scheduler_abort"),
+        }
+        if finish_reason.get("retry_after") is not None:
+            detail["retry_after"] = int(finish_reason["retry_after"])
+        raw_status_code = finish_reason.get("status_code")
+        raise HTTPException(
+            status_code=int(
+                raw_status_code
+                if raw_status_code is not None
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            ),
+            detail=detail,
+        )
+
+    def _reasoning_boundary_tokens(
+        self,
+        injection: Any,
+        reasoning_end_token_id: int,
+        *,
+        forced: bool = False,
+    ) -> tuple[str, tuple[int, ...]]:
+        injected_text = injection.text if injection is not None else ""
+        if forced:
+            injected_text = "\nlet me do this now stop over thinking\n"
+        injected_ids = self.tokenizer_manager.tokenizer.encode(
+            injected_text, add_special_tokens=False
+        )
+        end_text = self.tokenizer_manager.tokenizer.decode(
+            [reasoning_end_token_id], skip_special_tokens=False
+        )
+        if not end_text:
+            end_text = "</think>"
+        return (
+            f"{injected_text}{end_text}",
+            tuple([*injected_ids, reasoning_end_token_id]),
+        )
+
+    def _phase_two_sampling_params(
+        self,
+        sampling_params: Any,
+        *,
+        prompt_length: int,
+        consumed_tokens: int,
+    ) -> Any:
+        configured_max = (
+            sampling_params.get("max_new_tokens")
+            if isinstance(sampling_params, dict)
+            else getattr(sampling_params, "max_new_tokens", None)
+        )
+        context_length = getattr(
+            self.tokenizer_manager.model_config, "context_len", 4096
+        )
+        context_remaining = max(
+            context_length - prompt_length - self.tokenizer_manager.num_reserved_tokens,
+            1,
+        )
+        if configured_max is None:
+            remaining = context_remaining
+        else:
+            remaining = min(
+                context_remaining,
+                max(int(configured_max) - consumed_tokens, 1),
+            )
+        return self._copy_sampling_params(sampling_params, max_new_tokens=remaining)
 
     async def _generate_with_builtin_tools(
         self,
@@ -2348,62 +3461,431 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
         orig_priority = priority or 0
+        generation_index = 0
+        incremental_logprobs = bool(
+            adapted_request.stream
+            and self.tokenizer_manager.server_args.incremental_streaming_output
+        )
+        native_prefix_ids = tuple(kwargs.get("native_prefix_ids") or ())
 
         while True:
-            # Generate using SGLang's tokenizer manager
+            qwen_exo_runtime = (
+                getattr(raw_request.app.state, "qwen_exo_runtime", None)
+                if raw_request is not None
+                else None
+            )
+            replay_prompt = (
+                adapted_request.input_ids
+                if adapted_request.input_ids is not None
+                else adapted_request.text
+            )
+            if qwen_exo_runtime is not None and replay_prompt is not None:
+                qwen_exo_runtime.register_generation_prompt(
+                    request_id,
+                    replay_prompt,
+                    generation_index=generation_index,
+                )
+
+            prompt_token_ids = self._request_prompt_token_ids(adapted_request)
+            trajectory_spans = ()
+            if qwen_exo_runtime is not None and prompt_token_ids is not None:
+                score_bias_builder = getattr(
+                    qwen_exo_runtime, "score_bias_payload", None
+                )
+                if callable(score_bias_builder):
+                    custom_params = dict(sampling_params.get("custom_params") or {})
+                    score_bias_blocks = score_bias_builder(request_id, prompt_token_ids)
+                    if score_bias_blocks:
+                        custom_params["qwen_exo_score_bias_blocks"] = list(
+                            score_bias_blocks
+                        )
+                    else:
+                        custom_params.pop("qwen_exo_score_bias_blocks", None)
+                    capture_builder = getattr(
+                        qwen_exo_runtime, "score_bias_capture_payload", None
+                    )
+                    if callable(capture_builder):
+                        trajectory_spans = capture_builder(request_id, prompt_token_ids)
+                        if trajectory_spans:
+                            custom_params["qwen_exo_trajectory_spans"] = list(
+                                trajectory_spans
+                            )
+                        else:
+                            custom_params.pop("qwen_exo_trajectory_spans", None)
+                    sampling_params = dict(sampling_params)
+                    sampling_params["custom_params"] = custom_params
+            score_bias_logprob_start_len = None
+            if (
+                qwen_exo_runtime is not None
+                and getattr(qwen_exo_runtime, "score_bias_enabled", False)
+                and prompt_token_ids is not None
+            ):
+                score_bias_logprob_start_len = self._score_bias_logprob_start_len(
+                    prompt_token_ids, trajectory_spans
+                )
+                telemetry = getattr(qwen_exo_runtime, "telemetry", None)
+                emit = getattr(telemetry, "emit", None)
+                if callable(emit) and trajectory_spans:
+                    emit(
+                        request_id,
+                        "score_bias.input_logprob_window",
+                        {
+                            "generation_index": generation_index,
+                            "prompt_tokens": len(prompt_token_ids),
+                            "logprob_start_len": score_bias_logprob_start_len,
+                            "scored_input_tokens": (
+                                len(prompt_token_ids) - score_bias_logprob_start_len
+                            ),
+                            "capture_count": len(trajectory_spans),
+                        },
+                    )
+
+            reasoning_end_token_id = (
+                qwen_exo_runtime.reasoning_end_token_id
+                if qwen_exo_runtime is not None
+                and qwen_exo_runtime.think_context_enabled
+                and prompt_token_ids is not None
+                else None
+            )
+            generation_request = (
+                replace(
+                    adapted_request,
+                    logprob_start_len=score_bias_logprob_start_len,
+                )
+                if score_bias_logprob_start_len is not None
+                else adapted_request
+            )
+            max_reasoning_tokens = 0
+            reasoning_cap_applied = False
+            if reasoning_end_token_id is not None:
+                max_reasoning_tokens = int(
+                    getattr(qwen_exo_runtime, "max_reasoning_tokens", 3072)
+                )
+                phase_sampling_params, reasoning_cap_applied = (
+                    self._reasoning_phase_sampling_params(
+                        sampling_params,
+                        reasoning_end_token_id,
+                        max_reasoning_tokens,
+                    )
+                )
+                generation_request = replace(
+                    generation_request,
+                    sampling_params=phase_sampling_params,
+                )
+            phase_output_ids: list[int] = []
+            phase_output_text = ""
+            phase_finish_reason: dict[str, Any] = {}
+            phase_prompt_tokens = 0
+            phase_cached_tokens = 0
+            output_tokens_before = getattr(context, "num_output_tokens", 0)
+            reasoning_tokens_before = getattr(context, "num_reasoning_tokens", 0)
+            logger.info(
+                "QWEN_EXO_GENERATION_START request_id=%s generation_index=%d "
+                "prompt_tokens=%d native_prefix_tokens=%d reasoning_end_token_id=%s "
+                "max_reasoning_tokens=%d",
+                request_id,
+                generation_index,
+                len(prompt_token_ids),
+                len(native_prefix_ids),
+                reasoning_end_token_id,
+                max_reasoning_tokens,
+            )
             generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
+                generation_request, raw_request
             )
 
             async for res in generator:
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
+                meta_info = res.get("meta_info") or {}
+                finish_reason = meta_info.get("finish_reason") or {}
+                self._raise_for_generation_abort(finish_reason)
+                if meta_info.get("prompt_tokens") is not None:
+                    phase_prompt_tokens = int(meta_info["prompt_tokens"])
+                if meta_info.get("cached_tokens") is not None:
+                    phase_cached_tokens = int(meta_info["cached_tokens"])
+                raw_output_ids = [int(token) for token in (res.get("output_ids") or ())]
+                output_text = str(res.get("text") or "")
+                if incremental_logprobs:
+                    phase_output_ids.extend(raw_output_ids)
+                    phase_output_text += output_text
+                else:
+                    phase_output_ids = raw_output_ids
+                    phase_output_text = output_text
+                if finish_reason:
+                    phase_finish_reason = finish_reason
+                if finish_reason:
+                    logger.warning(
+                        "QWEN_EXO_GENERATION_RESULT request_id=%s generation_index=%d "
+                        "prompt_tokens=%s cached_tokens=%s output_id_count=%d "
+                        "output_id_tail=%s output_text_bytes=%d finish_reason=%s "
+                        "reasoning_end_token_id=%s",
+                        request_id,
+                        generation_index,
+                        meta_info.get("prompt_tokens"),
+                        meta_info.get("cached_tokens"),
+                        len(raw_output_ids),
+                        raw_output_ids[-16:],
+                        len(output_text.encode("utf-8")),
+                        finish_reason,
+                        reasoning_end_token_id,
+                    )
+                if qwen_exo_runtime is not None:
+                    qwen_exo_runtime.observe_generation_result(
+                        request_id,
+                        res,
+                        incremental_logprobs=incremental_logprobs,
+                        generation_index=generation_index,
+                    )
+                public_result = res
+                if reasoning_end_token_id is not None and (
+                    self._matched_reasoning_boundary(
+                        finish_reason, reasoning_end_token_id
+                    )
+                    or self._forced_reasoning_boundary(
+                        finish_reason,
+                        output_tokens=len(phase_output_ids),
+                        max_reasoning_tokens=max_reasoning_tokens,
+                        cap_applied=reasoning_cap_applied,
+                    )
+                ):
+                    public_result = dict(res)
+                    public_meta = dict(meta_info)
+                    public_meta.pop("finish_reason", None)
+                    public_result["meta_info"] = public_meta
+                context.append_output(public_result)
                 yield context
+            matched_reasoning_boundary = (
+                reasoning_end_token_id is not None
+                and self._matched_reasoning_boundary(
+                    phase_finish_reason, reasoning_end_token_id
+                )
+            )
+            forced_reasoning_boundary = (
+                reasoning_end_token_id is not None
+                and self._forced_reasoning_boundary(
+                    phase_finish_reason,
+                    output_tokens=len(phase_output_ids),
+                    max_reasoning_tokens=max_reasoning_tokens,
+                    cap_applied=reasoning_cap_applied,
+                )
+            )
+            if matched_reasoning_boundary or forced_reasoning_boundary:
+                assert reasoning_end_token_id is not None
+                assert qwen_exo_runtime is not None
+                if forced_reasoning_boundary:
+                    await qwen_exo_runtime.discard_think_context_for_reasoning_budget(
+                        request_id,
+                        observed_tokens=len(phase_output_ids),
+                        generation_index=generation_index,
+                    )
+                    injection = None
+                else:
+                    injection = await qwen_exo_runtime.await_think_context(request_id)
+                boundary_text, boundary_ids = self._reasoning_boundary_tokens(
+                    injection,
+                    reasoning_end_token_id,
+                    forced=forced_reasoning_boundary,
+                )
+                combined_prefix_text = f"{phase_output_text}{boundary_text}"
+                combined_prefix_ids = [*phase_output_ids, *boundary_ids]
+                synthetic_result = {
+                    "text": (
+                        boundary_text if incremental_logprobs else combined_prefix_text
+                    ),
+                    "output_ids": (
+                        list(boundary_ids)
+                        if incremental_logprobs
+                        else combined_prefix_ids
+                    ),
+                    "meta_info": {
+                        "qwen_exo_self_ask_boundary": injection is not None,
+                    },
+                }
+                context.append_output(synthetic_result)
+                context.num_prompt_tokens = phase_prompt_tokens or len(prompt_token_ids)
+                context.num_cached_tokens = phase_cached_tokens
+                context.num_output_tokens = output_tokens_before + len(
+                    combined_prefix_ids
+                )
+                context.num_reasoning_tokens = reasoning_tokens_before + len(
+                    combined_prefix_ids
+                )
+                qwen_exo_runtime.record_reasoning_boundary(
+                    request_id,
+                    injection=injection,
+                    committed_text=boundary_text,
+                    token_ids=boundary_ids,
+                    generation_index=generation_index,
+                )
+                yield context
+
+                continuation_prompt_ids = [
+                    *prompt_token_ids,
+                    *combined_prefix_ids,
+                ]
+                continuation_sampling_params = self._phase_two_sampling_params(
+                    sampling_params,
+                    prompt_length=len(continuation_prompt_ids),
+                    consumed_tokens=len(combined_prefix_ids),
+                )
+                continuation_request = replace(
+                    adapted_request,
+                    text=None,
+                    input_ids=continuation_prompt_ids,
+                    sampling_params=continuation_sampling_params,
+                )
+                if hasattr(context, "num_processed_tokens"):
+                    context.num_processed_tokens = 0
+                continuation_output_ids: list[int] = []
+                continuation_runtime_ids = 0
+                continuation_runtime_text = ""
+                continuation_runtime_signals = 0
+                continuation_generator = self.tokenizer_manager.generate_request(
+                    continuation_request, raw_request
+                )
+                async for continuation_result in continuation_generator:
+                    continuation_meta = continuation_result.get("meta_info") or {}
+                    continuation_finish = continuation_meta.get("finish_reason") or {}
+                    self._raise_for_generation_abort(continuation_finish)
+                    raw_ids = [
+                        int(token)
+                        for token in (continuation_result.get("output_ids") or ())
+                    ]
+                    if incremental_logprobs:
+                        continuation_output_ids.extend(raw_ids)
+                    else:
+                        continuation_output_ids = raw_ids
+                    runtime_result = continuation_result
+                    if not incremental_logprobs:
+                        runtime_result = dict(continuation_result)
+                        runtime_result["output_ids"] = raw_ids[
+                            continuation_runtime_ids:
+                        ]
+                        continuation_text = str(continuation_result.get("text") or "")
+                        runtime_result["text"] = (
+                            continuation_text[len(continuation_runtime_text) :]
+                            if continuation_text.startswith(continuation_runtime_text)
+                            else continuation_text
+                        )
+                        runtime_meta = dict(continuation_meta)
+                        for signal_key in (
+                            "output_token_logprobs",
+                            "qwen_exo_q_norm",
+                            "qwen_exo_q_drift",
+                            "qwen_exo_memory_energy",
+                            "qwen_exo_q_sketch",
+                        ):
+                            values = runtime_meta.get(signal_key)
+                            if values is not None:
+                                runtime_meta[signal_key] = values[
+                                    continuation_runtime_signals:
+                                ]
+                        runtime_result["meta_info"] = runtime_meta
+                        continuation_runtime_ids = len(raw_ids)
+                        continuation_runtime_text = continuation_text
+                        continuation_runtime_signals = len(
+                            continuation_meta.get("output_token_logprobs") or ()
+                        )
+                    qwen_exo_runtime.observe_generation_result(
+                        request_id,
+                        runtime_result,
+                        incremental_logprobs=True,
+                        generation_index=generation_index,
+                    )
+                    public_result = continuation_result
+                    if isinstance(context, SimpleContext):
+                        public_result = dict(continuation_result)
+                        continuation_text = str(continuation_result.get("text") or "")
+                        if not incremental_logprobs:
+                            public_result["text"] = (
+                                f"{combined_prefix_text}{continuation_text}"
+                            )
+                            public_result["output_ids"] = [
+                                *combined_prefix_ids,
+                                *raw_ids,
+                            ]
+                        public_meta = dict(continuation_meta)
+                        if continuation_finish:
+                            completion_tokens = len(combined_prefix_ids) + len(
+                                continuation_output_ids
+                            )
+                            public_meta.update(
+                                {
+                                    "prompt_tokens": context.num_prompt_tokens,
+                                    "cached_tokens": phase_cached_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "reasoning_tokens": len(combined_prefix_ids),
+                                    "total_tokens": (
+                                        context.num_prompt_tokens + completion_tokens
+                                    ),
+                                }
+                            )
+                        public_result["meta_info"] = public_meta
+                    context.append_output(public_result)
+                    yield context
+                context.num_prompt_tokens = phase_prompt_tokens or len(prompt_token_ids)
+                context.num_cached_tokens = phase_cached_tokens
+                context.num_output_tokens = (
+                    output_tokens_before
+                    + len(combined_prefix_ids)
+                    + len(continuation_output_ids)
+                )
+                context.num_reasoning_tokens = reasoning_tokens_before + len(
+                    combined_prefix_ids
+                )
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
                 break
 
             # Call the tool and update the context with the result.
+            tool_request = context.messages[-1] if context.messages else None
+            tool_call_payload = None
+            if tool_request is not None:
+                tool_call_payload = {
+                    "recipient": str(getattr(tool_request, "recipient", "") or ""),
+                    "arguments": "\n".join(
+                        str(text)
+                        for part in getattr(tool_request, "content", ()) or ()
+                        if (text := getattr(part, "text", None))
+                    ),
+                }
             tool_output = await context.call_tool()
             context.append_output(tool_output)
+            if qwen_exo_runtime is not None:
+                observation_parts = []
+                for message in tool_output:
+                    for part in getattr(message, "content", ()) or ():
+                        text = getattr(part, "text", None)
+                        if text:
+                            observation_parts.append(str(text))
+                await qwen_exo_runtime.recall_after_tool(
+                    request_id,
+                    "\n".join(observation_parts),
+                    generation_index=generation_index,
+                    tool_call=tool_call_payload,
+                )
 
             # Prepare for the next generation turn
             # Render the updated conversation for the next completion
-            prompt_token_ids = context.render_for_completion()
+            prompt_token_ids = [
+                *native_prefix_ids,
+                *context.render_for_completion(),
+            ]
 
-            # Update the adapted request with new prompt
-            adapted_request = GenerateReqInput(
+            sampling_params = self._phase_two_sampling_params(
+                sampling_params,
+                prompt_length=len(prompt_token_ids),
+                consumed_tokens=0,
+            )
+            adapted_request = replace(
+                adapted_request,
+                text=None,
                 input_ids=prompt_token_ids,
                 sampling_params=sampling_params,
-                stream=adapted_request.stream,
-                rid=request_id,
-                session_id=adapted_request.session_id,
-                extra_key=adapted_request.extra_key,
-                return_logprob=adapted_request.return_logprob,
-                logprob_start_len=adapted_request.logprob_start_len,
-                top_logprobs_num=adapted_request.top_logprobs_num,
-                return_text_in_logprobs=adapted_request.return_text_in_logprobs,
-                return_hidden_states=adapted_request.return_hidden_states,
-                background=adapted_request.background,
             )
-
-            # Update sampling params with reduced max_tokens
-            if hasattr(sampling_params, "max_new_tokens") or isinstance(
-                sampling_params, dict
-            ):
-                context_len = getattr(
-                    self.tokenizer_manager.model_config, "context_len", 4096
-                )
-                num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
-                remaining_tokens = (
-                    context_len - len(prompt_token_ids) - num_reserved_tokens
-                )
-
-                if isinstance(sampling_params, dict):
-                    sampling_params["max_new_tokens"] = max(remaining_tokens, 1)
-                else:
-                    sampling_params.max_new_tokens = max(remaining_tokens, 1)
+            if hasattr(context, "num_processed_tokens"):
+                context.num_processed_tokens = 0
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1
+            generation_index += 1

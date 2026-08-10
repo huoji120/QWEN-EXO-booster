@@ -770,7 +770,6 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             )
 
     def test_num_token_non_padded_gathered_dp_branch(self):
-
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
@@ -1337,6 +1336,19 @@ class TestComputedSlots(unittest.TestCase):
                 torch.tensor([4], dtype=torch.int32),
             )
         )
+
+
+class TestCudaGraphCustomizedInfo(unittest.TestCase):
+    def test_replay_output_is_cloned_before_static_storage_is_reused(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            clone_cuda_graph_customized_info,
+        )
+
+        static = torch.tensor([[1.0, 2.0]])
+        copied = clone_cuda_graph_customized_info({"signal": static})
+        static.fill_(9.0)
+
+        self.assertTrue(torch.equal(copied["signal"], torch.tensor([[1.0, 2.0]])))
 
 
 if __name__ == "__main__":

@@ -59,8 +59,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-
+from fastapi.responses import JSONResponse, ORJSONResponse, Response, StreamingResponse
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -89,6 +88,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
+    ResponsesCompactRequest,
     ResponsesRequest,
     ScoringRequest,
     TokenizeRequest,
@@ -372,7 +372,10 @@ async def lifespan(fast_api_app: FastAPI):
         logger.debug(
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
-
+        if server_args.enable_qwen_exo:
+            raise RuntimeError(
+                "QWEN-EXO requires a working OpenAI Responses serving handler"
+            ) from e
 
     fast_api_app.state.qwen_exo_runtime = None
     if server_args.enable_qwen_exo:
@@ -424,9 +427,7 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
-        qwen_exo_runtime = getattr(
-            fast_api_app.state, "qwen_exo_runtime", None
-        )
+        qwen_exo_runtime = getattr(fast_api_app.state, "qwen_exo_runtime", None)
         if qwen_exo_runtime is not None:
             await qwen_exo_runtime.close()
 
@@ -471,9 +472,13 @@ from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 
 app.include_router(elastic_ep_router)
 
-from qwen_exo_booster.router import router as qwen_exo_router
+from qwen_exo_booster.router import (
+    compat_router as qwen_exo_compat_router,
+    router as qwen_exo_router,
+)
 
 app.include_router(qwen_exo_router)
+app.include_router(qwen_exo_compat_router)
 
 
 def _anthropic_validation_message(raw_errors) -> str:
@@ -765,9 +770,9 @@ async def get_server_info():
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: List[
+        Dict[Any, Any]
+    ] = await _global_state.tokenizer_manager.get_internal_state()
 
     server_args = _global_state.tokenizer_manager.server_args
 
@@ -1469,9 +1474,12 @@ async def check_weights(
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
-    success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
-    )
+    (
+        success,
+        message,
+        ranks,
+        per_engine_checksum,
+    ) = await _global_state.tokenizer_manager.check_weights(obj, request)
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
@@ -1866,20 +1874,157 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
+    serving = raw_request.app.state.openai_serving_responses
+    qwen_exo_runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
+    if qwen_exo_runtime is not None:
+        validation_error = await serving.prevalidate_qwen_exo_request(request)
+        if validation_error is not None:
+            return validation_error
+        raw_request.state.qwen_exo_original_instructions = request.instructions
+        raw_request.state.qwen_exo_original_extra_key = request.extra_key
+        try:
+            request, memory_state = await qwen_exo_runtime.prepare_responses_request(
+                request
+            )
+            raw_request.state.qwen_exo_memory = (
+                memory_state.public_dict() if memory_state is not None else None
+            )
+            raw_request.state.qwen_exo_memory_state = memory_state
+        except asyncio.CancelledError:
+            cancelled_response = await serving.register_cancelled_response(request)
+            await qwen_exo_runtime.cancel_request(request.request_id)
+            qwen_exo_runtime.acknowledge_request_cancellation(request.request_id)
+            if request.background:
+                return cancelled_response
+            raise
+        except Exception as exc:
+            from qwen_exo_booster.runtime import (
+                QwenExoCapacityConflict,
+                QwenExoRequestConflict,
+            )
 
-    result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request, raw_request
-    )
+            if isinstance(exc, QwenExoRequestConflict):
+                return serving.create_error_response(
+                    str(exc),
+                    err_type="request_conflict",
+                    status_code=HTTPStatus.CONFLICT,
+                    param="request_id",
+                )
+            if isinstance(exc, QwenExoCapacityConflict):
+                response = serving.create_error_response(
+                    str(exc),
+                    err_type="rate_limit_exceeded",
+                    status_code=HTTPStatus.TOO_MANY_REQUESTS,
+                )
+                response.headers["Retry-After"] = "1"
+                return response
+            # Memory is optional evidence. Preparation always fails closed.
+            raw_request.state.qwen_exo_memory = {
+                "status": "failed_closed",
+                "error_type": type(exc).__name__,
+            }
+            raw_request.state.qwen_exo_memory_state = None
+            logger.exception("QWEN-EXO memory preparation failed closed")
 
+    result = await serving.create_responses(request, raw_request)
+    if qwen_exo_runtime is not None:
+        qwen_exo_runtime.mark_request_scheduled(request.request_id)
     # Handle streaming responses
     if isinstance(result, AsyncGenerator):
+
+        async def stream_with_qwen_exo_cleanup():
+            completed = False
+            try:
+                async for event in result:
+                    yield event
+                completed = True
+            finally:
+                if not completed:
+                    _global_state.tokenizer_manager.abort_request(
+                        rid=request.request_id
+                    )
+                    await serving.cancel_responses(request.request_id)
+                    if qwen_exo_runtime is not None:
+                        await qwen_exo_runtime.cancel_request(request.request_id)
+
         return StreamingResponse(
-            result,
+            stream_with_qwen_exo_cleanup(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
+    if (
+        qwen_exo_runtime is not None
+        and qwen_exo_runtime.owns_request(request.request_id)
+        and not qwen_exo_runtime.is_finalizing(request.request_id)
+    ):
+        background_tasks = (
+            raw_request.app.state.openai_serving_responses.background_tasks
+        )
+        if request.request_id not in background_tasks:
+            await qwen_exo_runtime.cancel_request(request.request_id)
+
     return result
+
+
+@app.post("/v1/responses/compact", dependencies=[Depends(validate_json_request)])
+async def v1_responses_compact_request(
+    request: ResponsesCompactRequest, raw_request: Request
+):
+    """Compact a Responses conversation without creating a user generation."""
+    runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
+    if runtime is None:
+        return JSONResponse(
+            status_code=501,
+            content={
+                "error": {
+                    "message": "QWEN-EXO response compaction is unavailable",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "compaction_unavailable",
+                }
+            },
+        )
+    try:
+        result = await runtime.compact_responses(request)
+        user_items, summary = runtime.compaction_replay_payload(result["id"])
+        await (
+            raw_request.app.state.openai_serving_responses.register_compaction_response(
+                response_id=result["id"],
+                model_name=request.model,
+                user_items=user_items,
+                summary=summary,
+            )
+        )
+        return result
+    except Exception as exc:
+        from qwen_exo_booster.compaction import ResponseCompactionError
+
+        if isinstance(exc, ResponseCompactionError):
+            status_code = 409 if exc.code == "compaction_disabled" else 400
+            return JSONResponse(
+                status_code=status_code,
+                content={
+                    "error": {
+                        "message": str(exc),
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": exc.code,
+                    }
+                },
+            )
+        logger.exception("Responses compaction failed")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": "Response compaction failed",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "compaction_failed",
+                }
+            },
+        )
 
 
 @app.get("/v1/responses/{response_id}")
@@ -1893,9 +2038,29 @@ async def v1_retrieve_responses(response_id: str, raw_request: Request):
 @app.post("/v1/responses/{response_id}/cancel")
 async def v1_cancel_responses(response_id: str, raw_request: Request):
     """Cancel a background response."""
-    return await raw_request.app.state.openai_serving_responses.cancel_responses(
-        response_id
-    )
+    serving = raw_request.app.state.openai_serving_responses
+    result = await serving.cancel_responses(response_id)
+    qwen_exo_runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
+    pending_cancelled = False
+    if qwen_exo_runtime is not None and getattr(result, "status", None) != "cancelled":
+        pending_cancelled = await qwen_exo_runtime.cancel_pending_background_request(
+            response_id
+        )
+        # The request may have atomically claimed its pending slot after the first
+        # lookup. Retry after marking cancellation so either side of the race wins.
+        raced_result = await serving.cancel_responses(response_id)
+        if getattr(raced_result, "status", None) == "cancelled":
+            result = raced_result
+
+    if (
+        qwen_exo_runtime is not None
+        and getattr(result, "status", None) == "cancelled"
+        and qwen_exo_runtime.owns_request(response_id)
+    ):
+        await qwen_exo_runtime.cancel_request(response_id)
+    if pending_cancelled and getattr(result, "status", None) != "cancelled":
+        result = await serving.register_pending_cancelled_response(response_id)
+    return result
 
 
 @app.api_route(

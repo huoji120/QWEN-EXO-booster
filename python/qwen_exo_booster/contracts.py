@@ -30,6 +30,15 @@ class InternalJobType(str, Enum):
     CAPSULE_UPDATE = "capsule_update"
     RETRIEVAL_REFRESH = "retrieval_refresh"
     ADMISSION_PROBE = "admission_probe"
+    BANK_INDEX = "bank_index"
+    CAUSAL_REPLAY = "causal_replay"
+    SELF_ASK = "self_ask"
+    SELF_ANSWER = "self_answer"
+    POST_TOOL_RECALL = "post_tool_recall"
+    CONTEXT_INTEGRITY = "context_integrity"
+    REFLECTION_MEMORY = "reflection_memory"
+    RESPONSE_COMPACTION = "response_compaction"
+    QUERY_PROBE = "query_probe"
 
 
 class EligibilityStatus(str, Enum):
@@ -107,7 +116,9 @@ class HybridStateHandle:
             "model_fingerprint": self.model_fingerprint,
             "tokenizer_fingerprint": self.tokenizer_fingerprint,
         }
-        missing = [name for name, value in required_text.items() if not str(value).strip()]
+        missing = [
+            name for name, value in required_text.items() if not str(value).strip()
+        ]
         if missing:
             raise ContractViolation(f"Missing hybrid state identity fields: {missing}")
         if self.tp_world_size < 1:
@@ -142,10 +153,14 @@ class HybridStateHandle:
             raise ContractViolation(
                 "Resident hybrid state requires Full-Attention KV, recurrent, and conv slots"
             )
-        if self.lifecycle in {
-            HybridLifecycleState.EVICTED,
-            HybridLifecycleState.RELEASED,
-        } and self.has_any_component:
+        if (
+            self.lifecycle
+            in {
+                HybridLifecycleState.EVICTED,
+                HybridLifecycleState.RELEASED,
+            }
+            and self.has_any_component
+        ):
             raise ContractViolation(
                 f"{self.lifecycle.value} hybrid state cannot retain GPU component slots"
             )
@@ -153,17 +168,13 @@ class HybridStateHandle:
     @property
     def has_any_component(self) -> bool:
         return bool(
-            self.full_kv_blocks
-            or self.recurrent_state_slots
-            or self.conv_state_slots
+            self.full_kv_blocks or self.recurrent_state_slots or self.conv_state_slots
         )
 
     @property
     def has_complete_hybrid_state(self) -> bool:
         return bool(
-            self.full_kv_blocks
-            and self.recurrent_state_slots
-            and self.conv_state_slots
+            self.full_kv_blocks and self.recurrent_state_slots and self.conv_state_slots
         )
 
     def bind_components(
@@ -218,14 +229,18 @@ class HybridStateHandle:
             "namespace",
         )
         mismatched = [
-            name for name in logical_fields if getattr(self, name) != getattr(other, name)
+            name
+            for name in logical_fields
+            if getattr(self, name) != getattr(other, name)
         ]
         if mismatched:
             raise ContractViolation(
                 f"Hybrid prefix reuse fingerprint mismatch: {mismatched}"
             )
         if not self.has_complete_hybrid_state or not other.has_complete_hybrid_state:
-            raise ContractViolation("Hybrid prefix reuse requires complete state on both handles")
+            raise ContractViolation(
+                "Hybrid prefix reuse requires complete state on both handles"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,13 +273,19 @@ class InternalJob:
         if not self.parent_request_id or not self.turn_id or not self.job_id:
             raise ContractViolation("Internal jobs require parent, turn, and job IDs")
         if not self.shared_prefix_key or not self.telemetry_correlation_id:
-            raise ContractViolation("Internal jobs require prefix and telemetry identities")
+            raise ContractViolation(
+                "Internal jobs require prefix and telemetry identities"
+            )
         if self.token_budget < 1 or self.state_budget_bytes < 0:
-            raise ContractViolation("Internal job budgets must be non-negative and non-empty")
+            raise ContractViolation(
+                "Internal job budgets must be non-negative and non-empty"
+            )
         if self.max_fanout < 1:
             raise ContractViolation("Internal job max_fanout must be positive")
         if self.recursion_depth != 0:
-            raise ContractViolation("Internal jobs cannot recursively create internal jobs")
+            raise ContractViolation(
+                "Internal jobs cannot recursively create internal jobs"
+            )
 
     def is_cancelled_or_expired(self, now: float | None = None) -> bool:
         current = time.monotonic() if now is None else now

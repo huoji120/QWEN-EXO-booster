@@ -61,7 +61,6 @@ from typing import (
 import msgspec
 import numpy as np
 import torch
-
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -1832,6 +1831,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+    qwen_exo_final_prefill: Optional[List[bool]] = None
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
@@ -2892,6 +2892,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        if self.qwen_exo_final_prefill is not None:
+            self.qwen_exo_final_prefill = [
+                self.qwen_exo_final_prefill[i] for i in keep_indices
+            ]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -2978,6 +2982,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         elif other.return_logprob:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
+        if (
+            self.qwen_exo_final_prefill is not None
+            or other.qwen_exo_final_prefill is not None
+        ):
+            left_final_prefill = self.qwen_exo_final_prefill or [True] * len(self.reqs)
+            right_final_prefill = other.qwen_exo_final_prefill or [True] * len(
+                other.reqs
+            )
+            self.qwen_exo_final_prefill = left_final_prefill + right_final_prefill
         self.reqs = self.reqs + other.reqs
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = self.multimodal_inputs + other.multimodal_inputs

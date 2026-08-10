@@ -1,0 +1,282 @@
+@import "@fontsource-variable/manrope/index.css";
+@import "@fontsource/jetbrains-mono/400.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 40 14% 97%;
+    --foreground: 222 22% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 22% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 22% 11%;
+    --primary: 221 83% 53%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 94%;
+    --secondary-foreground: 222 22% 15%;
+    --muted: 40 10% 94%;
+    --muted-foreground: 220 9% 42%;
+    --accent: 220 14% 94%;
+    --accent-foreground: 222 22% 15%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 88%;
+    --input: 220 13% 84%;
+    --ring: 221 83% 53%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 222 18% 9%;
+    --foreground: 40 12% 92%;
+    --card: 222 16% 12%;
+    --card-foreground: 40 12% 92%;
+    --popover: 222 16% 12%;
+    --popover-foreground: 40 12% 92%;
+    --primary: 217 91% 62%;
+    --primary-foreground: 222 30% 10%;
+    --secondary: 220 12% 18%;
+    --secondary-foreground: 40 10% 90%;
+    --muted: 220 12% 16%;
+    --muted-foreground: 220 10% 62%;
+    --accent: 220 12% 18%;
+    --accent-foreground: 40 10% 90%;
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 220 12% 22%;
+    --input: 220 12% 26%;
+    --ring: 217 91% 62%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    min-width: 320px;
+    background: hsl(var(--background));
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    margin: 0;
+    min-width: 320px;
+    min-height: 100vh;
+    font-family: "Manrope Variable", "Microsoft YaHei", sans-serif;
+    font-feature-settings: "ss01", "cv02", "cv03";
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: "JetBrains Mono", "Cascadia Code", monospace;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.18);
+  }
+}
+
+@layer components {
+  .app-shell {
+    display: grid;
+    grid-template-columns: 236px minmax(0, 1fr);
+    min-height: 100vh;
+  }
+
+  .app-sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 30;
+    display: flex;
+    width: 236px;
+    flex-direction: column;
+    border-right: 1px solid hsl(var(--border));
+    background: hsl(var(--card));
+  }
+
+  .app-main {
+    grid-column: 2;
+    min-width: 0;
+  }
+
+  .page-frame {
+    width: 100%;
+    max-width: 1480px;
+    margin: 0 auto;
+    padding: 28px 32px 44px;
+  }
+
+  .page-title {
+    @apply text-xl font-semibold tracking-[-0.02em];
+  }
+
+  .page-description {
+    @apply mt-1 max-w-3xl text-sm leading-6 text-muted-foreground;
+  }
+
+  .eyebrow {
+    @apply text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground;
+  }
+
+  .metric-value {
+    @apply mt-3 text-2xl font-semibold tracking-[-0.04em];
+  }
+
+  .mono-value {
+    @apply font-mono text-xs tracking-tight;
+  }
+
+  .status-dot {
+    @apply inline-block h-2 w-2 rounded-full bg-slate-400;
+  }
+
+  .status-dot[data-state="ready"],
+  .status-dot[data-state="live"] {
+    @apply bg-emerald-500;
+    box-shadow: 0 0 0 3px rgb(16 185 129 / 0.12);
+  }
+
+  .status-dot[data-state="starting"] {
+    @apply bg-amber-500;
+    box-shadow: 0 0 0 3px rgb(245 158 11 / 0.12);
+  }
+
+  .status-dot[data-state="failed"],
+  .status-dot[data-state="unavailable"] {
+    @apply bg-red-500;
+    box-shadow: 0 0 0 3px rgb(239 68 68 / 0.12);
+  }
+
+  .brand-mark {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border: 1px solid hsl(var(--foreground));
+    color: hsl(var(--foreground));
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: -0.08em;
+  }
+
+  .nav-item {
+    @apply flex h-9 w-full items-center gap-3 rounded-md px-3 text-sm font-medium text-muted-foreground transition-colors;
+  }
+
+  .nav-item:hover {
+    @apply bg-muted text-foreground;
+  }
+
+  .nav-item[data-active="true"] {
+    @apply bg-foreground text-background;
+  }
+
+  .nav-item[data-active="true"] svg {
+    @apply text-background;
+  }
+
+  .chat-copy {
+    @apply text-[15px] leading-7 text-foreground;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .chat-copy code {
+    @apply rounded border bg-muted px-1 py-0.5 text-[0.88em];
+  }
+
+  .chat-copy pre {
+    @apply my-3 overflow-x-auto rounded-md border bg-slate-950 p-4 text-xs leading-6 text-slate-100;
+  }
+
+  .chat-composer:focus-within {
+    border-color: hsl(var(--ring));
+    box-shadow: 0 0 0 3px hsl(var(--ring) / 0.1);
+  }
+
+  .trace-json {
+    @apply overflow-auto rounded-md border bg-slate-950 p-4 font-mono text-xs leading-5 text-slate-200;
+    max-height: 56vh;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .field-grid {
+    display: grid;
+    grid-template-columns: minmax(180px, 1fr) minmax(140px, 220px);
+    gap: 16px;
+    align-items: center;
+    padding: 14px 0;
+    border-top: 1px solid hsl(var(--border));
+  }
+
+  .field-grid:first-child {
+    border-top: 0;
+  }
+
+  .source-editor {
+    font-family: "JetBrains Mono", "Cascadia Code", monospace;
+    font-size: 12px;
+    line-height: 1.75;
+    tab-size: 2;
+  }
+
+  .thin-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+
+  .mobile-only {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    display: block;
+  }
+
+  .app-sidebar {
+    display: none;
+  }
+
+  .app-main {
+    display: block;
+  }
+
+  .page-frame {
+    padding: 22px 18px 36px;
+  }
+
+  .mobile-only {
+    display: inline-flex;
+  }
+
+  .field-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

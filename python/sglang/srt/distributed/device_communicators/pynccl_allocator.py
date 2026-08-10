@@ -6,12 +6,25 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+from torch.cuda.memory import CUDAPluggableAllocator
+
+try:
+    from torch.cuda.memory import (
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+        _cuda_releasePool,
+    )
+except ImportError:
+
+    def _unsupported_thread_pool_api(*_args, **_kwargs):
+        raise RuntimeError(
+            "NCCL symmetric memory requires Torch 2.8 or newer; "
+            "disable --enable-symm-mem on this runtime"
+        )
+
+    _cuda_beginAllocateCurrentThreadToPool = _unsupported_thread_pool_api
+    _cuda_endAllocateToPool = _unsupported_thread_pool_api
+    _cuda_releasePool = _unsupported_thread_pool_api
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs

@@ -3,3 +3,15 @@ scripts/qwen_exo/*.py text eol=lf
 docker/QWEN-EXO-booster.Dockerfile text eol=lf
 python/qwen_exo_booster/*.py text eol=lf
 test/registered/qwen_exo/*.py text eol=lf
+
+scripts/qwen_exo/corpus/** text eol=lf
+frontend/qwen-exo/*.html text eol=lf
+frontend/qwen-exo/*.json text eol=lf
+frontend/qwen-exo/*.js text eol=lf
+frontend/qwen-exo/*.ts text eol=lf
+frontend/qwen-exo/src/** text eol=lf
+python/qwen_exo_booster/static/app/*.html text eol=lf
+python/qwen_exo_booster/static/app/assets/*.css text eol=lf
+python/qwen_exo_booster/static/app/assets/*.js text eol=lf whitespace=-blank-at-eol,-blank-at-eof
+python/qwen_exo_booster/static/app/assets/*.woff binary
+python/qwen_exo_booster/static/app/assets/*.woff2 binary

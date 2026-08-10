@@ -27,15 +27,29 @@ ScheduleBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import math
 import hashlib
+import json
+import os
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
-
+from qwen_exo_booster.score_bias import (
+    SCORE_BIAS_KERNEL_MAX_BLOCKS,
+    SCORE_BIAS_SKETCH_DIMENSIONS,
+)
+from qwen_exo_booster.latent_transplant import parse_latent_transplant_spec
+from qwen_exo_booster.activation_editor import (
+    _normalize_editor_strength,
+    parse_activation_editor_spec,
+    resolve_default_activation_editor_spec,
+)
+from qwen_exo_booster.memory_span import parse_private_memory_span
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
@@ -349,6 +363,228 @@ class NgramEmbeddingInfo:
         )
 
 
+def _qwen_exo_memory_span(req):
+    custom_params = getattr(req.sampling_params, "custom_params", None)
+    prompt_tokens = len(getattr(req, "origin_input_ids", ()) or ())
+    return parse_private_memory_span(
+        custom_params,
+        request_id=str(getattr(req, "rid", "")),
+        prompt_tokens=prompt_tokens,
+    )
+
+
+def _qwen_exo_trajectory_spans(req):
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    raw_spans = custom_params.get("qwen_exo_trajectory_spans")
+    prompt_tokens = len(getattr(req, "origin_input_ids", ()) or ())
+    if not isinstance(raw_spans, (list, tuple)):
+        return None
+    spans: list[tuple[int, int]] = []
+    for raw in raw_spans[:SCORE_BIAS_KERNEL_MAX_BLOCKS]:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            start = int(raw["start"])
+            end = int(raw["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= start < end <= prompt_tokens:
+            spans.append((start, end))
+    return tuple(spans) if spans else None
+
+
+def _qwen_exo_score_bias_blocks(req):
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    raw_blocks = custom_params.get("qwen_exo_score_bias_blocks")
+    prompt_tokens = len(getattr(req, "origin_input_ids", ()) or ())
+    if not isinstance(raw_blocks, (list, tuple)):
+        return None
+    blocks: list[dict[str, object]] = []
+    for raw in raw_blocks[:SCORE_BIAS_KERNEL_MAX_BLOCKS]:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            start = int(raw["start"])
+            end = int(raw["end"])
+            score = float(raw["score"])
+            key_sketch = tuple(float(value) for value in raw["key_sketch"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            start < 0
+            or end <= start
+            or end > prompt_tokens
+            or not math.isfinite(score)
+            or score <= 0
+            or len(key_sketch) != SCORE_BIAS_SKETCH_DIMENSIONS
+            or not all(math.isfinite(value) for value in key_sketch)
+        ):
+            continue
+        blocks.append(
+            {"start": start, "end": end, "score": score, "key_sketch": key_sketch}
+        )
+    return tuple(blocks) if blocks else None
+
+
+def _qwen_exo_user_query(req) -> dict[str, object]:
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    raw = custom_params.get("qwen_exo_score_bias_user_query")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _qwen_exo_user_query_spans(req):
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    raw_spans = custom_params.get("qwen_exo_query_spans")
+    if not isinstance(raw_spans, (list, tuple)):
+        raw_spans = _qwen_exo_user_query(req).get("spans")
+    prompt_tokens = len(getattr(req, "origin_input_ids", ()) or ())
+    if not isinstance(raw_spans, (list, tuple)):
+        return None
+    spans: list[tuple[int, int]] = []
+    for raw in raw_spans[:SCORE_BIAS_KERNEL_MAX_BLOCKS]:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            start, end = int(raw["start"]), int(raw["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= start < end <= prompt_tokens:
+            spans.append((start, end))
+    return tuple(spans) if spans else None
+
+
+def _qwen_exo_score_bias_anchor_spans(req):
+    raw_spans = _qwen_exo_user_query(req).get("anchor_spans")
+    prompt_tokens = len(getattr(req, "origin_input_ids", ()) or ())
+    if not isinstance(raw_spans, (list, tuple)):
+        return None
+    spans: list[tuple[int, int]] = []
+    for raw in raw_spans[:SCORE_BIAS_KERNEL_MAX_BLOCKS]:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            start, end = int(raw["start"]), int(raw["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= start < end <= prompt_tokens:
+            spans.append((start, end))
+    return tuple(spans) if spans else None
+
+
+def _qwen_exo_persisted_user_queries(req):
+    raw_rows = _qwen_exo_user_query(req).get("persisted_sketches")
+    if not isinstance(raw_rows, (list, tuple)):
+        return None
+    rows: list[tuple[float, ...]] = []
+    for raw in raw_rows[:SCORE_BIAS_KERNEL_MAX_BLOCKS]:
+        if not isinstance(raw, (list, tuple)):
+            continue
+        try:
+            row = tuple(float(value) for value in raw)
+        except (TypeError, ValueError):
+            continue
+        if len(row) == SCORE_BIAS_SKETCH_DIMENSIONS and all(
+            math.isfinite(value) for value in row
+        ):
+            rows.append(row)
+    return tuple(rows) if rows else None
+
+
+def _qwen_exo_score_bias_phase(req) -> int:
+    mode = str(_qwen_exo_user_query(req).get("mode") or "off")
+    if mode == "trajectory_shadow":
+        return 1
+    if mode == "trajectory_active":
+        return 2
+    return 0
+
+
+def _qwen_exo_latent_transplant(req) -> dict[str, object] | None:
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    return parse_latent_transplant_spec(custom_params.get("qwen_exo_latent_transplant"))
+
+
+_ACTIVE_EDITOR_CACHE: dict[str, object] = {
+    "path": None,
+    "mtime": None,
+    "spec": None,
+}
+
+
+def _qwen_exo_editor_env_name() -> str | None:
+    """Parse the opt-in default activation editor from the environment."""
+    raw = os.getenv("QWEN_EXO_DEFAULT_ACTIVATION_EDITOR", "")
+    name = raw.strip().lower()
+    return name if name and "," not in name else None
+
+
+def _qwen_exo_editor_env_strength() -> float | None:
+    raw = os.getenv("QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH", "")
+    return _normalize_editor_strength(raw) if raw else None
+
+
+def _qwen_exo_active_editor_spec() -> dict[str, object] | None:
+    try:
+        state_dir = str(getattr(get_server_args(), "qwen_exo_state_dir", "") or "")
+        if not state_dir:
+            return None
+        path = Path(state_dir) / "activation-editors" / "active.json"
+        mtime = path.stat().st_mtime
+        if (
+            _ACTIVE_EDITOR_CACHE["path"] == str(path)
+            and _ACTIVE_EDITOR_CACHE["mtime"] == mtime
+        ):
+            cached = _ACTIVE_EDITOR_CACHE["spec"]
+            return dict(cached) if isinstance(cached, dict) else None
+        payload = json.loads(path.read_text("utf-8"))
+        raw_spec = payload
+        if isinstance(payload, dict) and isinstance(payload.get("editors"), list):
+            items = [item for item in payload["editors"] if isinstance(item, dict)]
+            raw_spec = items[0] if len(items) == 1 else None
+        spec = parse_activation_editor_spec(raw_spec)
+        _ACTIVE_EDITOR_CACHE.update(path=str(path), mtime=mtime, spec=spec)
+        return dict(spec) if spec is not None else None
+    except Exception:
+        return None
+
+
+def _qwen_exo_activation_editor(req) -> dict[str, object] | None:
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    raw_custom = custom_params.get("qwen_exo_activation_editor")
+    if isinstance(raw_custom, list):
+        return None
+    spec = parse_activation_editor_spec(raw_custom)
+    if spec is not None:
+        return spec
+    if str(custom_params.get("qwen_exo_kind") or "") == "internal":
+        return None
+    server_args = get_server_args()
+    fallback_strength = _qwen_exo_editor_env_strength()
+    if fallback_strength is None:
+        fallback_strength = float(
+            getattr(server_args, "qwen_exo_activation_editor_strength", 2.0) or 2.0
+        )
+    return resolve_default_activation_editor_spec(
+        _qwen_exo_active_editor_spec(),
+        _qwen_exo_editor_env_name(),
+        enabled=bool(getattr(server_args, "qwen_exo_activation_editor_enabled", False)),
+        fallback_strength=fallback_strength,
+    )
+
+
+def _qwen_exo_should_observe(req) -> bool:
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    return (
+        custom_params.get("qwen_exo_kind") == "user"
+        or custom_params.get("qwen_exo_job_type") == "query_probe"
+    )
+
+
+def _qwen_exo_full_query_capture(req) -> bool:
+    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    return custom_params.get("qwen_exo_job_type") == "query_probe"
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -417,6 +653,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
+    contains_last_prefill_chunk: bool = True
+    qwen_exo_final_prefill: Optional[List[bool]] = None
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -452,6 +690,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # External-memory and trajectory metadata per request.
+    qwen_exo_memory_spans: Optional[List[Optional[Tuple[int, int, str]]]] = None
+    qwen_exo_trajectory_spans: Optional[List[Optional[Tuple[Tuple[int, int], ...]]]] = (
+        None
+    )
+    qwen_exo_user_query_spans: Optional[List[Optional[Tuple[Tuple[int, int], ...]]]] = (
+        None
+    )
+    qwen_exo_score_bias_anchor_spans: Optional[
+        List[Optional[Tuple[Tuple[int, int], ...]]]
+    ] = None
+    qwen_exo_persisted_user_queries: Optional[
+        List[Optional[Tuple[Tuple[float, ...], ...]]]
+    ] = None
+    qwen_exo_observe: Optional[List[bool]] = None
+    qwen_exo_observe_mask: Optional[torch.Tensor] = None
+    qwen_exo_full_query_capture: Optional[List[bool]] = None
+    qwen_exo_score_bias_blocks: Optional[List[Optional[Tuple[dict, ...]]]] = None
+    qwen_exo_score_bias_phases: Optional[List[int]] = None
+    qwen_exo_latent_transplants: Optional[List[Optional[dict[str, object]]]] = None
+    qwen_exo_activation_editors: Optional[List[Optional[dict[str, object]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -718,6 +977,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
+            contains_last_prefill_chunk=batch.contains_last_prefill_chunk,
+            qwen_exo_final_prefill=batch.qwen_exo_final_prefill,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
@@ -734,6 +995,67 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            qwen_exo_memory_spans=(
+                [_qwen_exo_memory_span(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                else None
+            ),
+            qwen_exo_trajectory_spans=(
+                [_qwen_exo_trajectory_spans(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                else None
+            ),
+            qwen_exo_user_query_spans=(
+                [_qwen_exo_user_query_spans(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                else None
+            ),
+            qwen_exo_score_bias_anchor_spans=(
+                [_qwen_exo_score_bias_anchor_spans(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                and getattr(get_server_args(), "qwen_exo_score_bias_mode", "off")
+                != "off"
+                else None
+            ),
+            qwen_exo_persisted_user_queries=(
+                [_qwen_exo_persisted_user_queries(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                else None
+            ),
+            qwen_exo_observe=(
+                [_qwen_exo_should_observe(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                else None
+            ),
+            qwen_exo_full_query_capture=(
+                [_qwen_exo_full_query_capture(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                else None
+            ),
+            qwen_exo_score_bias_blocks=(
+                [_qwen_exo_score_bias_blocks(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                and getattr(get_server_args(), "qwen_exo_score_bias_mode", "off")
+                != "off"
+                else None
+            ),
+            qwen_exo_score_bias_phases=(
+                [_qwen_exo_score_bias_phase(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                and getattr(get_server_args(), "qwen_exo_score_bias_mode", "off")
+                != "off"
+                else None
+            ),
+            qwen_exo_latent_transplants=(
+                [_qwen_exo_latent_transplant(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                else None
+            ),
+            qwen_exo_activation_editors=(
+                [_qwen_exo_activation_editor(req) for req in batch.reqs]
+                if get_server_args().enable_qwen_exo
+                else None
+            ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
@@ -742,6 +1064,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+        if ret.qwen_exo_observe is not None:
+            ret.qwen_exo_observe_mask = torch.tensor(
+                ret.qwen_exo_observe, dtype=torch.bool, device=device
+            )
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(

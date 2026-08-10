@@ -774,7 +774,101 @@ class OpenAIServingChat(OpenAIServingBase):
             return_prompt_token_ids=request.return_prompt_token_ids,
         )
 
+        adapted_request = self._apply_qwen_exo_chat_native_prefix(
+            adapted_request, raw_request
+        )
         return adapted_request, request
+
+    def _apply_qwen_exo_chat_native_prefix(
+        self, adapted_request: GenerateReqInput, raw_request: Request | None
+    ) -> GenerateReqInput:
+        """Bind the always-on Cognition state for Chat Completions requests.
+
+        Responses API performs this preparation in QwenExoRuntime. OpenCode and
+        other clients commonly use Chat Completions instead, so that path must
+        carry the same native identity state without adding text to the prompt.
+        """
+        if raw_request is None:
+            return adapted_request
+        try:
+            runtime = raw_request.app.state.qwen_exo_runtime
+            tensor_bank = runtime.memory_pipeline.tensor_bank
+            selection = tensor_bank.cognition_selection()
+        except Exception as exc:
+            logger.warning(
+                "QWEN_EXO_CHAT_COGNITION_PREFIX_SKIPPED reason=%s",
+                type(exc).__name__,
+            )
+            return adapted_request
+        if selection is None:
+            return adapted_request
+        if adapted_request.input_ids is None:
+            if (
+                not isinstance(adapted_request.text, str)
+                or adapted_request.image_data
+                or adapted_request.video_data
+                or adapted_request.audio_data
+            ):
+                return adapted_request
+            adapted_request.input_ids = list(
+                self.tokenizer_manager.tokenizer.encode(
+                    adapted_request.text, add_special_tokens=False
+                )
+            )
+            adapted_request.text = None
+        if not isinstance(adapted_request.input_ids, list):
+            return adapted_request
+        nested_input_ids = bool(adapted_request.input_ids) and isinstance(
+            adapted_request.input_ids[0], list
+        )
+        if nested_input_ids and len(adapted_request.input_ids) != 1:
+            return adapted_request
+        native_prefix_ids = tuple(int(token) for token in selection.token_ids)
+        if not native_prefix_ids:
+            return adapted_request
+        sampling_params = adapted_request.sampling_params
+        if not isinstance(sampling_params, dict):
+            return adapted_request
+        custom_params = dict(sampling_params.get("custom_params") or {})
+        editor_request = runtime.activation_editor_request(
+            custom_params.get("qwen_exo_activation_editor")
+        )
+        if editor_request["spec"] is not None:
+            custom_params["qwen_exo_activation_editor"] = editor_request["spec"]
+        custom_params.update(
+            {
+                "qwen_exo_kind": "user",
+                "qwen_exo_radix_prefix_page_id": selection.page_id,
+                "qwen_exo_radix_prefix_identity": selection.prefix_identity,
+                "qwen_exo_radix_prefix_tokens": len(native_prefix_ids),
+                "qwen_exo_native_bank_selection": {
+                    "source_digest": selection.source_digest,
+                    "page_id": selection.page_id,
+                    "local_positions": list(selection.local_positions),
+                    "prefix_identity": selection.prefix_identity,
+                },
+                "qwen_exo_memory_start": 0,
+                "qwen_exo_memory_length": len(native_prefix_ids),
+                "qwen_exo_memory_key": f"qwen-exo-native:{selection.prefix_identity}",
+            }
+        )
+        sampling_params["custom_params"] = custom_params
+        adapted_request.sampling_params = sampling_params
+        adapted_request.extra_key = (
+            f"{selection.radix_namespace}|qwen-exo-editor="
+            f"{editor_request['cache_identity']}"
+        )
+        adapted_request.input_ids = (
+            [[*native_prefix_ids, *adapted_request.input_ids[0]]]
+            if nested_input_ids
+            else [*native_prefix_ids, *adapted_request.input_ids]
+        )
+        logger.info(
+            "QWEN_EXO_CHAT_COGNITION_PREFIX_APPLIED page_id=%s tokens=%d",
+            selection.page_id,
+            len(native_prefix_ids),
+        )
+        return adapted_request
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool

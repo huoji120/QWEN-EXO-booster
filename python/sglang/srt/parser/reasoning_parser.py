@@ -1,4 +1,5 @@
 import inspect
+import json
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -82,6 +83,10 @@ class BaseReasoningFormatDetector:
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
 
+    def _tool_call_boundary_status(self, text: str, tool_idx: int) -> str:
+        """Classify an implicit tool boundary without changing base behavior."""
+        return "valid"
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses reasoning sections in the provided text.
@@ -103,25 +108,28 @@ class BaseReasoningFormatDetector:
         while processed_text.startswith(think_start_text):
             processed_text = processed_text[len(think_start_text) :]
 
+        tool_idx = -1
+        if self.tool_start_token and self.tool_start_token in processed_text:
+            tool_idx = processed_text.find(self.tool_start_token)
+            status = self._tool_call_boundary_status(processed_text, tool_idx)
+            end_idx = processed_text.find(self.think_end_token)
+            if status == "valid" and (end_idx < 0 or tool_idx < end_idx):
+                reasoning_text = processed_text[:tool_idx]
+                normal_text = processed_text[tool_idx:]
+                if end_idx > tool_idx:
+                    normal_text = (
+                        processed_text[tool_idx:end_idx]
+                        + processed_text[end_idx + len(self.think_end_token) :]
+                    )
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
+
         if (
             self.think_end_token not in processed_text
             and self.think_end_token not in self.previous_content
         ):
-            # Check for tool_start_token interruption
-            if (
-                in_reasoning
-                and self.tool_start_token is not None
-                and self.tool_start_token in processed_text
-            ):
-                # Find the first occurrence of tool_start_token and split there
-                tool_idx = processed_text.find(self.tool_start_token)
-                reasoning_text = processed_text[:tool_idx]
-                # Preserve tool_start_token in normal text
-                normal_text = processed_text[tool_idx:]
-                return StreamingParseResult(
-                    normal_text=normal_text, reasoning_text=reasoning_text
-                )
-            # Assume reasoning was truncated before end token
+            # Assume reasoning was truncated before end token.
             return StreamingParseResult(reasoning_text=processed_text)
 
         # Extract reasoning content
@@ -177,6 +185,27 @@ class BaseReasoningFormatDetector:
             self.stripped_think_start = True
             self._in_reasoning = True
 
+        # A complete implicit tool call closes reasoning before a later
+        # explicit think-end token in the same chunk.
+        if self._in_reasoning and self.tool_start_token:
+            tool_idx = current_text.find(self.tool_start_token)
+            if tool_idx >= 0:
+                status = self._tool_call_boundary_status(current_text, tool_idx)
+                end_idx = current_text.find(self.think_end_token)
+                if status == "valid" and (end_idx < 0 or tool_idx < end_idx):
+                    reasoning_text = current_text[:tool_idx]
+                    normal_text = current_text[tool_idx:]
+                    if end_idx > tool_idx:
+                        normal_text = (
+                            current_text[tool_idx:end_idx]
+                            + current_text[end_idx + len(self.think_end_token) :]
+                        )
+                    self._buffer = ""
+                    self._in_reasoning = False
+                    return StreamingParseResult(
+                        normal_text=normal_text, reasoning_text=reasoning_text
+                    )
+
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:
             end_idx = current_text.find(self.think_end_token)
@@ -193,11 +222,25 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
-            # Check for tool_start_token interruption
+            # An implicit tool boundary is detector-specific. Qwen3 only
+            # accepts a complete, non-quoted protocol block; other detectors
+            # retain the historical interruption behavior.
             if self.tool_start_token and self.tool_start_token in current_text:
                 tool_idx = current_text.find(self.tool_start_token)
+                status = self._tool_call_boundary_status(current_text, tool_idx)
+                if status == "pending":
+                    if self.stream_reasoning:
+                        reasoning_text = current_text[:tool_idx]
+                        self._buffer = current_text[tool_idx:]
+                        return StreamingParseResult(reasoning_text=reasoning_text)
+                    return StreamingParseResult()
+                if status != "valid":
+                    if self.stream_reasoning:
+                        self._buffer = ""
+                        return StreamingParseResult(reasoning_text=current_text)
+                    return StreamingParseResult()
                 reasoning_text = current_text[:tool_idx]
-                # Preserve tool_start_token in normal text
+                # Preserve tool_start_token in normal text.
                 normal_text = current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
@@ -205,11 +248,10 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             if self.stream_reasoning:
-                # Stream the content immediately
+                # Stream the content immediately.
                 self._buffer = ""
                 return StreamingParseResult(reasoning_text=current_text)
-            else:
-                return StreamingParseResult()
+            return StreamingParseResult()
 
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
@@ -297,6 +339,76 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
+    tool_call_end_token = "</tool_call>"
+
+    @staticmethod
+    def _scan_backticks(in_code: bool, text: str) -> bool:
+        index = 0
+        while index < len(text):
+            if text[index] != "`":
+                index += 1
+                continue
+            while index < len(text) and text[index] == "`":
+                index += 1
+            in_code = not in_code
+        return in_code
+
+    def _inside_backticks(self, text: str, position: int) -> bool:
+        return self._scan_backticks(self._reasoning_in_backticks, text[:position])
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        result = super().parse_streaming_increment(new_text)
+        if result.reasoning_text:
+            self._reasoning_in_backticks = self._scan_backticks(
+                self._reasoning_in_backticks, result.reasoning_text
+            )
+        return result
+
+    def _tool_call_boundary_status(self, text: str, tool_idx: int) -> str:
+        """Do not close reasoning on quoted or placeholder tool examples."""
+        if self._inside_backticks(text, tool_idx):
+            return "invalid"
+        body_start = tool_idx + len(self.tool_start_token or "")
+        body = text[body_start:]
+        stripped = body.lstrip()
+        if not stripped:
+            return "pending"
+        if stripped.startswith("<function="):
+            end_idx = text.find(self.tool_call_end_token, body_start)
+            function_end_idx = text.find("</function>", body_start)
+            if end_idx < 0:
+                return "pending"
+            if function_end_idx < 0 or function_end_idx > end_idx:
+                return "invalid"
+            return "valid"
+        if not stripped.startswith("{"):
+            return "invalid"
+        if stripped.startswith(("{...", "{…")):
+            return "invalid"
+        end_idx = text.find(self.tool_call_end_token, body_start)
+        if end_idx < 0:
+            return "pending"
+        candidate = text[body_start:end_idx].strip()
+        if candidate in {"{...}", "{…}"}:
+            return "invalid"
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, ValueError):
+            return "invalid"
+        if not isinstance(payload, dict):
+            return "invalid"
+        if isinstance(payload.get("action"), str):
+            return "valid"
+        if not isinstance(payload.get("name"), str):
+            return "invalid"
+        return (
+            "valid"
+            if any(
+                key in payload for key in ("arguments", "args", "parameters", "input")
+            )
+            else "invalid"
+        )
+
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -305,6 +417,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         previous_content: str = "",
         force_nonempty_content: bool = False,
     ):
+        self._reasoning_in_backticks = False
         think_excluded_tokens = [
             "<tool_call>",
             "</tool_call>",

@@ -37,6 +37,20 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+def _allows_chained_decode(req) -> bool:
+    """Only chain requests whose next sampling step has no host-side state."""
+
+    params = req.sampling_params
+    return (
+        getattr(req, "grammar", None) is None
+        and float(getattr(params, "temperature", 1.0) or 0.0) <= 1e-6
+        and float(getattr(params, "repetition_penalty", 1.0) or 1.0) == 1.0
+        and float(getattr(params, "frequency_penalty", 0.0) or 0.0) == 0.0
+        and float(getattr(params, "presence_penalty", 0.0) or 0.0) == 0.0
+        and int(getattr(params, "min_new_tokens", 0) or 0) == 0
+    )
+
+
 @dataclass
 class MlxPendingJob:
     """Unfinished MLX work and graphs queued on the GPU.
@@ -206,6 +220,7 @@ class SchedulerMlxOverlapMixin:
                 and pending_curr.mode == "decode"
                 and pending_curr.decode is not None
                 and not self.waiting_queue
+                and all(_allows_chained_decode(req) for req in pending_curr.reqs)
             )
             if can_chain and pending_next is None:
                 # Build + launch the chained step BEFORE we block on
