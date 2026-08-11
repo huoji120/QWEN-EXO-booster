@@ -168,6 +168,22 @@ class KnowledgeDocument:
         return payload
 
 
+def semantic_document_group(document: KnowledgeDocument) -> str:
+    """Return only groups that represent one semantic document."""
+
+    group = str(document.document_group or "").strip()
+    if document.source_kind == "trajectory_reflection" or group == "reflection_memory":
+        return document.document_id
+    return group or document.document_id
+
+
+def retrieval_diversity_bucket(document: KnowledgeDocument) -> str:
+    """Keep collection families from monopolizing the first retrieval wave."""
+
+    source_kind = str(document.source_kind or "unclassified").strip()
+    return source_kind or "unclassified"
+
+
 @dataclass(frozen=True, slots=True)
 class KnowledgeSnapshot:
     source_digest: str
@@ -222,6 +238,8 @@ class QueryQKAttribution:
     source_positions: tuple[int, ...]
     window_start: int
     window_end: int
+    relative_score: float = 0.0
+    head_group_count: int = 0
 
     def public_dict(self) -> dict[str, object]:
         return {
@@ -237,6 +255,8 @@ class QueryQKAttribution:
             "source_positions": list(self.source_positions),
             "window_start": self.window_start,
             "window_end": self.window_end,
+            "relative_score": self.relative_score,
+            "head_group_count": self.head_group_count,
         }
 
 
@@ -254,6 +274,12 @@ class KnowledgeCandidate:
     normalized_reference_content: str = field(repr=False)
     lane: str = "knowledge"
     tensor_score: float | None = None
+    relative_tensor_score: float | None = None
+    score_percentile: float | None = None
+    anchor_support_count: int = 0
+    anchor_role_count: int = 0
+    head_group_count: int = 0
+
     page_ids: tuple[int, ...] = ()
     source_positions: tuple[int, ...] = ()
     virtual_positions: tuple[int, ...] = ()
@@ -275,6 +301,11 @@ class KnowledgeCandidate:
             "lane": self.lane,
             "policy": self.lane == "policydata",
             "tensor_score": self.tensor_score,
+            "relative_tensor_score": self.relative_tensor_score,
+            "score_percentile": self.score_percentile,
+            "anchor_support_count": self.anchor_support_count,
+            "anchor_role_count": self.anchor_role_count,
+            "head_group_count": self.head_group_count,
             "page_ids": list(self.page_ids),
             "source_positions": list(self.source_positions),
             "virtual_positions": list(self.virtual_positions),

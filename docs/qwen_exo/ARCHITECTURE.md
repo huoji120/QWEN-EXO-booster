@@ -52,23 +52,34 @@ flowchart LR
    and the response trajectory.
 2. A previous execution capsule is restored as private instructions, when one
    exists.
-3. `MemoryPipeline` ranks Knowledge and PolicyData Markdown candidates in
-   physically separate lanes.
-4. `ReferenceJudge` sends one constrained JSON decision job per candidate as a
-   shared-prefix scheduler batch. Invalid output is ineligible.
-5. Eligible Knowledge may be rendered as private, untrusted reference text.
-   Eligible PolicyData is never appended to `instructions`: the highest-ranked
-   page is bound to its precompiled Full-Attention K/V plus complete Gated
-   DeltaNet recurrent/conv state. PolicyData state takes the single recurrent
-   state slot ahead of Knowledge native restore.
-6. SGLang prepends only the 64-token-aligned cache identity tokens, restores the
-   rank-local state atomically, and admits the user prompt. The policy source
-   text is not rendered into the request.
-7. Selected-token log probability plus last-Full-Attention-layer Q signals are
+3. `MemoryPipeline` uses role-separated final-Full-Attention raw Q heads to
+   rank Tensor Bank K heads in physically separate Knowledge and PolicyData
+   lanes. Fixed Reflection template markers are excluded from search, while
+   the complete compiled Native state remains unchanged.
+4. Ranking requires supported 16-token local windows and records per-query
+   median/MAD-relative scores, source-family diversity, anchor coverage, and
+   head-group agreement as audit evidence. Relative scores remain shadow data
+   until corpus holdouts calibrate an admission threshold; production gates
+   continue to use the configured raw-score and independent-document margin.
+5. Collection labels such as `reflection_memory` are not semantic-equivalence
+   groups. Candidate ordering interleaves source families before the bounded
+   Judge shortlist, while real multi-part document groups still merge before
+   judging.
+6. `ReferenceJudge` performs the final semantic decision. Q/K-only retrieval
+   never bypasses this gate, and invalid, rejected, or unavailable Judge output
+   produces no Knowledge native binding.
+7. Only admitted candidates are bound to query-conditioned, precompiled
+   Full-Attention K/V plus complete Gated DeltaNet recurrent/conv state. No
+   extra causal replay or second model-effect forward is added to request-start
+   admission.
+8. SGLang prepends only the 64-token-aligned cache identity tokens, restores the
+   rank-local state atomically, and admits the user prompt. Source text is not
+   rendered into the request when Tensor Bank native state is available.
+9. Selected-token log probability plus last-Full-Attention-layer Q signals are
    returned through SGLang's `customized_info` channel, correlated by request
-   ID rather than mutable batch position.
-8. At terminal completion, an execution-capsule update is submitted as a hidden
-   scheduler job. Disconnect/cancel propagates to owned internal jobs.
+   ID rather than mutable batch position. At terminal completion, an execution
+   capsule update is submitted as a hidden scheduler job; disconnect/cancel
+   propagates to owned internal jobs.
 
 ### In-flight refresh
 

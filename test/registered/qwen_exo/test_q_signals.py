@@ -430,13 +430,25 @@ async def test_fp8_tensor_bank_ranks_pages_from_raw_attention_heads(tmp_path):
     assert prefix_ids
     assert page.radix_namespace in runner.shared_prefix_keys
     assert candidates[0].relative_path == "wfp.md"
-    assert candidates[0].candidate_origin == "attention_q_native_tensor_bank"
-    assert candidates[0].page_ids
-    assert candidates[0].source_positions
-    assert candidates[0].virtual_positions == tuple(
-        range(len(candidates[0].source_positions))
+    candidate = candidates[0]
+    assert candidate.candidate_origin == "attention_q_native_tensor_bank"
+    assert candidate.page_ids
+    assert candidate.source_positions == ()
+    assert candidate.virtual_positions == ()
+    assert candidate.native_prefix is None
+    assert candidate.relative_tensor_score is not None
+    assert 0.0 <= candidate.score_percentile <= 1.0
+    assert candidate.anchor_support_count > 0
+    assert candidate.head_group_count > 0
+    assert len(candidate.token_attributions) == 12 * len(candidate.page_ids)
+    assert all(
+        attribution.head_group_count > 0 for attribution in candidate.qk_attributions
     )
-    assert len(candidates[0].token_attributions) == 12 * len(candidates[0].page_ids)
+    bound = bank.bind_native_prefix(candidate, query="WFP outbound authorization")
+    assert bound.candidate_origin == "admitted_native_tensor_bank"
+    assert bound.native_prefix is not None
+    assert bound.source_positions
+    assert bound.virtual_positions == tuple(range(len(bound.source_positions)))
     assert rank_audit["status"] == "ready"
     assert rank_audit["reason"] == "candidates_ready"
     assert rank_audit["considered_documents"] == 2
@@ -529,6 +541,137 @@ async def test_fp8_tensor_bank_ranks_pages_from_raw_attention_heads(tmp_path):
     assert cached_runner.calls == 0
     await cached.ensure_resident((cached_snapshot.pages[0].page_id,))
     assert cached_runner.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_reflection_template_tokens_are_not_searchable_but_native_state_is_complete(
+    tmp_path,
+):
+    root = tmp_path / "reflection-template"
+    root.mkdir()
+    (root / "reflection.md").write_text(
+        "---\nsource_kind: trajectory_reflection\n"
+        "document_group: reflection_memory\n---\n"
+        "# WFP remote assistance\n\n"
+        "**结果：** 成功\n\n"
+        "UNIQUE_BODY_EVIDENCE preserves the requested API relationship.\n\n"
+        "证据与时间线:\nConcrete runtime evidence.",
+        encoding="utf-8",
+    )
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "reflection-template.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="reflection-template",
+        max_document_tokens=256,
+        salient_token_budget=128,
+    )
+
+    snapshot = await bank.ensure_ready()
+    (page,) = snapshot.pages
+    mask = bank._token_search_mask(page, int(snapshot.raw_key_heads[0].shape[0]))
+    document_ids = bank._page_document_token_ids(page)
+    marker_ids = tuple(bank.tokenizer.encode("**结果：** 成功"))
+    marker_positions = bank._subsequence_positions(document_ids, marker_ids)
+    evidence_ids = tuple(bank.tokenizer.encode("UNIQUE_BODY_EVIDENCE"))
+    evidence_positions = bank._subsequence_positions(document_ids, evidence_ids)
+
+    assert marker_positions
+    assert all(not bool(mask[position].item()) for position in marker_positions)
+    assert evidence_positions
+    assert all(bool(mask[position].item()) for position in evidence_positions)
+    assert page.state_token_count == int(snapshot.raw_key_heads[0].shape[0])
+    audit = {}
+    (candidate,) = bank.rank(
+        (((1.0, 0.0),),),
+        query_states=_query_states(1),
+        query_identity="reflection-template",
+        limit=1,
+        min_document_margin=0.0,
+        audit=audit,
+    )
+    assert candidate.native_prefix is None
+    assert audit["scored_documents"][0]["template_filtered_tokens"] >= len(
+        marker_positions
+    )
+    bound = bank.bind_native_prefix(candidate, query="WFP remote assistance")
+    assert bound.native_prefix is not None
+    assert len(bound.native_prefix.token_ids) % 64 == 0
+
+
+@pytest.mark.asyncio
+async def test_tensor_bank_interleaves_source_families_without_group_score_inheritance(
+    tmp_path,
+):
+    root = tmp_path / "diverse-ranking"
+    root.mkdir()
+    reflection_header = (
+        "---\nsource_kind: trajectory_reflection\n"
+        "document_group: reflection_memory\n---\n"
+    )
+    (root / "reflection-a.md").write_text(
+        reflection_header + "WFP reflection A " * 8, encoding="utf-8"
+    )
+    (root / "reflection-b.md").write_text(
+        reflection_header + "WFP reflection B " * 8, encoding="utf-8"
+    )
+    (root / "curated.md").write_text(
+        "---\nsource_kind: curated_reference\n---\n" + "WFP curated C " * 8,
+        encoding="utf-8",
+    )
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "diverse-ranking.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="diverse-ranking",
+        max_document_tokens=256,
+        salient_token_budget=128,
+    )
+
+    snapshot = await bank.ensure_ready()
+    score_by_path = {
+        "reflection-a.md": 1.0,
+        "reflection-b.md": 0.95,
+        "curated.md": 0.90,
+    }
+    raw_key_heads = []
+    for page, keys in zip(snapshot.pages, snapshot.raw_key_heads):
+        values = torch.zeros_like(keys)
+        values[:, :, 0] = score_by_path[page.relative_path] * (keys.shape[2] ** 0.5)
+        raw_key_heads.append(values)
+    bank._snapshot = replace(snapshot, raw_key_heads=tuple(raw_key_heads))
+    bank._token_search_masks.clear()
+    bank._rank_key_cache.clear()
+    audit = {}
+
+    candidates = bank.rank(
+        (((1.0, 0.0),),),
+        query_states=_query_states(1),
+        query_identity="diverse-ranking",
+        limit=3,
+        min_document_margin=0.0,
+        audit=audit,
+    )
+
+    assert [candidate.relative_path for candidate in candidates] == [
+        "reflection-a.md",
+        "curated.md",
+        "reflection-b.md",
+    ]
+    rows = {row["relative_path"]: row for row in audit["scored_documents"]}
+    assert (
+        rows["reflection-a.md"]["semantic_group"]
+        != rows["reflection-b.md"]["semantic_group"]
+    )
+    assert rows["reflection-b.md"]["pre_diversity_rank"] == 2
+    assert rows["reflection-b.md"]["post_diversity_rank"] == 3
+    assert audit["relative_score_active"] is False
 
 
 @pytest.mark.asyncio
@@ -763,8 +906,10 @@ async def test_tensor_bank_conditions_specialized_state_on_cognition_without_ran
     assert knowledge_prefix[: len(cognition_ids)] == cognition_ids
     assert bank.cognition_selection().page_id == cognition_page.page_id
     assert [candidate.lane for candidate in candidates] == ["knowledge"]
-    assert candidates[0].native_prefix is not None
-    assert candidates[0].native_prefix.token_ids[: len(cognition_ids)] == cognition_ids
+    assert candidates[0].native_prefix is None
+    bound = bank.bind_native_prefix(candidates[0], query="specialized state")
+    assert bound.native_prefix is not None
+    assert bound.native_prefix.token_ids[: len(cognition_ids)] == cognition_ids
     attribution = candidates[0].qk_attributions[0]
     expected_tail = tuple(
         knowledge_page.source_positions[
@@ -1121,11 +1266,11 @@ async def test_tensor_bank_group_score_rejects_single_page_outlier(tmp_path):
         min_document_margin=0.0,
     )
 
-    assert candidates[0].relative_path == "unrelated.md"
-    assert {candidate.relative_path for candidate in candidates[1:]} == {
+    assert [candidate.relative_path for candidate in candidates] == [
         "shared-a.md",
+        "unrelated.md",
         "shared-b.md",
-    }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1195,13 +1340,21 @@ async def test_document_selection_preserves_query_token_attribution(tmp_path):
         "page-b.md",
     }
     assert all(len(candidate.page_ids) == 1 for candidate in candidates)
-    assert all(
-        candidate.source_positions == tuple(range(64)) for candidate in candidates
-    )
-    assert all(
-        candidate.virtual_positions == tuple(range(64)) for candidate in candidates
-    )
+    assert all(candidate.source_positions == () for candidate in candidates)
+    assert all(candidate.virtual_positions == () for candidate in candidates)
+    assert all(candidate.native_prefix is None for candidate in candidates)
     assert all(len(candidate.token_attributions) == 2 for candidate in candidates)
+    bound_candidates = tuple(
+        bank.bind_native_prefix(candidate, query="PAGE_A PAGE_B")
+        for candidate in candidates
+    )
+    assert all(
+        candidate.source_positions == tuple(range(64)) for candidate in bound_candidates
+    )
+    assert all(
+        candidate.virtual_positions == tuple(range(64))
+        for candidate in bound_candidates
+    )
 
 
 @pytest.mark.asyncio

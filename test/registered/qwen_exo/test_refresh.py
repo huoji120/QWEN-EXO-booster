@@ -11,7 +11,7 @@ from qwen_exo_booster.internal_jobs import (
     InternalScoreResult,
 )
 from qwen_exo_booster.judge import ReferenceJudge
-from qwen_exo_booster.knowledge import KnowledgeRepository
+from qwen_exo_booster.knowledge import KnowledgeRepository, NativePrefixSelection
 from qwen_exo_booster.observer import MidThinkEvent
 from qwen_exo_booster.pipeline import MemoryPipeline
 from qwen_exo_booster.policy_data import PolicyDataRepository
@@ -171,6 +171,42 @@ class RecordingTensorBank:
         self.resident_page_ids = tuple(page_ids)
 
 
+class JudgeGatedBindingTensorBank:
+    def __init__(self, manager):
+        self.manager = manager
+        self.bind_calls = []
+        self.resident_page_ids = None
+
+    def bind_native_prefix(self, candidate, *, query, preferred_page_ids=()):
+        assert any(
+            "Judge whether the supplied candidate" in prompt
+            for request in self.manager.requests
+            for prompt in request.text
+        )
+        page_id = preferred_page_ids[0] if preferred_page_ids else candidate.page_ids[0]
+        native = NativePrefixSelection(
+            source_digest="c" * 64,
+            page_id=page_id,
+            document_id=candidate.document_id,
+            local_positions=tuple(range(64)),
+            source_positions=(1, 2, 3, 4),
+            token_ids=tuple(range(64)),
+            prefix_identity=f"judge-gated-{page_id}",
+            radix_namespace=f"qwen-exo:v1:tensor-bank-native:{page_id}",
+        )
+        self.bind_calls.append((candidate.candidate_id, query))
+        return replace(
+            candidate,
+            source_positions=native.source_positions,
+            virtual_positions=tuple(range(len(native.source_positions))),
+            native_prefix=native,
+            candidate_origin="admitted_native_tensor_bank",
+        )
+
+    async def ensure_resident(self, page_ids):
+        self.resident_page_ids = tuple(page_ids)
+
+
 def request_factory(**kwargs):
     return SimpleNamespace(**kwargs)
 
@@ -247,7 +283,7 @@ async def test_tensor_refresh_forwards_resolved_admission_margin(tmp_path):
     assert candidates == ()
     assert bank.rank_kwargs["min_document_margin"] == 0.02
     assert bank.rank_kwargs["min_tensor_score"] == 8.0
-    assert bank.resident_page_ids == ()
+    assert bank.resident_page_ids is None
 
 
 @pytest.mark.parametrize("candidate_source", ("fixed", "tensor"))
@@ -752,6 +788,44 @@ async def test_not_covered_answer_is_not_committed_as_think_context(tmp_path):
     ]
     assert completed[-1].payload["decision"] == "not_covered"
     assert completed[-1].payload["semantic_injection_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_binds_and_residents_qk_native_state_only_after_judge(tmp_path):
+    manager = FakeManager(all_supported=True)
+    bank = JudgeGatedBindingTensorBank(manager)
+    service, repo = build_service(tmp_path, manager, tensor_bank=bank)
+    document = next(
+        item for item in repo.snapshot.documents if item.relative_path == "wfp.md"
+    )
+    candidate = replace(
+        repo.candidate_for_document(document.document_id, "event-judge-gated"),
+        score=0.95,
+        lexical_score=0.0,
+        tensor_score=0.95,
+        page_ids=(7,),
+        source_positions=(),
+        virtual_positions=(),
+        native_prefix=None,
+        candidate_origin="attention_q_native_tensor_bank",
+    )
+
+    record = await service.refresh(
+        parent_request_id="request-judge-gated",
+        turn_id="turn-judge-gated",
+        user_question="Which WFP AppID controls outbound connect?",
+        partial_output="The exact constant remains uncertain.",
+        candidates=(candidate,),
+    )
+
+    assert record.status == "semantic_ready"
+    assert bank.bind_calls == [
+        (candidate.candidate_id, "What is the required WFP AppID?")
+    ]
+    assert bank.resident_page_ids == (7,)
+    (eligible,) = service.eligible_candidates("request-judge-gated")
+    assert eligible.native_prefix is not None
+    assert eligible.candidate_origin == "admitted_native_tensor_bank"
 
 
 @pytest.mark.asyncio

@@ -100,6 +100,25 @@ class FakeQKTensorBank:
         )
         if match is None:
             return candidate
+        if match.native_prefix is None:
+            page_id = preferred_page_ids[0] if preferred_page_ids else match.page_ids[0]
+            native = NativePrefixSelection(
+                source_digest="b" * 64,
+                page_id=page_id,
+                document_id=match.document_id,
+                local_positions=tuple(range(64)),
+                source_positions=tuple(range(4)),
+                token_ids=tuple(range(page_id * 100, page_id * 100 + 64)),
+                prefix_identity=f"admitted-{page_id}",
+                radix_namespace=f"qwen-exo:v1:tensor-bank-native:{page_id}",
+            )
+            return replace(
+                match,
+                source_positions=native.source_positions,
+                virtual_positions=tuple(range(len(native.source_positions))),
+                native_prefix=native,
+                candidate_origin="admitted_native_tensor_bank",
+            )
         if preferred_page_ids and match.native_prefix.page_id != preferred_page_ids[0]:
             native = replace(match.native_prefix, page_id=preferred_page_ids[0])
             return replace(match, page_ids=preferred_page_ids, native_prefix=native)
@@ -871,6 +890,107 @@ def test_same_document_group_candidates_merge_before_judge(tmp_path):
     assert prefilter["margin"] == pytest.approx(0.15)
 
 
+def test_qk_native_prefix_is_bound_only_after_judge_approval(tmp_path):
+    repo = repository(tmp_path)
+    ranked = native_candidate(repo, "wfp.md", page_id=3, score=0.95)
+    ranked = replace(
+        ranked,
+        source_positions=(),
+        virtual_positions=(),
+        native_prefix=None,
+    )
+    bank = FakeQKTensorBank((ranked,))
+    judge = FakeReferenceJudge()
+    pipeline = build_pipeline(
+        config(tmp_path, policy_data=False),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=bank,
+        reference_judge=judge,
+    )
+
+    _prepared, state = prepare(
+        pipeline,
+        FakeRequest(request_id="resp-judge-before-bind", input="Which WFP layer?"),
+    )
+
+    judged = judge.calls[0][2][0]
+    assert judged.native_prefix is None
+    assert judged.source_positions == ()
+    selected = next(
+        candidate
+        for candidate in state.candidates
+        if candidate.document_id == ranked.document_id
+    )
+    assert selected.native_prefix is not None
+    assert selected.candidate_origin == "admitted_native_tensor_bank"
+    assert state.radix_prefix_page_id == 3
+    assert state.judge_bypassed_count == 0
+
+
+def test_qk_only_knowledge_still_requires_semantic_judge(tmp_path):
+    repo = repository(tmp_path)
+    candidate = native_candidate(repo, "wfp.md", page_id=3, score=0.95)
+    bank = FakeQKTensorBank((candidate,))
+    judge = FakeReferenceJudge(supported=False)
+    pipeline = build_pipeline(
+        replace(config(tmp_path, policy_data=False), qk_only_knowledge=True),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=bank,
+        reference_judge=judge,
+    )
+
+    _prepared, state = prepare(
+        pipeline,
+        FakeRequest(request_id="resp-qk-only-judge", input="Which WFP layer?"),
+    )
+
+    assert len(judge.calls) == 1
+    assert state.selected_document_ids == ()
+    assert state.radix_prefix_page_id is None
+    assert state.judge_bypassed_count == 0
+    assert state.knowledge_admission_mode == "semantic_eligibility"
+
+
+def test_reflection_collection_label_does_not_merge_distinct_memories(tmp_path):
+    repo = KnowledgeRepository(tmp_path / "reflection-knowledge")
+    header = (
+        "---\nsource_kind: trajectory_reflection\n"
+        "document_group: reflection_memory\n---\n"
+    )
+    repo.upsert("reflection-memory/one.md", header + "Go WebSocket registration.")
+    repo.upsert("reflection-memory/two.md", header + "Padding Oracle triage.")
+    first = native_candidate(repo, "reflection-memory/one.md", page_id=3, score=0.95)
+    second = native_candidate(repo, "reflection-memory/two.md", page_id=4, score=0.90)
+    bank = FakeQKTensorBank((first, second))
+    judge = FakeReferenceJudge(winner_path="reflection-memory/one.md")
+    telemetry = FakeTelemetry()
+    pipeline = build_pipeline(
+        config(tmp_path, policy_data=False),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=bank,
+        reference_judge=judge,
+        telemetry=telemetry,
+    )
+
+    _prepared, state = prepare(
+        pipeline,
+        FakeRequest(request_id="resp-reflection-diverse", input="Fix WebSocket"),
+    )
+
+    judged = judge.calls[0][2]
+    assert [candidate.relative_path for candidate in judged] == [
+        "reflection-memory/one.md",
+        "reflection-memory/two.md",
+    ]
+    (prefilter,) = telemetry.by_type("qk.prefilter")
+    assert prefilter["merged_count"] == 0
+    assert prefilter["sent_to_judge"] == 2
+    assert state.selected_document_ids == (first.document_id,)
+
+
 def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):
     repo = repository(tmp_path)
     higher_qk = native_candidate(repo, "wfp.md", page_id=3, score=0.95)
@@ -1191,30 +1311,35 @@ def test_policy_qk_page_over_budget_fails_closed(tmp_path):
     assert state.policy_document_ids == ()
 
 
-def test_turn_end_qk_attractor_is_rejudged_on_next_request(tmp_path):
+def test_turn_end_attractor_reuses_judge_admitted_candidate_and_is_rejudged(
+    tmp_path,
+):
     repo = repository(tmp_path)
     first_candidate = native_candidate(repo, "ctf.md", page_id=4, score=8.80)
-    attractor_candidate = native_candidate(repo, "wfp.md", page_id=23, score=8.96)
+    next_ranked_candidate = native_candidate(repo, "wfp.md", page_id=23, score=8.96)
     bank = FakeQKTensorBank((first_candidate,))
+    judge = FakeReferenceJudge(winner_path="ctf.md")
     pipeline = build_pipeline(
         replace(config(tmp_path, policy_data=False), qk_recall_preset="strict"),
         repo,
         FakeTokenizer(),
         tensor_bank=bank,
+        reference_judge=judge,
     )
     _prepared, first = prepare(
         pipeline,
         FakeRequest(request_id="resp-attractor-1", input="Start the task"),
     )
-    bank.candidates = (attractor_candidate,)
+    rank_call_count = len(bank.rank_calls)
+    bank.candidates = (next_ranked_candidate, first_candidate)
 
     captured = asyncio.run(pipeline.capture_native_attractor(first.request_id))
-    assert bank.rank_gates[-1] == (8.0, 0.02)
 
+    assert len(bank.rank_calls) == rank_call_count
     assert captured.next_attractor_status == "ready"
     assert captured.query_heads == ()
-    assert captured.next_attractor_page_id == 23
-    assert captured.next_attractor_decision_id is None
+    assert captured.next_attractor_page_id == 4
+    assert captured.next_attractor_decision_id is not None
 
     _prepared, followup = prepare(
         pipeline,
@@ -1225,7 +1350,7 @@ def test_turn_end_qk_attractor_is_rejudged_on_next_request(tmp_path):
         ),
     )
     assert followup.restoration_status == "attractor_restored"
-    assert followup.radix_prefix_page_id == 23
+    assert followup.radix_prefix_page_id == 4
     assert followup.radix_prefix_selection_reason == "restored"
     assert len(followup.decisions) == 2
 

@@ -598,15 +598,10 @@ class SelfAskRefreshService:
                         ),
                     )[: self.max_candidates]
                 )
-                bypassed_knowledge_candidates = (
-                    knowledge_candidates if self.knowledge_qk_only else ()
-                )
-                judged_knowledge_candidates = (
-                    () if self.knowledge_qk_only else knowledge_candidates
-                )
+                bypassed_knowledge_candidates: tuple[KnowledgeCandidate, ...] = ()
                 judged_candidates = (
                     *qk_policy_candidates,
-                    *judged_knowledge_candidates,
+                    *knowledge_candidates,
                 )
                 proposed = (
                     *direct_candidates,
@@ -628,6 +623,32 @@ class SelfAskRefreshService:
                     judged_candidates,
                     judged_references,
                 )
+                if self.tensor_bank is not None and eligible_judged:
+                    bind_native_prefix = getattr(
+                        self.tensor_bank, "bind_native_prefix", None
+                    )
+                    if callable(bind_native_prefix):
+                        eligible_judged = tuple(
+                            (
+                                bind_native_prefix(
+                                    candidate,
+                                    query=self_question,
+                                    preferred_page_ids=candidate.page_ids,
+                                )
+                                if candidate.candidate_origin
+                                == "attention_q_native_tensor_bank"
+                                else candidate
+                            )
+                            for candidate in eligible_judged
+                        )
+                        resident_page_ids = tuple(
+                            page_id
+                            for candidate in eligible_judged
+                            if candidate.native_prefix is not None
+                            for page_id in candidate.page_ids
+                        )
+                        if resident_page_ids:
+                            await self.tensor_bank.ensure_resident(resident_page_ids)
                 eligible_candidates = (
                     *direct_candidates,
                     *bypassed_knowledge_candidates,
@@ -663,7 +684,6 @@ class SelfAskRefreshService:
                         ],
                         "bypassed_lanes": [
                             *(["policydata"] if direct_candidates else []),
-                            *(["knowledge"] if bypassed_knowledge_candidates else []),
                         ],
                     },
                 )
@@ -679,8 +699,7 @@ class SelfAskRefreshService:
                             else 0
                         ),
                         "eligible_count": len(eligible_judged),
-                        "bypassed_count": len(direct_candidates)
-                        + len(bypassed_knowledge_candidates),
+                        "bypassed_count": len(direct_candidates),
                         "cache_hit_count": (
                             judged_references.cache_hit_count
                             if judged_references is not None
@@ -1056,9 +1075,6 @@ class SelfAskRefreshService:
             limit=self.max_candidates,
             min_tensor_score=self.qk_min_tensor_score,
             min_document_margin=self.qk_admission_margin,
-        )
-        await self.tensor_bank.ensure_resident(
-            tuple(page_id for candidate in candidates for page_id in candidate.page_ids)
         )
         return candidates
 
