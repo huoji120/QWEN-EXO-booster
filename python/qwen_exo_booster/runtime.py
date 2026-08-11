@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import base64
 import json
 import os
 import logging
 import math
 import time
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -50,7 +52,7 @@ from qwen_exo_booster.latent_transplant import (
     validate_artifact_name,
 )
 from qwen_exo_booster.internal_jobs import InternalJobRunner
-from qwen_exo_booster.query_probe import QueryProbeService
+from qwen_exo_booster.query_probe import QueryProbePlan, QueryProbeService
 from qwen_exo_booster.judge import ReferenceJudge
 from qwen_exo_booster.knowledge import KnowledgeDocument, KnowledgeRepository
 from qwen_exo_booster.observer import (
@@ -189,6 +191,14 @@ class CompactionReflectionCheckpoint:
     trajectory_history: tuple[dict[str, Any], ...]
     capsule_history: tuple[dict[str, Any], ...]
     source_token_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseConversationIdentity:
+    conversation_key: str
+    crc32: str
+    payload_digest: str
+    original_task: str
 
 
 @dataclass(slots=True)
@@ -378,9 +388,15 @@ class QwenExoRuntime:
         self._parent_capsules: dict[str, CapsuleRecord] = {}
         self._capsule_restorations: dict[str, tuple[str | None, str | None]] = {}
         self._original_tasks: OrderedDict[str, str] = OrderedDict()
+        self._original_tasks_by_association: OrderedDict[str, str] = OrderedDict()
         self._seen_tool_events: OrderedDict[str, None] = OrderedDict()
         self._max_seen_tool_events = self.capsule_store.max_records * 32
         self._conversation_keys_by_response_id: OrderedDict[str, str] = OrderedDict()
+        self._canonical_payload_digests: OrderedDict[str, str] = OrderedDict()
+        self._conversation_keys_by_call_association: OrderedDict[
+            str, tuple[str, ...]
+        ] = OrderedDict()
+        self._memory_parents_by_conversation: OrderedDict[str, str] = OrderedDict()
         self._max_conversation_keys = self.capsule_store.max_records
         self._request_conversation_keys: dict[str, str] = {}
         self._recent_self_questions: OrderedDict[
@@ -622,6 +638,8 @@ class QwenExoRuntime:
                             self.config.context_integrity_max_tokens
                         ),
                         knowledge_qk_only=self.config.qk_only_knowledge,
+                        qk_admission_margin=self.config.qk_admission_margin,
+                        qk_min_tensor_score=self.config.qk_admission_gates[0],
                     )
                     self.causal_replay = CausalReplayService(
                         self.internal_jobs,
@@ -758,8 +776,12 @@ class QwenExoRuntime:
             self._parent_capsules.clear()
             self._capsule_restorations.clear()
             self._original_tasks.clear()
+            self._original_tasks_by_association.clear()
             self._seen_tool_events.clear()
             self._conversation_keys_by_response_id.clear()
+            self._canonical_payload_digests.clear()
+            self._conversation_keys_by_call_association.clear()
+            self._memory_parents_by_conversation.clear()
             self._request_conversation_keys.clear()
             self._request_tool_event_marks.clear()
             self._request_score_bias_steps.clear()
@@ -790,6 +812,14 @@ class QwenExoRuntime:
             if compaction_envelope is not None
             else ""
         )
+        if (
+            api_previous_response_id
+            and compaction_envelope is not None
+            and str(api_previous_response_id) != str(compaction_envelope["response_id"])
+        ):
+            raise ValueError(
+                "previous_response_id does not match verified compaction lineage"
+            )
         if compaction_envelope is not None:
             request = request.model_copy(
                 update={
@@ -803,20 +833,19 @@ class QwenExoRuntime:
             if compaction_envelope is not None
             else None
         )
-        retrieval_question = MemoryPipeline._request_question(
-            request.input, previous_response_id
-        )
-        if compaction_context:
-            retrieval_question = (
-                "COMPACTED RESPONSE CONTEXT:\n"
-                + compaction_context
-                + "\n\nCURRENT REQUEST:\n"
-                + retrieval_question
+        first_user = MemoryPipeline._first_user_text(request.input)
+        current_user = MemoryPipeline._latest_user_text(request.input)
+        current_request_question = MemoryPipeline._request_question(request.input)
+        provisional_task = (
+            first_user
+            or current_user
+            or (
+                MemoryPipeline._request_question(
+                    request.input, compaction_context=compaction_context
+                )
+                if compaction_context
+                else current_request_question
             )
-        initial_task = (
-            MemoryPipeline._first_user_text(request.input)
-            or MemoryPipeline._latest_user_text(request.input)
-            or retrieval_question
         )
         async with self._lifecycle_lock:
             if self.state is not QwenExoRuntimeState.READY:
@@ -832,26 +861,40 @@ class QwenExoRuntime:
                 )
             if self.adaptive_retrieval is not None:
                 self.adaptive_retrieval.begin(request.request_id)
-            self._request_questions[request.request_id] = initial_task
+            self._request_questions[request.request_id] = provisional_task
             if bool(getattr(request, "background", False)):
                 self._pending_background_requests.add(request.request_id)
-        if previous_response_id:
-            parent_finalization = self._finalize_tasks.get(str(previous_response_id))
+        tool_events = self._response_tool_events(request.input)
+        call_ids = tuple(
+            str(tool_call.get("call_id"))
+            for tool_call, _observation in tool_events
+            if tool_call.get("call_id")
+        )
+        canonical_identity = (
+            self._canonical_response_identity(request)
+            if previous_response_id is None
+            else None
+        )
+        conversation_key = self._response_conversation_key(
+            request_id=request.request_id,
+            previous_response_id=previous_response_id,
+            request=request,
+            canonical_identity=canonical_identity,
+            call_ids=call_ids,
+        )
+        self._request_conversation_keys[request.request_id] = conversation_key
+        effective_memory_previous_response_id = previous_response_id or (
+            self._memory_parents_by_conversation.get(conversation_key)
+        )
+        if effective_memory_previous_response_id:
+            parent_finalization = self._finalize_tasks.get(
+                str(effective_memory_previous_response_id)
+            )
             if parent_finalization is not None:
                 await asyncio.shield(parent_finalization)
         self._raise_if_cancelled(request.request_id)
         if previous_response_id:
             self._parent_response_ids[request.request_id] = str(previous_response_id)
-        self.telemetry.emit(
-            request.request_id,
-            "request.started",
-            {
-                "input": initial_task,
-                "retrieval_query_digest": stable_digest(retrieval_question),
-                "parent_response_id": previous_response_id,
-                "background": bool(getattr(request, "background", False)),
-            },
-        )
         parent_record = (
             self.capsule_store.get(previous_response_id)
             if previous_response_id and self.capsules is not None
@@ -859,40 +902,69 @@ class QwenExoRuntime:
         )
         if parent_record is not None:
             self._parent_capsules[request.request_id] = parent_record
-        original_task = (
+        lineage_task = (
             parent_record.original_task
             if parent_record is not None
-            else self._original_tasks.get(previous_response_id, initial_task)
+            else (
+                self._original_tasks.get(str(previous_response_id), "")
+                if previous_response_id
+                else ""
+            )
         )
-        self._original_tasks[request.request_id] = original_task
-        self._request_questions[request.request_id] = original_task
+        associated_task = self._original_tasks_by_association.get(conversation_key, "")
+        if lineage_task:
+            original_task = str(lineage_task).strip()
+        elif associated_task:
+            original_task = str(associated_task)
+        elif canonical_identity is not None:
+            original_task = canonical_identity.original_task
+        else:
+            original_task = first_user or current_user
+
+        query_plan = MemoryPipeline._request_query_plan(
+            request.input,
+            original_task=original_task or None,
+            compaction_context=compaction_context or None,
+        )
+        retrieval_question = MemoryPipeline._request_question(
+            request.input,
+            original_task=original_task or None,
+            compaction_context=compaction_context or None,
+        )
+        self._request_questions[request.request_id] = (
+            original_task or current_user or retrieval_question
+        )
+        if original_task:
+            self._original_tasks[request.request_id] = original_task
+            self._original_tasks.move_to_end(request.request_id)
+            while len(self._original_tasks) > self.capsule_store.max_records:
+                self._original_tasks.popitem(last=False)
+            if canonical_identity is not None:
+                self._original_tasks_by_association[conversation_key] = (
+                    canonical_identity.original_task
+                )
+                self._original_tasks_by_association.move_to_end(conversation_key)
+                while (
+                    len(self._original_tasks_by_association)
+                    > self.capsule_store.max_records
+                ):
+                    self._original_tasks_by_association.popitem(last=False)
+        self.telemetry.emit(
+            request.request_id,
+            "request.started",
+            {
+                "input": provisional_task,
+                "retrieval_query_digest": stable_digest(retrieval_question),
+                "retrieval_role_plan_digest": query_plan.identity,
+                "parent_response_id": previous_response_id,
+                "background": bool(getattr(request, "background", False)),
+            },
+        )
         self._raise_if_cancelled(request.request_id)
-        self._original_tasks.move_to_end(request.request_id)
-        while len(self._original_tasks) > self.capsule_store.max_records:
-            self._original_tasks.popitem(last=False)
         trajectory_context = self._response_trajectory_context(
             request.input,
             max_tokens=self.config.context_integrity_max_tokens,
         )
-        tool_events = self._response_tool_events(request.input)
-        stateless_anchor = (
-            next(
-                (
-                    str(tool_call.get("call_id"))
-                    for tool_call, _observation in tool_events
-                    if tool_call.get("call_id")
-                ),
-                None,
-            )
-            if previous_response_id is None
-            else None
-        )
-        conversation_key = self._response_conversation_key(
-            request_id=request.request_id,
-            previous_response_id=previous_response_id,
-            stateless_anchor=stateless_anchor,
-        )
-        self._request_conversation_keys[request.request_id] = conversation_key
         if self.config.reflection_memory_mode != "off":
             self._cancel_reflection_memory_task(conversation_key)
             self._record_reflection_memory_rows(
@@ -908,13 +980,15 @@ class QwenExoRuntime:
             while len(self._score_bias_step_counts) > self.capsule_store.max_records:
                 self._score_bias_step_counts.popitem(last=False)
         query_heads: tuple[tuple[tuple[float, ...], ...], ...] = ()
+        query_states = ()
+        query_role_plan_digest = query_plan.identity
         query_probe_status = "unavailable"
         query_probe_prompt_tokens = 0
         if self.memory_pipeline is not None and self.query_probe is not None:
-            query_probe = await self.query_probe.probe(
-                request.request_id, retrieval_question
-            )
+            query_probe = await self.query_probe.probe(request.request_id, query_plan)
             query_heads = query_probe.query_heads
+            query_states = query_probe.query_states
+            query_role_plan_digest = query_probe.role_plan_digest
             query_probe_status = query_probe.status
             query_probe_prompt_tokens = query_probe.prompt_tokens
         unseen_tool_events = self._unseen_response_tool_events(
@@ -958,7 +1032,7 @@ class QwenExoRuntime:
             else None
         )
         if callable(record_reader):
-            restoration = record_reader(previous_response_id)
+            restoration = record_reader(effective_memory_previous_response_id)
         if (
             restoration is not None
             and restoration.status
@@ -984,6 +1058,9 @@ class QwenExoRuntime:
                     "self_ask.next_turn_context_restored",
                     {
                         "previous_response_id": previous_response_id,
+                        "effective_memory_previous_response_id": (
+                            effective_memory_previous_response_id
+                        ),
                         "source_turn_id": restoration.turn_id,
                         "question_digest": stable_digest(restored.question),
                         "answer_digest": stable_digest(restored.answer),
@@ -1000,9 +1077,12 @@ class QwenExoRuntime:
             restoration=restoration,
             retrieval_question=retrieval_question,
             query_heads=query_heads,
+            query_states=query_states,
+            query_role_plan_digest=query_role_plan_digest,
             query_probe_status=query_probe_status,
             query_probe_prompt_tokens=query_probe_prompt_tokens,
-            memory_previous_response_id=previous_response_id,
+            memory_previous_response_id=effective_memory_previous_response_id,
+            published_previous_response_id=previous_response_id,
         )
         self._raise_if_cancelled(request.request_id)
         self.telemetry.emit(
@@ -1137,6 +1217,7 @@ class QwenExoRuntime:
         *,
         response_id: str,
         previous_response_id: str | None,
+        conversation_key: str,
         original_items: list[dict[str, Any]],
         tokenizer: Any,
     ) -> CompactionReflectionCheckpoint | None:
@@ -1146,24 +1227,6 @@ class QwenExoRuntime:
         ):
             return None
         tool_events = self._response_tool_events(original_items)
-        stateless_anchor = next(
-            (
-                str(tool_call.get("call_id"))
-                for tool_call, _observation in tool_events
-                if tool_call.get("call_id")
-            ),
-            None,
-        )
-        if previous_response_id:
-            conversation_key = self._conversation_keys_by_response_id.get(
-                str(previous_response_id)
-            ) or stable_digest("response-lineage", previous_response_id)
-        elif stateless_anchor:
-            conversation_key = stable_digest(
-                "stateless-response-lineage", stateless_anchor
-            )
-        else:
-            conversation_key = stable_digest("response-compaction-lineage", response_id)
         self._record_reflection_memory_rows(
             conversation_key,
             response_id,
@@ -1210,7 +1273,7 @@ class QwenExoRuntime:
         original_task = str(
             self._original_tasks.get(str(previous_response_id), "")
             if previous_response_id
-            else ""
+            else self._original_tasks_by_association.get(conversation_key, "")
         ).strip()
         if not original_task:
             original_task = (
@@ -1287,17 +1350,31 @@ class QwenExoRuntime:
                     original_items, previous_envelope
                 )
             )
-        if not original_items and previous_response_id:
+        if (
+            previous_response_id
+            and previous_envelope is not None
+            and str(previous_response_id) != str(previous_envelope["response_id"])
+        ):
+            raise ResponseCompactionError(
+                "compaction_lineage_mismatch",
+                "previous_response_id does not match verified compaction lineage",
+            )
+        lineage_previous_response_id = previous_response_id or (
+            str(previous_envelope["response_id"])
+            if previous_envelope is not None
+            else None
+        )
+        if not original_items and lineage_previous_response_id:
             previous_summary = self._compaction_summaries.get(
-                str(previous_response_id), {}
+                str(lineage_previous_response_id), {}
             )
             summary_text = str(previous_summary.get("summary") or "")
             if not summary_text:
                 summary_text = str(
-                    self._request_outputs.get(str(previous_response_id), "")
+                    self._request_outputs.get(str(lineage_previous_response_id), "")
                 ).strip()
             original_task = str(
-                self._original_tasks.get(str(previous_response_id), "")
+                self._original_tasks.get(str(lineage_previous_response_id), "")
             ).strip()
             if summary_text or original_task:
                 original_items = [
@@ -1326,18 +1403,80 @@ class QwenExoRuntime:
             json.dumps(dropped_items, ensure_ascii=False, sort_keys=True, default=str),
         )
         response_id = "resp_compact_" + source_digest[:32]
+        tool_events = self._response_tool_events(original_items)
+        call_ids = tuple(
+            str(tool_call.get("call_id"))
+            for tool_call, _observation in tool_events
+            if tool_call.get("call_id")
+        )
+        canonical_identity = (
+            self._canonical_response_identity(request, input_value=original_items)
+            if lineage_previous_response_id is None
+            else None
+        )
+        conversation_key = self._response_conversation_key(
+            request_id=response_id,
+            previous_response_id=(
+                str(lineage_previous_response_id)
+                if lineage_previous_response_id
+                else None
+            ),
+            request=request,
+            canonical_identity=canonical_identity,
+            call_ids=call_ids,
+        )
+        effective_memory_previous_response_id = lineage_previous_response_id or (
+            getattr(self, "_memory_parents_by_conversation", {}).get(conversation_key)
+        )
+        if effective_memory_previous_response_id:
+            finalization = getattr(self, "_finalize_tasks", {}).get(
+                str(effective_memory_previous_response_id)
+            )
+            if finalization is not None:
+                await asyncio.shield(finalization)
+        compaction_original_task = str(
+            getattr(self, "_original_tasks", {}).get(
+                str(lineage_previous_response_id), ""
+            )
+            if lineage_previous_response_id
+            else getattr(self, "_original_tasks_by_association", {}).get(
+                conversation_key, ""
+            )
+        ).strip()
+        if not compaction_original_task:
+            compaction_original_task = (
+                canonical_identity.original_task
+                if canonical_identity is not None
+                else MemoryPipeline._first_user_text(original_items)
+                or MemoryPipeline._latest_user_text(original_items)
+            )
+        if canonical_identity is not None:
+            associated_tasks = getattr(self, "_original_tasks_by_association", None)
+            if associated_tasks is None:
+                associated_tasks = OrderedDict()
+                self._original_tasks_by_association = associated_tasks
+            associated_tasks[conversation_key] = canonical_identity.original_task
+            associated_tasks.move_to_end(conversation_key)
+            max_records = int(
+                getattr(getattr(self, "capsule_store", None), "max_records", 512)
+            )
+            while len(associated_tasks) > max_records:
+                associated_tasks.popitem(last=False)
         checkpoint = self._build_compaction_reflection_checkpoint(
             response_id=response_id,
             previous_response_id=(
-                str(previous_response_id) if previous_response_id else None
+                str(lineage_previous_response_id)
+                if lineage_previous_response_id
+                else None
             ),
+            conversation_key=conversation_key,
             original_items=original_items,
             tokenizer=tokenizer,
         )
         memory_state = None
-        if self.memory_pipeline is not None and previous_response_id:
+        if self.memory_pipeline is not None and effective_memory_previous_response_id:
             memory_state = await self.memory_pipeline.get_state(
-                str(previous_response_id)
+                str(effective_memory_previous_response_id)
             )
         memory_payload = self._compaction_memory_payload(memory_state)
         summary = await self.compaction_service.summarize(
@@ -1351,9 +1490,21 @@ class QwenExoRuntime:
             memory_state is not None
             and self.config.response_compaction_mode == "active"
         ):
+            state_updates: dict[str, Any] = {"request_id": response_id}
+            if hasattr(memory_state, "previous_response_id"):
+                state_updates["previous_response_id"] = (
+                    str(lineage_previous_response_id)
+                    if lineage_previous_response_id
+                    else None
+                )
+            if hasattr(memory_state, "effective_memory_previous_response_id"):
+                state_updates["effective_memory_previous_response_id"] = str(
+                    effective_memory_previous_response_id
+                )
             await self.memory_pipeline._store_state(
-                replace(memory_state, request_id=response_id)
+                replace(memory_state, **state_updates)
             )
+            self._remember_memory_parent(conversation_key, response_id)
         encrypted_content = summary.encrypted_content(
             response_id=response_id,
             memory=memory_payload,
@@ -1383,20 +1534,18 @@ class QwenExoRuntime:
         self._compaction_summaries.move_to_end(response_id)
         while len(self._compaction_summaries) > self._max_compaction_summaries:
             self._compaction_summaries.popitem(last=False)
-        if checkpoint is not None:
-            self._conversation_keys_by_response_id[response_id] = (
-                checkpoint.conversation_key
+        if compaction_original_task:
+            original_tasks = getattr(self, "_original_tasks", None)
+            if original_tasks is None:
+                original_tasks = OrderedDict()
+                self._original_tasks = original_tasks
+            original_tasks[response_id] = compaction_original_task
+            original_tasks.move_to_end(response_id)
+            max_original_tasks = int(
+                getattr(getattr(self, "capsule_store", None), "max_records", 512)
             )
-            self._conversation_keys_by_response_id.move_to_end(response_id)
-            while (
-                len(self._conversation_keys_by_response_id)
-                > self._max_conversation_keys
-            ):
-                self._conversation_keys_by_response_id.popitem(last=False)
-            self._original_tasks[response_id] = checkpoint.original_task
-            self._original_tasks.move_to_end(response_id)
-            while len(self._original_tasks) > self.capsule_store.max_records:
-                self._original_tasks.popitem(last=False)
+            while len(original_tasks) > max_original_tasks:
+                original_tasks.popitem(last=False)
         checkpoint_queued = await self._enqueue_compaction_reflection_checkpoint(
             checkpoint
         )
@@ -3329,32 +3478,200 @@ class QwenExoRuntime:
     def _response_item_text(value: Any) -> str:
         return MemoryPipeline._response_item_text(value)
 
+    @staticmethod
+    def _canonical_identity_text(value: Any) -> str:
+        return MemoryPipeline._response_item_text(value).replace("\r\n", "\n")
+
+    @classmethod
+    def _canonical_response_identity(
+        cls, request: Any, *, input_value: Any | None = None
+    ) -> ResponseConversationIdentity | None:
+        value = getattr(request, "input", None) if input_value is None else input_value
+        instructions: list[dict[str, str]] = []
+        request_instructions = getattr(request, "instructions", None)
+        if request_instructions is not None:
+            normalized_instructions = cls._canonical_identity_text(request_instructions)
+            if normalized_instructions:
+                instructions.append(
+                    {
+                        "role": "instructions",
+                        "content": normalized_instructions,
+                    }
+                )
+        first_user: str | None = None
+        if isinstance(value, str):
+            first_user = cls._canonical_identity_text(value)
+        elif isinstance(value, list):
+            for raw_item in value:
+                item = (
+                    raw_item.model_dump(exclude_none=True)
+                    if hasattr(raw_item, "model_dump")
+                    else raw_item
+                )
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "")
+                content = item.get("content", item.get("text"))
+                if role in {"system", "developer"}:
+                    normalized_instruction = cls._canonical_identity_text(content)
+                    if normalized_instruction:
+                        instructions.append(
+                            {
+                                "role": role,
+                                "content": normalized_instruction,
+                            }
+                        )
+                elif role == "user" and first_user is None:
+                    first_user = cls._canonical_identity_text(content)
+        if first_user is None or not first_user.strip():
+            return None
+        payload = json.dumps(
+            {
+                "schema": "qwen-exo-responses-conversation-v1",
+                "instructions": instructions,
+                "first_user": {"role": "user", "content": first_user},
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        crc32 = f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}"
+        payload_digest = hashlib.sha256(payload).hexdigest()
+        return ResponseConversationIdentity(
+            conversation_key=f"responses-crc32:{crc32}:{payload_digest}",
+            crc32=crc32,
+            payload_digest=payload_digest,
+            original_task=first_user,
+        )
+
+    @staticmethod
+    def _prompt_cache_conversation_key(request: Any) -> str | None:
+        prompt_cache_key = str(getattr(request, "prompt_cache_key", None) or "").strip()
+        if not prompt_cache_key:
+            return None
+        return "responses-prompt-cache:" + stable_digest(
+            "responses-prompt-cache-v1", prompt_cache_key
+        )
+
+    @staticmethod
+    def _response_call_association_key(request: Any, call_id: str) -> str:
+        user = str(getattr(request, "user", None) or "").strip()
+        session_id = str(getattr(request, "session_id", None) or "").strip()
+        return stable_digest("responses-call-association-v2", user, session_id, call_id)
+
+    def _remember_call_associations(
+        self, request: Any, call_ids: Iterable[str], conversation_key: str
+    ) -> None:
+        associations = getattr(self, "_conversation_keys_by_call_association", None)
+        if associations is None:
+            associations = OrderedDict()
+            self._conversation_keys_by_call_association = associations
+        max_conversation_keys = int(getattr(self, "_max_conversation_keys", 512))
+        for call_id in dict.fromkeys(str(value) for value in call_ids if str(value)):
+            association_key = self._response_call_association_key(request, call_id)
+            existing = associations.get(association_key, ())
+            if conversation_key not in existing:
+                associations[association_key] = (*existing, conversation_key)
+            associations.move_to_end(association_key)
+        while len(associations) > max_conversation_keys * 32:
+            associations.popitem(last=False)
+
     def _response_conversation_key(
         self,
         *,
         request_id: str,
         previous_response_id: str | None,
-        stateless_anchor: str | None = None,
+        request: Any | None = None,
+        canonical_identity: ResponseConversationIdentity | None = None,
+        call_ids: Iterable[str] = (),
     ) -> str:
         request_id = str(request_id)
         previous_response_id = (
             str(previous_response_id) if previous_response_id is not None else None
         )
-        if previous_response_id is None:
-            conversation_key = (
-                stable_digest("stateless-response-lineage", stateless_anchor)
-                if stateless_anchor
-                else stable_digest("response-lineage", request_id)
+        call_ids = tuple(dict.fromkeys(str(value) for value in call_ids if str(value)))
+        response_keys = getattr(self, "_conversation_keys_by_response_id", None)
+        if response_keys is None:
+            response_keys = OrderedDict()
+            self._conversation_keys_by_response_id = response_keys
+        canonical_digests = getattr(self, "_canonical_payload_digests", None)
+        if canonical_digests is None:
+            canonical_digests = OrderedDict()
+            self._canonical_payload_digests = canonical_digests
+        call_associations = getattr(
+            self, "_conversation_keys_by_call_association", None
+        )
+        if call_associations is None:
+            call_associations = OrderedDict()
+            self._conversation_keys_by_call_association = call_associations
+        max_conversation_keys = int(getattr(self, "_max_conversation_keys", 512))
+        if previous_response_id is not None:
+            conversation_key = response_keys.get(previous_response_id) or stable_digest(
+                "response-lineage", previous_response_id
             )
+        elif (
+            request is not None
+            and (
+                prompt_cache_conversation_key := self._prompt_cache_conversation_key(
+                    request
+                )
+            )
+            is not None
+        ):
+            conversation_key = prompt_cache_conversation_key
+            self._remember_call_associations(request, call_ids, conversation_key)
+        elif canonical_identity is not None:
+            conversation_key = canonical_identity.conversation_key
+            existing_digest = canonical_digests.get(conversation_key)
+            if (
+                existing_digest is not None
+                and existing_digest != canonical_identity.payload_digest
+            ):
+                conversation_key = stable_digest(
+                    "canonical-payload-collision-fail-closed",
+                    request_id,
+                    canonical_identity.payload_digest,
+                )
+            else:
+                canonical_digests[conversation_key] = canonical_identity.payload_digest
+                canonical_digests.move_to_end(conversation_key)
+                if request is not None:
+                    self._remember_call_associations(
+                        request, call_ids, conversation_key
+                    )
         else:
-            conversation_key = self._conversation_keys_by_response_id.get(
-                previous_response_id
-            ) or stable_digest("response-lineage", previous_response_id)
-        self._conversation_keys_by_response_id[request_id] = conversation_key
-        self._conversation_keys_by_response_id.move_to_end(request_id)
-        while len(self._conversation_keys_by_response_id) > self._max_conversation_keys:
-            self._conversation_keys_by_response_id.popitem(last=False)
+            learned: list[str] = []
+            unknown = not call_ids
+            if request is not None:
+                for call_id in call_ids:
+                    keys = call_associations.get(
+                        self._response_call_association_key(request, call_id), ()
+                    )
+                    if len(keys) != 1:
+                        unknown = True
+                        break
+                    learned.append(keys[0])
+            if not unknown and learned and len(set(learned)) == 1:
+                conversation_key = learned[0]
+            else:
+                conversation_key = stable_digest("response-lineage", request_id)
+        response_keys[request_id] = conversation_key
+        response_keys.move_to_end(request_id)
+        while len(response_keys) > max_conversation_keys:
+            response_keys.popitem(last=False)
+        while len(canonical_digests) > max_conversation_keys:
+            canonical_digests.popitem(last=False)
         return conversation_key
+
+    def _remember_memory_parent(self, conversation_key: str, response_id: str) -> None:
+        parents = getattr(self, "_memory_parents_by_conversation", None)
+        if parents is None:
+            parents = OrderedDict()
+            self._memory_parents_by_conversation = parents
+        parents[str(conversation_key)] = str(response_id)
+        parents.move_to_end(str(conversation_key))
+        max_conversation_keys = int(getattr(self, "_max_conversation_keys", 512))
+        while len(parents) > max_conversation_keys:
+            parents.popitem(last=False)
 
     def _unseen_response_tool_events(
         self,
@@ -4640,6 +4957,7 @@ class QwenExoRuntime:
         return payload
 
     async def _finish_request(self, request_id: str) -> None:
+        attractor_state = None
         try:
             tasks = tuple(
                 task
@@ -4684,6 +5002,10 @@ class QwenExoRuntime:
                     "score_bias.failed_closed",
                     {"error_type": type(exc).__name__},
                 )
+            if attractor_state is not None:
+                conversation_key = self._request_conversation_keys.get(request_id)
+                if conversation_key:
+                    self._remember_memory_parent(conversation_key, request_id)
         finally:
             self._adaptive_transition(
                 request_id,
@@ -4851,7 +5173,9 @@ class QwenExoRuntime:
         bank_snapshot = await self.tensor_bank.ensure_ready()
         if not bank_snapshot.ready:
             raise RuntimeError("Reflection memory QK Tensor Bank is not ready")
-        probe = await self.query_probe.probe(parent_id, query)
+        probe = await self.query_probe.probe(
+            parent_id, QueryProbePlan.current_user(query)
+        )
         if probe.status != "ready" or not probe.query_heads:
             raise RuntimeError(
                 f"Reflection memory QK query probe failed: {probe.status}"
@@ -4862,6 +5186,7 @@ class QwenExoRuntime:
         rank_audit: dict[str, Any] = {}
         ranked = self.tensor_bank.rank(
             probe.query_heads,
+            query_states=probe.query_states,
             query_identity=(
                 "reflection-memory-consolidation:"
                 + stable_digest(parent_id, query)[:24]
@@ -5236,7 +5561,8 @@ class QwenExoRuntime:
                     )
                 probe_parent = f"{parent_id}:q:{document.document_id}"
                 probe = await self.query_probe.probe(
-                    probe_parent, document.normalized_content
+                    probe_parent,
+                    QueryProbePlan.current_user(document.normalized_content),
                 )
                 if probe.status != "ready" or not probe.query_heads:
                     probe_failures.append(
@@ -5253,6 +5579,7 @@ class QwenExoRuntime:
                 )
                 ranked = self.tensor_bank.rank(
                     probe.query_heads,
+                    query_states=probe.query_states,
                     query_identity=(
                         "reflection-memory-organization:"
                         + stable_digest(document.sha256)[:24]

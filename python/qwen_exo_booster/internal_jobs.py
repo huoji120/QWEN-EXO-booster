@@ -156,8 +156,9 @@ class InternalJobRunner:
                     "qwen_exo_job_type": job_list[0].job_type.value,
                 },
             )
-            timeout = min(job.deadline_monotonic for job in job_list) - time.monotonic()
-            if timeout <= 0:
+            deadline = self._earliest_deadline(job_list)
+            timeout = None if deadline is None else deadline - time.monotonic()
+            if timeout is not None and timeout <= 0:
                 raise asyncio.TimeoutError(
                     "Internal job deadline elapsed before dispatch"
                 )
@@ -278,8 +279,9 @@ class InternalJobRunner:
                     "qwen_exo_job_type": job_list[0].job_type.value,
                 },
             )
-            timeout = min(job.deadline_monotonic for job in job_list) - time.monotonic()
-            if timeout <= 0:
+            deadline = self._earliest_deadline(job_list)
+            timeout = None if deadline is None else deadline - time.monotonic()
+            if timeout is not None and timeout <= 0:
                 raise asyncio.TimeoutError(
                     "Replay score deadline elapsed before dispatch"
                 )
@@ -329,25 +331,28 @@ class InternalJobRunner:
                 raise ContractViolation(
                     "Internal jobs exceed the parent cumulative token reserve"
                 )
-            deadline = min(job.deadline_monotonic for job in jobs)
+            deadline = self._earliest_deadline(jobs)
             while (
                 sum(len(active_jobs) for active_jobs in self._active.values())
                 + len(jobs)
                 > self.max_fanout
             ):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError(
-                        "Internal job deadline elapsed during global admission"
-                    )
-                try:
-                    await asyncio.wait_for(
-                        self._capacity_changed.wait(), timeout=remaining
-                    )
-                except asyncio.TimeoutError as exc:
-                    raise asyncio.TimeoutError(
-                        "Internal job deadline elapsed during global admission"
-                    ) from exc
+                if deadline is None:
+                    await self._capacity_changed.wait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError(
+                            "Internal job deadline elapsed during global admission"
+                        )
+                    try:
+                        await asyncio.wait_for(
+                            self._capacity_changed.wait(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise asyncio.TimeoutError(
+                            "Internal job deadline elapsed during global admission"
+                        ) from exc
                 if parent_request_id in self._cancelled_parents or any(
                     job.is_cancelled_or_expired() for job in jobs
                 ):
@@ -388,6 +393,17 @@ class InternalJobRunner:
             else:
                 payloads.append(payload)
         return payloads
+
+    @staticmethod
+    def _earliest_deadline(jobs: tuple[InternalJob, ...]) -> float | None:
+        return min(
+            (
+                job.deadline_monotonic
+                for job in jobs
+                if job.deadline_monotonic is not None
+            ),
+            default=None,
+        )
 
     def _abort_jobs(self, jobs: tuple[InternalJob, ...]) -> None:
         for job in jobs:

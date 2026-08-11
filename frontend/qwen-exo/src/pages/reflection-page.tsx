@@ -8,6 +8,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   Table,
   TableBody,
   TableCell,
@@ -23,7 +31,7 @@ import {
 } from "@/lib/api";
 import { translate as t } from "@/lib/i18n";
 import type { PendingReflectionMemory } from "@/lib/types";
-import { formatNumber, formatTime, shortHash } from "@/lib/utils";
+import { formatNumber, formatTime } from "@/lib/utils";
 
 function remainingLabel(item: PendingReflectionMemory, now: number) {
   if (item.status === "running") return t("整理中");
@@ -47,6 +55,9 @@ export function ReflectionPage() {
   const [available, setAvailable] = useState(true);
   const [action, setAction] = useState<"start" | "cancel" | null>(null);
   const [now, setNow] = useState(() => Date.now() / 1000);
+  const [summaryConversationKey, setSummaryConversationKey] = useState<
+    string | null
+  >(null);
 
   const load = async (silent = false) => {
     if (!silent) setLoading(true);
@@ -113,6 +124,9 @@ export function ReflectionPage() {
   );
   const selectedHasRunning = selectedItems.some(
     (item) => item.status === "running",
+  );
+  const summaryItem = items.find(
+    (item) => item.conversation_key === summaryConversationKey,
   );
 
   const toggleAll = () => {
@@ -193,7 +207,7 @@ export function ReflectionPage() {
           <Input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder={t("搜索任务或轨迹 ID")}
+            placeholder={t("搜索响应 ID 或摘要")}
             className="pl-9"
           />
         </div>
@@ -232,7 +246,7 @@ export function ReflectionPage() {
       <Card>
         <CardContent className="p-0">
           {visible.length ? (
-            <Table>
+            <Table className="min-w-[1080px] table-fixed">
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-11">
@@ -249,12 +263,13 @@ export function ReflectionPage() {
                       className="h-4 w-4 accent-primary"
                     />
                   </TableHead>
-                  <TableHead>{t("轨迹")}</TableHead>
-                  <TableHead className="w-28">{t("状态")}</TableHead>
-                  <TableHead className="w-40">{t("上次活动")}</TableHead>
-                  <TableHead className="w-36">{t("开始整理")}</TableHead>
-                  <TableHead className="w-32">{t("规模")}</TableHead>
-                  <TableHead className="w-44 text-right">{t("操作")}</TableHead>
+                  <TableHead className="w-44">{t("响应 ID")}</TableHead>
+                  <TableHead className="w-64">{t("摘要")}</TableHead>
+                  <TableHead className="w-24">{t("状态")}</TableHead>
+                  <TableHead className="w-32">{t("上次活动")}</TableHead>
+                  <TableHead className="w-28">{t("开始整理")}</TableHead>
+                  <TableHead className="w-28">{t("规模")}</TableHead>
+                  <TableHead className="w-40 text-right">{t("操作")}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -270,13 +285,24 @@ export function ReflectionPage() {
                       />
                     </TableCell>
                     <TableCell>
-                      <div className="max-w-xl text-sm font-medium">
+                      <span className="block select-all break-all font-mono text-[11px] leading-4 text-muted-foreground">
+                        {item.trajectory_id}
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <button
+                        type="button"
+                        aria-expanded={
+                          summaryConversationKey === item.conversation_key
+                        }
+                        aria-label={t("查看任务全文")}
+                        className="line-clamp-2 w-full max-w-64 rounded-sm text-left text-sm font-medium leading-5 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                        onClick={() =>
+                          setSummaryConversationKey(item.conversation_key)
+                        }
+                      >
                         {item.original_task || t("未命名任务")}
-                      </div>
-                      <div className="mt-1 font-mono text-[11px] text-muted-foreground">
-                        {shortHash(item.trajectory_id, 28)} ·{" "}
-                        {shortHash(item.conversation_key, 18)}
-                      </div>
+                      </button>
                     </TableCell>
                     <TableCell>
                       <Badge
@@ -354,6 +380,35 @@ export function ReflectionPage() {
           )}
         </CardContent>
       </Card>
+
+      <Dialog
+        open={Boolean(summaryItem)}
+        onOpenChange={(open) => {
+          if (!open) setSummaryConversationKey(null);
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{t("任务全文")}</DialogTitle>
+            <DialogDescription className="break-all font-mono text-xs leading-5">
+              {summaryItem?.trajectory_id}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[60vh] overflow-y-auto overflow-x-hidden rounded-md border bg-muted/30 p-4">
+            <p className="whitespace-pre-wrap break-words text-sm leading-6">
+              {summaryItem?.original_task || t("未命名任务")}
+            </p>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setSummaryConversationKey(null)}
+            >
+              {t("关闭")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

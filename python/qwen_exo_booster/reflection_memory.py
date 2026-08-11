@@ -38,16 +38,6 @@ _REFLECTION_MEMORY_FIELD_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _REFLECTION_MEMORY_TAG_PATTERN = re.compile(r"<\/?[a-z_][^>]*>", re.IGNORECASE)
-_REFLECTION_MEMORY_PABLUM_PATTERN = re.compile(
-    r"(?:认真仔细|检查(?:代码|语法)?|确保准确|注意细节|be careful|"
-    r"check the syntax|ensure correctness|follow best practices)",
-    re.IGNORECASE,
-)
-_REFLECTION_MEMORY_CONCRETE_PATTERN = re.compile(
-    r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_./:-]{2,}|\b\d{3,}\b|"
-    r"错误|异常|失败|成功|超时|重试|回滚|版本|路径|接口|参数)",
-    re.IGNORECASE,
-)
 _REFLECTION_MEMORY_CJK_PATTERN = re.compile(r"[\u3400-\u9fff]")
 _REFLECTION_MEMORY_HUMAN_FIELDS = (
     "title",
@@ -1070,7 +1060,7 @@ class ReflectionMemoryService:
                 - (1 if self.retrieve_similar is not None else 0),
             ),
             state_budget_bytes=0,
-            deadline_monotonic=time.monotonic() + 120.0,
+            deadline_monotonic=None,
             cancellation_token=CancellationToken(f"cancel-{job_id}"),
             telemetry_correlation_id=parent_id,
             max_fanout=1,
@@ -1100,6 +1090,8 @@ class ReflectionMemoryService:
         blocks = tuple(cls._tool_blocks(text))
         if not blocks:
             raise ValueError("Reflection memory did not call a reflection tool")
+        if len(blocks) != 1:
+            raise ValueError("Reflection memory must call exactly one reflection tool")
         name, body = blocks[-1]
         if name == REFLECTION_MEMORY_SKIP_TOOL_NAME:
             reasons = tuple(
@@ -1194,37 +1186,6 @@ class ReflectionMemoryService:
             for field in _REFLECTION_MEMORY_HUMAN_FIELDS
         ):
             raise ValueError("Reflection memory human-readable fields must be Chinese")
-        total = sum(
-            len(str(values[field]))
-            for field in (
-                "reflection",
-                "evidence",
-                "causal_analysis",
-                "reusable_experience",
-                "avoid",
-                "next_time",
-                "conflict_resolution",
-            )
-        )
-        if total < 480:
-            raise ValueError("Reflection memory is too short to be reusable")
-        concrete = sum(
-            1
-            for field in (
-                "reflection",
-                "evidence",
-                "causal_analysis",
-                "reusable_experience",
-                "avoid",
-                "next_time",
-                "conflict_resolution",
-            )
-            if _REFLECTION_MEMORY_CONCRETE_PATTERN.search(values[field])
-        )
-        if concrete < 3:
-            raise ValueError("Reflection memory lacks concrete technical evidence")
-        if _REFLECTION_MEMORY_PABLUM_PATTERN.search(values["reusable_experience"]):
-            raise ValueError("Reflection memory contains generic advice")
         return values
 
     @staticmethod

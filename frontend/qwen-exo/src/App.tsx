@@ -43,9 +43,10 @@ export default function App() {
 
   useEffect(() => {
     void loadStatus();
+    if (view === "trace") return;
     const timer = window.setInterval(() => void loadStatus(), 5000);
     return () => window.clearInterval(timer);
-  }, [loadStatus]);
+  }, [loadStatus, view]);
 
   useEffect(() => {
     const onHashChange = () => setView(initialView());

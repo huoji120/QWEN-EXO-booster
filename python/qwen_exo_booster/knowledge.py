@@ -209,6 +209,38 @@ class NativePrefixSelection:
 
 
 @dataclass(frozen=True, slots=True)
+class QueryQKAttribution:
+    query_index: int
+    query_role: str
+    query_prompt_start: int
+    query_prompt_end: int
+    query_source_start: int
+    query_source_end: int
+    page_id: int
+    score: float
+    support_score: float
+    source_positions: tuple[int, ...]
+    window_start: int
+    window_end: int
+
+    def public_dict(self) -> dict[str, object]:
+        return {
+            "query_index": self.query_index,
+            "query_role": self.query_role,
+            "query_prompt_start": self.query_prompt_start,
+            "query_prompt_end": self.query_prompt_end,
+            "query_source_start": self.query_source_start,
+            "query_source_end": self.query_source_end,
+            "page_id": self.page_id,
+            "score": self.score,
+            "support_score": self.support_score,
+            "source_positions": list(self.source_positions),
+            "window_start": self.window_start,
+            "window_end": self.window_end,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class KnowledgeCandidate:
     candidate_id: str
     document_id: str
@@ -226,6 +258,7 @@ class KnowledgeCandidate:
     source_positions: tuple[int, ...] = ()
     virtual_positions: tuple[int, ...] = ()
     token_attributions: tuple[tuple[int, int, float], ...] = ()
+    qk_attributions: tuple[QueryQKAttribution, ...] = ()
     candidate_origin: str = "lexical"
     native_prefix: NativePrefixSelection | None = field(default=None, repr=False)
 
@@ -252,6 +285,9 @@ class KnowledgeCandidate:
                     "score": score,
                 }
                 for query_token_offset, page_id, score in self.token_attributions
+            ],
+            "qk_attributions": [
+                attribution.public_dict() for attribution in self.qk_attributions
             ],
             "native_prefix": (
                 self.native_prefix.public_dict()

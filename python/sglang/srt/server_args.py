@@ -3016,7 +3016,7 @@ class ServerArgs:
     qwen_exo_qk_expansion_margin: A[
         float,
         "Expand QWEN-EXO Attention-Q/K candidates below this raw score margin.",
-    ] = 0.01
+    ] = 0.02
     qwen_exo_enable_capsule: A[
         bool,
         Arg(

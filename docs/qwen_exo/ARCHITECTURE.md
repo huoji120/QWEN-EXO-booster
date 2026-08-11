@@ -146,18 +146,49 @@ Judge, Self-Ask, Self-Answer, and capsule work use
 `GenerateReqInput` directly. Self-Ask additionally uses the grammar backend
 with a strict JSON Schema; it no longer parses a language-sensitive text
 prefix.
-They never call the HTTP API. Every job has a parent request, deadline,
-priority, cancellation token, token/state budgets, visibility marker, and a
-recursion depth fixed at zero. Parent token reserve is cumulative until the
-request finishes.
+They never call the HTTP API. Ordinary internal jobs require a finite deadline;
+Reflection Memory jobs are the sole deadline-free exception and remain bound by
+their cancellation token. Every job has a parent request, priority,
+cancellation token, token/state budgets, visibility marker, and a recursion
+depth fixed at zero. Parent token reserve is cumulative until the request
+finishes.
 
 ### Stateless Responses agents
 
-Some Responses clients resend the complete conversation on every model call and tag `function_call_output` items with `role=user`. QWEN-EXO treats the first non-tool user item as the stable task question; tool output remains an observation for post-tool refresh and never replaces that question.
+OpenCode does not send `previous_response_id`. Its native Responses path and
+default AI SDK path resend the prepared full message history and set
+`prompt_cache_key` to the stable OpenCode session ID. For no-parent requests,
+QWEN-EXO therefore uses a non-empty `prompt_cache_key` as the primary
+conversation identity. Different keys isolate otherwise identical prompts.
 
-The runtime binds each tool event to the stable task plus its type, call ID, and output digest. A bounded process-local LRU admits every unseen event once, skips replayed history, and emits `post_tool_recall.history_deduplicated` counts without text. Multiple newly supplied tool outputs may be judged, but a later rejected result does not erase an earlier eligible injection. Once replayed full history is observed, redundant per-response capsule generation is skipped because that client is not linking turns with `previous_response_id`.
+If the key is absent, the runtime builds versioned canonical bytes from the
+effective `instructions` plus role-preserving system/developer messages,
+followed by the first real user task. It normalizes CRLF, computes a CRC32
+identity prefix, and appends the full canonical-payload SHA-256 digest as a
+collision discriminator. A forced equal CRC32 therefore cannot merge different
+canonical payloads. The unavoidable fallback boundary is that two independent
+clients with no explicit key and byte-identical canonical payloads are
+indistinguishable and intentionally share the same fallback conversation.
 
-Internal batches from all parents also share one process-wide condition. Capacity is reserved atomically before scheduler submission, released on completion/cancellation, and bounded by each waiting batch's deadline.
+The runtime binds each tool event to the resolved conversation plus its type,
+call ID, and output digest. A call ID is only a bounded learned alias back to an
+identity already established by `prompt_cache_key` or the canonical fallback;
+an unknown or ambiguous tool-only request fails closed to request-local state.
+A bounded process-local LRU admits every unseen event once, skips replayed
+history, and emits `post_tool_recall.history_deduplicated` counts without text.
+The same identity scopes the stable original task, tool budgets and dedupe,
+Context Integrity, Reflection Memory trajectory and scheduling, and other
+conversation-scoped runtime state.
+
+After successful request finalization and native-attractor capture, the runtime
+may use the latest finalized response for that identity as an internal
+MemoryPipeline and next-turn refresh predecessor. It never writes this synthetic
+continuity into API `previous_response_id`, response-store lineage, or execution
+capsule parents, and stateless full-history requests do not restore capsules.
+Multiple newly supplied tool outputs may be judged, but a later rejected result
+does not erase an earlier eligible injection.
+
+Internal batches from all parents also share one process-wide condition. Capacity is reserved atomically before scheduler submission and released on completion or cancellation. Finite-deadline batches are bounded by each waiting batch's deadline; deadline-free Reflection Memory admission waits for capacity or cancellation.
 
 ### Request-local context evidence
 

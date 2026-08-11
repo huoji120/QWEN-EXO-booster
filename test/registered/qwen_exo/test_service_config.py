@@ -28,7 +28,6 @@ def test_tensor_bank_defaults_reserve_context_and_full_attention_capacity():
         validate_values(values)
 
 
-
 def test_values_round_trip_through_managed_server_args():
     values = default_values()
     values.update(
@@ -192,6 +191,16 @@ def test_new_runtime_features_default_active_with_distinct_groups():
     assert settings["qwen_exo_response_compaction_mode"].group == "compaction"
     assert settings["qwen_exo_qk_prefilter_mode"].choices == ("off", "active")
     assert settings["qwen_exo_context_integrity_mode"].choices == ("off", "active")
+
+
+def test_managed_qk_expansion_margin_defaults_to_production_rank_gate():
+    values = default_values()
+    settings = {setting.key: setting for setting in SERVICE_SETTINGS}
+    margin = settings["qwen_exo_qk_expansion_margin"]
+
+    assert values["qwen_exo_qk_expansion_margin"] == 0.02
+    assert margin.default == 0.02
+    assert "推荐值：0.02" in margin.description
 
 
 def test_ensure_migrates_legacy_modes_to_active_reflection_memory(tmp_path: Path):

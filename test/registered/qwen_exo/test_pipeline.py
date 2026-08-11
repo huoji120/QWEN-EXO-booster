@@ -12,6 +12,7 @@ from qwen_exo_booster.contracts import (
 from qwen_exo_booster.knowledge import KnowledgeRepository, NativePrefixSelection
 from qwen_exo_booster.pipeline import MemoryPipeline, response_memory_metadata
 from qwen_exo_booster.policy_data import PolicyDataRepository
+from qwen_exo_booster.query_probe import QueryStateSpan
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class FakeQKTensorBank:
     def rank(
         self,
         query_heads,
+        query_states,
         *,
         query_identity,
         limit,
@@ -68,7 +70,7 @@ class FakeQKTensorBank:
         audit=None,
     ):
         self.rank_calls.append(
-            (query_heads, query_identity, limit, min_document_margin)
+            (query_heads, query_states, query_identity, limit, min_document_margin)
         )
         self.rank_gates.append((min_tensor_score, min_document_margin))
         candidates = self.candidates[:limit]
@@ -116,6 +118,42 @@ class FakeQKTensorBank:
             for item in self.candidates
             if item.native_prefix is not None and item.native_prefix.page_id == page_id
         )
+
+
+class MarginGatedFakeQKTensorBank(FakeQKTensorBank):
+    def __init__(self, candidates, *, observed_margin):
+        super().__init__(candidates)
+        self.observed_margin = float(observed_margin)
+
+    def rank(
+        self,
+        query_heads,
+        query_states,
+        *,
+        query_identity,
+        limit,
+        min_tensor_score=0.0,
+        min_document_margin=0.005,
+        audit=None,
+    ):
+        self.rank_calls.append(
+            (query_heads, query_states, query_identity, limit, min_document_margin)
+        )
+        self.rank_gates.append((min_tensor_score, min_document_margin))
+        rejected = self.observed_margin < float(min_document_margin)
+        candidates = () if rejected else self.candidates[:limit]
+        if audit is not None:
+            audit.update(
+                status="rejected" if rejected else "ready",
+                reason=(
+                    "document_margin_too_small" if rejected else "candidates_ready"
+                ),
+                min_tensor_score=min_tensor_score,
+                min_document_margin=min_document_margin,
+                observed_margin=self.observed_margin,
+                candidate_count=len(candidates),
+            )
+        return candidates
 
 
 class FakeCognitionTensorBank(FakeQKTensorBank):
@@ -403,11 +441,20 @@ def test_policy_data_upsert_rejects_a_second_document_before_writing(tmp_path):
     ]
 
 
+def query_states(query_heads, role="current_user"):
+    return tuple(
+        QueryStateSpan(role, index, index + 1, index, index + 1)
+        for index, _query in enumerate(query_heads)
+    )
+
+
 def prepare(pipeline, request, query_heads=(((1.0, 0.0),),)):
     return asyncio.run(
         pipeline.prepare_responses_request(
             request,
             query_heads=query_heads,
+            query_states=query_states(query_heads),
+            query_role_plan_digest="test-role-plan",
             query_probe_status="ready" if query_heads else "no_q_signal",
             query_probe_prompt_tokens=4 if query_heads else 0,
         )
@@ -612,15 +659,108 @@ def test_low_margin_qk_expands_before_semantic_judge(tmp_path):
     assert state.public_dict()["qk_retrieval"]["shortlist_size"] == 2
     assert len(judge.calls) == 1
     assert len(judge.calls[0][2]) == 2
-    assert [call[2] for call in bank.rank_calls] == [8, 16]
+    assert [call[3] for call in bank.rank_calls] == [8, 16]
     assert len(state.decisions) == 2
+
+
+@pytest.mark.parametrize(
+    (
+        "observed_margin",
+        "expected_reason",
+        "expected_rank_limits",
+        "expected_candidate_count",
+    ),
+    [
+        (0.019999, "document_margin_too_small", [8, 16], 0),
+        (0.020000, "candidates_ready", [8], 2),
+    ],
+)
+def test_initial_raw_rank_margin_has_exact_fail_closed_boundary(
+    tmp_path,
+    observed_margin,
+    expected_reason,
+    expected_rank_limits,
+    expected_candidate_count,
+):
+    repo = repository(tmp_path)
+    first = native_candidate(repo, "wfp.md", page_id=3, score=0.5 + observed_margin)
+    second = native_candidate(repo, "ctf.md", page_id=4, score=0.5)
+    bank = MarginGatedFakeQKTensorBank((first, second), observed_margin=observed_margin)
+    judge = FakeReferenceJudge()
+    pipeline = build_pipeline(
+        replace(
+            config(tmp_path, policy_data=False),
+            max_internal_fanout=16,
+            qk_expansion_margin=0.02,
+            qk_prefilter_mode="off",
+        ),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=bank,
+        reference_judge=judge,
+    )
+
+    _prepared, state = prepare(
+        pipeline,
+        FakeRequest(
+            request_id=f"resp-rank-margin-{observed_margin}", input="WFP or CTF"
+        ),
+    )
+
+    assert [call[3] for call in bank.rank_calls] == expected_rank_limits
+    assert all(gate == (0.0, 0.02) for gate in bank.rank_gates)
+    assert state.qk_rank_audit["reason"] == expected_reason
+    assert state.qk_rank_audit["observed_margin"] == observed_margin
+    assert len(state.candidates) == expected_candidate_count
+    if expected_candidate_count:
+        assert len(judge.calls) == 1
+        assert state.qk_expanded is False
+    else:
+        assert judge.calls == []
+        assert state.qk_expanded is True
+        assert state.qk_expansion_reason == "empty"
+
+
+def test_rank_cache_key_tracks_effective_initial_margin(tmp_path):
+    repo = repository(tmp_path)
+    first = native_candidate(repo, "wfp.md", page_id=3, score=0.52)
+    second = native_candidate(repo, "ctf.md", page_id=4, score=0.5)
+    bank = MarginGatedFakeQKTensorBank((first, second), observed_margin=0.02)
+    pipeline = build_pipeline(
+        replace(
+            config(tmp_path, policy_data=False),
+            max_internal_fanout=16,
+            qk_expansion_margin=0.02,
+        ),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=bank,
+    )
+    heads = (((1.0, 0.0),),)
+    states = query_states(heads)
+
+    accepted, initial_meta = pipeline._rank_query_candidates(
+        heads, states, "stable-query"
+    )
+    cached, cached_meta = pipeline._rank_query_candidates(heads, states, "stable-query")
+    pipeline.config = replace(pipeline.config, qk_expansion_margin=0.03)
+    rejected, stricter_meta = pipeline._rank_query_candidates(
+        heads, states, "stable-query"
+    )
+
+    assert len(accepted) == len(cached) == 2
+    assert initial_meta["cache_hit"] is False
+    assert cached_meta["cache_hit"] is True
+    assert rejected == ()
+    assert stricter_meta["cache_hit"] is False
+    assert [gate[1] for gate in bank.rank_gates] == [0.02, 0.03, 0.03]
 
 
 @pytest.mark.parametrize(
     ("preset", "expected_gates"),
     [
-        ("broad", (-0.05, 0.0)),
-        ("balanced", (0.0, 0.0)),
+        ("broad", (-0.05, 0.02)),
+        ("balanced", (0.0, 0.02)),
         ("strict", (8.0, 0.02)),
     ],
 )
@@ -648,6 +788,30 @@ def test_qk_recall_presets_apply_fixed_gates_and_publish_audit(
     assert bank.rank_gates[0] == expected_gates
     assert state.qk_rank_audit["preset"] == preset
     assert state.public_dict()["qk_retrieval"]["audit"] == state.qk_rank_audit
+
+
+def test_qk_only_knowledge_floor_remains_in_effective_rank_margin(tmp_path):
+    repo = repository(tmp_path)
+    candidate = native_candidate(repo, "wfp.md", page_id=3, score=0.91)
+    bank = FakeQKTensorBank((candidate,))
+    pipeline = build_pipeline(
+        replace(
+            config(tmp_path, policy_data=False),
+            qk_recall_preset="broad",
+            qk_expansion_margin=0.0,
+            qk_only_knowledge=True,
+        ),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=bank,
+    )
+
+    prepare(
+        pipeline,
+        FakeRequest(request_id="resp-qk-only-floor", input="Which WFP layer?"),
+    )
+
+    assert bank.rank_gates[0] == (-0.05, 0.005)
 
 
 def grouped_repository(tmp_path):
@@ -1029,11 +1193,11 @@ def test_policy_qk_page_over_budget_fails_closed(tmp_path):
 
 def test_turn_end_qk_attractor_is_rejudged_on_next_request(tmp_path):
     repo = repository(tmp_path)
-    first_candidate = native_candidate(repo, "ctf.md", page_id=4, score=0.80)
-    attractor_candidate = native_candidate(repo, "wfp.md", page_id=23, score=0.96)
+    first_candidate = native_candidate(repo, "ctf.md", page_id=4, score=8.80)
+    attractor_candidate = native_candidate(repo, "wfp.md", page_id=23, score=8.96)
     bank = FakeQKTensorBank((first_candidate,))
     pipeline = build_pipeline(
-        config(tmp_path, policy_data=False),
+        replace(config(tmp_path, policy_data=False), qk_recall_preset="strict"),
         repo,
         FakeTokenizer(),
         tensor_bank=bank,
@@ -1045,6 +1209,7 @@ def test_turn_end_qk_attractor_is_rejudged_on_next_request(tmp_path):
     bank.candidates = (attractor_candidate,)
 
     captured = asyncio.run(pipeline.capture_native_attractor(first.request_id))
+    assert bank.rank_gates[-1] == (8.0, 0.02)
 
     assert captured.next_attractor_status == "ready"
     assert captured.query_heads == ()
@@ -1091,6 +1256,7 @@ def test_next_turn_restoration_rechecks_semantic_eligibility(tmp_path):
             FakeRequest(request_id="resp-restored", input="Continue"),
             restoration=restoration,
             query_heads=(((1.0, 0.0),),),
+            query_states=query_states((((1.0, 0.0),),)),
             query_probe_status="ready",
             query_probe_prompt_tokens=1,
         )
@@ -1166,7 +1332,7 @@ def test_request_question_combines_original_task_with_latest_tool_evidence():
         {"role": "user", "content": "Continue"},
     ]
 
-    question = MemoryPipeline._request_question(value, previous_response_id=None)
+    question = MemoryPipeline._request_question(value)
 
     assert "Implement the repository task" in question
     assert "FileNotFoundError" in question
@@ -1180,11 +1346,44 @@ def test_request_question_includes_current_instruction_after_reasoning():
         {"role": "user", "content": "Use the direct module path instead"},
     ]
 
-    question = MemoryPipeline._request_question(value, previous_response_id=None)
+    question = MemoryPipeline._request_question(value)
 
     assert "Implement the repository task" in question
     assert "wrapper path is unresolved" in question
     assert "Use the direct module path instead" in question
+
+
+def test_request_question_keeps_compaction_and_current_context_once():
+    root = "Implement the request lineage fix"
+    current = "Verify the compaction continuation"
+    summary = "The backend edit is complete and focused tests remain."
+    observation = "Ruff passed for runtime.py"
+    value = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": f"<context_compaction>\n{summary}\n</context_compaction>",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-verify",
+            "output": observation,
+        },
+        {"type": "message", "role": "user", "content": current},
+    ]
+
+    question = MemoryPipeline._request_question(
+        value,
+        original_task=root,
+        compaction_context=summary,
+    )
+
+    assert question.count("COMPACTED RESPONSE CONTEXT:\n") == 1
+    assert question.count(summary) == 1
+    assert question.count(root) == 1
+    assert question.count(current) == 1
+    assert question.count(observation) == 1
+    assert "<context_compaction>" not in question
 
 
 @pytest.mark.asyncio
@@ -1208,4 +1407,5 @@ async def test_compaction_memory_parent_override_restores_without_api_parent(tmp
         query_probe_status="no_q_signal",
     )
 
-    assert child_state.previous_response_id == "resp_compact_parent"
+    assert child_state.previous_response_id is None
+    assert child_state.effective_memory_previous_response_id == "resp_compact_parent"

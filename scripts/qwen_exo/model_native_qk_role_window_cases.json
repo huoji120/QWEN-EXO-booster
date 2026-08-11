@@ -1,0 +1,22 @@
+[
+  {
+    "case_id": "go-gin-remote-assistance-vs-padding-oracle-trajectory",
+    "review_status": "reviewed_sanitized_incident_fixture",
+    "original_task": "帮我写一个远程协助软件 服务端基于GO的GIN 客户端也基于GO 要求功能 web管理客户端的功能 能对客户端执行命令并且有回显 并且能查看客户端的进程列表 （windows）",
+    "current_user": "帮我写一个远程协助软件 服务端基于GO的GIN 客户端也基于GO 要求功能 web管理客户端的功能 能对客户端执行命令并且有回显 并且能查看客户端的进程列表 （windows）",
+    "trajectory_compaction": "Inspect the homepage and 1-2 prominent endpoints, then submit your one-line classification via answer. Padding Oracle FTW. captcha cookie is 32 bytes (two AES blocks); classify Padding Oracle (CBC).",
+    "trajectory_source": "reviewed_reconstruction_from_persisted_ctf_memory",
+    "gold_path": "reflection-memory/934574a9bfc086d29d45a01ccd13060a.md",
+    "hard_negative_paths": [
+      "reflection-memory/b006758717b7f519914489248fd36c7b.md",
+      "reflection-memory/00a0e9fc8aaeec92e8d3869e9a32202b.md",
+      "reflection-memory/07c9fb3347602ea7d52de84ed51cc8aa.md",
+      "reflection-memory/254718e9b2ddbf1fb9fed7822d55ce8e.md",
+      "reflection-memory/7ee429e4857c72624a0eb2ec6a75624f.md",
+      "reflection-memory/83f76eb3e2dc71aaaa5fef6887d9ff06.md",
+      "reflection-memory/a4ed4d1131335110a0dca603962844ec.md",
+      "reflection-memory/aa7d5809300ea599086584a487223aaf.md",
+      "reflection-memory/dc172465e602f69ead3918a64d6f4549.md"
+    ]
+  }
+]

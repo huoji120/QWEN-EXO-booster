@@ -1462,6 +1462,7 @@ class ResponsesRequest(BaseModel):
     model: Optional[str] = None  # Made optional to match vLLM
     parallel_tool_calls: Optional[bool] = True
     previous_response_id: Optional[str] = None
+    prompt_cache_key: Optional[str] = None
     reasoning: Optional[ResponseReasoningParam] = None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] = "auto"
     store: Optional[bool] = True

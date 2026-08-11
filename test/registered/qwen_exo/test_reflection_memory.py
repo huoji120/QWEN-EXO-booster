@@ -119,6 +119,90 @@ def _tool_call(name: str, fields: dict[str, str]) -> str:
     )
 
 
+
+def _short_fields() -> dict[str, str]:
+    fields = _fields()
+    fields.update(
+        {
+            "title": "简短反思",
+            "reflection": "现象已确认。",
+            "evidence": "证据已记录。",
+            "causal_analysis": "原因已定位。",
+            "conflict_resolution": "边界已保留。",
+            "reusable_experience": "条件成立后执行。",
+            "avoid": "避免误判。",
+            "next_time": "下次再验证。",
+        }
+    )
+    return fields
+
+
+def test_reflection_memory_accepts_structurally_valid_short_output():
+    parsed = ReflectionMemoryService.parse_tool_call(
+        _tool_call(REFLECTION_MEMORY_TOOL_NAME, _short_fields())
+    )
+
+    assert parsed is not None
+    assert parsed["title"] == "简短反思"
+    assert parsed["reflection"] == "现象已确认。"
+
+
+def test_reflection_memory_accepts_concrete_bare_check_rule():
+    fields = _fields()
+    fields["reusable_experience"] = "检查 WebSocket 握手状态后再决定是否重试。"
+
+    parsed = ReflectionMemoryService.parse_tool_call(
+        _tool_call(REFLECTION_MEMORY_TOOL_NAME, fields)
+    )
+
+    assert parsed is not None
+    assert parsed["reusable_experience"] == "检查 WebSocket 握手状态后再决定是否重试。"
+
+
+def test_reflection_memory_rejects_multiple_tool_calls():
+    call = _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
+
+    with pytest.raises(ValueError, match="exactly one"):
+        ReflectionMemoryService.parse_tool_call(call + call)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (lambda fields: fields.pop("evidence"), "fields are incomplete"),
+        (lambda fields: fields.update(evidence=""), "cannot be empty"),
+        (lambda fields: fields.update(outcome="complete"), "outcome is invalid"),
+        (lambda fields: fields.update(memory_action="replace"), "action is invalid"),
+        (lambda fields: fields.update(merge_document_paths="not-json"), "must be JSON"),
+        (
+            lambda fields: fields.update(
+                memory_action="update",
+                target_document_path="reflection-memory/safe.md",
+                merge_document_paths='["reflection-memory/../unsafe.md"]',
+            ),
+            "merge path is invalid",
+        ),
+        (lambda fields: fields.update(title="短"), "title length is invalid"),
+    ),
+)
+def test_reflection_memory_keeps_structural_validation(mutate, message):
+    fields = _fields()
+    mutate(fields)
+
+    with pytest.raises(ValueError, match=message):
+        ReflectionMemoryService.parse_tool_call(
+            _tool_call(REFLECTION_MEMORY_TOOL_NAME, fields)
+        )
+
+
+def test_reflection_memory_rejects_duplicate_required_field():
+    body = _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()).replace(
+        "</evidence>", "</evidence><evidence>重复证据。</evidence>"
+    )
+
+    with pytest.raises(ValueError, match="duplicated field: evidence"):
+        ReflectionMemoryService.parse_tool_call(body)
+
 def test_reflection_memory_uses_renamed_tool_and_knowledge_metadata():
     fields = _fields()
     parsed = ReflectionMemoryService.parse_tool_call(
@@ -393,6 +477,8 @@ def test_reflection_generation_updates_retrieved_memory_instead_of_inserting(tmp
     assert retrieval_queries and "WinError 10106" in retrieval_queries[0]
     assert candidate.content in runner.prompts[0]
     assert runner.jobs[0].token_budget == service.max_output_tokens - 1
+    assert runner.jobs[0].deadline_monotonic is None
+    assert not runner.jobs[0].is_cancelled_or_expired(now=1e300)
     assert len(published) == 1
     assert published[0].memory_action == "update"
     assert published[0].target_document_path == candidate.document_path
@@ -609,12 +695,8 @@ def test_reflection_store_removes_every_merged_document_record(tmp_path):
     assert records[0]["source_digest"] == "source-merged"
 
 
-
-
 def test_precompaction_checkpoint_can_reflect_without_tool_events(tmp_path):
-    runner = _ReflectionRunner(
-        _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
-    )
+    runner = _ReflectionRunner(_tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()))
     service = ReflectionMemoryService(
         runner,
         _CharacterTokenizer(),
@@ -645,6 +727,8 @@ def test_precompaction_checkpoint_can_reflect_without_tool_events(tmp_path):
 
     assert reflection is not None
     assert "PRECOMPACTION-EVIDENCE" in runner.prompts[0]
+
+
 if __name__ == "__main__":
     import sys
 

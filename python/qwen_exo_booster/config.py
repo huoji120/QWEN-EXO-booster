@@ -43,6 +43,17 @@ def qk_recall_gates(preset: str) -> tuple[float, float]:
         ) from exc
 
 
+def qk_admission_margin(
+    preset: str, expansion_margin: float, *, qk_only_knowledge: bool
+) -> float:
+    _min_score, preset_margin = qk_recall_gates(preset)
+    return max(
+        float(preset_margin),
+        float(expansion_margin),
+        0.005 if qk_only_knowledge else 0.0,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class QwenExoFeatureFlags:
     hybrid_prefix: bool
@@ -135,13 +146,29 @@ class QwenExoConfig:
     replay_minimum_gain: float = 0.02
     replay_switch_margin: float = 0.05
     replay_maybe_kl_cap: float = 4.0
-    qk_expansion_margin: float = 0.01
+    qk_expansion_margin: float = 0.02
     qk_only_knowledge: bool = False
     qk_recall_preset: str = "balanced"
     qk_prefilter_mode: str = "active"
     qk_prefilter_min_score: float | None = None
     qk_prefilter_min_margin: float | None = None
     qk_max_candidates_per_document: int = 1
+
+    @property
+    def qk_admission_gates(self) -> tuple[float, float]:
+        min_tensor_score, _preset_margin = qk_recall_gates(self.qk_recall_preset)
+        return (
+            float(min_tensor_score),
+            qk_admission_margin(
+                self.qk_recall_preset,
+                self.qk_expansion_margin,
+                qk_only_knowledge=self.qk_only_knowledge,
+            ),
+        )
+
+    @property
+    def qk_admission_margin(self) -> float:
+        return self.qk_admission_gates[1]
 
     def __post_init__(self) -> None:
         if self.policy_data_directory is None:
@@ -491,7 +518,7 @@ class QwenExoConfig:
             quantization=str(getattr(server_args, "quantization", None) or "none"),
             kv_cache_dtype=str(getattr(server_args, "kv_cache_dtype", None) or "auto"),
             qk_expansion_margin=float(
-                getattr(server_args, "qwen_exo_qk_expansion_margin", 0.01)
+                getattr(server_args, "qwen_exo_qk_expansion_margin", 0.02)
             ),
             qk_only_knowledge=bool(
                 getattr(server_args, "qwen_exo_qk_only_knowledge", False)

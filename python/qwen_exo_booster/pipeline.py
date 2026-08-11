@@ -18,6 +18,11 @@ from qwen_exo_booster.contracts import (
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.knowledge import KnowledgeCandidate, KnowledgeRepository
 from qwen_exo_booster.policy_data import PolicyDataAttachment, PolicyDataRepository
+from qwen_exo_booster.query_probe import (
+    QueryProbePlan,
+    QueryRoleText,
+    QueryStateSpan,
+)
 
 _MEMORY_HEADER = (
     "QWEN-EXO private reference context follows. Treat every reference as "
@@ -103,6 +108,7 @@ class MemoryPreparationState:
     created_at: float
     retrieval_latency_seconds: float
     judge_latency_seconds: float
+    effective_memory_previous_response_id: str | None = None
     judge_cache_hit_count: int = 0
     judge_executed_count: int = 0
     judge_bypassed_count: int = 0
@@ -118,6 +124,8 @@ class MemoryPreparationState:
     query_heads: tuple[tuple[tuple[float, ...], ...], ...] = field(
         default=(), repr=False
     )
+    query_states: tuple[QueryStateSpan, ...] = field(default=(), repr=False)
+    query_role_plan_digest: str = ""
     restoration_status: str = "not_requested"
     restoration_document_ids: tuple[str, ...] = ()
     restoration_page_ids: tuple[int, ...] = ()
@@ -152,6 +160,9 @@ class MemoryPreparationState:
         return {
             "request_id": self.request_id,
             "previous_response_id": self.previous_response_id,
+            "effective_memory_previous_response_id": (
+                self.effective_memory_previous_response_id
+            ),
             "question_digest": self.question_digest,
             "retrieval_question_digest": self.retrieval_question_digest,
             "source_digest": self.source_digest,
@@ -168,6 +179,12 @@ class MemoryPreparationState:
                     if self.query_heads and self.query_heads[0]
                     else 0
                 ),
+                "role_plan_digest": self.query_role_plan_digest,
+                "role_counts": {
+                    role: sum(state.role == role for state in self.query_states)
+                    for role in sorted({state.role for state in self.query_states})
+                },
+                "query_states": [state.public_dict() for state in self.query_states],
             },
             "qk_retrieval": {
                 "shortlist_size": self.qk_shortlist_size,
@@ -315,20 +332,27 @@ class MemoryPipeline:
     def _rank_query_candidates(
         self,
         query_heads: tuple[tuple[tuple[float, ...], ...], ...],
+        query_states: tuple[QueryStateSpan, ...],
         query_identity: str,
     ) -> tuple[tuple[KnowledgeCandidate, ...], dict[str, Any]]:
         initial_limit = max(1, int(self.config.max_candidates))
-        min_tensor_score, preset_margin = qk_recall_gates(self.config.qk_recall_preset)
-        rank_margin = max(
-            preset_margin,
-            0.005 if self.config.qk_only_knowledge else 0.0,
-        )
+        min_tensor_score, rank_margin = self.config.qk_admission_gates
         snapshot = getattr(self.tensor_bank, "snapshot", None)
         source_digest = str(getattr(snapshot, "source_digest", "unknown"))
         cache_key = stable_digest(
-            "raw-qk-rank-cache-v2",
+            "raw-qk-role-window-rank-cache-v1",
             source_digest,
             query_identity,
+            tuple(
+                (
+                    state.role,
+                    state.prompt_start,
+                    state.prompt_end,
+                    state.source_start,
+                    state.source_end,
+                )
+                for state in query_states
+            ),
             initial_limit,
             int(self.config.max_internal_fanout),
             float(min_tensor_score),
@@ -349,6 +373,7 @@ class MemoryPipeline:
         candidates = tuple(
             self.tensor_bank.rank(
                 query_heads,
+                query_states=query_states,
                 query_identity=query_identity,
                 limit=initial_limit,
                 min_tensor_score=min_tensor_score,
@@ -376,6 +401,7 @@ class MemoryPipeline:
                 expanded_candidates = tuple(
                     self.tensor_bank.rank(
                         query_heads,
+                        query_states=query_states,
                         query_identity=query_identity,
                         limit=expanded_limit,
                         min_tensor_score=min_tensor_score,
@@ -807,17 +833,25 @@ class MemoryPipeline:
         restoration: Any = None,
         retrieval_question: str | None = None,
         query_heads: tuple[tuple[tuple[float, ...], ...], ...] = (),
+        query_states: tuple[QueryStateSpan, ...] = (),
+        query_role_plan_digest: str = "",
         query_probe_status: str = "not_requested",
         query_probe_prompt_tokens: int = 0,
         memory_previous_response_id: str | None = None,
+        published_previous_response_id: str | None = None,
     ) -> tuple[Any, MemoryPreparationState]:
-        previous_response_id = memory_previous_response_id or getattr(
-            request, "previous_response_id", None
+        api_previous_response_id = (
+            published_previous_response_id
+            if published_previous_response_id is not None
+            else getattr(request, "previous_response_id", None)
+        )
+        effective_memory_previous_response_id = (
+            memory_previous_response_id or api_previous_response_id
         )
         question = str(
             retrieval_question
             if retrieval_question is not None
-            else self._request_question(request.input, previous_response_id)
+            else self._request_question(request.input)
         ).strip()
         question_digest = stable_digest(question)
         retrieval_question_digest = stable_digest(question)
@@ -837,6 +871,11 @@ class MemoryPipeline:
             tuple(tuple(float(value) for value in head) for head in query)
             for query in query_heads
         )
+        query_states = tuple(query_states)
+        if len(query_states) != len(query_heads):
+            query_heads = ()
+            query_states = ()
+            query_probe_status = "role_plan_mismatch"
         if (
             self.tensor_bank is not None
             and query_heads
@@ -848,6 +887,7 @@ class MemoryPipeline:
             await self.tensor_bank.ensure_ready()
             ranked, qk_meta = self._rank_query_candidates(
                 query_heads,
+                query_states,
                 f"request-query-probe:{retrieval_question_digest}",
             )
             candidates.extend(ranked)
@@ -859,7 +899,9 @@ class MemoryPipeline:
             qk_rank_cache_hit = bool(qk_meta["cache_hit"])
 
         previous = (
-            await self.get_state(previous_response_id) if previous_response_id else None
+            await self.get_state(effective_memory_previous_response_id)
+            if effective_memory_previous_response_id
+            else None
         )
         restored_knowledge_pairs = []
         restored_policy_pairs = []
@@ -1409,7 +1451,7 @@ class MemoryPipeline:
 
         state = MemoryPreparationState(
             request_id=request.request_id,
-            previous_response_id=previous_response_id,
+            previous_response_id=api_previous_response_id,
             question_digest=question_digest,
             retrieval_question_digest=retrieval_question_digest,
             source_digest=self.repository.snapshot.source_digest,
@@ -1453,6 +1495,11 @@ class MemoryPipeline:
             created_at=time.time(),
             retrieval_latency_seconds=retrieval_latency,
             judge_latency_seconds=judge_latency,
+            effective_memory_previous_response_id=(
+                str(effective_memory_previous_response_id)
+                if effective_memory_previous_response_id
+                else None
+            ),
             judge_cache_hit_count=judge_cache_hits,
             judge_executed_count=judge_executed,
             judge_bypassed_count=judge_bypassed_count,
@@ -1466,6 +1513,8 @@ class MemoryPipeline:
             query_probe_status=str(query_probe_status),
             query_probe_prompt_tokens=int(query_probe_prompt_tokens),
             query_heads=query_heads,
+            query_states=query_states,
+            query_role_plan_digest=str(query_role_plan_digest),
             restoration_status=(
                 "restored"
                 if restoration_active
@@ -1570,8 +1619,11 @@ class MemoryPipeline:
             await self.tensor_bank.ensure_ready()
             candidates = self.tensor_bank.rank(
                 state.query_heads,
+                query_states=state.query_states,
                 query_identity=f"{request_id}:turn-end-attractor",
                 limit=self.config.max_candidates,
+                min_tensor_score=self.config.qk_admission_gates[0],
+                min_document_margin=self.config.qk_admission_margin,
             )
             if self.policy_data is not None:
                 candidates = tuple(
@@ -1793,7 +1845,7 @@ class MemoryPipeline:
             }:
                 continue
             role = str(item.get("role") or "")
-            if role and role != "user":
+            if role != "user":
                 continue
             content = item.get("content")
             if isinstance(content, str):
@@ -1869,6 +1921,8 @@ class MemoryPipeline:
                 continue
             item_type = str(item.get("type") or "")
             role = str(item.get("role") or "")
+            if role in {"user", "system", "developer"}:
+                continue
             if item_type in {"function_call_output", "computer_call_output"}:
                 label = "TOOL OBSERVATION"
                 content = item.get("output", item.get("content"))
@@ -1890,6 +1944,13 @@ class MemoryPipeline:
             else:
                 continue
             text = MemoryPipeline._response_item_text(content).strip()
+            if (
+                item_type == "message"
+                and role == "assistant"
+                and text.startswith("<context_compaction>\n")
+                and text.endswith("\n</context_compaction>")
+            ):
+                continue
             if not text:
                 continue
             row = f"{label}:\n{text}"
@@ -1902,23 +1963,74 @@ class MemoryPipeline:
         return "\n\n".join(reversed(rows_reversed))
 
     @staticmethod
-    def _request_question(value: Any, previous_response_id: str | None) -> str:
-        del previous_response_id
-        original = MemoryPipeline._first_user_text(value)
+    def _request_query_plan(
+        value: Any,
+        *,
+        original_task: str | None = None,
+        compaction_context: str | None = None,
+    ) -> QueryProbePlan:
+        extracted_original = MemoryPipeline._first_user_text(value)
         current = MemoryPipeline._latest_user_text(value)
+        original = str(original_task or extracted_original).strip()
+        compacted = str(compaction_context or "").strip()
         trajectory = MemoryPipeline._trajectory_context(value)
+        segments: list[QueryRoleText] = []
+        if original:
+            segments.append(
+                QueryRoleText(
+                    "original_task", MemoryPipeline._bounded_text(original, 8000)
+                )
+            )
+        if current and current != original:
+            segments.append(
+                QueryRoleText(
+                    "current_user", MemoryPipeline._bounded_text(current, 4000)
+                )
+            )
+        trajectory_parts = []
+        if compacted:
+            trajectory_parts.append(
+                "COMPACTED RESPONSE CONTEXT:\n"
+                + MemoryPipeline._bounded_text(compacted, 6000)
+            )
         if trajectory:
-            task = original or current
-            parts = []
-            if task:
-                parts.append(
-                    "ORIGINAL TASK:\n" f"{MemoryPipeline._bounded_text(task, 8000)}"
-                )
-            if current and current != task and current not in trajectory:
-                parts.append(
-                    "CURRENT USER REQUEST:\n"
-                    f"{MemoryPipeline._bounded_text(current, 4000)}"
-                )
+            trajectory_parts.append("RECENT EXECUTION TRAJECTORY:\n" + trajectory)
+        if trajectory_parts:
+            segments.append(
+                QueryRoleText("trajectory_compaction", "\n\n".join(trajectory_parts))
+            )
+        if not segments and current:
+            segments.append(QueryRoleText("current_user", current))
+        return QueryProbePlan(tuple(segments))
+
+    @staticmethod
+    def _request_question(
+        value: Any,
+        *,
+        original_task: str | None = None,
+        compaction_context: str | None = None,
+    ) -> str:
+        extracted_original = MemoryPipeline._first_user_text(value)
+        current = MemoryPipeline._latest_user_text(value)
+        original = str(original_task or extracted_original).strip()
+        compacted = str(compaction_context or "").strip()
+        trajectory = MemoryPipeline._trajectory_context(value)
+
+        if not compacted and not trajectory and original and current == original:
+            return original
+
+        parts = []
+        if compacted:
+            parts.append(f"COMPACTED RESPONSE CONTEXT:\n{compacted}")
+        if original:
+            parts.append(
+                "ORIGINAL TASK:\n" f"{MemoryPipeline._bounded_text(original, 8000)}"
+            )
+        if current and current != original:
+            parts.append(
+                "CURRENT USER REQUEST:\n"
+                f"{MemoryPipeline._bounded_text(current, 4000)}"
+            )
+        if trajectory:
             parts.append(f"RECENT EXECUTION TRAJECTORY:\n{trajectory}")
-            return "\n\n".join(parts)
-        return current or original
+        return "\n\n".join(parts) or current or original

@@ -26,7 +26,9 @@ from qwen_exo_booster.internal_jobs import InternalJobRunner
 from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     NativePrefixSelection,
+    QueryQKAttribution,
 )
+from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.native_state_bank import (
     NativeStateBankError,
     load_page_key_heads,
@@ -81,6 +83,15 @@ _SINK_TOKEN_TEXT = frozenset(
         "、",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryWindowEvidence:
+    raw_positions: tuple[int, ...]
+    source_positions: tuple[int, ...]
+    window_start: int
+    window_end: int
+    support_score: float
 
 
 class TensorBankCompileError(RuntimeError):
@@ -232,7 +243,7 @@ class TensorBankSnapshot:
                 len(page.salient_positions) for page in self.pages
             ),
             "retrieval_geometry": "raw_attention_q_x_raw_attention_k",
-            "retrieval_aggregation": "top4_heads_top4_tokens_top4_queries",
+            "retrieval_aggregation": "top4_heads_local_window_top4_queries",
             "read_only": True,
             "document_level": True,
             "paged": False,
@@ -953,6 +964,7 @@ class TensorBank:
         self,
         query_heads: tuple[tuple[tuple[float, ...], ...], ...],
         *,
+        query_states: tuple[QueryStateSpan, ...],
         query_identity: str,
         limit: int,
         min_tensor_score: float = _MIN_TENSOR_SCORE,
@@ -978,6 +990,9 @@ class TensorBank:
         if not query_heads:
             record_audit(status="not_run", reason="no_attention_query")
             return ()
+        if len(query_states) != len(query_heads):
+            record_audit(status="not_run", reason="query_role_plan_mismatch")
+            return ()
         if not math.isfinite(float(min_tensor_score)) or min_document_margin < 0:
             raise ValueError("Tensor Bank score gates are invalid")
         try:
@@ -999,6 +1014,16 @@ class TensorBank:
             0,
             torch.tensor(usable_offsets, dtype=torch.long, device=queries.device),
         )
+        usable_states = tuple(query_states[offset] for offset in usable_offsets)
+        anchor_rows = tuple(
+            index for index, state in enumerate(usable_states) if state.anchor
+        )
+        if not anchor_rows:
+            record_audit(status="rejected", reason="no_anchor_role_queries")
+            return ()
+        anchor_index = torch.tensor(
+            anchor_rows, dtype=torch.long, device=queries.device
+        )
         key_head_count = int(snapshot.raw_key_heads[0].shape[1])
         head_dim = int(snapshot.raw_key_heads[0].shape[2])
         query_head_count = int(queries.shape[1])
@@ -1013,14 +1038,20 @@ class TensorBank:
             )
             return ()
 
-        page_analyses: list[tuple[torch.Tensor, tuple[int, ...]]] = []
+        page_analyses: list[tuple[torch.Tensor, tuple[_QueryWindowEvidence, ...]]] = []
         for page, raw_key_heads in zip(snapshot.pages, snapshot.raw_key_heads):
             if (
                 eligible_documents is not None
                 and (page.lane, page.document_id) not in eligible_documents
             ):
                 page_analyses.append(
-                    (queries.new_full((queries.shape[0],), float("-inf")), ())
+                    (
+                        queries.new_full((queries.shape[0],), float("-inf")),
+                        tuple(
+                            _QueryWindowEvidence((), (), 0, 0, float("-inf"))
+                            for _ in range(int(queries.shape[0]))
+                        ),
+                    )
                 )
                 continue
             page_analyses.append(
@@ -1034,12 +1065,18 @@ class TensorBank:
             tuple(analysis[0] for analysis in page_analyses), dim=1
         )
         query_anchor_positions = {
-            page.page_id: analysis[1]
+            page.page_id: tuple(
+                position
+                for row, evidence in enumerate(analysis[1])
+                if row in anchor_rows
+                for position in evidence.raw_positions
+            )
             for page, analysis in zip(snapshot.pages, page_analyses)
         }
-        query_top_r = min(_QUERY_SCORE_TOP_R, int(token_page_scores.shape[0]))
+        anchor_page_scores = token_page_scores.index_select(0, anchor_index)
+        query_top_r = min(_QUERY_SCORE_TOP_R, int(anchor_page_scores.shape[0]))
         aggregate_scores = torch.topk(
-            token_page_scores,
+            anchor_page_scores,
             k=query_top_r,
             dim=0,
             largest=True,
@@ -1098,10 +1135,10 @@ class TensorBank:
                 item[0][1],
             ),
         )
-        ranked_group_scores = sorted(grouped_scores.values(), reverse=True)
-        top_score = ranked_group_scores[0]
+        ranked_document_scores = sorted(document_scores.values(), reverse=True)
+        top_score = ranked_document_scores[0]
         runner_up_score = (
-            ranked_group_scores[1] if len(ranked_group_scores) > 1 else None
+            ranked_document_scores[1] if len(ranked_document_scores) > 1 else None
         )
         observed_margin = (
             top_score - runner_up_score if runner_up_score is not None else None
@@ -1131,12 +1168,22 @@ class TensorBank:
                 }
             )
         audit_base = {
-            "scoring_method": "raw_attention_top4_heads_top4_tokens_top4_queries",
+            "scoring_method": "raw_attention_top4_heads_local_window_top4_queries",
             "rank_device": str(self._rank_device),
             "query_count": int(queries.shape[0]),
             "query_head_count": query_head_count,
             "key_head_count": key_head_count,
             "head_dim": head_dim,
+            "window_tokens": int(self.span_tokens),
+            "query_role_counts": {
+                role: sum(state.role == role for state in usable_states)
+                for role in sorted({state.role for state in usable_states})
+            },
+            "knowledge_origin_roles": ["original_task", "current_user"],
+            "knowledge_anchor_query_count": len(anchor_rows),
+            "trajectory_diagnostic_query_count": sum(
+                state.role == "trajectory_compaction" for state in usable_states
+            ),
             "min_tensor_score": float(min_tensor_score),
             "min_document_margin": float(min_document_margin),
             "top_score": top_score,
@@ -1155,7 +1202,16 @@ class TensorBank:
                 **audit_base,
             )
             return ()
-        if observed_margin is not None and observed_margin < float(min_document_margin):
+        if (
+            observed_margin is not None
+            and observed_margin < float(min_document_margin)
+            and not math.isclose(
+                observed_margin,
+                float(min_document_margin),
+                rel_tol=1e-6,
+                abs_tol=1e-8,
+            )
+        ):
             record_audit(
                 status="rejected",
                 reason="document_margin_too_small",
@@ -1191,14 +1247,38 @@ class TensorBank:
             virtual_positions = tuple(range(len(source_positions)))
             selected_page_ids = tuple(page.page_id for _score, page in selected_pages)
             judge_excerpt = self._judge_excerpt(candidate, primary_page)
+            primary_page_index = next(
+                index
+                for index, page in enumerate(snapshot.pages)
+                if page.page_id == primary_page.page_id
+            )
+            primary_evidence = page_analyses[primary_page_index][1]
             token_attributions = tuple(
                 (
                     int(query_offset),
-                    page_id,
-                    float(token_page_scores[row, page_id].item()),
+                    primary_page.page_id,
+                    float(token_page_scores[row, primary_page_index].item()),
                 )
                 for row, query_offset in enumerate(usable_offsets)
-                for page_id in selected_page_ids
+            )
+            qk_attributions = tuple(
+                QueryQKAttribution(
+                    query_index=int(query_offset),
+                    query_role=usable_states[row].role,
+                    query_prompt_start=usable_states[row].prompt_start,
+                    query_prompt_end=usable_states[row].prompt_end,
+                    page_id=primary_page.page_id,
+                    query_source_start=usable_states[row].source_start,
+                    query_source_end=usable_states[row].source_end,
+                    score=float(token_page_scores[row, primary_page_index].item()),
+                    support_score=evidence.support_score,
+                    source_positions=evidence.source_positions,
+                    window_start=evidence.window_start,
+                    window_end=evidence.window_end,
+                )
+                for row, (query_offset, evidence) in enumerate(
+                    zip(usable_offsets, primary_evidence)
+                )
             )
             candidates.append(
                 replace(
@@ -1210,6 +1290,7 @@ class TensorBank:
                     source_positions=source_positions,
                     virtual_positions=virtual_positions,
                     token_attributions=token_attributions,
+                    qk_attributions=qk_attributions,
                     candidate_origin="attention_q_native_tensor_bank",
                     native_prefix=native_prefix,
                     reference_content=(
@@ -1287,7 +1368,7 @@ class TensorBank:
         queries: torch.Tensor,
         page: TensorBankPage,
         raw_key_heads: torch.Tensor,
-    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+    ) -> tuple[torch.Tensor, tuple[_QueryWindowEvidence, ...]]:
         if (
             raw_key_heads.ndim != 3
             or queries.ndim != 3
@@ -1301,7 +1382,10 @@ class TensorBank:
         if not bool(searchable.any()):
             return (
                 queries.new_full((queries.shape[0],), float("-inf")),
-                (),
+                tuple(
+                    _QueryWindowEvidence((), (), 0, 0, float("-inf"))
+                    for _ in range(int(queries.shape[0]))
+                ),
             )
         query_groups = queries.reshape(
             int(queries.shape[0]),
@@ -1321,22 +1405,78 @@ class TensorBank:
             largest=True,
             sorted=False,
         ).values.mean(dim=2)
-        searchable_positions = searchable.nonzero().flatten()
-        searchable_scores = token_scores.index_select(1, searchable_positions)
-        token_top_r = min(_TOKEN_SCORE_TOP_R, int(searchable_scores.shape[1]))
+        document_start = int(page.cognition_token_count)
+        document_end = int(page.token_end)
+        if document_end > int(token_scores.shape[1]):
+            raise RuntimeError(
+                "Tensor Bank raw K cannot cover the page source positions"
+            )
+        source_position_map = tuple(
+            int(position)
+            for position in page.source_positions[document_start:document_end]
+        )
+        document_scores = token_scores[:, document_start:document_end]
+        if len(source_position_map) != int(document_scores.shape[1]):
+            raise RuntimeError("Tensor Bank page source-position map is incomplete")
+        document_searchable = searchable[document_start:document_end]
+        window_width = min(max(1, int(self.span_tokens)), int(document_scores.shape[1]))
+        if window_width < 1 or not bool(document_searchable.any()):
+            return (
+                queries.new_full((queries.shape[0],), float("-inf")),
+                tuple(
+                    _QueryWindowEvidence((), (), 0, 0, float("-inf"))
+                    for _ in range(int(queries.shape[0]))
+                ),
+            )
+        score_windows = document_scores.unfold(1, window_width, 1)
+        search_windows = document_searchable.unfold(0, window_width, 1)
+        finite_windows = search_windows.unsqueeze(0) & torch.isfinite(score_windows)
+        required_support = min(_TOKEN_SCORE_TOP_R, window_width)
+        masked_windows = score_windows.masked_fill(~finite_windows, float("-inf"))
         top = torch.topk(
-            searchable_scores,
-            k=token_top_r,
-            dim=1,
+            masked_windows,
+            k=required_support,
+            dim=2,
             largest=True,
             sorted=True,
         )
-        anchors = tuple(
-            int(searchable_positions[index].item())
-            for row in range(int(top.indices.shape[0]))
-            for index in top.indices[row].tolist()
+        finite_support_count = finite_windows.sum(dim=2)
+        support_scores = top.values.mean(dim=2)
+        support_scores = support_scores.masked_fill(
+            finite_support_count < required_support, float("-inf")
         )
-        return top.values.mean(dim=1), anchors
+        best_scores, best_window_indices = support_scores.max(dim=1)
+        evidences: list[_QueryWindowEvidence] = []
+        for row, raw_window_start in enumerate(best_window_indices.tolist()):
+            window_start_index = int(raw_window_start)
+            selected_offsets = top.indices[row, window_start_index].tolist()
+            source_evidence_positions = tuple(
+                sorted(
+                    source_position_map[window_start_index + int(offset)]
+                    for offset in selected_offsets
+                    if bool(search_windows[window_start_index, int(offset)].item())
+                )
+            )
+            raw_evidence_positions = tuple(
+                document_start + window_start_index + int(offset)
+                for offset in selected_offsets
+                if bool(search_windows[window_start_index, int(offset)].item())
+            )
+            window_start = source_position_map[window_start_index]
+            window_last_index = min(
+                len(source_position_map) - 1,
+                window_start_index + window_width - 1,
+            )
+            evidences.append(
+                _QueryWindowEvidence(
+                    raw_positions=tuple(sorted(raw_evidence_positions)),
+                    source_positions=source_evidence_positions,
+                    window_start=window_start,
+                    window_end=source_position_map[window_last_index] + 1,
+                    support_score=float(best_scores[row].item()),
+                )
+            )
+        return best_scores, tuple(evidences)
 
     def _page_query_scores(
         self,
@@ -1770,7 +1910,7 @@ class TensorBank:
             "surprisal_threshold": snapshot.surprisal_threshold,
             "span_tokens": snapshot.span_tokens,
             "retrieval_geometry": "raw_attention_q_x_raw_attention_k",
-            "retrieval_aggregation": "top4_heads_top4_tokens_top4_queries",
+            "retrieval_aggregation": "top4_heads_local_window_top4_queries",
             "pages": [page.public_dict() for page in snapshot.pages],
         }
         try:

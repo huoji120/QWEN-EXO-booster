@@ -1,0 +1,102 @@
+[
+  {
+    "case_id": "go-gin-remote-assistance-vs-padding-oracle",
+    "original_task": "帮我写一个远程协助软件 服务端基于GO的GIN 客户端也基于GO 要求功能 web管理客户端的功能 能对客户端执行命令并且有回显 并且能查看客户端的进程列表 （windows）",
+    "current_user": "帮我写一个远程协助软件 服务端基于GO的GIN 客户端也基于GO 要求功能 web管理客户端的功能 能对客户端执行命令并且有回显 并且能查看客户端的进程列表 （windows）",
+    "trajectory_document_paths": [
+      "reflection-memory/b006758717b7f519914489248fd36c7b.md"
+    ],
+    "trajectory_max_tokens": 4500,
+    "gold_path": "reflection-memory/934574a9bfc086d29d45a01ccd13060a.md",
+    "hard_negative_paths": [
+      "reflection-memory/b006758717b7f519914489248fd36c7b.md",
+      "reflection-memory/00a0e9fc8aaeec92e8d3869e9a32202b.md",
+      "reflection-memory/07c9fb3347602ea7d52de84ed51cc8aa.md",
+      "reflection-memory/254718e9b2ddbf1fb9fed7822d55ce8e.md",
+      "reflection-memory/7ee429e4857c72624a0eb2ec6a75624f.md",
+      "reflection-memory/83f76eb3e2dc71aaaa5fef6887d9ff06.md",
+      "reflection-memory/a4ed4d1131335110a0dca603962844ec.md",
+      "reflection-memory/aa7d5809300ea599086584a487223aaf.md",
+      "reflection-memory/dc172465e602f69ead3918a64d6f4549.md"
+    ]
+  },
+  {
+    "case_id": "wfp-appid-outbound-block-vs-threejs",
+    "original_task": "Which Windows Filtering Platform management APIs and condition should block one executable's new IPv4 and IPv6 outbound connections? Use FwpmGetAppIdFromFileName0, FWPM_CONDITION_ALE_APP_ID, FWPM_LAYER_ALE_AUTH_CONNECT_V4 and V6, and DWORD error handling.",
+    "current_user": "Which Windows Filtering Platform management APIs and condition should block one executable's new IPv4 and IPv6 outbound connections? Use FwpmGetAppIdFromFileName0, FWPM_CONDITION_ALE_APP_ID, FWPM_LAYER_ALE_AUTH_CONNECT_V4 and V6, and DWORD error handling.",
+    "trajectory_document_paths": [
+      "threejs-lifecycle-and-verification.md"
+    ],
+    "trajectory_max_tokens": 4500,
+    "gold_path": "uploads/wfp-appid-ale-auth-connect-part-01.md",
+    "hard_negative_paths": [
+      "threejs-architecture-and-assets.md",
+      "threejs-lifecycle-and-verification.md",
+      "threejs-performance-and-rendering.md"
+    ]
+  },
+  {
+    "case_id": "threejs-lifecycle-cleanup-vs-wfp",
+    "original_task": "Fix a Three.js GPU leak during React route changes by disposing geometries, materials, textures, render targets, controls, workers, listeners and animation frames, then diagnose repeated navigation with renderer.info.",
+    "current_user": "Fix a Three.js GPU leak during React route changes by disposing geometries, materials, textures, render targets, controls, workers, listeners and animation frames, then diagnose repeated navigation with renderer.info.",
+    "trajectory_document_paths": [
+      "uploads/wfp-appid-ale-auth-connect-part-01.md"
+    ],
+    "trajectory_max_tokens": 4500,
+    "gold_path": "threejs-lifecycle-and-verification.md",
+    "hard_negative_paths": [
+      "uploads/wfp-appid-ale-auth-connect-part-01.md",
+      "uploads/wfp-appid-ale-auth-connect-part-02.md"
+    ]
+  },
+  {
+    "case_id": "python-api-propagation-vs-padding-oracle",
+    "original_task": "A Python API default is changing. Trace the authoritative definition, public exports, wrappers, constructors, decorators, sync and async variants, serializers, generated factories, registries, and cache keys before editing.",
+    "current_user": "A Python API default is changing. Trace the authoritative definition, public exports, wrappers, constructors, decorators, sync and async variants, serializers, generated factories, registries, and cache keys before editing.",
+    "trajectory_document_paths": [
+      "reflection-memory/b006758717b7f519914489248fd36c7b.md"
+    ],
+    "trajectory_max_tokens": 4500,
+    "gold_path": "python-change-surfaces.md",
+    "hard_negative_paths": [
+      "reflection-memory/b006758717b7f519914489248fd36c7b.md",
+      "reflection-memory/00a0e9fc8aaeec92e8d3869e9a32202b.md",
+      "reflection-memory/07c9fb3347602ea7d52de84ed51cc8aa.md",
+      "reflection-memory/254718e9b2ddbf1fb9fed7822d55ce8e.md",
+      "reflection-memory/7ee429e4857c72624a0eb2ec6a75624f.md",
+      "reflection-memory/83f76eb3e2dc71aaaa5fef6887d9ff06.md",
+      "reflection-memory/a4ed4d1131335110a0dca603962844ec.md",
+      "reflection-memory/aa7d5809300ea599086584a487223aaf.md",
+      "reflection-memory/dc172465e602f69ead3918a64d6f4549.md"
+    ]
+  },
+  {
+    "case_id": "repository-evidence-verification-vs-threejs",
+    "original_task": "Before changing the repository, identify the public entry point and every caller, then prove behavior with a focused regression and the real command exit status rather than filenames, comments, or source inspection alone.",
+    "current_user": "Before changing the repository, identify the public entry point and every caller, then prove behavior with a focused regression and the real command exit status rather than filenames, comments, or source inspection alone.",
+    "trajectory_document_paths": [
+      "threejs-lifecycle-and-verification.md"
+    ],
+    "trajectory_max_tokens": 4500,
+    "gold_path": "repository-evidence-and-change-verification.md",
+    "hard_negative_paths": [
+      "threejs-architecture-and-assets.md",
+      "threejs-lifecycle-and-verification.md",
+      "threejs-performance-and-rendering.md"
+    ]
+  },
+  {
+    "case_id": "frontend-visual-quality-vs-wfp",
+    "original_task": "Build a responsive product dashboard with semantic HTML, intentional typography and spacing tokens, accessible focus states, restrained surfaces, and no generic AI gradients or excessive glass cards.",
+    "current_user": "Build a responsive product dashboard with semantic HTML, intentional typography and spacing tokens, accessible focus states, restrained surfaces, and no generic AI gradients or excessive glass cards.",
+    "trajectory_document_paths": [
+      "uploads/wfp-appid-ale-auth-connect-part-01.md"
+    ],
+    "trajectory_max_tokens": 4500,
+    "gold_path": "frontend-visual-quality-guardrails.md",
+    "hard_negative_paths": [
+      "uploads/wfp-appid-ale-auth-connect-part-01.md",
+      "uploads/wfp-appid-ale-auth-connect-part-02.md"
+    ]
+  }
+]
