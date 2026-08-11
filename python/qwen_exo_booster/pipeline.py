@@ -16,7 +16,11 @@ from qwen_exo_booster.contracts import (
     stable_digest,
 )
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
-from qwen_exo_booster.knowledge import KnowledgeCandidate, KnowledgeRepository
+from qwen_exo_booster.knowledge import (
+    KnowledgeCandidate,
+    KnowledgeRepository,
+    semantic_document_group,
+)
 from qwen_exo_booster.policy_data import PolicyDataAttachment, PolicyDataRepository
 from qwen_exo_booster.query_probe import (
     QueryProbePlan,
@@ -466,23 +470,21 @@ class MemoryPipeline:
         document_group = candidate.document_id
         if repository is not None:
             try:
-                document = repository.get(candidate.document_id)
+                document_group = semantic_document_group(
+                    repository.get(candidate.document_id)
+                )
             except KeyError:
                 pass
-            else:
-                document_group = document.document_group or candidate.document_id
         return (candidate.lane, document_group)
 
     def _merge_same_document_candidates(
         self, candidates: tuple[KnowledgeCandidate, ...]
     ) -> tuple[tuple[KnowledgeCandidate, ...], int]:
-        """Keep only the best page candidate(s) per document before judging.
+        """Keep only the best page candidate(s) per semantic document.
 
-        Several Tensor Bank pages or shards can belong to one logical
-        document (``document_group``); without this merge a single document
-        could fill the judge shortlist. Each kept candidate is preserved
-        untouched so its page_ids, source_positions, and native-prefix
-        provenance stay intact.
+        Collection labels such as ``reflection_memory`` are not semantic groups.
+        Each retained candidate preserves its ranked page and Q/K attribution;
+        native positions are attached only after the Judge admits it.
         """
         per_document_limit = max(1, int(self.config.qk_max_candidates_per_document))
         groups: dict[tuple[str, str], list[KnowledgeCandidate]] = {}
@@ -649,16 +651,11 @@ class MemoryPipeline:
         merged_candidates, merged_count = self._merge_same_document_candidates(
             candidates
         )
-        bypassed = tuple(
-            candidate
-            for candidate in merged_candidates
-            if candidate.lane == "knowledge" and self.config.qk_only_knowledge
-        )
+        bypassed: tuple[KnowledgeCandidate, ...] = ()
         all_judged = tuple(
             candidate
             for candidate in merged_candidates
             if candidate.lane in {"knowledge", "policydata"}
-            and candidate not in bypassed
         )
         judge_limit = min(
             _COMPARATIVE_CANDIDATE_LIMIT,
@@ -727,21 +724,16 @@ class MemoryPipeline:
                 == stable_digest(candidate.reference_content)
             )
         }
-        bypassed_ids = {candidate.candidate_id for candidate in bypassed}
         eligible = tuple(
             candidate
             for candidate in merged_candidates
             if candidate.candidate_id in eligible_ids
-            or candidate.candidate_id in bypassed_ids
         )
-        if bypassed and not judged:
-            admission_mode = "native_qk"
-        elif bypassed:
-            admission_mode = "mixed_qk_semantic"
-        elif batch is not None and batch.selection_method == "comparative_listwise":
-            admission_mode = "comparative_semantic_selection"
-        else:
-            admission_mode = "semantic_eligibility"
+        admission_mode = (
+            "comparative_semantic_selection"
+            if batch is not None and batch.selection_method == "comparative_listwise"
+            else "semantic_eligibility"
+        )
         self._emit_request_judge_telemetry(
             request_id,
             candidates=judged,
@@ -1615,39 +1607,32 @@ class MemoryPipeline:
             return None
         status = "unavailable"
         winner = None
-        if self.tensor_bank is not None and state.query_heads:
-            await self.tensor_bank.ensure_ready()
-            candidates = self.tensor_bank.rank(
-                state.query_heads,
-                query_states=state.query_states,
-                query_identity=f"{request_id}:turn-end-attractor",
-                limit=self.config.max_candidates,
-                min_tensor_score=self.config.qk_admission_gates[0],
-                min_document_margin=self.config.qk_admission_margin,
+        winner_decision = None
+        decision_by_candidate = {
+            decision.candidate_id: decision
+            for decision in state.decisions
+            if decision.status is EligibilityStatus.ELIGIBLE
+            and decision.parent_request_id == request_id
+        }
+        native_candidates = tuple(
+            candidate
+            for candidate in state.candidates
+            if candidate.native_prefix is not None
+            and candidate.candidate_id in decision_by_candidate
+        )
+        if native_candidates:
+            winner = min(
+                native_candidates,
+                key=lambda candidate: (
+                    -self._raw_tensor_score(candidate),
+                    candidate.lane,
+                    candidate.document_id,
+                ),
             )
-            if self.policy_data is not None:
-                candidates = tuple(
-                    candidate
-                    for candidate in candidates
-                    if not self.policy_data.is_non_reference_candidate(candidate)
-                )
-            native_candidates = tuple(
-                candidate
-                for candidate in candidates
-                if candidate.native_prefix is not None
-            )
-            if native_candidates:
-                winner = min(
-                    native_candidates,
-                    key=lambda candidate: (
-                        -self._raw_tensor_score(candidate),
-                        candidate.lane,
-                        candidate.document_id,
-                    ),
-                )
-                status = "ready"
-            else:
-                status = "no_stable_match"
+            winner_decision = decision_by_candidate[winner.candidate_id]
+            status = "ready"
+        else:
+            status = "no_admitted_match"
         updated = replace(
             state,
             query_heads=(),
@@ -1671,7 +1656,9 @@ class MemoryPipeline:
             next_attractor_tensor_score=(
                 winner.tensor_score if winner is not None else None
             ),
-            next_attractor_decision_id=None,
+            next_attractor_decision_id=(
+                winner_decision.decision_id if winner_decision is not None else None
+            ),
         )
         await self._store_state(updated)
         return updated

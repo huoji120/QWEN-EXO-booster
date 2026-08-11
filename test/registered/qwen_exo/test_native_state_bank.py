@@ -459,6 +459,10 @@ async def test_tensor_bank_builds_one_document_state_with_aligned_surprisal_span
         query_identity="query",
         limit=1,
     )
+    assert candidate.native_prefix is None
+    candidate = bank.bind_native_prefix(
+        candidate, query="token-100 token-300 token-500"
+    )
     selection = candidate.native_prefix
     assert selection is not None
     assert len(selection.token_ids) % 64 == 0
@@ -471,6 +475,8 @@ async def test_tensor_bank_builds_one_document_state_with_aligned_surprisal_span
         query_identity="query-other",
         limit=1,
     )
+    assert other_candidate.native_prefix is None
+    other_candidate = bank.bind_native_prefix(other_candidate, query="token-other")
     assert other_candidate.native_prefix is not None
     assert other_candidate.native_prefix.prefix_identity != selection.prefix_identity
     assert other_candidate.native_prefix.local_positions != selection.local_positions

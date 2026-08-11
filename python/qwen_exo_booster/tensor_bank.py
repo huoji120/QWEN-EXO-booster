@@ -27,6 +27,8 @@ from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     NativePrefixSelection,
     QueryQKAttribution,
+    retrieval_diversity_bucket,
+    semantic_document_group,
 )
 from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.native_state_bank import (
@@ -63,7 +65,20 @@ _HEAD_SCORE_TOP_R = 4
 _TOKEN_SCORE_TOP_R = 4
 _QUERY_SCORE_TOP_R = 4
 _DOCUMENT_PAGE_TOP_R = 2
-_DOCUMENT_GROUP_TOP_R = 2
+_ROBUST_SCALE_FACTOR = 1.4826
+_ROBUST_SCALE_EPSILON = 1e-6
+_REFLECTION_TEMPLATE_MARKERS = (
+    "**结果：** 成功",
+    "**结果：** 失败",
+    "**结果：** 混合",
+    "**结果：** 不确定",
+    "证据与时间线:",
+    "因果分析与不确定性:",
+    "冲突整理与保留边界:",
+    "可复用经验与适用边界:",
+    "应避免的做法:",
+    "下一次建议:",
+)
 _MIN_TENSOR_SCORE = 0.0
 _MIN_DOCUMENT_MARGIN = 0.005
 _SINK_TOKEN_TEXT = frozenset(
@@ -81,6 +96,15 @@ _SINK_TOKEN_TEXT = frozenset(
         "！",
         "？",
         "、",
+        "#",
+        "##",
+        "###",
+        "*",
+        "**",
+        "-",
+        "---",
+        "`",
+        "```",
     }
 )
 
@@ -92,6 +116,7 @@ class _QueryWindowEvidence:
     window_start: int
     window_end: int
     support_score: float
+    head_groups: tuple[int, ...] = ()
 
 
 class TensorBankCompileError(RuntimeError):
@@ -243,7 +268,7 @@ class TensorBankSnapshot:
                 len(page.salient_positions) for page in self.pages
             ),
             "retrieval_geometry": "raw_attention_q_x_raw_attention_k",
-            "retrieval_aggregation": "top4_heads_local_window_top4_queries",
+            "retrieval_aggregation": "top4_heads_template_masked_local_window_top4_queries_relative_shadow",
             "read_only": True,
             "document_level": True,
             "paged": False,
@@ -313,6 +338,7 @@ class TensorBank:
         self._refresh_lock = asyncio.Lock()
         self._resident_page_ids: set[int] = set()
         self._token_search_masks: dict[tuple[str, int], torch.Tensor] = {}
+        self._template_filtered_counts: dict[tuple[str, int], int] = {}
         self._judge_excerpt_cache: OrderedDict[tuple[int, str], str | None] = (
             OrderedDict()
         )
@@ -473,6 +499,7 @@ class TensorBank:
         )
         if self._snapshot.source_digest != source_digest:
             self._token_search_masks.clear()
+            self._template_filtered_counts.clear()
             self._rank_key_cache.clear()
         if self._failure_digest == source_digest and self._compile_failure is not None:
             raise self._compile_failure
@@ -944,6 +971,60 @@ class TensorBank:
         selected = finite[: max(1, int(limit))]
         return sum(selected) / len(selected)
 
+    @staticmethod
+    def _robust_standardize(
+        scores: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[float, ...], tuple[float, ...]]:
+        standardized = scores.new_full(scores.shape, float("-inf"))
+        medians: list[float] = []
+        scales: list[float] = []
+        for row in range(int(scores.shape[0])):
+            values = scores[row]
+            finite = torch.isfinite(values)
+            finite_values = values[finite]
+            if not int(finite_values.numel()):
+                medians.append(float("nan"))
+                scales.append(float("nan"))
+                continue
+            median = finite_values.median()
+            deviation = (finite_values - median).abs().median()
+            robust_scale = deviation * _ROBUST_SCALE_FACTOR
+            fallback_scale = finite_values.std(unbiased=False)
+            scale = torch.where(
+                robust_scale > _ROBUST_SCALE_EPSILON,
+                robust_scale,
+                torch.clamp(fallback_scale, min=1.0),
+            )
+            standardized[row, finite] = (finite_values - median) / scale
+            medians.append(float(median.item()))
+            scales.append(float(scale.item()))
+        return standardized, tuple(medians), tuple(scales)
+
+    def _diversify_ranked_documents(
+        self,
+        ranked: list[tuple[tuple[str, str], list[tuple[float, TensorBankPage]]]],
+    ) -> list[tuple[tuple[str, str], list[tuple[float, TensorBankPage]]]]:
+        buckets: OrderedDict[
+            tuple[str, str],
+            list[tuple[tuple[str, str], list[tuple[float, TensorBankPage]]]],
+        ] = OrderedDict()
+        for item in ranked:
+            lane, document_id = item[0]
+            repository = self.repositories.get(lane)
+            bucket = "unclassified"
+            if repository is not None:
+                try:
+                    bucket = retrieval_diversity_bucket(repository.get(document_id))
+                except KeyError:
+                    pass
+            buckets.setdefault((lane, bucket), []).append(item)
+        diversified = []
+        while any(buckets.values()):
+            for entries in buckets.values():
+                if entries:
+                    diversified.append(entries.pop(0))
+        return diversified
+
     def _rank_key_heads(
         self, page: TensorBankPage, raw_key_heads: torch.Tensor
     ) -> torch.Tensor:
@@ -1064,16 +1145,13 @@ class TensorBank:
         token_page_scores = torch.stack(
             tuple(analysis[0] for analysis in page_analyses), dim=1
         )
-        query_anchor_positions = {
-            page.page_id: tuple(
-                position
-                for row, evidence in enumerate(analysis[1])
-                if row in anchor_rows
-                for position in evidence.raw_positions
-            )
-            for page, analysis in zip(snapshot.pages, page_analyses)
-        }
+        (
+            relative_page_scores,
+            query_background_medians,
+            query_background_scales,
+        ) = self._robust_standardize(token_page_scores)
         anchor_page_scores = token_page_scores.index_select(0, anchor_index)
+        anchor_relative_scores = relative_page_scores.index_select(0, anchor_index)
         query_top_r = min(_QUERY_SCORE_TOP_R, int(anchor_page_scores.shape[0]))
         aggregate_scores = torch.topk(
             anchor_page_scores,
@@ -1082,20 +1160,33 @@ class TensorBank:
             largest=True,
             sorted=False,
         ).values.mean(dim=0)
+        relative_aggregate_scores = torch.topk(
+            anchor_relative_scores,
+            k=query_top_r,
+            dim=0,
+            largest=True,
+            sorted=False,
+        ).values.mean(dim=0)
 
         per_document: dict[tuple[str, str], list[tuple[float, TensorBankPage]]] = {}
-        for page, score in zip(snapshot.pages, aggregate_scores.tolist()):
+        relative_pages: dict[tuple[str, str], list[float]] = {}
+        for page, score, relative_score in zip(
+            snapshot.pages,
+            aggregate_scores.tolist(),
+            relative_aggregate_scores.tolist(),
+        ):
             score = float(score)
+            relative_score = float(relative_score)
             if (
                 eligible_documents is not None
                 and (page.lane, page.document_id) not in eligible_documents
             ):
                 continue
-            if not math.isfinite(score):
+            if not math.isfinite(score) or not math.isfinite(relative_score):
                 continue
-            per_document.setdefault((page.lane, page.document_id), []).append(
-                (score, page)
-            )
+            key = (page.lane, page.document_id)
+            per_document.setdefault(key, []).append((score, page))
+            relative_pages.setdefault(key, []).append(relative_score)
         if not per_document:
             record_audit(status="rejected", reason="no_finite_document_scores")
             return ()
@@ -1105,36 +1196,44 @@ class TensorBank:
             )
             for key, page_scores in per_document.items()
         }
-        document_groups: dict[tuple[str, str], tuple[str, str]] = {}
-        grouped_document_scores: dict[tuple[str, str], list[float]] = {}
-        for (lane, document_id), _page_scores in per_document.items():
-            document_group = document_id
-            repository = self.repositories.get(lane)
-            if repository is not None:
-                try:
-                    document = repository.get(document_id)
-                except KeyError:
-                    pass
-                else:
-                    document_group = document.document_group or document_id
-            group_key = (lane, document_group)
-            document_groups[(lane, document_id)] = group_key
-            grouped_document_scores.setdefault(group_key, []).append(
-                document_scores[(lane, document_id)]
-            )
-        grouped_scores = {
-            group_key: self._top_mean(scores, _DOCUMENT_GROUP_TOP_R)
-            for group_key, scores in grouped_document_scores.items()
+        relative_document_scores = {
+            key: self._top_mean(scores, _DOCUMENT_PAGE_TOP_R)
+            for key, scores in relative_pages.items()
         }
-        ranked_documents = sorted(
+        ranked_by_score = sorted(
             per_document.items(),
             key=lambda item: (
-                -grouped_scores[document_groups[item[0]]],
                 -document_scores[item[0]],
                 item[0][0],
                 item[0][1],
             ),
         )
+        ranked_documents = self._diversify_ranked_documents(list(ranked_by_score))
+        pre_diversity_rank = {
+            key: index + 1 for index, (key, _pages) in enumerate(ranked_by_score)
+        }
+        post_diversity_rank = {
+            key: index + 1 for index, (key, _pages) in enumerate(ranked_documents)
+        }
+        relative_ranked_keys = sorted(
+            relative_document_scores,
+            key=lambda key: (
+                -relative_document_scores[key],
+                key[0],
+                key[1],
+            ),
+        )
+        relative_rank = {
+            key: index + 1 for index, key in enumerate(relative_ranked_keys)
+        }
+        relative_percentiles = {
+            key: (
+                1.0
+                if len(relative_ranked_keys) == 1
+                else 1.0 - (relative_rank[key] - 1) / (len(relative_ranked_keys) - 1)
+            )
+            for key in relative_ranked_keys
+        }
         ranked_document_scores = sorted(document_scores.values(), reverse=True)
         top_score = ranked_document_scores[0]
         runner_up_score = (
@@ -1143,15 +1242,31 @@ class TensorBank:
         observed_margin = (
             top_score - runner_up_score if runner_up_score is not None else None
         )
+        ranked_relative_scores = sorted(relative_document_scores.values(), reverse=True)
+        relative_top_score = ranked_relative_scores[0]
+        relative_runner_up_score = (
+            ranked_relative_scores[1] if len(ranked_relative_scores) > 1 else None
+        )
+        relative_observed_margin = (
+            relative_top_score - relative_runner_up_score
+            if relative_runner_up_score is not None
+            else None
+        )
         scored_documents = []
-        for (lane, document_id), _page_scores in ranked_documents:
+        for (lane, document_id), page_scores in ranked_by_score:
             repository = self.repositories.get(lane)
             relative_path = document_id
+            semantic_group = document_id
+            diversity_bucket = "unclassified"
             if repository is not None:
                 try:
-                    relative_path = repository.get(document_id).relative_path
+                    document = repository.get(document_id)
                 except KeyError:
                     pass
+                else:
+                    relative_path = document.relative_path
+                    semantic_group = semantic_document_group(document)
+                    diversity_bucket = retrieval_diversity_bucket(document)
             tensor_score = document_scores[(lane, document_id)]
             scored_documents.append(
                 {
@@ -1159,6 +1274,20 @@ class TensorBank:
                     "document_id": document_id,
                     "relative_path": relative_path,
                     "tensor_score": tensor_score,
+                    "relative_tensor_score": relative_document_scores[
+                        (lane, document_id)
+                    ],
+                    "score_percentile": relative_percentiles[(lane, document_id)],
+                    "semantic_group": semantic_group,
+                    "diversity_bucket": diversity_bucket,
+                    "pre_diversity_rank": pre_diversity_rank[(lane, document_id)],
+                    "post_diversity_rank": post_diversity_rank[(lane, document_id)],
+                    "template_filtered_tokens": sum(
+                        self._template_filtered_counts.get(
+                            (snapshot.source_digest, page.page_id), 0
+                        )
+                        for _score, page in page_scores
+                    ),
                     "passed_score": tensor_score >= float(min_tensor_score),
                     "rejection_reason": (
                         None
@@ -1169,6 +1298,7 @@ class TensorBank:
             )
         audit_base = {
             "scoring_method": "raw_attention_top4_heads_local_window_top4_queries",
+            "relative_scoring_method": "per_query_median_mad_top4_queries_shadow",
             "rank_device": str(self._rank_device),
             "query_count": int(queries.shape[0]),
             "query_head_count": query_head_count,
@@ -1184,11 +1314,17 @@ class TensorBank:
             "trajectory_diagnostic_query_count": sum(
                 state.role == "trajectory_compaction" for state in usable_states
             ),
+            "query_background_medians": list(query_background_medians),
+            "query_background_scales": list(query_background_scales),
             "min_tensor_score": float(min_tensor_score),
             "min_document_margin": float(min_document_margin),
             "top_score": top_score,
             "runner_up_score": runner_up_score,
             "observed_margin": observed_margin,
+            "relative_top_score": relative_top_score,
+            "relative_runner_up_score": relative_runner_up_score,
+            "relative_observed_margin": relative_observed_margin,
+            "relative_score_active": False,
             "considered_documents": len(ranked_documents),
             "scored_documents": scored_documents[: max(limit * 2, 8)],
             "document_scope_size": (
@@ -1237,14 +1373,6 @@ class TensorBank:
                 continue
             selected_pages = (max(page_scores, key=lambda item: item[0]),)
             primary_page = selected_pages[0][1]
-            native_prefix = self._select_native_prefix(
-                primary_page,
-                query_anchor_positions=query_anchor_positions.get(
-                    primary_page.page_id, ()
-                ),
-            )
-            source_positions = native_prefix.source_positions
-            virtual_positions = tuple(range(len(source_positions)))
             selected_page_ids = tuple(page.page_id for _score, page in selected_pages)
             judge_excerpt = self._judge_excerpt(candidate, primary_page)
             primary_page_index = next(
@@ -1275,24 +1403,47 @@ class TensorBank:
                     source_positions=evidence.source_positions,
                     window_start=evidence.window_start,
                     window_end=evidence.window_end,
+                    relative_score=float(
+                        relative_page_scores[row, primary_page_index].item()
+                    ),
+                    head_group_count=len(evidence.head_groups),
                 )
                 for row, (query_offset, evidence) in enumerate(
                     zip(usable_offsets, primary_evidence)
                 )
             )
+            supported_anchor_rows = tuple(
+                row
+                for row in anchor_rows
+                if math.isfinite(
+                    float(relative_page_scores[row, primary_page_index].item())
+                )
+                and float(relative_page_scores[row, primary_page_index].item()) > 0.0
+            )
+            supported_roles = {usable_states[row].role for row in supported_anchor_rows}
+            supported_head_groups = {
+                head_group
+                for row in supported_anchor_rows
+                for head_group in primary_evidence[row].head_groups
+            }
             candidates.append(
                 replace(
                     candidate,
                     score=tensor_score + candidate.quality_prior,
                     lexical_score=0.0,
                     tensor_score=tensor_score,
+                    relative_tensor_score=relative_document_scores[(lane, document_id)],
+                    score_percentile=relative_percentiles[(lane, document_id)],
+                    anchor_support_count=len(supported_anchor_rows),
+                    anchor_role_count=len(supported_roles),
+                    head_group_count=len(supported_head_groups),
                     page_ids=selected_page_ids,
-                    source_positions=source_positions,
-                    virtual_positions=virtual_positions,
+                    source_positions=(),
+                    virtual_positions=(),
                     token_attributions=token_attributions,
                     qk_attributions=qk_attributions,
                     candidate_origin="attention_q_native_tensor_bank",
-                    native_prefix=native_prefix,
+                    native_prefix=None,
                     reference_content=(
                         judge_excerpt
                         if judge_excerpt is not None
@@ -1398,13 +1549,16 @@ class TensorBank:
         ) / math.sqrt(int(queries.shape[2]))
         flattened_heads = head_logits.flatten(start_dim=2)
         head_top_r = min(_HEAD_SCORE_TOP_R, int(flattened_heads.shape[2]))
-        token_scores = torch.topk(
+        head_top = torch.topk(
             flattened_heads,
             k=head_top_r,
             dim=2,
             largest=True,
             sorted=False,
-        ).values.mean(dim=2)
+        )
+        token_scores = head_top.values.mean(dim=2)
+        query_heads_per_key = int(queries.shape[1]) // int(raw_key_heads.shape[1])
+        token_head_groups = head_top.indices // query_heads_per_key
         document_start = int(page.cognition_token_count)
         document_end = int(page.token_end)
         if document_end > int(token_scores.shape[1]):
@@ -1462,6 +1616,19 @@ class TensorBank:
                 for offset in selected_offsets
                 if bool(search_windows[window_start_index, int(offset)].item())
             )
+            evidence_head_groups = tuple(
+                sorted(
+                    {
+                        int(head_group)
+                        for offset in selected_offsets
+                        if bool(search_windows[window_start_index, int(offset)].item())
+                        for head_group in token_head_groups[
+                            row,
+                            document_start + window_start_index + int(offset),
+                        ].tolist()
+                    }
+                )
+            )
             window_start = source_position_map[window_start_index]
             window_last_index = min(
                 len(source_position_map) - 1,
@@ -1474,6 +1641,7 @@ class TensorBank:
                     window_start=window_start,
                     window_end=source_position_map[window_last_index] + 1,
                     support_score=float(best_scores[row].item()),
+                    head_groups=evidence_head_groups,
                 )
             )
         return best_scores, tuple(evidences)
@@ -1493,7 +1661,7 @@ class TensorBank:
         query: str,
         preferred_page_ids: tuple[int, ...] = (),
     ) -> KnowledgeCandidate:
-        """Attach an exact precompiled document state to a restored candidate."""
+        """Attach query-conditioned native state only after semantic admission."""
         del query
 
         if candidate.native_prefix is not None or not self._snapshot.ready:
@@ -1507,20 +1675,39 @@ class TensorBank:
         )
         if not pages:
             return candidate
-        preferred = {page_id: index for index, page_id in enumerate(preferred_page_ids)}
+        preferred_ids = preferred_page_ids or candidate.page_ids
+        preferred = {page_id: index for index, page_id in enumerate(preferred_ids)}
         preferred_pages = tuple(page for page in pages if page.page_id in preferred)
         page = (
             min(preferred_pages, key=lambda item: preferred[item.page_id])
             if preferred_pages
             else min(pages, key=lambda item: item.page_id)
         )
-        native_prefix = self.selection_for_page(page.page_id)
+        query_anchor_positions = tuple(
+            sorted(
+                {
+                    int(position)
+                    for attribution in candidate.qk_attributions
+                    if attribution.page_id == page.page_id
+                    and attribution.query_role in {"original_task", "current_user"}
+                    for position in attribution.source_positions
+                }
+            )
+        )
+        native_prefix = self._select_native_prefix(
+            page,
+            query_anchor_positions=query_anchor_positions,
+        )
         return replace(
             candidate,
             page_ids=(page.page_id,),
             source_positions=native_prefix.source_positions,
             virtual_positions=tuple(range(len(native_prefix.source_positions))),
-            candidate_origin="restored_native_tensor_bank",
+            candidate_origin=(
+                "admitted_native_tensor_bank"
+                if candidate.qk_attributions
+                else "restored_native_tensor_bank"
+            ),
             native_prefix=native_prefix,
         )
 
@@ -1552,6 +1739,48 @@ class TensorBank:
         repeated = padding * math.ceil(missing / len(padding))
         return document_token_ids + repeated[:missing]
 
+    @staticmethod
+    def _subsequence_positions(
+        values: tuple[int, ...], pattern: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        if not pattern or len(pattern) > len(values):
+            return ()
+        positions = []
+        width = len(pattern)
+        for start in range(len(values) - width + 1):
+            if values[start : start + width] == pattern:
+                positions.extend(range(start, start + width))
+        return tuple(positions)
+
+    def _template_token_positions(self, page: TensorBankPage) -> frozenset[int]:
+        if page.lane != "knowledge":
+            return frozenset()
+        repository = self.repositories.get(page.lane)
+        if repository is None:
+            return frozenset()
+        try:
+            document = repository.get(page.document_id)
+        except KeyError:
+            return frozenset()
+        if document.source_kind != "trajectory_reflection":
+            return frozenset()
+        document_ids = tuple(
+            int(token)
+            for token in self.tokenizer.encode(
+                document.normalized_content,
+                add_special_tokens=False,
+            )
+        )
+        filtered = set()
+        for marker in _REFLECTION_TEMPLATE_MARKERS:
+            marker_ids = tuple(
+                int(token)
+                for token in self.tokenizer.encode(marker, add_special_tokens=False)
+            )
+            filtered.update(self._subsequence_positions(document_ids, marker_ids))
+        offset = int(page.cognition_token_count)
+        return frozenset(offset + position for position in filtered)
+
     def _token_search_mask(self, page: TensorBankPage, available: int) -> torch.Tensor:
         cache_key = (self._snapshot.source_digest, page.page_id)
         cached = self._token_search_masks.get(cache_key)
@@ -1562,10 +1791,16 @@ class TensorBank:
             int(token_id)
             for token_id in tuple(getattr(self.tokenizer, "all_special_ids", ()) or ())
         }
+        template_positions = self._template_token_positions(page)
+        self._template_filtered_counts[cache_key] = len(template_positions)
         for position, token_id in enumerate(self._page_document_token_ids(page)):
             if page.lane == "cognition" or position < page.cognition_token_count:
                 continue
-            if position >= available or token_id in special_ids:
+            if (
+                position >= available
+                or token_id in special_ids
+                or position in template_positions
+            ):
                 continue
             try:
                 token_text = self.tokenizer.decode(
@@ -1910,7 +2145,7 @@ class TensorBank:
             "surprisal_threshold": snapshot.surprisal_threshold,
             "span_tokens": snapshot.span_tokens,
             "retrieval_geometry": "raw_attention_q_x_raw_attention_k",
-            "retrieval_aggregation": "top4_heads_local_window_top4_queries",
+            "retrieval_aggregation": "top4_heads_template_masked_local_window_top4_queries_relative_shadow",
             "pages": [page.public_dict() for page in snapshot.pages],
         }
         try:
