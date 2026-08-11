@@ -17,6 +17,7 @@ from qwen_exo_booster.document_ingest import (
 from qwen_exo_booster.reflection_memory import ReflectionMemory
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.runtime import QwenExoRuntime
+from qwen_exo_booster.query_probe import QueryStateSpan
 
 
 def test_markdown_normalization_removes_metadata_and_comments():
@@ -463,11 +464,15 @@ class _ReflectionQueryProbe:
         return SimpleNamespace(
             status="ready",
             query_heads=(((1.0, 0.0),),),
+            query_states=(QueryStateSpan("current_user", 0, 1, 0, 1),),
             public_dict=lambda: {
                 "status": "ready",
                 "query_count": 1,
                 "query_head_count": 1,
                 "head_dim": 2,
+                "query_states": [
+                    QueryStateSpan("current_user", 0, 1, 0, 1).public_dict()
+                ],
             },
         )
 

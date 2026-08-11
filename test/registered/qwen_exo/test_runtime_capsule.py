@@ -6,9 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 from qwen_exo_booster.capsule import CapsuleUpdateInput
+from qwen_exo_booster.compaction import CompactionSummary
 from qwen_exo_booster.config import QwenExoConfig, QwenExoFeatureFlags
+from qwen_exo_booster.contracts import stable_digest
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.observer import MidThinkEvent, ObserverResult
+from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.runtime import (
     PendingReflectionMemory,
     QwenExoCapacityConflict,
@@ -25,6 +28,9 @@ class FakeRequest:
     instructions: str | None = None
     extra_key: str | None = None
     background: bool = False
+    user: str | None = None
+    session_id: str | None = None
+    prompt_cache_key: str | None = None
 
     def model_copy(self, update):
         return replace(self, **update)
@@ -66,6 +72,64 @@ def runtime(tmp_path):
     )
     value.state = QwenExoRuntimeState.READY
     return value
+
+
+def capture_retrieval_questions(value):
+    captures = {"query_probe": [], "memory_pipeline": [], "role_plans": []}
+
+    class QueryProbe:
+        async def probe(self, request_id, plan):
+            captures["role_plans"].append((request_id, plan))
+            state = QueryStateSpan("original_task", 0, 1, 0, 1)
+            return SimpleNamespace(
+                query_heads=(((0.1, 0.2),),),
+                query_states=(state,),
+                role_plan_digest=plan.identity,
+                status="ready",
+                prompt_tokens=2,
+            )
+
+    class Pipeline:
+        def __init__(self):
+            self.states = {}
+
+        async def prepare_responses_request(self, request, **kwargs):
+            question = kwargs["retrieval_question"]
+            captures["memory_pipeline"].append((request.request_id, question))
+            captures["query_probe"].append((request.request_id, question))
+            state = SimpleNamespace(
+                public_dict=lambda: {
+                    "question_digest": stable_digest(question),
+                    "retrieval_question_digest": stable_digest(question),
+                    "next_native_attractor": {"status": "ready"},
+                },
+                question_digest=stable_digest(question),
+                retrieval_question_digest=stable_digest(question),
+                policy_attachment=None,
+                radix_prefix_identity=None,
+                previous_response_id=kwargs.get("published_previous_response_id"),
+                effective_memory_previous_response_id=kwargs.get(
+                    "memory_previous_response_id"
+                ),
+                policy_attached_tokens=0,
+                attached_tokens=0,
+                policy_document_ids=(),
+                radix_prefix_page_id=None,
+                radix_prefix_token_ids=(),
+                restoration_status="not_requested",
+            )
+            self.states[request.request_id] = state
+            return request, state
+
+        async def capture_native_attractor(self, request_id):
+            return self.states.get(request_id)
+
+        async def get_state(self, request_id):
+            return self.states.get(request_id)
+
+    value.query_probe = QueryProbe()
+    value.memory_pipeline = Pipeline()
+    return captures
 
 
 def test_reflection_memory_runs_after_own_request_becomes_idle(tmp_path, monkeypatch):
@@ -1061,11 +1125,13 @@ def test_query_probe_precedes_stateless_post_tool_recall(tmp_path):
     pipeline_kwargs = {}
 
     class QueryProbe:
-        async def probe(self, request_id, question):
-            del request_id, question
+        async def probe(self, request_id, plan):
+            del request_id
             order.append("query_probe")
             return SimpleNamespace(
                 query_heads=(((0.1, 0.2),),),
+                query_states=(QueryStateSpan("current_user", 0, 1, 0, 1),),
+                role_plan_digest=plan.identity,
                 status="ready",
                 prompt_tokens=2,
             )
@@ -1128,6 +1194,225 @@ def test_query_probe_precedes_stateless_post_tool_recall(tmp_path):
     assert pipeline_kwargs["query_heads"] == (((0.1, 0.2),),)
     assert pipeline_kwargs["query_probe_status"] == "ready"
     assert pipeline_kwargs["query_probe_prompt_tokens"] == 2
+
+
+def test_parent_root_drives_tool_only_query_probe_without_changing_started_input(
+    tmp_path,
+):
+    value = runtime(tmp_path)
+    captures = capture_retrieval_questions(value)
+    root = "Implement the WFP request-start lineage fix"
+    observation = "Script written successfully"
+    value._original_tasks["resp-parent"] = root
+
+    _prepared, state = asyncio.run(
+        value.prepare_responses_request(
+            FakeRequest(
+                request_id="resp-child",
+                previous_response_id="resp-parent",
+                input=[
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-write",
+                        "output": observation,
+                    }
+                ],
+            )
+        )
+    )
+
+    question = captures["query_probe"][0][1]
+    assert captures["memory_pipeline"] == [("resp-child", question)]
+    assert question.count("ORIGINAL TASK:\n") == 1
+    assert question.count(root) == 1
+    assert question.count("RECENT EXECUTION TRAJECTORY:\n") == 1
+    assert question.count(observation) == 1
+    assert value._request_questions["resp-child"] == root
+    assert state.question_digest == stable_digest(question)
+    assert state.retrieval_question_digest == stable_digest(question)
+    started = next(
+        event
+        for event in value.telemetry.events("resp-child")
+        if event.event_type == "request.started"
+    )
+    expected_started_input = (
+        "RECENT EXECUTION TRAJECTORY:\n" f"TOOL OBSERVATION:\n{observation}"
+    )
+    assert started.payload["input"] == {
+        "redacted": True,
+        "sha256": stable_digest(expected_started_input),
+        "bytes": len(expected_started_input.encode("utf-8")),
+    }
+    assert started.payload["input"]["sha256"] != stable_digest(root)
+    assert started.payload["retrieval_query_digest"] == stable_digest(question)
+
+
+def test_stateless_full_history_drives_root_current_and_trajectory_once(tmp_path):
+    value = runtime(tmp_path)
+    captures = capture_retrieval_questions(value)
+    root = "Implement the stateless QK fix"
+    current = "Run the focused verification"
+    observation = "Source edit completed"
+
+    asyncio.run(
+        value.prepare_responses_request(
+            FakeRequest(
+                request_id="resp-stateless-capture",
+                input=[
+                    {"role": "user", "content": root},
+                    {"role": "assistant", "content": "Editing the runtime."},
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-stateless",
+                        "output": observation,
+                    },
+                    {"role": "user", "content": current},
+                ],
+            )
+        )
+    )
+
+    question = captures["query_probe"][0][1]
+    assert captures["memory_pipeline"] == [("resp-stateless-capture", question)]
+    assert question.count(root) == 1
+    assert question.count(current) == 1
+    assert question.count(observation) == 1
+    assert question.count("ORIGINAL TASK:\n") == 1
+    assert question.count("CURRENT USER REQUEST:\n") == 1
+    assert question.count("RECENT EXECUTION TRAJECTORY:\n") == 1
+    assert value._request_questions["resp-stateless-capture"] == root
+
+
+def test_stateless_call_association_requires_learned_isolated_root(tmp_path):
+    value = runtime(tmp_path)
+    captures = capture_retrieval_questions(value)
+    root = "Audit the authoritative caller lineage"
+    seed = FakeRequest(
+        request_id="resp-seed",
+        user="caller-a",
+        session_id="session-a",
+        instructions="shared system instructions",
+        input=[
+            {"role": "user", "content": root},
+            {
+                "type": "function_call_output",
+                "call_id": "call-known",
+                "output": "seed observation",
+            },
+        ],
+    )
+    known = FakeRequest(
+        request_id="resp-known",
+        user="caller-a",
+        session_id="session-a",
+        instructions="shared system instructions",
+        input=[
+            {
+                "type": "function_call_output",
+                "call_id": "call-known",
+                "output": "known observation",
+            }
+        ],
+    )
+    unknown = replace(
+        known,
+        request_id="resp-unknown",
+        input=[
+            {
+                "type": "function_call_output",
+                "call_id": "call-unknown",
+                "output": "unknown observation",
+            }
+        ],
+    )
+    isolated = replace(
+        known,
+        request_id="resp-isolated",
+        user="caller-b",
+        session_id="session-b",
+        input=[
+            {
+                "type": "function_call_output",
+                "call_id": "call-known",
+                "output": "isolated observation",
+            }
+        ],
+    )
+
+    async def exercise():
+        for request in (seed, known, unknown, isolated):
+            await value.prepare_responses_request(request)
+
+    asyncio.run(exercise())
+
+    questions = dict(captures["query_probe"])
+    assert questions["resp-known"].count(root) == 1
+    assert "known observation" in questions["resp-known"]
+    assert root not in questions["resp-unknown"]
+    assert questions["resp-unknown"].startswith("RECENT EXECUTION TRAJECTORY:\n")
+    assert root not in questions["resp-isolated"]
+    assert questions["resp-isolated"].startswith("RECENT EXECUTION TRAJECTORY:\n")
+
+
+def test_compaction_query_uses_root_and_summary_once_and_rejects_parent_mismatch(
+    tmp_path,
+):
+    value = runtime(tmp_path)
+    captures = capture_retrieval_questions(value)
+    response_id = "resp_compact_parent"
+    source_digest = "compaction-source"
+    root = "Implement the compaction lineage fix"
+    summary_text = "Runtime ordering was corrected; focused verification remains."
+    current = "Run the compaction regression"
+    observation = "Pipeline question captured"
+    summary = CompactionSummary(
+        summary=summary_text,
+        input_tokens=10,
+        output_tokens=8,
+        reasoning_tokens=1,
+        source_digest=source_digest,
+    )
+    encoded = summary.encrypted_content(response_id=response_id, memory={})
+    value._compaction_summaries[response_id] = {
+        "summary": summary_text,
+        "source_digest": source_digest,
+        "model_fingerprint": None,
+    }
+    value._original_tasks[response_id] = root
+    input_items = [
+        {"type": "compaction", "encrypted_content": encoded},
+        {
+            "type": "function_call_output",
+            "call_id": "call-compact",
+            "output": observation,
+        },
+        {"type": "message", "role": "user", "content": current},
+    ]
+
+    asyncio.run(
+        value.prepare_responses_request(
+            FakeRequest(request_id="resp-after-compact", input=input_items)
+        )
+    )
+
+    question = captures["query_probe"][0][1]
+    assert question.count(summary_text) == 1
+    assert question.count(root) == 1
+    assert question.count(current) == 1
+    assert question.count(observation) == 1
+    assert "<context_compaction>" not in question
+    assert value._request_questions["resp-after-compact"] == root
+
+    with pytest.raises(ValueError, match="does not match verified compaction lineage"):
+        asyncio.run(
+            value.prepare_responses_request(
+                FakeRequest(
+                    request_id="resp-mismatched-compact",
+                    previous_response_id="resp-other-parent",
+                    input=input_items,
+                )
+            )
+        )
 
 
 def test_semantically_repeated_self_question_is_not_reinjected(tmp_path):
@@ -1595,48 +1880,212 @@ def test_post_tool_recall_hard_budget_wins_over_cooldown(tmp_path):
     ]
 
 
-def test_response_conversation_keys_are_lineage_scoped(tmp_path):
+def test_response_conversation_keys_use_prompt_cache_then_crc_fallback(
+    tmp_path, monkeypatch
+):
     value = runtime(tmp_path)
-
-    first_a = value._response_conversation_key(
-        request_id="resp-a-0",
-        previous_response_id=None,
+    shared_input = [
+        {"role": "system", "content": "system\r\nrules"},
+        {"role": "user", "content": "implement the task"},
+    ]
+    prompt_a = FakeRequest(
+        request_id="resp-prompt-a",
+        prompt_cache_key="session-a",
+        input=shared_input,
     )
-    first_b = value._response_conversation_key(
-        request_id="resp-b-0",
-        previous_response_id=None,
-    )
-    child_a = value._response_conversation_key(
-        request_id="resp-a-1",
-        previous_response_id="resp-a-0",
-    )
-    child_b = value._response_conversation_key(
-        request_id="resp-b-1",
-        previous_response_id="resp-b-0",
+    prompt_a_next = replace(prompt_a, request_id="resp-prompt-a-next")
+    prompt_b = replace(
+        prompt_a, request_id="resp-prompt-b", prompt_cache_key="session-b"
     )
 
-    assert first_a != first_b
-    assert child_a == first_a
-    assert child_b == first_b
-    assert child_a != child_b
-    stateless_a = value._response_conversation_key(
-        request_id="resp-stateless-a",
-        previous_response_id=None,
-        stateless_anchor="call-a",
+    def resolve(request):
+        identity = value._canonical_response_identity(request)
+        return value._response_conversation_key(
+            request_id=request.request_id,
+            previous_response_id=None,
+            request=request,
+            canonical_identity=identity,
+        )
+
+    assert resolve(prompt_a) == resolve(prompt_a_next)
+    assert resolve(prompt_a) != resolve(prompt_b)
+
+    crc_a = replace(prompt_a, request_id="resp-crc-a", prompt_cache_key=None)
+    crc_b = replace(crc_a, request_id="resp-crc-b")
+    assert resolve(crc_a) == resolve(crc_b)
+    assert resolve(crc_a).startswith("responses-crc32:")
+
+    role_changed = replace(
+        crc_a,
+        request_id="resp-role-changed",
+        input=[
+            {"role": "developer", "content": "system\r\nrules"},
+            {"role": "user", "content": "implement the task"},
+        ],
     )
-    stateless_a_next = value._response_conversation_key(
-        request_id="resp-stateless-a-next",
-        previous_response_id=None,
-        stateless_anchor="call-a",
+    assert resolve(crc_a) != resolve(role_changed)
+
+    monkeypatch.setattr("qwen_exo_booster.runtime.zlib.crc32", lambda _payload: 7)
+    collision_a = replace(crc_a, request_id="resp-collision-a")
+    collision_b = replace(
+        crc_a,
+        request_id="resp-collision-b",
+        input=[{"role": "user", "content": "a different task"}],
     )
-    stateless_b = value._response_conversation_key(
-        request_id="resp-stateless-b",
+    key_a = resolve(collision_a)
+    key_b = resolve(collision_b)
+    assert key_a.startswith("responses-crc32:00000007:")
+    assert key_b.startswith("responses-crc32:00000007:")
+    assert key_a != key_b
+
+
+def test_learned_call_alias_points_to_prompt_cache_conversation(tmp_path):
+    value = runtime(tmp_path)
+    seed = FakeRequest(
+        request_id="resp-seed",
+        prompt_cache_key="session-call",
+        input=[{"role": "user", "content": "root task"}],
+    )
+    seed_identity = value._canonical_response_identity(seed)
+    seed_key = value._response_conversation_key(
+        request_id=seed.request_id,
         previous_response_id=None,
-        stateless_anchor="call-b",
+        request=seed,
+        canonical_identity=seed_identity,
+        call_ids=("call-known",),
+    )
+    fallback = replace(
+        seed,
+        request_id="resp-fallback",
+        prompt_cache_key=None,
+        input=[
+            {
+                "type": "function_call_output",
+                "call_id": "call-known",
+                "output": "done",
+            }
+        ],
+    )
+    unknown = replace(
+        fallback,
+        request_id="resp-unknown",
+        input=[
+            {
+                "type": "function_call_output",
+                "call_id": "call-unknown",
+                "output": "done",
+            }
+        ],
+    )
+    assert (
+        value._response_conversation_key(
+            request_id=fallback.request_id,
+            previous_response_id=None,
+            request=fallback,
+            call_ids=("call-known",),
+        )
+        == seed_key
+    )
+    assert (
+        value._response_conversation_key(
+            request_id=unknown.request_id,
+            previous_response_id=None,
+            request=unknown,
+            call_ids=("call-unknown",),
+        )
+        != seed_key
     )
 
-    assert stateless_a == stateless_a_next
-    assert stateless_a != stateless_b
+
+@pytest.mark.asyncio
+async def test_prompt_cache_restores_only_finalized_internal_memory_parent(tmp_path):
+    value = runtime(tmp_path)
+    capture_retrieval_questions(value)
+
+    async def skip_stage_summary(_request_id):
+        return None
+
+    value._emit_stage_summary = skip_stage_summary
+    first = FakeRequest(
+        request_id="resp-memory-first",
+        prompt_cache_key="memory-session",
+        instructions="system rules",
+        input=[{"role": "user", "content": "implement the task"}],
+    )
+    _prepared, first_state = await value.prepare_responses_request(first)
+    assert first_state.previous_response_id is None
+    assert first_state.effective_memory_previous_response_id is None
+    await value.complete_request(first.request_id)
+
+    second = replace(first, request_id="resp-memory-second")
+    _prepared, second_state = await value.prepare_responses_request(second)
+    assert second_state.previous_response_id is None
+    assert second_state.effective_memory_previous_response_id == first.request_id
+    assert second.request_id not in value._parent_response_ids
+    assert second.request_id not in value._parent_capsules
+    started = next(
+        event
+        for event in value.telemetry.events(second.request_id)
+        if event.event_type == "request.started"
+    )
+    assert started.payload["parent_response_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_keeps_reflection_rows_and_pending_work_cumulative(tmp_path):
+    value = runtime(tmp_path)
+    value.config = replace(
+        value.config,
+        feature_flags=replace(value.config.feature_flags, external_memory=True),
+        reflection_memory_mode="active",
+        reflection_memory_min_events=2,
+        reflection_memory_min_tokens=0,
+        max_internal_tokens=12288,
+    )
+    value.reflection_memory_service = SimpleNamespace(reflect=lambda **_kwargs: None)
+    root = {"role": "user", "content": "inspect the runtime"}
+    first_event = {
+        "type": "function_call_output",
+        "call_id": "call-one",
+        "output": "first observation",
+    }
+    second_event = {
+        "type": "function_call_output",
+        "call_id": "call-two",
+        "output": "second observation",
+    }
+    first = FakeRequest(
+        request_id="resp-reflection-one",
+        prompt_cache_key="reflection-session",
+        input=[root, first_event],
+    )
+    second = replace(
+        first,
+        request_id="resp-reflection-two",
+        input=[root, first_event, second_event],
+    )
+
+    await value.prepare_responses_request(first)
+    await value.prepare_responses_request(second)
+    first_key = value._request_conversation_keys[first.request_id]
+    second_key = value._request_conversation_keys[second.request_id]
+    assert first_key == second_key
+    assert len(value._context_integrity_ledgers[first_key]) == 2
+    rows = value._reflection_memory_trajectories[first_key]
+    assert {row["call_id"] for row in rows if row["call_id"]} == {
+        "call-one",
+        "call-two",
+    }
+
+    value._request_outputs[second.request_id] = "verification complete"
+    value._schedule_reflection_memory(second.request_id)
+    assert list(value._pending_reflection_memories) == [first_key]
+    pending = value._pending_reflection_memories[first_key]
+    assert len(pending.tool_ledger) == 2
+    assert pending.original_task == "inspect the runtime"
+    task = value._reflection_memory_tasks[first_key]
+    value._cancel_reflection_memory_task(first_key)
+    await asyncio.gather(task, return_exceptions=True)
 
 
 def test_replayed_full_history_skips_redundant_capsule_update(tmp_path):

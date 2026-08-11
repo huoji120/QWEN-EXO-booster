@@ -17,6 +17,7 @@ from qwen_exo_booster.native_state_bank import (
     _quantize_fp8,
 )
 from qwen_exo_booster.tensor_bank import TensorBank, TensorBankCompileError
+from qwen_exo_booster.query_probe import QueryStateSpan
 
 
 def test_native_bank_reads_unified_radix_mamba_component():
@@ -452,7 +453,12 @@ async def test_tensor_bank_builds_one_document_state_with_aligned_surprisal_span
     assert runner.calls == build_calls
 
     query = (1.0,) + (0.0,) * 31
-    (candidate,) = bank.rank(((query,),), query_identity="query", limit=1)
+    (candidate,) = bank.rank(
+        ((query,),),
+        query_states=(QueryStateSpan("current_user", 0, 1, 0, 1),),
+        query_identity="query",
+        limit=1,
+    )
     selection = candidate.native_prefix
     assert selection is not None
     assert len(selection.token_ids) % 64 == 0
@@ -461,6 +467,7 @@ async def test_tensor_bank_builds_one_document_state_with_aligned_surprisal_span
     assert selection.source_positions == selection.local_positions
     (other_candidate,) = bank.rank(
         (((0.0, 1.0) + (0.0,) * 30,),),
+        query_states=(QueryStateSpan("current_user", 0, 1, 0, 1),),
         query_identity="query-other",
         limit=1,
     )

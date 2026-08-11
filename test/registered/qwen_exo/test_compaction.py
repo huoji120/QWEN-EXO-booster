@@ -223,6 +223,7 @@ class TestResponseCompaction(CustomTestCase):
         assert response["object"] == "response.compaction"
         assert response["output"][-1]["type"] == "compaction"
         assert response["id"] in runtime._compaction_summaries
+        assert runtime._original_tasks[response["id"]] == "preserve this goal"
         assert runtime.telemetry.events[-1][1] == "response_compaction.published"
 
     def test_runtime_reuses_previous_native_state_without_query_probe(self):

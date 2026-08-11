@@ -17,7 +17,16 @@ from qwen_exo_booster.native_state_bank import (
     _quantize_fp8,
 )
 from qwen_exo_booster.policy_data import PolicyDataRepository
+from qwen_exo_booster.pipeline import MemoryPipeline
 from qwen_exo_booster.tensor_bank import TensorBank
+from qwen_exo_booster.query_probe import QueryStateSpan
+
+
+def _query_states(count, role="current_user"):
+    return tuple(
+        QueryStateSpan(role, index, index + 1, index, index + 1)
+        for index in range(count)
+    )
 
 
 def test_inverse_qwen35_mrope_uses_token_axis_and_interleaved_sections():
@@ -406,6 +415,7 @@ async def test_fp8_tensor_bank_ranks_pages_from_raw_attention_heads(tmp_path):
     rank_audit = {}
     candidates = bank.rank(
         tuple(((1.0, 0.0),) for _ in range(12)),
+        query_states=_query_states(12),
         query_identity="event-1",
         limit=2,
         audit=rank_audit,
@@ -439,6 +449,7 @@ async def test_fp8_tensor_bank_ranks_pages_from_raw_attention_heads(tmp_path):
     assert (
         bank.rank(
             tuple(((1.0, 0.0),) for _ in range(12)),
+            query_states=_query_states(12),
             query_identity="event-score-rejected",
             limit=2,
             min_tensor_score=2.0,
@@ -455,6 +466,7 @@ async def test_fp8_tensor_bank_ranks_pages_from_raw_attention_heads(tmp_path):
     assert (
         bank.rank(
             tuple(((1.0, 0.0),) for _ in range(12)),
+            query_states=_query_states(12),
             query_identity="event-margin-rejected",
             limit=2,
             min_tensor_score=-1.0,
@@ -482,6 +494,7 @@ async def test_fp8_tensor_bank_ranks_pages_from_raw_attention_heads(tmp_path):
     bank._rank_key_cache.clear()
     robust_candidates = bank.rank(
         tuple(((1.0, 0.0),) for _ in range(3)),
+        query_states=_query_states(3),
         query_identity="event-robust",
         limit=2,
         min_document_margin=0.0,
@@ -491,7 +504,12 @@ async def test_fp8_tensor_bank_ranks_pages_from_raw_attention_heads(tmp_path):
     bank._rank_key_cache.clear()
     bank._token_search_masks.clear()
     before_rank = (tmp_path / "tensor-bank.pt").read_bytes()
-    bank.rank((((0.0, 1.0),),), query_identity="event-2", limit=2)
+    bank.rank(
+        (((0.0, 1.0),),),
+        query_states=_query_states(1),
+        query_identity="event-2",
+        limit=2,
+    )
     assert (tmp_path / "tensor-bank.pt").read_bytes() == before_rank
 
     cached_runner = _BankRunner(tmp_path / "native-bank")
@@ -549,6 +567,7 @@ async def test_raw_qk_ranking_uses_strongest_four_head_pairs(tmp_path):
 
     candidates = bank.rank(
         query,
+        query_states=_query_states(len(query)),
         query_identity="raw-head-top4",
         limit=2,
         min_document_margin=0.0,
@@ -557,7 +576,7 @@ async def test_raw_qk_ranking_uses_strongest_four_head_pairs(tmp_path):
 
     assert candidates[0].relative_path == "wfp.md"
     assert audit["scoring_method"] == (
-        "raw_attention_top4_heads_top4_tokens_top4_queries"
+        "raw_attention_top4_heads_local_window_top4_queries"
     )
     assert audit["query_head_count"] == 8
     assert audit["key_head_count"] == 2
@@ -708,6 +727,7 @@ async def test_tensor_bank_conditions_specialized_state_on_cognition_without_ran
         model_fingerprint="model-fingerprint-cognition",
         max_document_tokens=128,
         salient_token_budget=64,
+        span_tokens=8,
     )
 
     snapshot = await bank.ensure_ready()
@@ -715,8 +735,22 @@ async def test_tensor_bank_conditions_specialized_state_on_cognition_without_ran
     cognition_page = next(page for page in snapshot.pages if page.lane == "cognition")
     knowledge_page = next(page for page in snapshot.pages if page.lane == "knowledge")
     _page, knowledge_prefix = bank.page_prefix_token_ids(knowledge_page.page_id)
+    source_count = knowledge_page.token_end - knowledge_page.cognition_token_count
+    assert knowledge_page.cognition_token_count > 0
+    assert source_count > bank.span_tokens
+    conditioned_keys = []
+    for page, keys in zip(snapshot.pages, snapshot.raw_key_heads):
+        values = keys.clone()
+        if page.page_id == knowledge_page.page_id:
+            values.zero_()
+            tail_start = page.token_end - 4
+            values[tail_start : tail_start + 4, :, 0] = 1.0
+        conditioned_keys.append(values)
+    bank._snapshot = replace(snapshot, raw_key_heads=tuple(conditioned_keys))
+    bank._rank_key_cache.clear()
     candidates = bank.rank(
         (((1.0, 0.0),),),
+        query_states=_query_states(1),
         query_identity="conditioned-query",
         limit=2,
         min_document_margin=0.0,
@@ -731,6 +765,21 @@ async def test_tensor_bank_conditions_specialized_state_on_cognition_without_ran
     assert [candidate.lane for candidate in candidates] == ["knowledge"]
     assert candidates[0].native_prefix is not None
     assert candidates[0].native_prefix.token_ids[: len(cognition_ids)] == cognition_ids
+    attribution = candidates[0].qk_attributions[0]
+    expected_tail = tuple(
+        knowledge_page.source_positions[
+            knowledge_page.token_end - 4 : knowledge_page.token_end
+        ]
+    )
+    assert attribution.source_positions == expected_tail
+    assert (
+        attribution.window_end
+        == knowledge_page.source_positions[knowledge_page.token_end - 1] + 1
+    )
+    assert (
+        attribution.window_start
+        == knowledge_page.source_positions[knowledge_page.token_end - bank.span_tokens]
+    )
 
 
 @pytest.mark.asyncio
@@ -807,6 +856,7 @@ async def test_tensor_bank_masks_punctuation_only_sink_page(tmp_path):
 
     candidates = bank.rank(
         tuple(((1.0, 0.0),) for _ in range(3)),
+        query_states=_query_states(3),
         query_identity="sink-mask",
         limit=2,
     )
@@ -882,9 +932,18 @@ async def test_tensor_bank_keeps_policy_and_knowledge_pages_in_separate_lanes(tm
     )
 
     snapshot = await bank.ensure_ready()
-    assert bank.rank((((1.0, 0.0),),), query_identity="ambiguous", limit=8) == ()
+    assert (
+        bank.rank(
+            (((1.0, 0.0),),),
+            query_states=_query_states(1),
+            query_identity="ambiguous",
+            limit=8,
+        )
+        == ()
+    )
     candidates = bank.rank(
         (((1.0, 0.0),),),
+        query_states=_query_states(1),
         query_identity="event",
         limit=8,
         min_document_margin=0.0,
@@ -929,7 +988,13 @@ async def test_tensor_bank_document_group_allows_close_shards_to_rank(tmp_path):
     )
 
     await bank.ensure_ready()
-    candidates = bank.rank((((1.0, 0.0),),), query_identity="grouped", limit=8)
+    candidates = bank.rank(
+        (((1.0, 0.0),),),
+        query_states=_query_states(1),
+        query_identity="grouped",
+        limit=8,
+        min_document_margin=0.0,
+    )
 
     grouped = {
         document.relative_path: document.document_group
@@ -944,6 +1009,70 @@ async def test_tensor_bank_document_group_allows_close_shards_to_rank(tmp_path):
         "trajectory-a.md",
         "trajectory-b.md",
     }
+
+
+@pytest.mark.parametrize("same_group", (False, True))
+@pytest.mark.parametrize(
+    ("document_margin", "accepted"),
+    ((0.019999, False), (0.020000, True)),
+)
+@pytest.mark.asyncio
+async def test_tensor_bank_margin_uses_individual_document_scores_at_boundary(
+    tmp_path, same_group, document_margin, accepted
+):
+    root = tmp_path / f"individual-margin-{same_group}-{document_margin}"
+    root.mkdir()
+    shared = "---\ndocument_group: shared\n---\n" if same_group else ""
+    (root / "top.md").write_text(shared + "top evidence " * 8, encoding="utf-8")
+    (root / "runner-up.md").write_text(
+        shared + "runner evidence " * 8, encoding="utf-8"
+    )
+    (root / "distant.md").write_text("distant evidence " * 8, encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / f"individual-margin-{same_group}-{document_margin}.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint=f"individual-margin-{same_group}-{document_margin}",
+        max_document_tokens=256,
+        salient_token_budget=256,
+    )
+
+    snapshot = await bank.ensure_ready()
+    score_by_path = {
+        "top.md": 0.5 + document_margin,
+        "runner-up.md": 0.5,
+        "distant.md": 0.1,
+    }
+    raw_key_heads = []
+    for page, keys in zip(snapshot.pages, snapshot.raw_key_heads):
+        values = torch.zeros_like(keys)
+        values[:, :, 0] = score_by_path[page.relative_path] * (keys.shape[2] ** 0.5)
+        raw_key_heads.append(values)
+    bank._snapshot = replace(snapshot, raw_key_heads=tuple(raw_key_heads))
+    bank._token_search_masks.clear()
+    bank._rank_key_cache.clear()
+    audit = {}
+
+    candidates = bank.rank(
+        (((1.0, 0.0),),),
+        query_states=_query_states(1),
+        query_identity=f"individual-margin-{same_group}-{document_margin}",
+        limit=8,
+        min_document_margin=0.02,
+        audit=audit,
+    )
+
+    assert bool(candidates) is accepted
+    assert audit["reason"] == (
+        "candidates_ready" if accepted else "document_margin_too_small"
+    )
+    assert audit["top_score"] == pytest.approx(0.5 + document_margin, abs=1e-6)
+    assert audit["runner_up_score"] == pytest.approx(0.5, abs=1e-6)
+    if accepted:
+        assert candidates[0].relative_path == "top.md"
 
 
 @pytest.mark.asyncio
@@ -986,6 +1115,7 @@ async def test_tensor_bank_group_score_rejects_single_page_outlier(tmp_path):
 
     candidates = bank.rank(
         (((1.0, 0.0),),),
+        query_states=_query_states(1),
         query_identity="group-outlier",
         limit=8,
         min_document_margin=0.0,
@@ -1054,6 +1184,7 @@ async def test_document_selection_preserves_query_token_attribution(tmp_path):
 
     candidates = bank.rank(
         (((1.0, 0.0),), ((0.0, 1.0),)),
+        query_states=_query_states(2),
         query_identity="event-documents",
         limit=2,
         min_document_margin=0.0,
@@ -1071,3 +1202,197 @@ async def test_document_selection_preserves_query_token_attribution(tmp_path):
         candidate.virtual_positions == tuple(range(64)) for candidate in candidates
     )
     assert all(len(candidate.token_attributions) == 2 for candidate in candidates)
+
+
+@pytest.mark.asyncio
+async def test_local_window_support_beats_four_distant_spikes_and_attributes_window(
+    tmp_path,
+):
+    root = tmp_path / "window-support"
+    root.mkdir()
+    (root / "near.md").write_text("n" * 64, encoding="utf-8")
+    (root / "distant.md").write_text("d" * 64, encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "window-support.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="model-fingerprint-window-support",
+        max_document_tokens=64,
+        salient_token_budget=64,
+        span_tokens=8,
+    )
+    snapshot = await bank.ensure_ready()
+    keys_by_page = []
+    for page, keys in zip(snapshot.pages, snapshot.raw_key_heads):
+        values = torch.zeros_like(keys)
+        positions = (
+            (10, 11, 12, 13) if page.relative_path == "near.md" else (5, 20, 35, 50)
+        )
+        for position in positions:
+            values[position, :, 0] = 1.0
+        keys_by_page.append(values)
+    bank._snapshot = replace(snapshot, raw_key_heads=tuple(keys_by_page))
+    bank._rank_key_cache.clear()
+    audit = {}
+
+    candidates = bank.rank(
+        (((1.0, 0.0),),),
+        query_states=_query_states(1),
+        query_identity="window-supported",
+        limit=2,
+        min_document_margin=0.0,
+        audit=audit,
+    )
+
+    assert [candidate.relative_path for candidate in candidates] == [
+        "near.md",
+        "distant.md",
+    ]
+    assert candidates[0].tensor_score > candidates[1].tensor_score
+    attribution = candidates[0].qk_attributions[0]
+    assert attribution.query_role == "current_user"
+    assert attribution.source_positions == (10, 11, 12, 13)
+    assert attribution.window_end - attribution.window_start == bank.span_tokens
+    assert all(
+        attribution.window_start <= position < attribution.window_end
+        for position in attribution.source_positions
+    )
+    assert attribution.support_score == candidates[0].tensor_score
+    assert (attribution.query_prompt_start, attribution.query_prompt_end) == (0, 1)
+    assert (attribution.query_source_start, attribution.query_source_end) == (0, 1)
+    assert candidates[0].public_dict()["qk_attributions"][0] == (
+        attribution.public_dict()
+    )
+    assert audit["scoring_method"] == (
+        "raw_attention_top4_heads_local_window_top4_queries"
+    )
+    assert audit["window_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_trajectory_only_q_cannot_originate_knowledge_candidate(tmp_path):
+    root = tmp_path / "trajectory-only"
+    root.mkdir()
+    (root / "knowledge.md").write_text("k" * 64, encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "trajectory-only.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="model-fingerprint-trajectory-only",
+        max_document_tokens=64,
+        salient_token_budget=64,
+        span_tokens=8,
+    )
+    snapshot = await bank.ensure_ready()
+    bank._snapshot = replace(
+        snapshot,
+        raw_key_heads=tuple(torch.ones_like(keys) for keys in snapshot.raw_key_heads),
+    )
+    bank._rank_key_cache.clear()
+    audit = {}
+    roleless_plan = MemoryPipeline._request_query_plan(
+        [
+            {"type": "reasoning", "content": "roleless hidden reasoning"},
+            {"type": "function_call_output", "output": "tool-only trajectory"},
+        ]
+    )
+    assert [segment.role for segment in roleless_plan.segments] == [
+        "trajectory_compaction"
+    ]
+
+    candidates = bank.rank(
+        (((1.0, 0.0),),),
+        query_states=_query_states(1, role=roleless_plan.segments[0].role),
+        query_identity="trajectory-only",
+        limit=1,
+        min_document_margin=0.0,
+        audit=audit,
+    )
+
+    assert candidates == ()
+    assert audit == {"status": "rejected", "reason": "no_anchor_role_queries"}
+
+
+@pytest.mark.asyncio
+async def test_local_window_uses_all_available_tokens_for_short_document(tmp_path):
+    root = tmp_path / "short-window"
+    root.mkdir()
+    (root / "short.md").write_text("abc", encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "short-window.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="model-fingerprint-short-window",
+        max_document_tokens=64,
+        salient_token_budget=64,
+        span_tokens=8,
+    )
+    snapshot = await bank.ensure_ready()
+    page = snapshot.pages[0]
+    values = torch.zeros_like(snapshot.raw_key_heads[0])
+    values[: page.token_end, :, 0] = -1.0
+    bank._snapshot = replace(snapshot, raw_key_heads=(values,))
+    bank._rank_key_cache.clear()
+
+    candidates = bank.rank(
+        (((1.0, 0.0),),),
+        query_states=_query_states(1),
+        query_identity="short-window",
+        limit=1,
+        min_tensor_score=-2.0,
+        min_document_margin=0.0,
+    )
+
+    assert len(candidates) == 1
+    attribution = candidates[0].qk_attributions[0]
+    assert attribution.source_positions == tuple(page.source_positions)
+    assert attribution.support_score == pytest.approx(-(2**-0.5))
+    assert candidates[0].tensor_score == pytest.approx(attribution.support_score)
+
+
+@pytest.mark.asyncio
+async def test_sparse_negative_window_fails_closed_instead_of_zero_filling(tmp_path):
+    root = tmp_path / "sparse-negative-window"
+    root.mkdir()
+    (root / "sparse.md").write_text("a...", encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    bank = TensorBank(
+        tmp_path / "sparse-negative-window.pt",
+        _BankRunner(tmp_path / "native-bank"),
+        _BankTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="model-fingerprint-sparse-negative-window",
+        max_document_tokens=64,
+        salient_token_budget=64,
+        span_tokens=4,
+    )
+    snapshot = await bank.ensure_ready()
+    page = snapshot.pages[0]
+    values = torch.zeros_like(snapshot.raw_key_heads[0])
+    values[: page.token_end, :, 0] = -1.0
+    bank._snapshot = replace(snapshot, raw_key_heads=(values,))
+    bank._rank_key_cache.clear()
+    audit = {}
+
+    candidates = bank.rank(
+        (((1.0, 0.0),),),
+        query_states=_query_states(1),
+        query_identity="sparse-negative-window",
+        limit=1,
+        min_tensor_score=-2.0,
+        min_document_margin=0.0,
+        audit=audit,
+    )
+
+    assert candidates == ()
+    assert audit == {"status": "rejected", "reason": "no_finite_document_scores"}

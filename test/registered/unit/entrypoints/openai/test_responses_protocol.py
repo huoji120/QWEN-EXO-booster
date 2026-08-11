@@ -9,6 +9,17 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class ResponsesRequestTestCase(unittest.TestCase):
+    def test_prompt_cache_key_is_preserved(self):
+        request = ResponsesRequest.model_validate(
+            {
+                "model": "x",
+                "input": [{"role": "user", "content": "task"}],
+                "prompt_cache_key": "opencode-session-123",
+            }
+        )
+
+        self.assertEqual(request.prompt_cache_key, "opencode-session-123")
+
     def test_function_tool_accepted(self):
         request = ResponsesRequest(
             model="x",

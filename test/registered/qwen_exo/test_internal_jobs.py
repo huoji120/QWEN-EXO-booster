@@ -93,6 +93,27 @@ def test_internal_batch_uses_one_scheduler_request():
     }
 
 
+def test_reflection_job_without_deadline_reaches_scheduler():
+    manager = FakeTokenizerManager(
+        outputs=[{"text": "ok", "meta_info": {"completion_tokens": 1}}]
+    )
+    runner = InternalJobRunner(
+        manager, max_fanout=1, max_tokens_per_parent=16, request_factory=request_factory
+    )
+    reflection_job = job(
+        job_type=InternalJobType.REFLECTION_MEMORY,
+        deadline_monotonic=None,
+        max_fanout=1,
+    )
+
+    result = asyncio.run(
+        runner.run_batch([reflection_job], ["prompt"], {"temperature": 0})
+    )
+
+    assert result[0].text == "ok"
+    assert len(manager.requests) == 1
+
+
 def test_internal_batch_enforces_parent_token_reserve():
     runner = InternalJobRunner(
         FakeTokenizerManager(),

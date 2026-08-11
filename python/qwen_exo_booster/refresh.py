@@ -20,6 +20,7 @@ from qwen_exo_booster.judge import ReferenceJudge
 from qwen_exo_booster.knowledge import KnowledgeCandidate, KnowledgeRepository
 from qwen_exo_booster.observer import MidThinkEvent
 from qwen_exo_booster.policy_data import PolicyDataRepository
+from qwen_exo_booster.query_probe import QueryProbePlan
 from qwen_exo_booster.telemetry import TelemetryStore
 from qwen_exo_booster.tensor_bank import TensorBank
 
@@ -314,6 +315,8 @@ class SelfAskRefreshService:
         context_integrity_mode: str = "off",
         context_integrity_max_tokens: int = 30720,
         knowledge_qk_only: bool = False,
+        qk_admission_margin: float = 0.02,
+        qk_min_tensor_score: float = 0.0,
     ):
         self.runner = runner
         self.repository = repository
@@ -329,6 +332,8 @@ class SelfAskRefreshService:
         self.context_integrity_mode = str(context_integrity_mode)
         self.context_integrity_max_tokens = int(context_integrity_max_tokens)
         self.knowledge_qk_only = bool(knowledge_qk_only)
+        self.qk_admission_margin = float(qk_admission_margin)
+        self.qk_min_tensor_score = float(qk_min_tensor_score)
 
         if self.context_evidence_mode not in _CONTEXT_EVIDENCE_MODES:
             raise ValueError(
@@ -342,6 +347,8 @@ class SelfAskRefreshService:
             )
         if self.context_integrity_max_tokens < 512:
             raise ValueError("Context integrity history budget must be at least 512")
+        if self.qk_admission_margin < 0:
+            raise ValueError("Q/K admission margin must be non-negative")
 
         if max_records < 1:
             raise ValueError("Refresh max_records must be positive")
@@ -1036,14 +1043,19 @@ class SelfAskRefreshService:
     ) -> tuple[KnowledgeCandidate, ...]:
         if self.tensor_bank is None or self.query_probe is None:
             return ()
-        probe = await self.query_probe.probe(event.request_id, user_question)
+        probe = await self.query_probe.probe(
+            event.request_id, QueryProbePlan.current_user(user_question)
+        )
         if probe.status != "ready" or not probe.query_heads:
             return ()
         await self.tensor_bank.ensure_ready()
         candidates = self.tensor_bank.rank(
             probe.query_heads,
+            query_states=probe.query_states,
             query_identity=event.event_id,
             limit=self.max_candidates,
+            min_tensor_score=self.qk_min_tensor_score,
+            min_document_margin=self.qk_admission_margin,
         )
         await self.tensor_bank.ensure_resident(
             tuple(page_id for candidate in candidates for page_id in candidate.page_ids)

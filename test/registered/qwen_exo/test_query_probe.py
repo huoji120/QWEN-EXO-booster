@@ -15,7 +15,12 @@ from qwen_exo_booster.contracts import (
 from qwen_exo_booster.internal_jobs import InternalJobResult, InternalJobRunner
 from qwen_exo_booster.knowledge import KnowledgeRepository, NativePrefixSelection
 from qwen_exo_booster.pipeline import MemoryPipeline
-from qwen_exo_booster.query_probe import QueryProbeService
+from qwen_exo_booster.query_probe import (
+    QueryProbePlan,
+    QueryProbeService,
+    QueryRoleText,
+    QueryStateSpan,
+)
 
 
 class FakeTelemetry:
@@ -43,6 +48,12 @@ class FakeProbeRunner:
     ):
         del extra_keys
         self.calls.append((jobs, prompts, sampling_params, custom_params_per_job))
+        spans = custom_params_per_job[0]["qwen_exo_query_spans"]
+        flattened = []
+        for index, _span in enumerate(spans):
+            flattened.extend(
+                [1.0, 0.0, 0.0, 1.0] if index % 2 == 0 else [0.0, 1.0, 1.0, 0.0]
+            )
         return (
             InternalJobResult(
                 job=jobs[0],
@@ -51,11 +62,7 @@ class FakeProbeRunner:
                 completion_tokens=0,
                 finish_reason={"type": "length"},
                 latency_seconds=0.01,
-                metadata={
-                    "qwen_exo_user_query_full_heads": [
-                        [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]
-                    ]
-                },
+                metadata={"qwen_exo_user_query_full_heads": [flattened]},
             ),
         )
 
@@ -79,6 +86,13 @@ class FakeRequest:
         return replace(self, **update)
 
 
+def _states(count, role="current_user"):
+    return tuple(
+        QueryStateSpan(role, index, index + 1, index, index + 1)
+        for index in range(count)
+    )
+
+
 class FakeQKBank:
     def __init__(self, candidate):
         self.candidate = candidate
@@ -92,6 +106,7 @@ class FakeQKBank:
         self,
         query_heads,
         *,
+        query_states,
         query_identity,
         limit,
         min_tensor_score=0.0,
@@ -99,7 +114,7 @@ class FakeQKBank:
         audit=None,
     ):
         self.rank_calls.append(
-            (query_heads, query_identity, limit, min_document_margin)
+            (query_heads, query_states, query_identity, limit, min_document_margin)
         )
         if audit is not None:
             audit.update(
@@ -183,21 +198,26 @@ def test_query_probe_returns_finite_raw_q_heads_from_hidden_job():
         head_dim=2,
     )
 
-    result = asyncio.run(probe.probe("resp-1", "one two three four five six"))
+    result = asyncio.run(
+        probe.probe(
+            "resp-1", QueryProbePlan.current_user("one two three four five six")
+        )
+    )
 
     assert result.status == "ready"
-    assert len(result.query_heads) == 2
+    assert len(result.query_heads) == 4
     assert result.query_heads[0][0] == (1.0, 0.0)
     assert result.query_heads[1][0] == (0.0, 1.0)
     jobs, prompts, _sampling, custom = runner.calls[0]
     assert jobs[0].job_type is InternalJobType.QUERY_PROBE
     assert prompts == ((3, 4, 5, 6),)
     assert custom[0]["qwen_exo_query_spans"] == [
-        {"start": 0, "end": 1},
-        {"start": 1, "end": 2},
-        {"start": 2, "end": 3},
-        {"start": 3, "end": 4},
+        {"start": 0, "end": 1, "role": "current_user"},
+        {"start": 1, "end": 2, "role": "current_user"},
+        {"start": 2, "end": 3, "role": "current_user"},
+        {"start": 3, "end": 4, "role": "current_user"},
     ]
+    assert {state.role for state in result.query_states} == {"current_user"}
     assert [event[1] for event in telemetry.events] == [
         "query_probe.started",
         "query_probe.completed",
@@ -218,8 +238,12 @@ def test_query_probe_reuses_exact_raw_q_heads_without_disabling_probe():
 
     async def run_twice():
         return (
-            await probe.probe("resp-first", "one two three four"),
-            await probe.probe("resp-second", "one two three four"),
+            await probe.probe(
+                "resp-first", QueryProbePlan.current_user("one two three four")
+            ),
+            await probe.probe(
+                "resp-second", QueryProbePlan.current_user("one two three four")
+            ),
         )
 
     first, repeated = asyncio.run(run_twice())
@@ -247,18 +271,216 @@ def test_query_probe_conditions_q_spans_on_cognition_prefix():
         head_dim=2,
     )
 
-    result = asyncio.run(probe.probe("resp-cognition", "one two three four five six"))
+    result = asyncio.run(
+        probe.probe(
+            "resp-cognition", QueryProbePlan.current_user("one two three four five six")
+        )
+    )
 
     _jobs, prompts, _sampling, custom = runner.calls[0]
     assert result.prompt_tokens == 6
     assert prompts == ((90, 91, 3, 4, 5, 6),)
     assert custom[0]["qwen_exo_query_spans"] == [
-        {"start": 2, "end": 3},
-        {"start": 3, "end": 4},
-        {"start": 4, "end": 5},
-        {"start": 5, "end": 6},
+        {"start": 2, "end": 3, "role": "current_user"},
+        {"start": 3, "end": 4, "role": "current_user"},
+        {"start": 4, "end": 5, "role": "current_user"},
+        {"start": 5, "end": 6, "role": "current_user"},
     ]
     assert telemetry.events[0][2]["cognition_tokens"] == 2
+
+
+def test_query_probe_preserves_anchor_roles_and_bounds_trajectory():
+    runner = FakeProbeRunner()
+    telemetry = FakeTelemetry()
+    probe = QueryProbeService(
+        runner,
+        FakeTokenizer(),
+        telemetry,
+        max_prompt_tokens=8,
+        query_head_count=2,
+        head_dim=2,
+    )
+    plan = QueryProbePlan(
+        (
+            QueryRoleText("original_task", "original anchor words"),
+            QueryRoleText("current_user", "current request words"),
+            QueryRoleText("trajectory_compaction", " ".join(["history"] * 100)),
+        )
+    )
+
+    result = asyncio.run(probe.probe("resp-roles", plan))
+
+    roles = [state.role for state in result.query_states]
+    assert "original_task" in roles
+    assert "current_user" in roles
+    assert roles.count("trajectory_compaction") <= 2
+    assert result.prompt_tokens == 8
+    assert all(
+        left.prompt_end <= right.prompt_start
+        for left, right in zip(result.query_states, result.query_states[1:])
+    )
+    assert telemetry.events[-1][2]["role_plan_digest"] == plan.identity
+
+
+def test_query_probe_cache_identity_includes_role_plan():
+    runner = FakeProbeRunner()
+    probe = QueryProbeService(
+        runner,
+        FakeTokenizer(),
+        FakeTelemetry(),
+        max_prompt_tokens=4,
+        query_head_count=2,
+        head_dim=2,
+    )
+
+    async def probe_roles():
+        return (
+            await probe.probe("anchor", QueryProbePlan.current_user("same words")),
+            await probe.probe(
+                "trajectory",
+                QueryProbePlan((QueryRoleText("trajectory_compaction", "same words"),)),
+            ),
+        )
+
+    anchor, trajectory = asyncio.run(probe_roles())
+    assert anchor.cache_hit is False
+    assert trajectory.cache_hit is False
+    assert anchor.role_plan_digest != trajectory.role_plan_digest
+    assert len(runner.calls) == 2
+
+
+def test_request_query_plan_separates_task_current_and_history():
+    plan = MemoryPipeline._request_query_plan(
+        [
+            {"role": "user", "content": "root task"},
+            {"role": "assistant", "content": "working"},
+            {"type": "function_call_output", "output": "tool observation"},
+            {"role": "user", "content": "current correction"},
+        ],
+        original_task="root task",
+        compaction_context="compacted history",
+    )
+
+    assert [segment.role for segment in plan.segments] == [
+        "original_task",
+        "current_user",
+        "trajectory_compaction",
+    ]
+    assert plan.segments[0].text == "root task"
+    assert plan.segments[1].text == "current correction"
+    assert "compacted history" in plan.segments[2].text
+    assert "tool observation" in plan.segments[2].text
+
+
+def test_request_query_plan_deduplicates_equal_original_and_current():
+    plan = MemoryPipeline._request_query_plan(
+        "same first request", original_task="same first request"
+    )
+
+    assert [segment.role for segment in plan.segments] == ["original_task"]
+    assert plan.segments[0].text == "same first request"
+
+
+def test_latest_user_ignores_roleless_reasoning_after_explicit_user():
+    value = [
+        {"role": "user", "content": "explicit user task"},
+        {"type": "reasoning", "content": "roleless hidden reasoning"},
+    ]
+
+    assert MemoryPipeline._latest_user_text(value) == "explicit user task"
+    plan = MemoryPipeline._request_query_plan(value)
+    assert [segment.role for segment in plan.segments] == [
+        "original_task",
+        "trajectory_compaction",
+    ]
+    assert plan.segments[0].text == "explicit user task"
+    assert all(segment.role != "current_user" for segment in plan.segments)
+    assert "roleless hidden reasoning" in plan.segments[1].text
+
+
+def test_roleless_reasoning_only_plan_has_no_current_user_anchor():
+    value = [
+        {"type": "reasoning", "content": "roleless hidden reasoning"},
+        {"type": "function_call_output", "output": "tool-only trajectory"},
+    ]
+
+    assert MemoryPipeline._latest_user_text(value) == ""
+    plan = MemoryPipeline._request_query_plan(value)
+    assert [segment.role for segment in plan.segments] == ["trajectory_compaction"]
+    assert all(segment.role != "current_user" for segment in plan.segments)
+
+
+def test_query_probe_fails_closed_on_interior_nonfinite_state():
+    class NonfiniteRunner(FakeProbeRunner):
+        async def run_batch(
+            self,
+            jobs,
+            prompts,
+            sampling_params,
+            *,
+            custom_params_per_job=None,
+            extra_keys=None,
+        ):
+            del extra_keys
+            self.calls.append((jobs, prompts, sampling_params, custom_params_per_job))
+            return (
+                InternalJobResult(
+                    job=jobs[0],
+                    text="",
+                    prompt_tokens=len(prompts[0]),
+                    completion_tokens=0,
+                    finish_reason={"type": "length"},
+                    latency_seconds=0.01,
+                    metadata={
+                        "qwen_exo_user_query_full_heads": [
+                            [
+                                1.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                float("nan"),
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                1.0,
+                                1.0,
+                                0.0,
+                            ]
+                        ]
+                    },
+                ),
+            )
+
+    runner = NonfiniteRunner()
+    telemetry = FakeTelemetry()
+    probe = QueryProbeService(
+        runner,
+        FakeTokenizer(),
+        telemetry,
+        max_prompt_tokens=4,
+        query_head_count=2,
+        head_dim=2,
+    )
+    plan = QueryProbePlan(
+        (
+            QueryRoleText("original_task", "original"),
+            QueryRoleText("current_user", "current"),
+            QueryRoleText("trajectory_compaction", "trajectory"),
+        )
+    )
+
+    async def run_twice():
+        return await probe.probe("first", plan), await probe.probe("second", plan)
+
+    first, second = asyncio.run(run_twice())
+
+    assert first.status == second.status == "no_q_signal"
+    assert first.query_heads == second.query_heads == ()
+    assert first.query_states == second.query_states == ()
+    assert first.cache_hit is second.cache_hit is False
+    assert len(runner.calls) == 2
+    assert telemetry.events[-1][2]["role_counts"] == {}
 
 
 def test_internal_query_probe_uses_one_hidden_token_for_prefill_metadata():
@@ -356,6 +578,8 @@ def test_request_memory_uses_only_query_q_and_skips_text_rankers(tmp_path):
         pipeline.prepare_responses_request(
             request,
             query_heads=(((1.0, 0.0),),),
+            query_states=_states(1),
+            query_role_plan_digest="role-plan-current",
             query_probe_status="ready",
             query_probe_prompt_tokens=2,
         )
@@ -365,6 +589,8 @@ def test_request_memory_uses_only_query_q_and_skips_text_rankers(tmp_path):
         pipeline.prepare_responses_request(
             repeated_request,
             query_heads=(((1.0, 0.0),),),
+            query_states=_states(1),
+            query_role_plan_digest="role-plan-current",
             query_probe_status="ready",
             query_probe_prompt_tokens=2,
         )
@@ -383,18 +609,23 @@ def test_request_memory_uses_only_query_q_and_skips_text_rankers(tmp_path):
         "query_count": 1,
         "query_head_count": 1,
         "head_dim": 2,
+        "role_plan_digest": "role-plan-current",
+        "role_counts": {"current_user": 1},
+        "query_states": [_states(1)[0].public_dict()],
     }
     assert state.qk_rank_cache_hit is False
     assert repeated_state.qk_rank_cache_hit is True
     assert repeated_state.public_dict()["qk_retrieval"]["cache_hit"] is True
     stable_identity = f"request-query-probe:{stable_digest('WFP question')}"
-    assert bank.rank_calls == [((((1.0, 0.0),),), stable_identity, 8, 0.0)]
+    assert bank.rank_calls == [((((1.0, 0.0),),), _states(1), stable_identity, 8, 0.02)]
     bank.snapshot = SimpleNamespace(source_digest="bank-b")
     changed_request = replace(request, request_id="resp-qk-changed-bank")
     _changed_prepared, changed_state = asyncio.run(
         pipeline.prepare_responses_request(
             changed_request,
             query_heads=(((1.0, 0.0),),),
+            query_states=_states(1),
+            query_role_plan_digest="role-plan-current",
             query_probe_status="ready",
             query_probe_prompt_tokens=2,
         )

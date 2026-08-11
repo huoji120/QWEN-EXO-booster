@@ -30,6 +30,35 @@ curl http://127.0.0.1:30000/v1/responses \
   }'
 ```
 
+OpenCode does not send `previous_response_id`. Both its native Responses path
+and default AI SDK path resend the prepared full history and send
+`prompt_cache_key` equal to the OpenCode session ID. `ResponsesRequest` accepts
+this field, and QWEN-EXO uses a non-empty value as the primary stateless
+conversation identity:
+
+```json
+{
+  "model": "duckgpt",
+  "prompt_cache_key": "<OpenCode session ID>",
+  "input": ["<full prepared message history>"]
+}
+```
+
+Without `prompt_cache_key`, QWEN-EXO falls back to versioned canonical bytes for
+effective `instructions`, role-separated system/developer content, and the
+first real user task. The key retains a CRC32 prefix and a full SHA-256 payload
+digest, so equal CRC32 values for different payloads remain isolated. Without
+an explicit key, byte-identical canonical payloads cannot be distinguished as
+independent conversations and intentionally share the fallback identity.
+
+Call IDs never create a new conversation. They are accepted only as bounded
+learned aliases to a previously established prompt-cache or canonical identity;
+unknown or ambiguous tool-only requests fail closed. QWEN-EXO may restore the
+latest successfully finalized MemoryPipeline/native-attractor state internally,
+but `request.started.parent_response_id`, API `previous_response_id`, response
+store lineage, and execution-capsule parents remain null unless the client sent
+an explicit parent or a verified compaction envelope supplied one.
+
 Calls that omit `reasoning` use the server default chat-template kwargs
 `{"enable_thinking": true, "preserve_thinking": true}`. Passing
 `{"reasoning":{"effort":"none"}}` is an explicit per-request opt-out and

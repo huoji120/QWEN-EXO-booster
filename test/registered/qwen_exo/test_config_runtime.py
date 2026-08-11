@@ -125,6 +125,48 @@ def test_qk_expansion_margin_is_bounded_and_public(tmp_path):
 
     assert config.qk_expansion_margin == 0.02
     assert config.public_dict()["qk_expansion_margin"] == 0.02
+
+    default_config = QwenExoConfig.from_server_args(server_args(tmp_path))
+    assert default_config.qk_expansion_margin == 0.02
+    assert default_config.qk_admission_margin == 0.02
+    assert default_config.qk_admission_gates == (0.0, 0.02)
+
+    broad = QwenExoConfig.from_server_args(
+        server_args(
+            tmp_path,
+            qwen_exo_qk_recall_preset="broad",
+            qwen_exo_qk_expansion_margin=0.0,
+        )
+    )
+    assert broad.qk_admission_margin == 0.0
+    assert (
+        QwenExoConfig.from_server_args(
+            server_args(
+                tmp_path,
+                qwen_exo_qk_recall_preset="broad",
+                qwen_exo_qk_expansion_margin=0.0,
+                qwen_exo_qk_only_knowledge=True,
+            )
+        ).qk_admission_margin
+        == 0.005
+    )
+    assert (
+        QwenExoConfig.from_server_args(
+            server_args(
+                tmp_path,
+                qwen_exo_qk_recall_preset="strict",
+                qwen_exo_qk_expansion_margin=0.0,
+            )
+        ).qk_admission_margin
+        == 0.02
+    )
+    assert QwenExoConfig.from_server_args(
+        server_args(
+            tmp_path,
+            qwen_exo_qk_recall_preset="strict",
+            qwen_exo_qk_expansion_margin=0.0,
+        )
+    ).qk_admission_gates == (8.0, 0.02)
     with pytest.raises(ValueError, match="expansion margin"):
         QwenExoConfig.from_server_args(
             server_args(tmp_path, qwen_exo_qk_expansion_margin=-0.01)

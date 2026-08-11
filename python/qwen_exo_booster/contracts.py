@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -262,7 +263,7 @@ class InternalJob:
     shared_prefix_key: str
     token_budget: int
     state_budget_bytes: int
-    deadline_monotonic: float
+    deadline_monotonic: float | None
     cancellation_token: CancellationToken
     telemetry_correlation_id: str
     max_fanout: int
@@ -286,10 +287,19 @@ class InternalJob:
             raise ContractViolation(
                 "Internal jobs cannot recursively create internal jobs"
             )
+        if self.deadline_monotonic is None:
+            if self.job_type is not InternalJobType.REFLECTION_MEMORY:
+                raise ContractViolation(
+                    "Only reflection memory internal jobs may omit a deadline"
+                )
+        elif not math.isfinite(self.deadline_monotonic):
+            raise ContractViolation("Internal job deadlines must be finite")
 
     def is_cancelled_or_expired(self, now: float | None = None) -> bool:
         current = time.monotonic() if now is None else now
-        return self.cancellation_token.cancelled or current >= self.deadline_monotonic
+        return self.cancellation_token.cancelled or (
+            self.deadline_monotonic is not None and current >= self.deadline_monotonic
+        )
 
 
 @dataclass(frozen=True, slots=True)

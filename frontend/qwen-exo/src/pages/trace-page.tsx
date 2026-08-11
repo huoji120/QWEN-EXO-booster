@@ -123,7 +123,6 @@ type TraceEvidence = {
   judgeQuestionReviewTokens: number | null;
   candidates: CandidateEvidence[];
   rejectedCount: number;
-  actualCount: number;
   fullyJudged: boolean;
   qkRecall: QkRecallAudit;
   selfAsk: RequestTrace["self_ask"];
@@ -360,12 +359,15 @@ function dateTime(value?: string | number | null) {
     : DATE_TIME_FORMATTERS[currentLanguage()].format(date);
 }
 
-function hasActualMemory(trace: RequestTrace) {
-  const lane = trace.native_restore?.lane;
+function hasActualKnowledge(trace: RequestTrace) {
   return (
     Number(trace.attached_tokens || 0) > 0 ||
-    (Boolean(trace.native_restore) && lane !== "cognition")
+    trace.native_restore?.lane === "knowledge"
   );
+}
+
+function hasPolicyDataRestore(trace: RequestTrace) {
+  return trace.native_restore?.lane === "policydata";
 }
 
 function contextIntegrityEventCount(trace: RequestTrace) {
@@ -650,11 +652,11 @@ function buildEvidence(
   const rankAudit = Object.keys(memoryRankAudit).length
     ? memoryRankAudit
     : proposalRankAudit;
-  const selectedKnowledgeIds = strings(memory.selected_document_ids);
-  const selectedPolicyIds = strings(policyData.document_ids);
+  const rawSelectedKnowledgeIds = strings(memory.selected_document_ids);
+  const rawSelectedPolicyIds = strings(policyData.document_ids);
   const selectedDocumentIds = new Set([
-    ...selectedKnowledgeIds,
-    ...selectedPolicyIds,
+    ...rawSelectedKnowledgeIds,
+    ...rawSelectedPolicyIds,
   ]);
   const decisions = new Map(
     asObjects(memory.semantic_decisions).map((decision) => [
@@ -683,6 +685,7 @@ function buildEvidence(
     const path = String(candidate.relative_path || UNKNOWN_DOCUMENT_SOURCE);
     const lane = String(candidate.lane || "knowledge");
     const decision = decisions.get(candidateId) || {};
+    const decisionStatus = String(decision.status || "");
     const positions = numbers(candidate.source_positions);
     const attributions = asObjects(candidate.token_attributions);
     const attributionScores = attributions
@@ -696,8 +699,10 @@ function buildEvidence(
       score: numberOrNull(candidate.score),
       tensorScore: numberOrNull(candidate.tensor_score),
       lexicalScore: numberOrNull(candidate.lexical_score),
-      selected: selectedDocumentIds.has(documentId),
-      decisionStatus: String(decision.status || ""),
+      selected:
+        selectedDocumentIds.has(documentId) &&
+        !decisionIsRejected(decisionStatus),
+      decisionStatus,
       judgeMethod: String(decision.judge_method || ""),
       origin: String(candidate.candidate_origin || ""),
       pageIds: numbers(candidate.page_ids),
@@ -710,6 +715,23 @@ function buildEvidence(
       excerpt: excerpts.get(`${lane}:${path}`) || "",
     };
   });
+  const rejectedDocumentIds = new Set(
+    candidates
+      .filter((candidate) => decisionIsRejected(candidate.decisionStatus))
+      .map((candidate) => candidate.documentId),
+  );
+  const nonRejectedSelectedDocumentIds = new Set(
+    candidates
+      .filter((candidate) => candidate.selected)
+      .map((candidate) => candidate.documentId),
+  );
+  const selectedIsNotRejected = (documentId: string) =>
+    !rejectedDocumentIds.has(documentId) ||
+    nonRejectedSelectedDocumentIds.has(documentId);
+  const selectedKnowledgeIds = rawSelectedKnowledgeIds.filter(
+    selectedIsNotRejected,
+  );
+  const selectedPolicyIds = rawSelectedPolicyIds.filter(selectedIsNotRejected);
   candidates.sort((left, right) => {
     if (left.selected !== right.selected) return left.selected ? -1 : 1;
     return (
@@ -717,7 +739,6 @@ function buildEvidence(
       Number(left.tensorScore || left.score || 0)
     );
   });
-  const actualCount = selectedKnowledgeIds.length + selectedPolicyIds.length;
   const rejectedCount = candidates.filter((candidate) =>
     decisionIsRejected(candidate.decisionStatus),
   ).length;
@@ -755,7 +776,6 @@ function buildEvidence(
     ),
     candidates,
     rejectedCount,
-    actualCount,
     fullyJudged: candidates.length > 0 && rejectedCount === candidates.length,
     qkRecall: {
       status: String(rankAudit.status || "not_run"),
@@ -847,10 +867,7 @@ function injectionFailureExplanation(evidence: TraceEvidence) {
       reason: qkAuditExplanation(evidence.qkRecall),
     });
   }
-  if (
-    evidence.selectedKnowledgeIds.length ||
-    evidence.selectedPolicyIds.length
-  ) {
+  if (evidence.selectedKnowledgeIds.length) {
     return evidence.nativeRestore.reason
       ? t("候选已经通过语义准入，但原生状态没有绑定。服务端原因：{reason}。", {
           reason: evidence.nativeRestore.reason,
@@ -858,6 +875,12 @@ function injectionFailureExplanation(evidence: TraceEvidence) {
       : t(
           "候选已经通过语义准入，但既没有文本 token，也没有可验证的原生状态绑定；请下钻原始事件检查预算、状态摘要或前缀绑定失败。",
         );
+  }
+  if (evidence.rejectedCount) {
+    return t(
+      "Semantic Judge 已拒绝 {count} 份候选；本次没有 Knowledge 准入、文本注入或 Knowledge 原生恢复。",
+      { count: formatNumber(evidence.rejectedCount) },
+    );
   }
   if (evidence.candidates.length && evidence.fullyJudged) {
     return t(
@@ -1105,11 +1128,13 @@ function RequestRow({
   onSelect: () => void;
 }) {
   const running = trace.duration_seconds === null;
-  const actual = hasActualMemory(trace);
+  const actualKnowledge = hasActualKnowledge(trace);
+  const policyDataRestored = hasPolicyDataRestore(trace);
   const integrityStatus = contextIntegrityListStatus(trace);
   return (
     <button
       type="button"
+      data-request-id={trace.request_id}
       onClick={onSelect}
       className={cn(
         "group relative w-full border-b px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
@@ -1140,9 +1165,9 @@ function RequestRow({
         {trace.input_text || t("该事件片段缺少请求输入")}
       </p>
       <div className="mt-2.5 flex items-center gap-1.5">
-        {actual ? (
+        {actualKnowledge ? (
           <Badge variant="success" className="px-1.5 py-0 text-[10px]">
-            {t("已注入")}
+            {t("知识已注入")}
           </Badge>
         ) : trace.candidates.length ? (
           <Badge variant="warning" className="px-1.5 py-0 text-[10px]">
@@ -1155,6 +1180,11 @@ function RequestRow({
             {t("无候选")}
           </Badge>
         )}
+        {policyDataRestored ? (
+          <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+            {t("PolicyData 原生恢复")}
+          </Badge>
+        ) : null}
         {trace.self_ask.length ? (
           <span className="text-[10px] text-muted-foreground">
             Self-Ask ×{formatNumber(trace.self_ask.length)}
@@ -1186,16 +1216,18 @@ function CandidateRow({
   onOpenDocument: (candidate: CandidateEvidence) => void;
 }) {
   const rejected = decisionIsRejected(candidate.decisionStatus);
-  const status = candidate.selected
-    ? "injected"
-    : rejected
-      ? "rejected"
+  const status = rejected
+    ? "rejected"
+    : candidate.selected
+      ? "injected"
       : "proposed";
   return (
     <div
+      data-candidate-id={candidate.candidateId}
+      data-recall-status={status}
       className={cn(
         "relative overflow-hidden rounded-lg border bg-card",
-        candidate.selected && "border-emerald-500/40",
+        status === "injected" && "border-emerald-500/40",
       )}
     >
       <div
@@ -1384,11 +1416,15 @@ function EvidencePanel({
   }
 
   const status = statusMeta(evidence.requestStatus);
-  const hasActual =
-    evidence.actualCount > 0 ||
+  const hasKnowledgeInjection =
+    evidence.selectedKnowledgeIds.length > 0 ||
     evidence.attachedTokens > 0 ||
     (evidence.nativeRestore.active &&
-      evidence.nativeRestore.lane !== "cognition");
+      evidence.nativeRestore.lane === "knowledge");
+  const policyDataRestored =
+    evidence.selectedPolicyIds.length > 0 ||
+    (evidence.nativeRestore.active &&
+      evidence.nativeRestore.lane === "policydata");
   const visibleCandidates = showAllCandidates
     ? evidence.candidates
     : evidence.candidates.slice(0, 6);
@@ -1397,10 +1433,12 @@ function EvidencePanel({
   );
   const integrityVerdict = contextIntegrityVerdict(contextIntegrityEvents);
   const ContextIntegrityIcon = integrityVerdict?.icon ?? CircleDot;
-  const verdict = hasActual
+  const verdict = hasKnowledgeInjection
     ? {
-        title: t("已实际注入 {count} 份记忆", {
-          count: formatNumber(Math.max(1, evidence.actualCount)),
+        title: t("已实际注入 {count} 份知识", {
+          count: formatNumber(
+            Math.max(1, evidence.selectedKnowledgeIds.length),
+          ),
         }),
         description: t(
           "下方绿色条目标记服务端已准入并绑定到本次请求的文档；这是实际注入证据，不是候选排名。",
@@ -1408,26 +1446,32 @@ function EvidencePanel({
         icon: CheckCircle2,
         tone: "success" as const,
       }
-    : evidence.candidates.length
+    : evidence.rejectedCount
       ? {
           title: t("0 份知识进入本次模型上下文"),
-          description: evidence.fullyJudged
-            ? t(
-                "{count} 份候选已由 Attention-Q 提出，但 Semantic Judge 全部拒绝。",
-                { count: formatNumber(evidence.candidates.length) },
-              )
-            : t("{count} 份候选已提出，但当前事件中没有实际准入或注入证据。", {
-                count: formatNumber(evidence.candidates.length),
-              }),
-          icon: AlertTriangle,
+          description: t(
+            "Semantic Judge 已拒绝 {count} 份候选；本次没有 Knowledge 准入、文本注入或 Knowledge 原生恢复。",
+            { count: formatNumber(evidence.rejectedCount) },
+          ),
+          icon: XCircle,
           tone: "warning" as const,
         }
-      : {
-          title: t("本次请求没有知识候选"),
-          description: qkAuditExplanation(evidence.qkRecall),
-          icon: CircleDot,
-          tone: "neutral" as const,
-        };
+      : evidence.candidates.length
+        ? {
+            title: t("0 份知识进入本次模型上下文"),
+            description: t(
+              "{count} 份候选已提出，但当前事件中没有实际准入或注入证据。",
+              { count: formatNumber(evidence.candidates.length) },
+            ),
+            icon: AlertTriangle,
+            tone: "warning" as const,
+          }
+        : {
+            title: t("本次请求没有知识候选"),
+            description: qkAuditExplanation(evidence.qkRecall),
+            icon: CircleDot,
+            tone: "neutral" as const,
+          };
   const VerdictIcon = verdict.icon;
 
   return (
@@ -1486,10 +1530,23 @@ function EvidencePanel({
             <VerdictIcon className="h-4 w-4" />
           </div>
           <div>
+            {!hasKnowledgeInjection && evidence.rejectedCount ? (
+              <Badge variant="warning" className="mb-1 px-1.5 py-0 text-[10px]">
+                {t("Judge 拒绝")}
+              </Badge>
+            ) : null}
             <div className="text-sm font-semibold">{verdict.title}</div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               {verdict.description}
             </p>
+            {policyDataRestored ? (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {t(
+                  "PolicyData 单独恢复 {tokens} token；它是始终生效的策略状态，不等于 Knowledge 候选通过或知识注入。",
+                  { tokens: formatNumber(evidence.nativeRestore.tokens) },
+                )}
+              </p>
+            ) : null}
             {evidence.nativeRestore.active &&
             evidence.nativeRestore.lane === "cognition" ? (
               <p className="mt-1 text-[11px] text-muted-foreground">
@@ -1716,7 +1773,7 @@ function EvidencePanel({
               index={3}
               title="Semantic Judge"
               value={t("{passed} 通过 / {rejected} 拒绝", {
-                passed: formatNumber(evidence.actualCount),
+                passed: formatNumber(evidence.selectedKnowledgeIds.length),
                 rejected: formatNumber(evidence.rejectedCount),
               })}
               detail={[
@@ -1739,7 +1796,7 @@ function EvidencePanel({
                 .filter(Boolean)
                 .join(" · ")}
               state={
-                evidence.actualCount
+                evidence.selectedKnowledgeIds.length
                   ? "success"
                   : evidence.rejectedCount
                     ? "warning"
@@ -1748,16 +1805,18 @@ function EvidencePanel({
             />
             <PipelineStage
               index={4}
-              title={t("实际注入")}
-              value={hasActual ? t("已绑定") : t("未注入")}
+              title={t("知识实际注入")}
+              value={hasKnowledgeInjection ? t("已绑定") : t("未注入")}
               detail={t("文本 {tokens} · 原生 {lane}", {
                 tokens: formatNumber(evidence.attachedTokens),
-                lane: evidence.nativeRestore.lane
-                  ? laneLabel(evidence.nativeRestore.lane)
-                  : t("无"),
+                lane:
+                  evidence.nativeRestore.active &&
+                  evidence.nativeRestore.lane === "knowledge"
+                    ? laneLabel(evidence.nativeRestore.lane)
+                    : t("无"),
               })}
               state={
-                hasActual
+                hasKnowledgeInjection
                   ? "success"
                   : evidence.candidates.length
                     ? "warning"
@@ -1766,12 +1825,12 @@ function EvidencePanel({
             />
           </div>
 
-          {!hasActual ? (
+          {!hasKnowledgeInjection ? (
             <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-500/[0.06] p-4">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700 dark:text-amber-300" />
               <div>
                 <div className="text-sm font-semibold">
-                  {t("为什么没有实际注入")}
+                  {t("为什么没有知识注入")}
                 </div>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
                   {injectionFailureExplanation(evidence)}
@@ -2015,9 +2074,7 @@ export function TracePage() {
   const [loading, setLoading] = useState(true);
   const [unavailable, setUnavailable] = useState(false);
   const [query, setQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [filter, setFilter] = useState<TraceFilter>("activity");
-  const [initialFilterLoaded, setInitialFilterLoaded] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<{
     requestId: string;
@@ -2040,8 +2097,6 @@ export function TracePage() {
         if (!cancelled && isTraceDefaultScope(value)) setFilter(value);
       } catch {
         // 保留页面默认筛选；配置不可读不应阻断轨迹查看。
-      } finally {
-        if (!cancelled) setInitialFilterLoaded(true);
       }
     };
     void loadDefaultScope();
@@ -2050,33 +2105,24 @@ export function TracePage() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!initialFilterLoaded) return;
-    const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 300);
-    return () => window.clearTimeout(timer);
-  }, [initialFilterLoaded, query]);
-
-  const loadListing = useCallback(
-    async (silent = false) => {
-      if (!silent) setLoading(true);
-      try {
-        setListing(await getRequestTraces(100, debouncedQuery));
-        setUnavailable(false);
-        setUpdatedAt(Date.now());
-      } catch (error) {
-        if (error instanceof ApiError && error.status === 404) {
-          setUnavailable(true);
-        } else if (!silent) {
-          toast.error(t("请求轨迹加载失败"), {
-            description: error instanceof Error ? error.message : t("未知错误"),
-          });
-        }
-      } finally {
-        if (!silent) setLoading(false);
+  const loadListing = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      setListing(await getRequestTraces(100));
+      setUnavailable(false);
+      setUpdatedAt(Date.now());
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        setUnavailable(true);
+      } else if (!silent) {
+        toast.error(t("请求轨迹加载失败"), {
+          description: error instanceof Error ? error.message : t("未知错误"),
+        });
       }
-    },
-    [debouncedQuery],
-  );
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, []);
 
   const loadDetail = useCallback(
     async (trace: RequestTrace, silent = false) => {
@@ -2109,26 +2155,37 @@ export function TracePage() {
   }, [loadListing]);
 
   const requests = listing?.requests ?? [];
-  const filteredRequests = useMemo(
-    () =>
-      requests.filter((trace) => {
-        if (filter === "activity") {
-          return (
-            hasActualMemory(trace) ||
-            trace.self_ask.length > 0 ||
-            contextIntegrityEventCount(trace) > 0
-          );
-        }
-        if (filter === "integrity") {
-          return contextIntegrityEventCount(trace) > 0;
-        }
-        if (filter === "actual") return hasActualMemory(trace);
-        if (filter === "proposed") return trace.candidates.length > 0;
-        if (filter === "running") return trace.duration_seconds === null;
-        return true;
-      }),
-    [filter, requests],
-  );
+  const filteredRequests = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return requests.filter((trace) => {
+      if (
+        normalizedQuery &&
+        !trace.request_id.toLowerCase().includes(normalizedQuery) &&
+        !trace.input_text.toLowerCase().includes(normalizedQuery) &&
+        !trace.output_text.toLowerCase().includes(normalizedQuery) &&
+        !trace.candidates.some((candidate) =>
+          candidate.relative_path.toLowerCase().includes(normalizedQuery),
+        )
+      ) {
+        return false;
+      }
+      if (filter === "activity") {
+        return (
+          hasActualKnowledge(trace) ||
+          trace.candidates.length > 0 ||
+          trace.self_ask.length > 0 ||
+          contextIntegrityEventCount(trace) > 0
+        );
+      }
+      if (filter === "integrity") {
+        return contextIntegrityEventCount(trace) > 0;
+      }
+      if (filter === "actual") return hasActualKnowledge(trace);
+      if (filter === "proposed") return trace.candidates.length > 0;
+      if (filter === "running") return trace.duration_seconds === null;
+      return true;
+    });
+  }, [filter, query, requests]);
 
   useEffect(() => {
     if (!filteredRequests.length) {
@@ -2149,17 +2206,10 @@ export function TracePage() {
   );
 
   useEffect(() => {
-    if (selectedTrace) void loadDetail(selectedTrace);
-  }, [loadDetail, selectedTrace]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (document.visibilityState !== "visible") return;
-      void loadListing(true);
-      if (selectedTrace) void loadDetail(selectedTrace, true);
-    }, 12000);
-    return () => window.clearInterval(timer);
-  }, [loadDetail, loadListing, selectedTrace]);
+    if (selectedTrace && detail?.requestId !== selectedTrace.request_id) {
+      void loadDetail(selectedTrace);
+    }
+  }, [detail?.requestId, loadDetail, selectedTrace]);
 
   const refresh = async () => {
     await loadListing();
@@ -2264,8 +2314,8 @@ export function TracePage() {
             </div>
             <div className="flex shrink-0 items-center gap-3 px-1 text-[10px] text-muted-foreground">
               <span className="flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                {t("12 秒自动刷新")}
+                <RefreshCw className="h-3 w-3" />
+                {t("仅手动刷新")}
               </span>
               <span>
                 {t("{count} 请求", {

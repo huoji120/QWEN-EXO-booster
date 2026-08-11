@@ -107,6 +107,16 @@ def test_internal_job_rejects_recursion_and_honors_cancellation():
         **{**fields, "cancellation_token": fields["cancellation_token"].cancel()}
     )
     assert cancelled.is_cancelled_or_expired()
+    with pytest.raises(ContractViolation, match="may omit a deadline"):
+        InternalJob(**{**fields, "deadline_monotonic": None})
+    with pytest.raises(ContractViolation, match="must be finite"):
+        InternalJob(
+            **{
+                **fields,
+                "job_type": InternalJobType.REFLECTION_MEMORY,
+                "deadline_monotonic": float("inf"),
+            }
+        )
 
 
 def test_resource_estimate_preserves_parent_reserve():

@@ -17,6 +17,7 @@ from qwen_exo_booster.pipeline import MemoryPipeline
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.refresh import SelfAskRefreshService
 from qwen_exo_booster.telemetry import TelemetryStore
+from qwen_exo_booster.query_probe import QueryStateSpan
 
 
 class FakeManager:
@@ -154,6 +155,22 @@ class BlockingTensorBank:
         raise AssertionError("Cancelled Tensor Bank task continued into residency")
 
 
+class RecordingTensorBank:
+    def __init__(self):
+        self.rank_kwargs = None
+        self.resident_page_ids = None
+
+    async def ensure_ready(self):
+        return SimpleNamespace(ready=True)
+
+    def rank(self, *_args, **kwargs):
+        self.rank_kwargs = kwargs
+        return ()
+
+    async def ensure_resident(self, page_ids):
+        self.resident_page_ids = tuple(page_ids)
+
+
 def request_factory(**kwargs):
     return SimpleNamespace(**kwargs)
 
@@ -199,6 +216,38 @@ def build_service(tmp_path, manager, **kwargs):
         ),
         repo,
     )
+
+
+@pytest.mark.asyncio
+async def test_tensor_refresh_forwards_resolved_admission_margin(tmp_path):
+    bank = RecordingTensorBank()
+    service, _repo = build_service(
+        tmp_path,
+        FakeManager(),
+        tensor_bank=bank,
+        query_probe=SimpleNamespace(
+            probe=lambda *_args, **_kwargs: asyncio.sleep(
+                0,
+                result=SimpleNamespace(
+                    status="ready",
+                    query_heads=(((1.0, 0.0),),),
+                    query_states=(QueryStateSpan("current_user", 0, 1, 0, 1),),
+                ),
+            )
+        ),
+        qk_admission_margin=0.02,
+        qk_min_tensor_score=8.0,
+    )
+
+    candidates = await service._tensor_candidates(
+        SimpleNamespace(event_id="event-margin", request_id="request-margin"),
+        "Which exact constant is needed?",
+    )
+
+    assert candidates == ()
+    assert bank.rank_kwargs["min_document_margin"] == 0.02
+    assert bank.rank_kwargs["min_tensor_score"] == 8.0
+    assert bank.resident_page_ids == ()
 
 
 @pytest.mark.parametrize("candidate_source", ("fixed", "tensor"))
@@ -247,6 +296,7 @@ async def test_refresh_cancellation_awaits_all_child_tasks(tmp_path, candidate_s
                 result=SimpleNamespace(
                     status="ready",
                     query_heads=(((1.0, 0.0),),),
+                    query_states=(QueryStateSpan("current_user", 0, 1, 0, 1),),
                 ),
             )
         )
