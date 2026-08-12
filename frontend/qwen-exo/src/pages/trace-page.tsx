@@ -101,6 +101,39 @@ type QkRecallAudit = {
   scoredDocuments: QkScoredDocument[];
 };
 
+type ReplayLossEvidence = {
+  candidateId: string | null;
+  documentId: string | null;
+  nll: number | null;
+  gainVsBaseline: number | null;
+  observedTokenKl: number | null;
+  observationTokens: number | null;
+};
+
+type CausalReplayEvidence = {
+  eventType: string;
+  eventId: number | null;
+  timestamp: string | number | null;
+  decision: string;
+  maybeDecision: string;
+  winnerCandidateId: string | null;
+  winnerDocumentId: string | null;
+  winnerGain: number | null;
+  winnerKl: number | null;
+  scheduledNextTurn: boolean | null;
+  latencySeconds: number | null;
+  errorType: string | null;
+  losses: ReplayLossEvidence[];
+};
+
+type MaybeEvidence = {
+  eventId: number | null;
+  timestamp: string | number | null;
+  status: string;
+  decision: string;
+  scheduledNextTurn: boolean | null;
+};
+
 type TraceEvidence = {
   requestStatus: RequestStatus;
   promptTokens: number | null;
@@ -126,6 +159,8 @@ type TraceEvidence = {
   fullyJudged: boolean;
   qkRecall: QkRecallAudit;
   selfAsk: RequestTrace["self_ask"];
+  causalReplay: CausalReplayEvidence[];
+  maybe: MaybeEvidence[];
   events: TelemetryEvent[];
 };
 
@@ -165,6 +200,9 @@ const EVENT_TYPE_LABELS: Record<string, string> = {
   "tensor_bank.prefix_cache": "原生前缀缓存",
   "capsule.updated": "执行胶囊更新",
   "request.stage_summary": "请求阶段汇总",
+  "causal_replay.completed": "因果回放完成",
+  "causal_replay.failed_closed": "因果回放失败关闭",
+  "maybe.completed": "Maybe 门禁完成",
 };
 
 const FILTERS: { value: TraceFilter; label: string }[] = [
@@ -210,6 +248,25 @@ const SELF_ASK_STATUS_LABELS: Record<string, string> = {
   admit_maybe: "Maybe 已准入",
   pending: "等待判定",
   not_requested: "未请求",
+};
+
+const CAUSAL_REPLAY_DECISION_LABELS: Record<string, string> = {
+  shadow_would_switch: "候选分支胜出",
+  reject_no_challenger: "没有可比较候选",
+  reject_no_semantic_candidate: "没有通过语义准入的候选",
+  reject_insufficient_gain: "损失增益不足",
+  reject_switch_margin: "切换边际不足",
+  insufficient_future_observation: "未来观测 token 不足",
+  reject_empty_prefix: "回放前缀为空",
+  reject_empty_candidate_state: "候选状态为空",
+  failed_closed: "失败关闭",
+};
+
+const MAYBE_DECISION_LABELS: Record<string, string> = {
+  admit_maybe: "Maybe 已准入",
+  reject_maybe_kl: "KL 超限，拒绝 Maybe",
+  not_compiled: "未编译 Maybe",
+  not_recorded: "未记录",
 };
 
 const CONTEXT_INTEGRITY_REASON_LABELS: Record<string, string> = {
@@ -329,6 +386,10 @@ function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function booleanOrNull(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
 function eventType(event: TelemetryEvent): string {
   return String(event.event_type || event.event || event.type || "unknown");
 }
@@ -373,6 +434,12 @@ function hasPolicyDataRestore(trace: RequestTrace) {
 function contextIntegrityEventCount(trace: RequestTrace) {
   return trace.event_types.filter((type) =>
     type.startsWith("context_integrity."),
+  ).length;
+}
+
+function causalReplayEventCount(trace: RequestTrace) {
+  return trace.event_types.filter(
+    (type) => type.startsWith("causal_replay.") || type === "maybe.completed",
   ).length;
 }
 
@@ -742,6 +809,72 @@ function buildEvidence(
   const rejectedCount = candidates.filter((candidate) =>
     decisionIsRejected(candidate.decisionStatus),
   ).length;
+  const causalReplay: CausalReplayEvidence[] = ordered
+    .filter((event) => eventType(event).startsWith("causal_replay."))
+    .map((event) => {
+      const payload = eventPayload(event);
+      const winnerCandidateId = payload.winner_candidate_id;
+      const winnerDocumentId = payload.winner_document_id;
+      const errorType = payload.error_type;
+      return {
+        eventType: eventType(event),
+        eventId: numberOrNull(event.event_id),
+        timestamp: event.timestamp ?? null,
+        decision: String(
+          payload.replay_decision ||
+            (eventType(event) === "causal_replay.failed_closed"
+              ? "failed_closed"
+              : "not_recorded"),
+        ),
+        maybeDecision: String(payload.maybe_gate_decision || "not_recorded"),
+        winnerCandidateId:
+          typeof winnerCandidateId === "string" && winnerCandidateId
+            ? winnerCandidateId
+            : null,
+        winnerDocumentId:
+          typeof winnerDocumentId === "string" && winnerDocumentId
+            ? winnerDocumentId
+            : null,
+        winnerGain: numberOrNull(payload.winner_gain),
+        winnerKl: numberOrNull(payload.winner_kl),
+        scheduledNextTurn: booleanOrNull(payload.scheduled_next_turn),
+        latencySeconds: numberOrNull(payload.latency_seconds),
+        errorType:
+          typeof errorType === "string" && errorType ? errorType : null,
+        losses: asObjects(payload.losses).map((loss) => ({
+          candidateId:
+            typeof loss.candidate_id === "string" && loss.candidate_id
+              ? loss.candidate_id
+              : null,
+          documentId:
+            typeof loss.document_id === "string" && loss.document_id
+              ? loss.document_id
+              : null,
+          nll: numberOrNull(loss.nll),
+          gainVsBaseline: numberOrNull(loss.gain_vs_baseline),
+          observedTokenKl: numberOrNull(loss.observed_token_kl),
+          observationTokens: numberOrNull(loss.observation_tokens),
+        })),
+      };
+    });
+  const maybe: MaybeEvidence[] = ordered
+    .filter((event) => eventType(event) === "maybe.completed")
+    .map((event) => {
+      const payload = eventPayload(event);
+      return {
+        eventId: numberOrNull(event.event_id),
+        timestamp: event.timestamp ?? null,
+        status: String(payload.status || "not_recorded"),
+        decision: String(
+          payload.maybe_decision ||
+            payload.maybe_gate_decision ||
+            "not_recorded",
+        ),
+        scheduledNextTurn:
+          booleanOrNull(payload.maybe_scheduled_next_turn) ??
+          booleanOrNull(payload.scheduled_next_turn),
+      };
+    });
   return {
     requestStatus: requestStatus(ordered),
     promptTokens:
@@ -804,6 +937,8 @@ function buildEvidence(
       ),
     },
     selfAsk: deduplicateSelfAsk(trace.self_ask),
+    causalReplay,
+    maybe,
     events: ordered,
   };
 }
@@ -946,6 +1081,61 @@ function selfAskSucceeded(status: string) {
   ].includes(status);
 }
 
+function causalReplayDecisionLabel(decision: string) {
+  return decision.startsWith("failed_closed")
+    ? t("失败关闭")
+    : translatedCodeLabel(
+        decision,
+        CAUSAL_REPLAY_DECISION_LABELS,
+        "状态未记录",
+      );
+}
+
+function maybeDecisionLabel(decision: string) {
+  return translatedCodeLabel(decision, MAYBE_DECISION_LABELS, "未记录");
+}
+
+function causalReplayExplanation(replay: CausalReplayEvidence) {
+  if (replay.eventType === "causal_replay.failed_closed") {
+    return replay.errorType
+      ? t("回放评分发生 {error}；服务端失败关闭，没有安排下一轮状态。", {
+          error: replay.errorType,
+        })
+      : t("回放评分异常；服务端失败关闭，没有安排下一轮状态。");
+  }
+  if (replay.decision === "shadow_would_switch") {
+    return replay.scheduledNextTurn
+      ? t(
+          "候选分支在同一组未来 token 上优于基线，并通过 KL 门禁；已安排为下一轮可恢复状态。",
+        )
+      : t(
+          "候选分支优于基线，但没有通过 Maybe/KL 门禁；本轮输出未被改写，也没有安排下一轮状态。",
+        );
+  }
+  if (replay.decision === "reject_insufficient_gain") {
+    return t("候选分支相对基线的 NLL 改善不足，回放拒绝切换。");
+  }
+  if (replay.decision === "reject_switch_margin") {
+    return t("新候选没有超过当前候选所需的切换边际，回放保持现状。");
+  }
+  if (replay.decision === "reject_no_semantic_candidate") {
+    return t("没有候选通过语义准入，回放未执行候选分支评分。");
+  }
+  if (replay.decision === "insufficient_future_observation") {
+    return t("触发点后的真实未来 token 不足，无法进行同窗口因果比较。");
+  }
+  if (replay.decision === "reject_empty_prefix") {
+    return t("没有可复用的父请求前缀，回放按失败关闭策略停止。");
+  }
+  if (replay.decision === "reject_empty_candidate_state") {
+    return t("候选没有可评分的原生状态或参考 token，回放没有启动分支比较。");
+  }
+  if (replay.decision === "reject_no_challenger") {
+    return t("回放只有基线分支，没有可比较的候选分支。");
+  }
+  return t("服务端记录了回放终态；可展开原始事件检查完整字段。");
+}
+
 function eventSummary(event: TelemetryEvent) {
   const type = eventType(event);
   const payload = eventPayload(event);
@@ -1005,6 +1195,30 @@ function eventSummary(event: TelemetryEvent) {
   }
   if (type === "context_integrity.failed_closed") {
     return t("检查失败关闭 · 未修改上下文");
+  }
+  if (type === "causal_replay.completed") {
+    return t("{decision} · 增益 {gain} · {schedule}", {
+      decision: causalReplayDecisionLabel(
+        String(payload.replay_decision || ""),
+      ),
+      gain: formatScore(numberOrNull(payload.winner_gain)),
+      schedule: payload.scheduled_next_turn
+        ? t("已安排下一轮")
+        : t("未安排下一轮"),
+    });
+  }
+  if (type === "causal_replay.failed_closed") {
+    return t("失败关闭 · {error}", {
+      error: String(payload.error_type || t("未知错误")),
+    });
+  }
+  if (type === "maybe.completed") {
+    return t("{status} · {decision}", {
+      status: selfAskStatusLabel(String(payload.status || "")),
+      decision: maybeDecisionLabel(
+        String(payload.maybe_decision || payload.maybe_gate_decision || ""),
+      ),
+    });
   }
   if (type.startsWith("refresh")) {
     return String(
@@ -1131,6 +1345,7 @@ function RequestRow({
   const actualKnowledge = hasActualKnowledge(trace);
   const policyDataRestored = hasPolicyDataRestore(trace);
   const integrityStatus = contextIntegrityListStatus(trace);
+  const replayEventCount = causalReplayEventCount(trace);
   return (
     <button
       type="button"
@@ -1189,6 +1404,11 @@ function RequestRow({
           <span className="text-[10px] text-muted-foreground">
             Self-Ask ×{formatNumber(trace.self_ask.length)}
           </span>
+        ) : null}
+        {replayEventCount ? (
+          <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+            {t("回放 ×{count}", { count: formatNumber(replayEventCount) })}
+          </Badge>
         ) : null}
         {integrityStatus ? (
           <Badge
@@ -1431,6 +1651,16 @@ function EvidencePanel({
   const contextIntegrityEvents = evidence.events.filter((event) =>
     eventType(event).startsWith("context_integrity."),
   );
+  const causalReplayTelemetryCount =
+    evidence.causalReplay.length + evidence.maybe.length;
+  const observerTriggered = evidence.events.some((event) => {
+    const type = eventType(event);
+    if (type === "observer.mid_think_triggered") return true;
+    return (
+      type === "observer.decode_summary" &&
+      Boolean(eventPayload(event).triggered)
+    );
+  });
   const integrityVerdict = contextIntegrityVerdict(contextIntegrityEvents);
   const ContextIntegrityIcon = integrityVerdict?.icon ?? CircleDot;
   const verdict = hasKnowledgeInjection
@@ -1607,7 +1837,7 @@ function EvidencePanel({
       ) : null}
 
       <Tabs defaultValue="recall" className="px-5 py-4">
-        <TabsList className="grid w-full grid-cols-4 sm:w-auto sm:inline-grid">
+        <TabsList className="grid w-full grid-cols-2 sm:w-auto sm:inline-grid sm:grid-cols-5">
           <TabsTrigger value="recall">
             {t("召回判定 · {count}", {
               count: formatNumber(evidence.candidates.length),
@@ -1615,6 +1845,11 @@ function EvidencePanel({
           </TabsTrigger>
           <TabsTrigger value="self-ask">
             Self-Ask · {formatNumber(evidence.selfAsk.length)}
+          </TabsTrigger>
+          <TabsTrigger value="causal-replay">
+            {t("因果回放 · {count}", {
+              count: formatNumber(causalReplayTelemetryCount),
+            })}
           </TabsTrigger>
           <TabsTrigger value="integrity">
             {t("完整性 · {count}", {
@@ -1939,6 +2174,218 @@ function EvidencePanel({
           )}
         </TabsContent>
 
+        <TabsContent value="causal-replay">
+          {causalReplayTelemetryCount ? (
+            <div className="space-y-3">
+              {evidence.causalReplay.map((replay, index) => {
+                const admitted = replay.scheduledNextTurn === true;
+                const failedClosed =
+                  replay.eventType === "causal_replay.failed_closed" ||
+                  replay.decision.startsWith("failed_closed");
+                return (
+                  <div
+                    key={`${replay.eventId ?? "replay"}-${replay.eventType}-${index}`}
+                    className={cn(
+                      "overflow-hidden rounded-lg border",
+                      admitted && "border-emerald-200 bg-emerald-500/[0.05]",
+                      !admitted &&
+                        !failedClosed &&
+                        "border-amber-200 bg-amber-500/[0.05]",
+                      failedClosed && "border-red-200 bg-red-500/[0.05]",
+                    )}
+                  >
+                    <div className="p-4">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="flex min-w-0 items-start gap-3">
+                          <div
+                            className={cn(
+                              "mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full",
+                              admitted &&
+                                "bg-emerald-500/15 text-emerald-600 dark:text-emerald-300",
+                              !admitted &&
+                                !failedClosed &&
+                                "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+                              failedClosed &&
+                                "bg-red-500/15 text-red-700 dark:text-red-300",
+                            )}
+                          >
+                            {admitted ? (
+                              <CheckCircle2 className="h-4 w-4" />
+                            ) : failedClosed ? (
+                              <XCircle className="h-4 w-4" />
+                            ) : (
+                              <Activity className="h-4 w-4" />
+                            )}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-semibold">
+                                {t("因果回放 {index}", {
+                                  index: formatNumber(index + 1),
+                                })}
+                              </span>
+                              <Badge
+                                variant={
+                                  admitted
+                                    ? "success"
+                                    : failedClosed
+                                      ? "warning"
+                                      : "outline"
+                                }
+                              >
+                                {causalReplayDecisionLabel(replay.decision)}
+                              </Badge>
+                            </div>
+                            <div className="mt-1 font-mono text-[10px] text-muted-foreground">
+                              #{replay.eventId ?? "—"} ·{" "}
+                              {timeOnly(replay.timestamp)} · {replay.eventType}
+                            </div>
+                          </div>
+                        </div>
+                        <Badge variant={admitted ? "success" : "outline"}>
+                          {admitted ? t("已安排下一轮") : t("未安排下一轮")}
+                        </Badge>
+                      </div>
+
+                      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+                        {causalReplayExplanation(replay)}
+                      </p>
+
+                      <div className="mt-4 grid grid-cols-2 gap-3 border-t pt-3 sm:grid-cols-4">
+                        <div>
+                          <div className="eyebrow">{t("胜出增益")}</div>
+                          <div className="mt-1 font-mono text-xs font-semibold">
+                            {formatScore(replay.winnerGain)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="eyebrow">{t("观测 KL")}</div>
+                          <div className="mt-1 font-mono text-xs font-semibold">
+                            {formatScore(replay.winnerKl)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="eyebrow">{t("Maybe 门禁")}</div>
+                          <div className="mt-1 text-xs font-semibold">
+                            {maybeDecisionLabel(replay.maybeDecision)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="eyebrow">{t("回放耗时")}</div>
+                          <div className="mt-1 font-mono text-xs font-semibold">
+                            {replay.latencySeconds === null
+                              ? "—"
+                              : formatDuration(replay.latencySeconds)}
+                          </div>
+                        </div>
+                      </div>
+
+                      {replay.winnerCandidateId || replay.winnerDocumentId ? (
+                        <div className="mt-3 rounded-md bg-muted/50 px-3 py-2 font-mono text-[10px] text-muted-foreground">
+                          {t("胜出候选")}{" "}
+                          {shortHash(replay.winnerCandidateId, 16)} ·{" "}
+                          {t("文档")} {shortHash(replay.winnerDocumentId, 16)}
+                        </div>
+                      ) : null}
+                    </div>
+
+                    {replay.losses.length ? (
+                      <div className="overflow-x-auto border-t">
+                        <div className="min-w-[620px]">
+                          <div className="grid grid-cols-[minmax(150px,1.5fr)_repeat(4,minmax(80px,1fr))] gap-3 bg-muted/45 px-3 py-2 text-[9px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                            <span>{t("分支")}</span>
+                            <span>NLL</span>
+                            <span>{t("相对基线增益")}</span>
+                            <span>KL</span>
+                            <span>{t("观测 token")}</span>
+                          </div>
+                          {replay.losses.map((loss, lossIndex) => (
+                            <div
+                              key={`${loss.candidateId ?? "baseline"}-${lossIndex}`}
+                              className="grid grid-cols-[minmax(150px,1.5fr)_repeat(4,minmax(80px,1fr))] gap-3 border-t px-3 py-2.5 text-[11px]"
+                            >
+                              <span className="min-w-0 truncate font-medium">
+                                {loss.candidateId
+                                  ? `${t("候选")} ${shortHash(loss.candidateId, 12)}`
+                                  : t("基线")}
+                              </span>
+                              <span className="font-mono">
+                                {formatScore(loss.nll)}
+                              </span>
+                              <span className="font-mono">
+                                {formatScore(loss.gainVsBaseline)}
+                              </span>
+                              <span className="font-mono">
+                                {formatScore(loss.observedTokenKl)}
+                              </span>
+                              <span className="font-mono">
+                                {loss.observationTokens === null
+                                  ? "—"
+                                  : formatNumber(loss.observationTokens)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+
+              {evidence.maybe.length ? (
+                <div className="overflow-hidden rounded-lg border">
+                  <div className="border-b bg-muted/45 px-3 py-2 text-[10px] font-semibold text-muted-foreground">
+                    {t("Maybe 终态")}
+                  </div>
+                  {evidence.maybe.map((item, index) => (
+                    <div
+                      key={`${item.eventId ?? "maybe"}-${index}`}
+                      className="flex flex-wrap items-center justify-between gap-3 border-b px-3 py-3 last:border-b-0"
+                    >
+                      <div>
+                        <div className="text-xs font-semibold">
+                          {selfAskStatusLabel(item.status)}
+                        </div>
+                        <div className="mt-1 font-mono text-[10px] text-muted-foreground">
+                          #{item.eventId ?? "—"} · {timeOnly(item.timestamp)}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Badge variant="outline">
+                          {maybeDecisionLabel(item.decision)}
+                        </Badge>
+                        <Badge
+                          variant={
+                            item.scheduledNextTurn ? "success" : "outline"
+                          }
+                        >
+                          {item.scheduledNextTurn
+                            ? t("已安排下一轮")
+                            : t("未安排下一轮")}
+                        </Badge>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-dashed p-10 text-center">
+              <Activity className="mx-auto h-5 w-5 text-muted-foreground" />
+              <p className="mt-3 text-sm font-medium">
+                {t("本次请求没有 Causal Replay 终态记录")}
+              </p>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                {observerTriggered
+                  ? t(
+                      "Observer 已触发，但后续没有进入回放终态；触发不等于执行了 Causal Replay。",
+                    )
+                  : t("没有持续不确定性触发，或语义候选未满足回放前置条件。")}
+              </p>
+            </div>
+          )}
+        </TabsContent>
+
         <TabsContent value="integrity">
           {integrityVerdict ? (
             <div className="space-y-3">
@@ -2174,6 +2621,7 @@ export function TracePage() {
           hasActualKnowledge(trace) ||
           trace.candidates.length > 0 ||
           trace.self_ask.length > 0 ||
+          causalReplayEventCount(trace) > 0 ||
           contextIntegrityEventCount(trace) > 0
         );
       }
