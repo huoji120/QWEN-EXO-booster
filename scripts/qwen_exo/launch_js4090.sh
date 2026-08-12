@@ -95,6 +95,32 @@ if [[ ! -d "${QWEN_EXO_MODEL_PATH}" ]]; then
   echo "Model directory not found: ${QWEN_EXO_MODEL_PATH}" >&2
   exit 1
 fi
+QWEN_EXO_MODEL_CATALOG_PATH="${QWEN_EXO_MODEL_CATALOG_PATH:-$(dirname -- "${QWEN_EXO_MODEL_PATH}")}"
+if [[ ! -d "${QWEN_EXO_MODEL_CATALOG_PATH}" ]]; then
+  echo "Model catalog directory not found: ${QWEN_EXO_MODEL_CATALOG_PATH}" >&2
+  exit 1
+fi
+catalog_host_roots=("${QWEN_EXO_MODEL_CATALOG_PATH}")
+if [[ -n "${QWEN_EXO_MODEL_CATALOG_EXTRA_PATHS:-}" ]]; then
+  IFS=':' read -r -a extra_catalog_roots <<< "${QWEN_EXO_MODEL_CATALOG_EXTRA_PATHS}"
+  for root in "${extra_catalog_roots[@]}"; do
+    [[ -z "${root}" ]] && continue
+    if [[ ! -d "${root}" ]]; then
+      echo "Additional model catalog directory not found: ${root}" >&2
+      exit 1
+    fi
+    catalog_host_roots+=("${root}")
+  done
+fi
+catalog_container_roots=()
+for index in "${!catalog_host_roots[@]}"; do
+  catalog_container_roots+=("/models/catalog-${index}")
+done
+QWEN_EXO_MODEL_CATALOG_ROOTS="$(IFS=:; echo "${catalog_container_roots[*]}")"
+: "${QWEN_EXO_MODEL_CATALOG_CONFIG:=/data/qwen-exo/model-catalog.json}"
+: "${QWEN_EXO_MODEL_DATA_ROOT:=/data/qwen-exo}"
+export QWEN_EXO_MODEL_PATH QWEN_EXO_MODEL_CATALOG_PATH QWEN_EXO_DATA_PATH
+export QWEN_EXO_MODEL_CATALOG_ROOTS QWEN_EXO_MODEL_CATALOG_CONFIG QWEN_EXO_MODEL_DATA_ROOT
 
 if [[ ! -f "${QWEN_EXO_SOURCE_PATH}/python/sglang/srt/server_args.py" ]]; then
   echo "QWEN-EXO source tree not found: ${QWEN_EXO_SOURCE_PATH}" >&2
@@ -138,12 +164,13 @@ mkdir -p \
 seed_corpus \
   "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/knowledge" \
   "${QWEN_EXO_DATA_PATH}/knowledge"
-seed_corpus \
-  "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/policydata" \
-  "${QWEN_EXO_DATA_PATH}/policydata"
-# Remove the retired text-injection identity card; Cognition is native-only and
-# optional, so an empty versioned cognition source intentionally seeds nothing.
-rm -f "${QWEN_EXO_DATA_PATH}/cognition/gpt-identity-card.md"
+# PolicyData is operator-managed and must remain a single document. Seed it only
+# when the persistent lane is empty; never re-expand a live profile on restart.
+if ! find "${QWEN_EXO_DATA_PATH}/policydata" -maxdepth 1 -type f \( -name '*.md' -o -name '*.markdown' \) -print -quit | grep -q .; then
+  install -m 0644 \
+    "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/policydata/coding-agent-execution-policy.md" \
+    "${QWEN_EXO_DATA_PATH}/policydata/coding-agent-execution-policy.md"
+fi
 seed_corpus \
   "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/cognition" \
   "${QWEN_EXO_DATA_PATH}/cognition"
@@ -168,11 +195,17 @@ docker_args=(
   -e QWEN_EXO_MANAGED_RESTART=1
   -e "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR:-}"
   -e "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH:-}"
-  -v "${QWEN_EXO_MODEL_PATH}:/models/qwen-exo-27b:ro"
+  -e "QWEN_EXO_MODEL_CATALOG_ROOTS=${QWEN_EXO_MODEL_CATALOG_ROOTS}"
+  -e "QWEN_EXO_MODEL_CATALOG_CONFIG=${QWEN_EXO_MODEL_CATALOG_CONFIG}"
+  -e "QWEN_EXO_MODEL_DATA_ROOT=${QWEN_EXO_MODEL_DATA_ROOT}"
+  -e QWEN_EXO_MODEL_PROFILE_SEED_ROOT=/sgl-workspace/sglang/scripts/qwen_exo/corpus
   -v "${QWEN_EXO_DATA_PATH}:/data/qwen-exo"
   -v "${QWEN_EXO_SOURCE_PATH}/python:/sgl-workspace/sglang/python:ro"
-  -v "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo:/sgl-workspace/sglang/scripts/qwen_exo:ro"
 )
+for index in "${!catalog_host_roots[@]}"; do
+  docker_args+=( -v "${catalog_host_roots[index]}:${catalog_container_roots[index]}:ro" )
+done
+
 
 for debug_env in \
   CUDA_LAUNCH_BLOCKING \
@@ -190,7 +223,7 @@ done
 unset debug_env
 
 server_args=(
-  --model-path /models/qwen-exo-27b
+  --model-path "${catalog_container_roots[0]}/$(basename -- "${QWEN_EXO_MODEL_PATH}")"
   --served-model-name duckgpt
   --tp-size "${QWEN_EXO_TP_SIZE}"
   --dtype "${QWEN_EXO_DTYPE}"

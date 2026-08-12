@@ -41,6 +41,7 @@ from qwen_exo_booster.service_config import (
     ServiceConfigStore,
     request_managed_restart,
 )
+from qwen_exo_booster.model_catalog import ModelCatalogError, ModelCatalogStore
 
 _STATIC_DIRECTORY = Path(__file__).resolve().parent / "static"
 _APP_DIRECTORY = _STATIC_DIRECTORY / "app"
@@ -65,6 +66,12 @@ class KnowledgeIngestRequest(BaseModel):
 class ServiceConfigWriteRequest(BaseModel):
     values: dict[str, object]
     expected_revision: str = Field(min_length=1)
+
+
+class ModelSelectionRequest(BaseModel):
+    model_fingerprint: str = Field(min_length=64, max_length=64)
+    expected_revision: str = Field(min_length=1)
+    clone_sources: bool = True
 
 
 class SourceSelectionRequest(BaseModel):
@@ -125,6 +132,66 @@ async def status(request: Request):
             "external_learning": False,
         }
     return {"enabled": True, **runtime.status()}
+
+
+@router.get("/models")
+async def get_model_catalog(request: Request):
+    runtime = getattr(request.app.state, "qwen_exo_runtime", None)
+    running_fingerprint = None
+    if runtime is not None and runtime.model_identity is not None:
+        running_fingerprint = runtime.model_identity.fingerprint
+    try:
+        return await asyncio.to_thread(
+            ModelCatalogStore.from_environment().public_document,
+            running_model_fingerprint=running_fingerprint,
+        )
+    except ModelCatalogError as exc:
+        return JSONResponse(status_code=503, content={"detail": exc.public_dict()})
+
+
+@router.put("/models/active", status_code=202)
+async def select_active_model(payload: ModelSelectionRequest, request: Request):
+    store = ModelCatalogStore.from_environment()
+    try:
+        if not store.public_document().get("managed_restart"):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": {
+                        "code": "restart_unmanaged",
+                        "message": "当前服务未由自动重启策略托管，模型未切换",
+                    }
+                },
+            )
+        document = await asyncio.to_thread(
+            store.select,
+            payload.model_fingerprint,
+            expected_revision=payload.expected_revision,
+            clone_sources=payload.clone_sources,
+        )
+        request_managed_restart()
+    except ModelCatalogError as exc:
+        status_code = 409 if exc.code == "revision_conflict" else 422
+        return JSONResponse(
+            status_code=status_code, content={"detail": exc.public_dict()}
+        )
+    except ServiceConfigError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": exc.public_dict()},
+        )
+    runtime = getattr(request.app.state, "qwen_exo_runtime", None)
+    if runtime is not None:
+        runtime.telemetry.emit(
+            "admin",
+            "model_catalog.restart_requested",
+            {
+                "revision": document["revision"],
+                "model_fingerprint": document["active_model_fingerprint"],
+                "clone_sources": payload.clone_sources,
+            },
+        )
+    return {**document, "restart_requested": True}
 
 
 @router.get("/service-config")

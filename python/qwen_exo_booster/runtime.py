@@ -698,6 +698,15 @@ class QwenExoRuntime:
                     },
                 )
                 ServiceConfigStore.from_environment().mark_healthy()
+                if (
+                    self.model_identity is not None
+                    and os.getenv("QWEN_EXO_MODEL_CATALOG_ROOTS", "").strip()
+                ):
+                    from qwen_exo_booster.model_catalog import ModelCatalogStore
+
+                    ModelCatalogStore.from_environment().mark_healthy(
+                        self.model_identity.fingerprint
+                    )
                 if self.reflection_memory_service is not None:
                     self._ensure_compaction_reflection_worker()
             except Exception:

@@ -5,12 +5,15 @@ import {
   Cpu,
   Database,
   Layers3,
+  LoaderCircle,
+  RefreshCw,
   Server,
   Sparkles,
 } from "lucide-react";
-import { EmptyState } from "@/components/empty-state";
+import { toast } from "sonner";
 import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -18,19 +21,52 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
-import { getModelId } from "@/lib/api";
-import type { RuntimeStatus } from "@/lib/types";
+import {
+  getModelCatalog,
+  getModelId,
+  getStatus,
+  selectActiveModel,
+} from "@/lib/api";
+import type { CatalogModel, ModelCatalog, RuntimeStatus } from "@/lib/types";
 import { runtimeStateSource, translate as t } from "@/lib/i18n";
-import { shortHash } from "@/lib/utils";
+import { formatNumber, shortHash } from "@/lib/utils";
 
 export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
   const [modelId, setModelId] = useState<string | null>(null);
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [switching, setSwitching] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<CatalogModel | null>(null);
+
+  const loadCatalog = async () => {
+    setCatalogLoading(true);
+    try {
+      const [nextCatalog, nextModelId] = await Promise.all([
+        getModelCatalog(),
+        getModelId().catch(() => null),
+      ]);
+      setCatalog(nextCatalog);
+      setModelId(nextModelId);
+    } catch (error) {
+      toast.error(t("模型目录加载失败"), {
+        description: error instanceof Error ? error.message : t("未知错误"),
+      });
+    } finally {
+      setCatalogLoading(false);
+    }
+  };
 
   useEffect(() => {
-    void getModelId()
-      .then(setModelId)
-      .catch(() => setModelId(null));
+    void loadCatalog();
   }, []);
 
   const model = status?.model;
@@ -61,14 +97,84 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
     },
   ];
 
+  const confirmSwitch = async () => {
+    if (!catalog || !selectedModel) return;
+    const targetModel = selectedModel;
+    setSwitching(true);
+    try {
+      await selectActiveModel(
+        targetModel.model_fingerprint,
+        catalog.revision,
+        true,
+      );
+      toast.success(t("模型切换已提交"), {
+        description: t(
+          "服务将重启并加载模型专属知识档案。首次切换会复制当前 Knowledge、PolicyData、Cognition 和轨迹，随后各模型独立维护。",
+        ),
+      });
+      setSelectedModel(null);
+      const deadline = Date.now() + 15 * 60 * 1000;
+      let completed = false;
+      while (Date.now() < deadline) {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        window.setTimeout(resolve, 5000);
+        await promise;
+        try {
+          const [nextCatalog, nextStatus] = await Promise.all([
+            getModelCatalog(),
+            getStatus(),
+          ]);
+          setCatalog(nextCatalog);
+          if (
+            nextCatalog.healthy_model_fingerprint ===
+              targetModel.model_fingerprint &&
+            nextStatus.runtime_state === "ready"
+          ) {
+            toast.success(t("模型切换完成"));
+            completed = true;
+            break;
+          }
+          if (
+            nextCatalog.last_failed_model_fingerprint ===
+            targetModel.model_fingerprint
+          ) {
+            toast.error(t("模型启动失败，已回滚"));
+            completed = true;
+            break;
+          }
+        } catch {
+          // Model weights are loading; the loopback API is temporarily unavailable.
+        }
+      }
+      if (!completed) {
+        toast.error(t("模型切换等待超时"), {
+          description: t("服务仍在加载，请稍后刷新模型目录检查最终状态。"),
+        });
+      }
+    } catch (error) {
+      toast.error(t("模型切换失败"), {
+        description: error instanceof Error ? error.message : t("未知错误"),
+      });
+    } finally {
+      setSwitching(false);
+      void loadCatalog();
+    }
+  };
+
   return (
     <div className="page-frame">
       <PageHeader
         eyebrow={t("部署目录")}
         title={t("模型目录")}
         description={t(
-          "查看当前服务实际加载的模型身份与后端能力。模型切换属于部署变更，不在运行参数热配置范围内。",
+          "发现服务器模型目录中的兼容模型，查看各自独立的 Knowledge、PolicyData、Cognition、轨迹与 Native Bank，并通过受管重启切换当前模型。",
         )}
+        actions={
+          <Button variant="outline" onClick={() => void loadCatalog()}>
+            <RefreshCw className={catalogLoading ? "animate-spin" : ""} />
+            {t("刷新")}
+          </Button>
+        }
       />
 
       <Card className="overflow-hidden">
@@ -167,15 +273,121 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
         </CardContent>
       </Card>
 
-      <div className="mt-5">
-        <EmptyState
-          icon={Boxes}
-          title={t("未公开其他部署槽位")}
-          description={t(
-            "当前 API 只公开正在服务的模型。要增加可切换模型，需要单独的镜像、权重挂载、Native Bank 隔离与部署级资源准入。",
-          )}
-        />
+      <div className="mt-5 grid gap-4 xl:grid-cols-2">
+        {catalog && !catalog.managed_restart ? (
+          <Card className="border-amber-300/70 bg-amber-50/60 xl:col-span-2 dark:bg-amber-950/15">
+            <CardContent className="p-4 text-xs text-amber-950 dark:text-amber-100">
+              {t(
+                "当前进程未启用受管重启，模型目录仅可查看，不能从控制台切换。",
+              )}
+            </CardContent>
+          </Card>
+        ) : null}
+        {catalogLoading && !catalog ? (
+          <Card className="xl:col-span-2">
+            <CardContent className="grid min-h-48 place-items-center">
+              <LoaderCircle className="h-5 w-5 animate-spin text-muted-foreground" />
+            </CardContent>
+          </Card>
+        ) : null}
+        {catalog?.models.map((entry) => (
+          <Card key={entry.model_fingerprint} className="overflow-hidden">
+            <CardHeader className="border-b">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <CardTitle className="text-sm">{entry.name}</CardTitle>
+                    {entry.running ? (
+                      <Badge variant="success">{t("运行中")}</Badge>
+                    ) : null}
+                    {entry.active && !entry.running ? (
+                      <Badge variant="warning">{t("等待重启")}</Badge>
+                    ) : null}
+                  </div>
+                  <CardDescription className="mt-1 break-all font-mono text-[10px]">
+                    {entry.model_path}
+                  </CardDescription>
+                </div>
+                <Badge variant="outline">{entry.variant}</Badge>
+              </div>
+            </CardHeader>
+            <CardContent className="p-4">
+              <div className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
+                <div>
+                  <div className="text-muted-foreground">Knowledge</div>
+                  <div className="mt-1 font-mono font-semibold">
+                    {formatNumber(entry.knowledge_document_count)}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">PolicyData</div>
+                  <div className="mt-1 font-mono font-semibold">
+                    {formatNumber(entry.policy_document_count)}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">Cognition</div>
+                  <div className="mt-1 font-mono font-semibold">
+                    {formatNumber(entry.cognition_document_count)}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">Native Bank</div>
+                  <div className="mt-1 font-semibold">
+                    {entry.native_bank_ready ? t("已编译") : t("等待首次编译")}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-4 flex items-center justify-between border-t pt-3">
+                <div className="font-mono text-[10px] text-muted-foreground">
+                  {shortHash(entry.model_fingerprint, 18)} ·{" "}
+                  {formatNumber(entry.layer_count)} layers
+                </div>
+                <Button
+                  size="sm"
+                  disabled={
+                    entry.running || switching || !catalog.managed_restart
+                  }
+                  onClick={() => setSelectedModel(entry)}
+                >
+                  {entry.running ? t("当前模型") : t("切换到此模型")}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
       </div>
+
+      <Dialog
+        open={Boolean(selectedModel)}
+        onOpenChange={(open) => !open && setSelectedModel(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("确认切换模型")}</DialogTitle>
+            <DialogDescription>
+              {t(
+                "切换会中断当前推理并重启模型服务。目标模型首次使用时会复制当前知识源建立独立档案；Native Bank 会由目标模型重新编译，之后两个模型的知识与记忆互不覆盖。",
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border bg-muted/35 p-3">
+            <div className="text-sm font-semibold">{selectedModel?.name}</div>
+            <div className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
+              {selectedModel?.model_path}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSelectedModel(null)}>
+              {t("取消")}
+            </Button>
+            <Button onClick={() => void confirmSwitch()} disabled={switching}>
+              {switching ? <LoaderCircle className="animate-spin" /> : null}
+              {t("重启并切换")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

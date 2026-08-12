@@ -46,6 +46,44 @@ export type RuntimeStatus = {
   [key: string]: unknown;
 };
 
+export type CatalogModel = {
+  model_fingerprint: string;
+  name: string;
+  model_path: string;
+  architecture: string;
+  model_type: string;
+  variant: string;
+  layer_count: number;
+  full_attention_layers: number;
+  linear_attention_layers: number;
+  max_position_embeddings: number;
+  weight_bytes: number;
+  active: boolean;
+  running: boolean;
+  profile_initialized: boolean;
+  profile_root: string;
+  knowledge_document_count: number;
+  policy_document_count: number;
+  cognition_document_count: number;
+  native_bank_ready: boolean;
+};
+
+export type ModelCatalog = {
+  schema: number;
+  revision: string;
+  active_model_fingerprint: string;
+  applied_model_fingerprint: string | null;
+  healthy_model_fingerprint: string | null;
+  previous_model_fingerprint: string | null;
+  last_failed_model_fingerprint: string | null;
+  last_rollback_at: string | null;
+  running_model_fingerprint: string | null;
+  managed_restart: boolean;
+  models: CatalogModel[];
+  catalog_roots: string[];
+  profiles_root: string;
+};
+
 export type HealthStatus = {
   project: string;
   status: string;

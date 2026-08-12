@@ -3,6 +3,7 @@ import type {
   EditorInfo,
   EditorTrainingStatus,
   HealthStatus,
+  ModelCatalog,
   KnowledgeDraft,
   RecallTrace,
   RequestTraceListing,
@@ -82,6 +83,27 @@ export async function getStatus() {
 
 export async function getHealth() {
   return (await (await apiFetch("/health")).json()) as HealthStatus;
+}
+
+export async function getModelCatalog() {
+  return (await (await apiFetch("/models")).json()) as ModelCatalog;
+}
+
+export async function selectActiveModel(
+  modelFingerprint: string,
+  expectedRevision: string,
+  cloneSources: boolean,
+) {
+  return (await (
+    await apiFetch("/models/active", {
+      method: "PUT",
+      body: JSON.stringify({
+        model_fingerprint: modelFingerprint,
+        expected_revision: expectedRevision,
+        clone_sources: cloneSources,
+      }),
+    })
+  ).json()) as ModelCatalog & { restart_requested: boolean };
 }
 
 export async function getTelemetry(limit = 100, requestId?: string) {
