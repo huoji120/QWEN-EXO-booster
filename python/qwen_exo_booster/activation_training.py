@@ -99,6 +99,9 @@ class ActivationTrainingStore:
 
     @classmethod
     def from_environment(cls) -> ActivationTrainingStore:
+        model_profile = os.getenv("QWEN_EXO_ACTIVE_MODEL_PROFILE", "").strip()
+        if model_profile:
+            return cls(Path(model_profile).resolve())
         config_path = Path(
             os.getenv("QWEN_EXO_SERVICE_CONFIG", "/data/qwen-exo/service-config.json")
         )

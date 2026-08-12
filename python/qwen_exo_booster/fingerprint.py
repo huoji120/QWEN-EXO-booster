@@ -62,7 +62,7 @@ _QWEN_EXO_LAYOUTS = {
             **_COMMON_TEXT_STRUCTURE,
             "num_hidden_layers": 40,
             "hidden_size": 2048,
-            "intermediate_size": 0,
+            "intermediate_size": None,
             "num_attention_heads": 16,
             "num_key_value_heads": 2,
             "linear_num_key_heads": 16,
@@ -132,6 +132,12 @@ def validate_qwen_exo_config(config: Any) -> str:
     text_structure = expected["text_structure"]
     for name, wanted in text_structure.items():
         observed = _config_value(text, name, None)
+        if (
+            architecture == _QWEN_EXO_MOE_ARCHITECTURE
+            and name == "intermediate_size"
+            and observed in {None, 5632}
+        ):
+            continue
         if observed != wanted:
             mismatches.append(f"{name}={observed!r} (expected {wanted!r})")
 
@@ -210,9 +216,9 @@ class ModelIdentity:
         text_config = config.get("text_config") or config
         architectures = config.get("architectures") or []
         architecture = str(architectures[0]) if architectures else ""
-        raw_layer_types = text_config.get("layer_types") or text_config.get(
-            "layers_block_type"
-        ) or ()
+        raw_layer_types = (
+            text_config.get("layer_types") or text_config.get("layers_block_type") or ()
+        )
         layer_types = tuple(_normalize_layer_type(value) for value in raw_layer_types)
         layer_count = int(text_config.get("num_hidden_layers") or len(layer_types))
         full_attention_layers = layer_types.count("full_attention")

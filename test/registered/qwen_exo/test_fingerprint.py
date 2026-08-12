@@ -4,6 +4,7 @@ import pytest
 from qwen_exo_booster.fingerprint import (
     ModelIdentity,
     main as fingerprint_main,
+    validate_qwen_exo_config,
     validate_qwen_exo_model_path,
 )
 from qwen_exo_booster.service_launcher import _validate_qwen_exo_model_arguments
@@ -56,7 +57,7 @@ def write_moe_model(root):
             "model_type": "qwen3_5_moe_text",
             "num_hidden_layers": 40,
             "hidden_size": 2048,
-            "intermediate_size": 0,
+            "intermediate_size": None,
             "num_attention_heads": 16,
             "num_key_value_heads": 2,
             "linear_num_value_heads": 32,
@@ -84,6 +85,47 @@ def test_moe_model_identity_accepts_hybrid_layout(tmp_path):
     assert identity.layer_count == 40
     assert identity.full_attention_layers == 10
     assert identity.linear_attention_layers == 30
+
+
+def test_moe_runtime_config_accepts_sglang_normalized_intermediate_size():
+    from types import SimpleNamespace
+
+    layer_types = [
+        "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
+        for index in range(40)
+    ]
+    text = SimpleNamespace(
+        model_type="qwen3_5_moe_text",
+        num_hidden_layers=40,
+        hidden_size=2048,
+        intermediate_size=5632,
+        head_dim=256,
+        full_attention_interval=4,
+        num_attention_heads=16,
+        num_key_value_heads=2,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        max_position_embeddings=262144,
+        vocab_size=248320,
+        num_experts=256,
+        num_experts_per_tok=8,
+        moe_intermediate_size=512,
+        shared_expert_intermediate_size=512,
+        layer_types=layer_types,
+        attn_output_gate=True,
+        partial_rotary_factor=0.25,
+        rope_parameters={"rope_theta": 10_000_000},
+    )
+    config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForConditionalGeneration"],
+        model_type="qwen3_5_moe",
+        text_config=text,
+    )
+
+    assert validate_qwen_exo_config(config) == "moe-35b-a3b"
 
 
 def test_model_identity_freezes_hybrid_layout(tmp_path):
@@ -123,9 +165,7 @@ def test_model_path_preflight_uses_config_structure_not_directory_name(tmp_path)
     assert validate_qwen_exo_model_path(model_path) == "dense-27b"
 
 
-def test_model_path_preflight_rejects_false_compatible_directory_name(
-    tmp_path, capsys
-):
+def test_model_path_preflight_rejects_false_compatible_directory_name(tmp_path, capsys):
     model_path = tmp_path / "Qwen3.8-27B-marketing-name"
     model_path.mkdir()
     write_model(model_path, architecture="OtherModel")
@@ -140,9 +180,7 @@ def test_model_path_preflight_rejects_false_compatible_directory_name(
     assert "Dense 27B or MoE 35B-A3B Qwen3_5* runtime structures" in error
 
 
-def test_model_path_preflight_missing_config_has_actionable_cli_error(
-    tmp_path, capsys
-):
+def test_model_path_preflight_missing_config_has_actionable_cli_error(tmp_path, capsys):
     with pytest.raises(SystemExit) as raised:
         fingerprint_main([str(tmp_path)])
 

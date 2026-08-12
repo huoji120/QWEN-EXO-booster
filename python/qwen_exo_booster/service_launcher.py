@@ -43,13 +43,45 @@ def main() -> None:
         raise SystemExit(
             "usage: python -m qwen_exo_booster.service_launcher -- <sglang args>"
         )
-    _validate_qwen_exo_model_arguments(base_args)
+
+    if (
+        "--enable-qwen-exo" not in base_args
+        or not os.getenv("QWEN_EXO_MODEL_CATALOG_ROOTS", "").strip()
+    ):
+        _validate_qwen_exo_model_arguments(base_args)
+    if (
+        "--enable-qwen-exo" in base_args
+        and os.getenv("QWEN_EXO_MODEL_CATALOG_ROOTS", "").strip()
+    ):
+        from qwen_exo_booster.model_catalog import ModelCatalogError, ModelCatalogStore
+
+        try:
+            _, base_args, selected_model = (
+                ModelCatalogStore.from_environment().mark_applied(base_args)
+            )
+        except ModelCatalogError as exc:
+            raise SystemExit(
+                f"QWEN-EXO model catalog error [{exc.code}]: {exc}"
+            ) from exc
+        _validate_qwen_exo_model_arguments(base_args)
+        os.environ["QWEN_EXO_ACTIVE_MODEL_PROFILE"] = str(
+            ModelCatalogStore.from_environment().profiles_root
+            / selected_model["model_fingerprint"]
+        )
+        os.environ["QWEN_EXO_ACTIVE_MODEL_PATH"] = str(selected_model["model_path"])
+        print(
+            "QWEN-EXO selected model profile: "
+            f"{selected_model['name']} ({selected_model['model_fingerprint'][:16]})",
+            flush=True,
+        )
 
     from qwen_exo_booster.activation_training import run_pending_activation_training
     from qwen_exo_booster.service_config import ServiceConfigError, ServiceConfigStore
 
     try:
-        training = run_pending_activation_training()
+        training = run_pending_activation_training(
+            model_path=os.getenv("QWEN_EXO_ACTIVE_MODEL_PATH") or None
+        )
         if training is not None:
             print(
                 "QWEN-EXO activation training "

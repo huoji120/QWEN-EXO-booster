@@ -13,6 +13,60 @@ from qwen_exo_booster.router import compat_router, router
 from qwen_exo_booster.runtime import QwenExoRuntimeState
 from qwen_exo_booster.service_config import ServiceConfigStore
 from qwen_exo_booster.tensor_bank import TensorBankCompileError
+from qwen_exo_booster.model_catalog import ModelCatalogStore
+
+
+def _write_catalog_model(root: Path, architecture: str) -> None:
+    root.mkdir()
+    moe = architecture == "Qwen3_5MoeForConditionalGeneration"
+    layer_count = 40 if moe else 64
+    text = {
+        "model_type": "qwen3_5_moe_text" if moe else "qwen3_5_text",
+        "head_dim": 256,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "max_position_embeddings": 262144,
+        "vocab_size": 248320,
+        "full_attention_interval": 4,
+        "num_hidden_layers": layer_count,
+        "intermediate_size": None if moe else 17408,
+        "hidden_size": 2048 if moe else 5120,
+        "num_attention_heads": 16 if moe else 24,
+        "num_key_value_heads": 2 if moe else 4,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32 if moe else 48,
+        "layer_types": [
+            "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
+            for index in range(layer_count)
+        ],
+        "attn_output_gate": True,
+        "partial_rotary_factor": 0.25,
+        "rope_parameters": {"rope_theta": 10_000_000},
+    }
+    if moe:
+        text.update(
+            num_experts=256,
+            num_experts_per_tok=8,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+        )
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": [architecture],
+                "model_type": "qwen3_5_moe" if moe else "qwen3_5",
+                "text_config": text,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 1}, "weight_map": {}}),
+        encoding="utf-8",
+    )
+    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        (root / name).write_text(name, encoding="utf-8")
 
 
 class FakeRuntime:
@@ -741,6 +795,106 @@ def test_service_config_validation_returns_structured_422_without_restart(
     }
     assert restart_calls == []
     assert ServiceConfigStore(path).public_document()["revision"] == initial["revision"]
+
+
+def test_model_catalog_routes_switch_revisioned_profile_and_restart(
+    tmp_path: Path, monkeypatch
+):
+    models = tmp_path / "models"
+    models.mkdir()
+    dense = models / "dense"
+    moe = models / "moe"
+    _write_catalog_model(dense, "Qwen3_5ForConditionalGeneration")
+    _write_catalog_model(moe, "Qwen3_5MoeForConditionalGeneration")
+    data = tmp_path / "data"
+    store = ModelCatalogStore([models], data)
+    initial = store.ensure(dense)
+    moe_fingerprint = next(
+        model["model_fingerprint"]
+        for model in store.public_document()["models"]
+        if model["model_path"] == str(moe.resolve())
+    )
+    restart_calls = []
+    monkeypatch.setenv("QWEN_EXO_MODEL_CATALOG_ROOTS", str(models))
+    monkeypatch.setenv(
+        "QWEN_EXO_MODEL_CATALOG_CONFIG", str(data / "model-catalog.json")
+    )
+    monkeypatch.setenv("QWEN_EXO_MODEL_DATA_ROOT", str(data))
+    monkeypatch.setenv("QWEN_EXO_MANAGED_RESTART", "1")
+    monkeypatch.setattr(
+        router_module,
+        "request_managed_restart",
+        lambda: restart_calls.append(True),
+    )
+    runtime = FakeRuntime()
+    runtime.model_identity = SimpleNamespace(
+        fingerprint=initial["active_model_fingerprint"]
+    )
+    api = client(runtime)
+
+    listing = api.get("/qwen-exo/models")
+    switched = api.put(
+        "/qwen-exo/models/active",
+        json={
+            "model_fingerprint": moe_fingerprint,
+            "expected_revision": initial["revision"],
+            "clone_sources": True,
+        },
+    )
+
+    assert listing.status_code == 200
+    assert (
+        listing.json()["running_model_fingerprint"]
+        == initial["active_model_fingerprint"]
+    )
+    assert switched.status_code == 202
+    assert switched.json()["active_model_fingerprint"] == moe_fingerprint
+    assert switched.json()["restart_requested"] is True
+    assert restart_calls == [True]
+
+
+def test_model_catalog_route_rejects_stale_revision_without_restart(
+    tmp_path: Path, monkeypatch
+):
+    models = tmp_path / "models"
+    models.mkdir()
+    dense = models / "dense"
+    moe = models / "moe"
+    _write_catalog_model(dense, "Qwen3_5ForConditionalGeneration")
+    _write_catalog_model(moe, "Qwen3_5MoeForConditionalGeneration")
+    data = tmp_path / "data"
+    store = ModelCatalogStore([models], data)
+    store.ensure(dense)
+    moe_fingerprint = next(
+        model["model_fingerprint"]
+        for model in store.public_document()["models"]
+        if model["model_path"] == str(moe.resolve())
+    )
+    restart_calls = []
+    monkeypatch.setenv("QWEN_EXO_MODEL_CATALOG_ROOTS", str(models))
+    monkeypatch.setenv(
+        "QWEN_EXO_MODEL_CATALOG_CONFIG", str(data / "model-catalog.json")
+    )
+    monkeypatch.setenv("QWEN_EXO_MODEL_DATA_ROOT", str(data))
+    monkeypatch.setenv("QWEN_EXO_MANAGED_RESTART", "1")
+    monkeypatch.setattr(
+        router_module,
+        "request_managed_restart",
+        lambda: restart_calls.append(True),
+    )
+
+    response = client(FakeRuntime()).put(
+        "/qwen-exo/models/active",
+        json={
+            "model_fingerprint": moe_fingerprint,
+            "expected_revision": "stale",
+            "clone_sources": True,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "revision_conflict"
+    assert restart_calls == []
 
 
 def test_tensor_bank_reindex_is_model_native():
