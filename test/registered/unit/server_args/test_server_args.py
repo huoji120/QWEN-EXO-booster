@@ -1036,6 +1036,25 @@ class TestDecoupledSpecArgs(CustomTestCase):
             prepare_server_args(
                 ["--model-path", "dummy", "--decoupled-spec-role", "bogus"]
             )
+    def test_qwen_exo_moe_top_k_cli_round_trip(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-qwen-exo",
+                "--qwen-exo-moe-top-k",
+                "32",
+            ]
+        )
+
+        self.assertEqual(server_args.qwen_exo_moe_top_k, 32)
+
+    def test_qwen_exo_moe_top_k_requires_qwen_exo(self):
+        server_args = ServerArgs(model_path="dummy", qwen_exo_moe_top_k=32)
+
+        with self.assertRaisesRegex(ValueError, "requires --enable-qwen-exo"):
+            server_args._handle_qwen_exo_runtime()
+
 
 
 class TestAdaptiveSpecArgs(CustomTestCase):

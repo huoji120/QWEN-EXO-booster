@@ -216,6 +216,23 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
+def _resolve_qwen_exo_moe_top_k(config: PretrainedConfig) -> int:
+    """Resolve the optional QWEN-EXO routed-expert experiment override."""
+    native_top_k = int(config.num_experts_per_tok)
+    override = getattr(get_server_args(), "qwen_exo_moe_top_k", None)
+    if override is None or getattr(config, "model_type", None) != "qwen3_5_moe_text":
+        return native_top_k
+
+    override = int(override)
+    num_experts = int(config.num_experts)
+    if not 1 <= override <= num_experts:
+        raise ValueError(
+            "--qwen-exo-moe-top-k must be between 1 and "
+            f"the model's {num_experts} routed experts; got {override}"
+        )
+    return override
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -252,8 +269,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
 
+        routed_top_k = _resolve_qwen_exo_moe_top_k(config)
+        if routed_top_k != config.num_experts_per_tok and layer_id == 0:
+            logger.warning(
+                "QWEN-EXO experimental MoE routing override: "
+                "num_experts_per_tok=%s (checkpoint=%s)",
+                routed_top_k,
+                config.num_experts_per_tok,
+            )
         self.topk = TopK(
-            top_k=config.num_experts_per_tok,
+            top_k=routed_top_k,
             renormalize=config.norm_topk_prob,
             layer_id=layer_id,
         )
@@ -266,9 +291,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=(
-                config.num_experts_per_tok
+                routed_top_k
                 if not self.enable_shared_expert_fusion
-                else config.num_experts_per_tok + self.num_fused_shared_experts
+                else routed_top_k + self.num_fused_shared_experts
             ),
             num_experts=(
                 config.num_experts + get_server_args().ep_num_redundant_experts
@@ -335,7 +360,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.num_experts = (
                 config.num_experts + get_server_args().ep_num_redundant_experts
             )
-            self.top_k = config.num_experts_per_tok
+            self.top_k = routed_top_k
         self.is_nextn = is_nextn
 
     def get_moe_weights(self):

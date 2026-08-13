@@ -2868,6 +2868,16 @@ class ServerArgs:
         bool,
         "Enable the QWEN-EXO-booster hybrid-memory runtime.",
     ] = False
+    qwen_exo_moe_top_k: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Experimental Qwen3.5 MoE routed-expert count per token. "
+                "Unset preserves the checkpoint value; this override is "
+                "isolated to QWEN-EXO Qwen3.5 MoE runs."
+            ),
+        ),
+    ] = None
     qwen_exo_state_dir: A[
         str,
         "Directory for QWEN-EXO authoritative runtime state and traces.",
@@ -3819,6 +3829,8 @@ class ServerArgs:
                 )
 
     def _handle_qwen_exo_runtime(self):
+        if self.qwen_exo_moe_top_k is not None and not self.enable_qwen_exo:
+            raise ValueError("--qwen-exo-moe-top-k requires --enable-qwen-exo")
         if not self.enable_qwen_exo:
             return
         if (
