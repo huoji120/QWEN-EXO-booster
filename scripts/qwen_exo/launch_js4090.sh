@@ -119,8 +119,10 @@ done
 QWEN_EXO_MODEL_CATALOG_ROOTS="$(IFS=:; echo "${catalog_container_roots[*]}")"
 : "${QWEN_EXO_MODEL_CATALOG_CONFIG:=/data/qwen-exo/model-catalog.json}"
 : "${QWEN_EXO_MODEL_DATA_ROOT:=/data/qwen-exo}"
+: "${QWEN_EXO_PRE_COMPLETE_PATH:=${QWEN_EXO_DATA_PATH}/pre-complete}"
 export QWEN_EXO_MODEL_PATH QWEN_EXO_MODEL_CATALOG_PATH QWEN_EXO_DATA_PATH
 export QWEN_EXO_MODEL_CATALOG_ROOTS QWEN_EXO_MODEL_CATALOG_CONFIG QWEN_EXO_MODEL_DATA_ROOT
+export QWEN_EXO_PRE_COMPLETE_PATH
 
 if [[ ! -f "${QWEN_EXO_SOURCE_PATH}/python/sglang/srt/server_args.py" ]]; then
   echo "QWEN-EXO source tree not found: ${QWEN_EXO_SOURCE_PATH}" >&2
@@ -134,7 +136,7 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]] && ! python3 \
   printf '%s\n' \
     "Directory names and marketing labels are never trusted." \
     "Set QWEN_EXO_MODEL_PATH to a Qwen-series checkpoint with one of the exact" \
-    "verified Dense 27B or MoE 35B-A3B Qwen3_5* runtime structures." >&2
+    "verified Dense 27B, MoE 35B-A3B, or MoE 122B-A10B Qwen3_5* runtime structures." >&2
   exit 2
 fi
 
@@ -160,6 +162,7 @@ mkdir -p \
   "${QWEN_EXO_DATA_PATH}/policydata" \
   "${QWEN_EXO_DATA_PATH}/cognition" \
   "${QWEN_EXO_DATA_PATH}/${QWEN_EXO_STATE_DIRECTORY_NAME}" \
+  "${QWEN_EXO_PRE_COMPLETE_PATH}" \
   "${QWEN_EXO_DATA_PATH}/logs"
 seed_corpus \
   "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus/knowledge" \
@@ -198,8 +201,10 @@ docker_args=(
   -e "QWEN_EXO_MODEL_CATALOG_ROOTS=${QWEN_EXO_MODEL_CATALOG_ROOTS}"
   -e "QWEN_EXO_MODEL_CATALOG_CONFIG=${QWEN_EXO_MODEL_CATALOG_CONFIG}"
   -e "QWEN_EXO_MODEL_DATA_ROOT=${QWEN_EXO_MODEL_DATA_ROOT}"
+  -e QWEN_EXO_PRE_COMPLETE_KNOWLEDGE_DIR=/data/qwen-exo-pre-complete
   -e QWEN_EXO_MODEL_PROFILE_SEED_ROOT=/sgl-workspace/sglang/scripts/qwen_exo/corpus
   -v "${QWEN_EXO_DATA_PATH}:/data/qwen-exo"
+  -v "${QWEN_EXO_PRE_COMPLETE_PATH}:/data/qwen-exo-pre-complete"
   -v "${QWEN_EXO_SOURCE_PATH}/python:/sgl-workspace/sglang/python:ro"
 )
 for index in "${!catalog_host_roots[@]}"; do
@@ -245,7 +250,7 @@ server_args=(
   --reasoning-parser qwen3
   --tool-call-parser qwen3_coder
   --default-chat-template-kwargs
-  '{"enable_thinking": true, "preserve_thinking": true}'
+  '{"enable_thinking": false, "preserve_thinking": false}'
   --watchdog-timeout 1200
   --host 127.0.0.1
   --port "${QWEN_EXO_PORT}"

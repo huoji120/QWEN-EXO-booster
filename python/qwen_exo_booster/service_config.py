@@ -83,6 +83,11 @@ _GROUPS = (
         "description": "上下文窗口、静态显存预留、运行并发与预填充批量预算；决定吞吐、首字延迟和调度拥塞边界。",
     },
     {
+        "id": "generation",
+        "label": "生成与思考",
+        "description": "控制客户端未显式指定推理选项时，主请求的默认思考模式及历史思考内容保留行为。",
+    },
+    {
         "id": "memory",
         "label": "知识检索与准入",
         "description": "定义 Attention-Q × K 召回、语义准入及原生状态注入的门限与预算；控制候选产生到实际进入上下文的完整链路。",
@@ -184,6 +189,22 @@ SERVICE_SETTINGS = (
         maximum=262144,
         step=1024,
         unit="tokens",
+    ),
+    _setting(
+        "default_enable_thinking",
+        "generation",
+        "默认启用思考",
+        "作用：仅当请求未显式指定 reasoning 或 chat_template_kwargs 时，决定主请求是否进入 THINK。推荐值：关闭；客户端显式设置仍优先。",
+        "boolean",
+        False,
+    ),
+    _setting(
+        "default_preserve_thinking",
+        "generation",
+        "保留历史思考",
+        "作用：决定聊天模板是否保留历史 assistant 消息中的 THINK 内容。推荐值：关闭，避免历史推理重复占用上下文。",
+        "boolean",
+        False,
     ),
     _setting(
         "mem_fraction_static",
@@ -1001,6 +1022,12 @@ _SHADOW_TO_ACTIVE_KEYS = frozenset(
         "qwen_exo_context_integrity_mode",
     }
 )
+_DEFAULT_CHAT_TEMPLATE_FLAG = "--default-chat-template-kwargs"
+_DEFAULT_CHAT_TEMPLATE_SETTINGS = {
+    "default_enable_thinking": "enable_thinking",
+    "default_preserve_thinking": "preserve_thinking",
+}
+
 
 _LEGACY_REFLECTION_MEMORY_KEYS = {
     "qwen_exo_dream_reflection_mode": "qwen_exo_reflection_memory_mode",
@@ -1204,13 +1231,43 @@ def _value_from_args(setting: ServiceSetting, args: list[str]) -> Any | None:
     return found
 
 
+def _argument_value(arguments: list[str], option: str) -> str | None:
+    value = None
+    prefix = option + "="
+    for index, argument in enumerate(arguments):
+        if argument.startswith(prefix):
+            value = argument[len(prefix) :]
+        elif argument == option and index + 1 < len(arguments):
+            value = arguments[index + 1]
+    return value
+
+
 def values_from_args(args: Iterable[str]) -> dict[str, Any]:
     argv = list(args)
+    template_kwargs: dict[str, Any] = {}
+    raw_template_kwargs = _argument_value(argv, _DEFAULT_CHAT_TEMPLATE_FLAG)
+    if raw_template_kwargs is not None:
+        try:
+            decoded_template_kwargs = json.loads(raw_template_kwargs)
+        except json.JSONDecodeError as exc:
+            raise ServiceConfigError(
+                "invalid_chat_template_kwargs",
+                "--default-chat-template-kwargs 必须是 JSON 对象",
+            ) from exc
+        if not isinstance(decoded_template_kwargs, dict):
+            raise ServiceConfigError(
+                "invalid_chat_template_kwargs",
+                "--default-chat-template-kwargs 必须是 JSON 对象",
+            )
+        template_kwargs = decoded_template_kwargs
     values = default_values()
     for setting in SERVICE_SETTINGS:
         explicit = _value_from_args(setting, argv)
         if explicit is not None:
             values[setting.key] = explicit
+    for setting_key, template_key in _DEFAULT_CHAT_TEMPLATE_SETTINGS.items():
+        if template_key in template_kwargs:
+            values[setting_key] = template_kwargs[template_key]
     return validate_values(values)
 
 
@@ -1221,7 +1278,7 @@ def apply_values_to_args(args: Iterable[str], values: dict[str, Any]) -> list[st
         flag
         for setting in SERVICE_SETTINGS
         for flag in (setting.flag, setting.negative_flag)
-    }
+    } | {_DEFAULT_CHAT_TEMPLATE_FLAG}
     cleaned: list[str] = []
     index = 0
     while index < len(argv):
@@ -1229,13 +1286,16 @@ def apply_values_to_args(args: Iterable[str], values: dict[str, Any]) -> list[st
         plain_flag = token.split("=", 1)[0]
         if plain_flag in managed_flags:
             setting = next(
-                item
-                for item in SERVICE_SETTINGS
-                if plain_flag in {item.flag, item.negative_flag}
+                (
+                    item
+                    for item in SERVICE_SETTINGS
+                    if plain_flag in {item.flag, item.negative_flag}
+                ),
+                None,
             )
             index += 1
             if (
-                setting.value_type != "boolean"
+                (setting is None or setting.value_type != "boolean")
                 and "=" not in token
                 and index < len(argv)
             ):
@@ -1245,11 +1305,23 @@ def apply_values_to_args(args: Iterable[str], values: dict[str, Any]) -> list[st
         index += 1
 
     for setting in SERVICE_SETTINGS:
+        if setting.key in _DEFAULT_CHAT_TEMPLATE_SETTINGS:
+            continue
         value = values[setting.key]
         if setting.value_type == "boolean":
             cleaned.append(setting.flag if value else setting.negative_flag)
         else:
             cleaned.extend((setting.flag, str(value)))
+    template_kwargs = {
+        template_key: values[setting_key]
+        for setting_key, template_key in _DEFAULT_CHAT_TEMPLATE_SETTINGS.items()
+    }
+    cleaned.extend(
+        (
+            _DEFAULT_CHAT_TEMPLATE_FLAG,
+            json.dumps(template_kwargs, separators=(",", ":")),
+        )
+    )
     return cleaned
 
 

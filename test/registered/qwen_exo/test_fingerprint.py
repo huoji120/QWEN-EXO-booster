@@ -75,6 +75,116 @@ def write_moe_model(root):
     (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
+def write_122b_moe_model(root):
+    write_moe_model(root)
+    config_path = root / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    text_config = config["text_config"]
+    text_config.update(
+        {
+            "num_hidden_layers": 48,
+            "hidden_size": 3072,
+            "num_attention_heads": 32,
+            "linear_num_value_heads": 64,
+            "moe_intermediate_size": 1024,
+            "shared_expert_intermediate_size": 1024,
+            "layer_types": [
+                "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
+                for index in range(48)
+            ],
+        }
+    )
+    text_config.pop("partial_rotary_factor")
+    text_config["rope_parameters"]["partial_rotary_factor"] = 0.25
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 127152313312}, "weight_map": {}}),
+        encoding="utf-8",
+    )
+
+
+def test_122b_moe_model_accepts_exact_published_hybrid_layout(tmp_path):
+    write_122b_moe_model(tmp_path)
+
+    assert validate_qwen_exo_model_path(tmp_path) == "moe-122b-a10b"
+    identity = ModelIdentity.from_path(tmp_path)
+    assert identity.layer_count == 48
+    assert identity.full_attention_layers == 12
+    assert identity.linear_attention_layers == 36
+    assert identity.weight_bytes == 127152313312
+    assert identity.fingerprint
+    config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert validate_qwen_exo_config(config) == "moe-122b-a10b"
+
+
+def test_122b_moe_layout_accepts_q4_checkpoint_metadata(tmp_path):
+    write_122b_moe_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["quantization_config"] = {
+        "quant_method": "gptq",
+        "bits": 4,
+        "group_size": 128,
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert validate_qwen_exo_model_path(tmp_path) == "moe-122b-a10b"
+
+
+def test_model_path_rejects_git_lfs_pointer_weight(tmp_path):
+    write_122b_moe_model(tmp_path)
+    shard = "model-00001-of-00001.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 1024},
+                "weight_map": {"model.weight": shard},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / shard).write_text(
+        "version https://git-lfs.github.com/spec/v1\n"
+        "oid sha256:" + "0" * 64 + "\nsize 1024\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="still a Git LFS pointer"):
+        validate_qwen_exo_model_path(tmp_path)
+
+
+def test_model_path_rejects_missing_weight_shard(tmp_path):
+    write_122b_moe_model(tmp_path)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 1024},
+                "weight_map": {"model.weight": "model-00001-of-00001.safetensors"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="weight shard is missing"):
+        validate_qwen_exo_model_path(tmp_path)
+
+
+def test_122b_moe_model_rejects_nearby_unverified_shape(tmp_path):
+    write_122b_moe_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["text_config"]["moe_intermediate_size"] = 768
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="moe-122b-a10b.*moe_intermediate_size"):
+        validate_qwen_exo_model_path(tmp_path)
+
+
 def test_moe_model_identity_accepts_hybrid_layout(tmp_path):
     write_moe_model(tmp_path)
 
@@ -177,7 +287,7 @@ def test_model_path_preflight_rejects_false_compatible_directory_name(tmp_path, 
     error = capsys.readouterr().err
     assert "Directory names and marketing labels are never trusted" in error
     assert "Set QWEN_EXO_MODEL_PATH to a Qwen-series checkpoint" in error
-    assert "Dense 27B or MoE 35B-A3B Qwen3_5* runtime structures" in error
+    assert "Dense 27B, MoE 35B-A3B, or MoE 122B-A10B" in error
 
 
 def test_model_path_preflight_missing_config_has_actionable_cli_error(tmp_path, capsys):
@@ -189,7 +299,7 @@ def test_model_path_preflight_missing_config_has_actionable_cli_error(tmp_path, 
     assert "model config was not found" in error
     assert "Directory names and marketing labels are never trusted" in error
     assert "Set QWEN_EXO_MODEL_PATH to a Qwen-series checkpoint" in error
-    assert "Dense 27B or MoE 35B-A3B Qwen3_5* runtime structures" in error
+    assert "Dense 27B, MoE 35B-A3B, or MoE 122B-A10B" in error
 
 
 def test_service_launcher_missing_model_path_has_actionable_error():

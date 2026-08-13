@@ -18,7 +18,7 @@ _MAX_FILES = 20
 _MAX_TOTAL_BYTES = 16 * 1024 * 1024
 _MAX_DOCUMENT_PARTS_PER_FILE = 64
 _MAX_DOCUMENT_PARTS_PER_BATCH = 128
-_SUPPORTED_SUFFIXES = frozenset(
+SUPPORTED_KNOWLEDGE_SUFFIXES = frozenset(
     {
         ".md",
         ".markdown",
@@ -31,6 +31,7 @@ _SUPPORTED_SUFFIXES = frozenset(
         ".csv",
     }
 )
+_SUPPORTED_SUFFIXES = SUPPORTED_KNOWLEDGE_SUFFIXES
 _MARKDOWN_SUFFIXES = frozenset({".md", ".markdown"})
 _STRUCTURED_LANGUAGES = {
     ".json": "json",
@@ -40,6 +41,33 @@ _STRUCTURED_LANGUAGES = {
     ".csv": "csv",
 }
 _HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
+
+
+def is_supported_knowledge_filename(filename: str) -> bool:
+    return Path(str(filename)).suffix.lower() in _SUPPORTED_SUFFIXES
+
+
+def validate_knowledge_source_bytes(filename: str, raw: bytes) -> None:
+    safe_name = Path(str(filename)).name.strip()
+    if not safe_name or safe_name in {".", ".."}:
+        raise KnowledgeIngestError("invalid_filename", "文件名无效", filename=filename)
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in _SUPPORTED_SUFFIXES:
+        raise KnowledgeIngestError(
+            "unsupported_file_type",
+            "仅支持 Markdown、TXT、RST、JSON、JSONL、YAML 和 CSV 文本文件",
+            filename=safe_name,
+            details={"suffix": suffix or None},
+        )
+    if not raw:
+        raise KnowledgeIngestError("empty_file", "文件内容为空", filename=safe_name)
+    if len(raw) > _MAX_FILE_BYTES:
+        raise KnowledgeIngestError(
+            "file_too_large",
+            f"单个文件不得超过 {_MAX_FILE_BYTES // (1024 * 1024)} MiB",
+            filename=safe_name,
+            details={"byte_count": len(raw), "maximum_bytes": _MAX_FILE_BYTES},
+        )
 
 
 class KnowledgeIngestError(ValueError):
@@ -206,6 +234,38 @@ def validate_prepared_batch(
         )
 
 
+def prepare_knowledge_bytes(
+    filename: str,
+    raw: bytes,
+    *,
+    tokenizer: Any,
+    max_source_tokens: int,
+    relative_path_prefix: str = "uploads",
+    document_group_prefix: str = "upload",
+) -> tuple[PreparedKnowledgeDocument, ...]:
+    safe_name = Path(str(filename)).name.strip()
+    validate_knowledge_source_bytes(safe_name, raw)
+    suffix = Path(safe_name).suffix.lower()
+    text, decoding_change = _decode_text(raw, safe_name)
+    body, changes, source_kind = _clean_body(text, suffix, safe_name)
+    if decoding_change is not None:
+        changes.insert(0, decoding_change)
+    title = _document_title(body, Path(safe_name).stem)
+    slug = _slug(Path(safe_name).stem, raw)
+    return _split_documents(
+        body,
+        title=title,
+        slug=slug,
+        group=f"{document_group_prefix}_{slug}",
+        source_kind=source_kind,
+        original_filename=safe_name,
+        tokenizer=tokenizer,
+        max_source_tokens=max_source_tokens,
+        changes=tuple(changes),
+        relative_path_prefix=relative_path_prefix,
+    )
+
+
 def prepare_knowledge_upload(
     filename: str,
     content_base64: str,
@@ -214,49 +274,17 @@ def prepare_knowledge_upload(
     max_source_tokens: int,
 ) -> tuple[PreparedKnowledgeDocument, ...]:
     safe_name = Path(str(filename)).name.strip()
-    if not safe_name or safe_name in {".", ".."}:
-        raise KnowledgeIngestError("invalid_filename", "文件名无效", filename=filename)
-    suffix = Path(safe_name).suffix.lower()
-    if suffix not in _SUPPORTED_SUFFIXES:
-        raise KnowledgeIngestError(
-            "unsupported_file_type",
-            "仅支持 Markdown、TXT、RST、JSON、JSONL、YAML 和 CSV 文本文件",
-            filename=safe_name,
-            details={"suffix": suffix or None},
-        )
     try:
         raw = base64.b64decode(str(content_base64), validate=True)
     except (binascii.Error, ValueError) as exc:
         raise KnowledgeIngestError(
             "invalid_base64", "文件内容不是有效的 Base64", filename=safe_name
         ) from exc
-    if not raw:
-        raise KnowledgeIngestError("empty_file", "文件内容为空", filename=safe_name)
-    if len(raw) > _MAX_FILE_BYTES:
-        raise KnowledgeIngestError(
-            "file_too_large",
-            f"单个文件不得超过 {_MAX_FILE_BYTES // (1024 * 1024)} MiB",
-            filename=safe_name,
-            details={"byte_count": len(raw), "maximum_bytes": _MAX_FILE_BYTES},
-        )
-
-    text, decoding_change = _decode_text(raw, safe_name)
-    body, changes, source_kind = _clean_body(text, suffix, safe_name)
-    if decoding_change is not None:
-        changes.insert(0, decoding_change)
-    title = _document_title(body, Path(safe_name).stem)
-    slug = _slug(Path(safe_name).stem, raw)
-    group = f"upload_{slug}"
-    return _split_documents(
-        body,
-        title=title,
-        slug=slug,
-        group=group,
-        source_kind=source_kind,
-        original_filename=safe_name,
+    return prepare_knowledge_bytes(
+        safe_name,
+        raw,
         tokenizer=tokenizer,
         max_source_tokens=max_source_tokens,
-        changes=tuple(changes),
     )
 
 
@@ -379,6 +407,7 @@ def _split_documents(
     tokenizer: Any,
     max_source_tokens: int,
     changes: tuple[str, ...],
+    relative_path_prefix: str,
 ) -> tuple[PreparedKnowledgeDocument, ...]:
     if max_source_tokens < 128:
         raise KnowledgeIngestError(
@@ -395,7 +424,7 @@ def _split_documents(
     if len(body_tokens) <= max_source_tokens:
         return (
             _prepared_document(
-                relative_path=f"uploads/{slug}.md",
+                relative_path=f"{relative_path_prefix}/{slug}.md",
                 body=body,
                 group=group,
                 source_kind=source_kind,
@@ -455,7 +484,7 @@ def _split_documents(
     part_changes = (*changes, f"split_into_{len(parts)}_parts")
     return tuple(
         _prepared_document(
-            relative_path=f"uploads/{slug}-part-{index:02d}.md",
+            relative_path=f"{relative_path_prefix}/{slug}-part-{index:02d}.md",
             body=part,
             group=group,
             source_kind=source_kind,

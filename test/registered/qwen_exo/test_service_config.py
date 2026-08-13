@@ -28,6 +28,39 @@ def test_tensor_bank_defaults_reserve_context_and_full_attention_capacity():
         validate_values(values)
 
 
+def test_default_thinking_settings_map_to_chat_template_kwargs():
+    values = default_values()
+    assert values["default_enable_thinking"] is False
+    assert values["default_preserve_thinking"] is False
+
+    values["default_enable_thinking"] = True
+    effective_args = apply_values_to_args(
+        [
+            "--model-path",
+            "/models/qwen-exo",
+            "--default-chat-template-kwargs",
+            '{"enable_thinking":false,"preserve_thinking":true,"extra":"drop"}',
+        ],
+        values,
+    )
+
+    flag_index = effective_args.index("--default-chat-template-kwargs")
+    template_kwargs = json.loads(effective_args[flag_index + 1])
+    assert template_kwargs == {
+        "enable_thinking": True,
+        "preserve_thinking": False,
+    }
+    assert values_from_args(effective_args)["default_enable_thinking"] is True
+    assert values_from_args(effective_args)["default_preserve_thinking"] is False
+    assert "--default-enable-thinking" not in effective_args
+    assert "--no-default-preserve-thinking" not in effective_args
+
+
+def test_invalid_default_chat_template_kwargs_fail_closed():
+    with pytest.raises(ServiceConfigError, match="必须是 JSON 对象"):
+        values_from_args(["--default-chat-template-kwargs", "[]"])
+
+
 def test_values_round_trip_through_managed_server_args():
     values = default_values()
     values.update(

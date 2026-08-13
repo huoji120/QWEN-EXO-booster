@@ -10,10 +10,16 @@ from qwen_exo_booster import activation_training, service_launcher
 from qwen_exo_booster.service_config import ServiceConfigStore
 
 
-def write_model(root: Path, architecture: str) -> None:
+def write_model(
+    root: Path,
+    architecture: str,
+    *,
+    large_moe: bool = False,
+    quantization_config: dict | None = None,
+) -> None:
     root.mkdir()
     moe = architecture == "Qwen3_5MoeForConditionalGeneration"
-    layer_count = 40 if moe else 64
+    layer_count = 48 if large_moe else (40 if moe else 64)
     text = {
         "model_type": "qwen3_5_moe_text" if moe else "qwen3_5_text",
         "head_dim": 256,
@@ -25,11 +31,11 @@ def write_model(root: Path, architecture: str) -> None:
         "full_attention_interval": 4,
         "num_hidden_layers": layer_count,
         "intermediate_size": None if moe else 17408,
-        "hidden_size": 2048 if moe else 5120,
-        "num_attention_heads": 16 if moe else 24,
+        "hidden_size": 3072 if large_moe else (2048 if moe else 5120),
+        "num_attention_heads": 32 if large_moe else (16 if moe else 24),
         "num_key_value_heads": 2 if moe else 4,
         "linear_num_key_heads": 16,
-        "linear_num_value_heads": 32 if moe else 48,
+        "linear_num_value_heads": 64 if large_moe else (32 if moe else 48),
         "layer_types": [
             "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
             for index in range(layer_count)
@@ -42,19 +48,17 @@ def write_model(root: Path, architecture: str) -> None:
         text.update(
             num_experts=256,
             num_experts_per_tok=8,
-            moe_intermediate_size=512,
-            shared_expert_intermediate_size=512,
+            moe_intermediate_size=1024 if large_moe else 512,
+            shared_expert_intermediate_size=1024 if large_moe else 512,
         )
-    (root / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": [architecture],
-                "model_type": "qwen3_5_moe" if moe else "qwen3_5",
-                "text_config": text,
-            }
-        ),
-        encoding="utf-8",
-    )
+    config = {
+        "architectures": [architecture],
+        "model_type": "qwen3_5_moe" if moe else "qwen3_5",
+        "text_config": text,
+    }
+    if quantization_config is not None:
+        config["quantization_config"] = quantization_config
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (root / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {"total_size": 1}, "weight_map": {}}),
         encoding="utf-8",
@@ -118,6 +122,87 @@ def test_model_catalog_clones_sources_and_keeps_profiles_isolated(tmp_path: Path
     assert selected_model["model_fingerprint"] == moe_fingerprint
     assert str(moe.resolve()) in args
     assert str(moe_knowledge) in args
+
+
+def test_gptq_122b_catalog_uses_required_moe_wna16_runtime(tmp_path: Path):
+    models = tmp_path / "models"
+    models.mkdir()
+    dense = models / "dense"
+    gptq = models / "gptq-122b"
+    write_model(dense, "Qwen3_5ForConditionalGeneration")
+    write_model(
+        gptq,
+        "Qwen3_5MoeForConditionalGeneration",
+        large_moe=True,
+        quantization_config={
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 128,
+            "desc_act": False,
+            "sym": True,
+            "dynamic": {
+                "-:.*attn.*": {},
+                "-:.*shared_expert.*": {},
+            },
+        },
+    )
+    store = ModelCatalogStore([models], tmp_path / "data")
+    initial = store.ensure(dense)
+    target = next(
+        model
+        for model in store.discover_models()
+        if model["model_path"] == str(gptq.resolve())
+    )
+
+    assert target["variant"] == "moe-122b-a10b"
+    assert target["checkpoint_quantization"] == "gptq"
+    assert target["runtime_quantization"] == "moe_wna16"
+    assert target["checkpoint_quantization_bits"] == 4
+    assert target["checkpoint_quantization_group_size"] == 128
+    assert target["checkpoint_quantization_exclusions"] == [
+        ".*attn.*",
+        ".*shared_expert.*",
+    ]
+
+    store.select(
+        target["model_fingerprint"],
+        expected_revision=initial["revision"],
+    )
+    _, args, selected = store.mark_applied(
+        [
+            "--model-path",
+            str(dense),
+            "--quantization",
+            "fp8",
+            "--qwen-exo-state-dir",
+            "/data/qwen-exo/state-cuda",
+        ]
+    )
+
+    quantization_index = args.index("--quantization")
+    assert args[quantization_index + 1] == "moe_wna16"
+    assert args.count("--quantization") == 1
+    assert selected["model_path"] == str(gptq.resolve())
+
+
+def test_gptq_122b_requires_desc_act_false(tmp_path: Path):
+    models = tmp_path / "models"
+    models.mkdir()
+    gptq = models / "gptq-122b"
+    write_model(
+        gptq,
+        "Qwen3_5MoeForConditionalGeneration",
+        large_moe=True,
+        quantization_config={
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 128,
+            "desc_act": True,
+            "sym": True,
+        },
+    )
+
+    assert ModelCatalogStore([models], tmp_path / "data").discover_models() == []
 
 
 def test_first_catalog_boot_keeps_legacy_runtime_paths(tmp_path: Path):

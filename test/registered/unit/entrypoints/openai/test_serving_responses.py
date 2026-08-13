@@ -967,6 +967,48 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         self.assertIsNotNone(msg)
 
 
+class ResponsesThinkingDefaultTestCase(unittest.TestCase):
+    def test_default_template_disables_thinking_when_reasoning_is_omitted(self):
+        serving = make_serving()
+        serving.reasoning_parser = "qwen3"
+        serving.default_chat_template_kwargs = {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }
+        serving.template_manager.reasoning_config = SimpleNamespace(
+            toggle_param="enable_thinking",
+            default_enabled=True,
+            special_case=None,
+        )
+
+        self.assertFalse(
+            serving._is_thinking_enabled_for_request(
+                ResponsesRequest(model="x", input="inspect", store=False)
+            )
+        )
+
+    def test_explicit_reasoning_overrides_disabled_template_default(self):
+        serving = make_serving()
+        serving.reasoning_parser = "qwen3"
+        serving.default_chat_template_kwargs = {"enable_thinking": False}
+        serving.template_manager.reasoning_config = SimpleNamespace(
+            toggle_param="enable_thinking",
+            default_enabled=True,
+            special_case=None,
+        )
+
+        self.assertTrue(
+            serving._is_thinking_enabled_for_request(
+                ResponsesRequest(
+                    model="x",
+                    input="inspect",
+                    reasoning={"effort": "high"},
+                    store=False,
+                )
+            )
+        )
+
+
 class NativeThinkContinuationTestCase(unittest.TestCase):
     def test_phase_two_self_ask_spill_is_partitioned_from_final_text(self):
         spill = (
