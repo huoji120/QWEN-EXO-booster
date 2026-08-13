@@ -10,6 +10,14 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
     "上下文长度",
     "定义单次请求可进入模型的最大 token 容量；调大可承载更长历史，调小可降低显存压力，当前双卡推荐 102400。",
   ],
+  default_enable_thinking: [
+    "默认启用思考",
+    "仅在客户端未显式指定推理选项时生效；关闭可避免普通请求自动进入 THINK，客户端显式开启仍然优先。",
+  ],
+  default_preserve_thinking: [
+    "保留历史思考",
+    "控制聊天模板是否保留历史 assistant 消息中的 THINK；关闭可减少上下文占用，回答正文不受影响。",
+  ],
   mem_fraction_static: [
     "静态显存预留",
     "定义启动时为模型权重与 KV/GDN 缓存预留的显存比例；提高可增强容量，降低可提升余量，推荐 0.80。",

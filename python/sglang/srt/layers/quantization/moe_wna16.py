@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.layers.quantization.utils import get_dynamic_override
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
@@ -85,6 +86,10 @@ class MoeWNA16Config(QuantizationConfig):
         self.bit8_pack_factor = 8 // self.weight_bits
         self.lm_head_quantized = lm_head_quantized
         self.linear_quant_method = linear_quant_method
+        dynamic = full_config.get("dynamic") or {}
+        if not isinstance(dynamic, dict):
+            raise ValueError("moe_wna16 dynamic config must be a mapping.")
+        self.dynamic = dynamic
         self.full_config = full_config
         self.use_marlin = False
         # Avoid circular import
@@ -194,32 +199,36 @@ class MoeWNA16Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-        # avoid circular import
+        # Avoid circular imports.
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
+        # GPTQModel checkpoints may use dynamic negative regexes rather than
+        # modules_to_not_convert (for example Qwen3.5 keeps attention and the
+        # shared expert in BF16). Honor both forms before constructing either
+        # the fused MoE or linear quantization method.
+        skipped = is_layer_skipped_quant(prefix, self.modules_to_not_convert) or (
+            get_dynamic_override(self, layer_name=prefix) is False
+        )
+        if skipped:
             if isinstance(layer, FusedMoE):
                 return UnquantizedFusedMoEMethod()
             return UnquantizedLinearMethod()
-        elif isinstance(layer, LinearBase):
-
+        if isinstance(layer, LinearBase):
             if self.linear_quant_method == "gptq":
                 if self.use_marlin:
                     return GPTQMarlinConfig.from_config(
                         self.full_config
                     ).get_quant_method(layer, prefix)
-                else:
-                    return GPTQConfig.from_config(self.full_config).get_quant_method(
-                        layer, prefix
-                    )
-            elif self.linear_quant_method == "awq":
+                return GPTQConfig.from_config(self.full_config).get_quant_method(
+                    layer, prefix
+                )
+            if self.linear_quant_method == "awq":
                 return AWQConfig.from_config(self.full_config).get_quant_method(
                     layer, prefix
                 )
-            else:
-                raise ValueError("moe_wna16 only support gptq and awq.")
-        elif isinstance(layer, FusedMoE):
+            raise ValueError("moe_wna16 only support gptq and awq.")
+        if isinstance(layer, FusedMoE):
             return MoeWNA16Method(self)
         return None
 

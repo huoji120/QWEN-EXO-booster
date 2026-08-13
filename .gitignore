@@ -301,3 +301,5 @@ internal-docs/
 /*.editor.pt
 /scripts/qwen_exo/corpus/knowledge/boeing-fable5-trajectory/
 /scripts/qwen_exo/corpus/knowledge/swe-mashumaro-flattened-targeted.md
+/pre-complete/
+/scripts/qwen_exo/pre-complete/

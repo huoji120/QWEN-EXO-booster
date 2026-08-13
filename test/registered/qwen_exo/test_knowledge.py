@@ -12,6 +12,7 @@ from qwen_exo_booster.knowledge import (
 )
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
+    prepare_knowledge_bytes,
     prepare_knowledge_upload,
 )
 from qwen_exo_booster.reflection_memory import ReflectionMemory
@@ -389,6 +390,128 @@ def test_upload_rejects_unsupported_or_malformed_files_with_actionable_codes():
         )
     assert malformed.value.code == "invalid_json"
     assert "第 1 行" in str(malformed.value)
+
+
+def test_pre_complete_bytes_use_isolated_paths_and_automatic_paging():
+    documents = prepare_knowledge_bytes(
+        "private-reference.txt",
+        ("private model facts " * 80).encode("utf-8"),
+        tokenizer=_CharacterTokenizer(),
+        max_source_tokens=192,
+        relative_path_prefix="pre-complete",
+        document_group_prefix="pre_complete",
+    )
+
+    assert len(documents) > 1
+    assert {document.document_group for document in documents} == {
+        "pre_complete_private-reference"
+    }
+    assert [document.relative_path for document in documents] == [
+        f"pre-complete/private-reference-part-{index:02d}.md"
+        for index in range(1, len(documents) + 1)
+    ]
+    assert all(document.token_count <= 192 for document in documents)
+
+
+def test_pre_complete_bytes_reject_files_above_upload_safety_limit():
+    with pytest.raises(KnowledgeIngestError) as error:
+        prepare_knowledge_bytes(
+            "huge-reference.txt",
+            b"x" * (4 * 1024 * 1024 + 1),
+            tokenizer=_CharacterTokenizer(),
+            max_source_tokens=192,
+            relative_path_prefix="pre-complete",
+            document_group_prefix="pre_complete",
+        )
+
+    assert error.value.code == "file_too_large"
+    assert error.value.details["maximum_bytes"] == 4 * 1024 * 1024
+
+
+def test_runtime_consumes_pre_complete_sources_once_after_materialization(tmp_path):
+    source_root = tmp_path / "pre-complete"
+    source_root.mkdir()
+    (source_root / ".gitkeep").write_text("", encoding="utf-8")
+    source = source_root / "private-reference.txt"
+    source.write_text("private model facts " * 80, encoding="utf-8")
+    events = []
+    runtime = object.__new__(QwenExoRuntime)
+    runtime._pre_complete_directory = source_root
+    runtime.knowledge = KnowledgeRepository(tmp_path / "knowledge")
+    runtime.config = SimpleNamespace(tensor_bank_max_document_tokens=192)
+    runtime.tensor_bank = SimpleNamespace(cognition_token_ids=lambda: ())
+    runtime.telemetry = SimpleNamespace(
+        emit=lambda request_id, event_type, payload: events.append(
+            (request_id, event_type, payload)
+        )
+    )
+
+    staged = runtime._stage_pre_complete_knowledge(_CharacterTokenizer())
+
+    assert staged is not None
+    assert staged["source_files"] == ["private-reference.txt"]
+    assert staged["document_count"] > 1
+    assert staged["split_document_count"] == 1
+    assert source.is_file()
+    assert events == []
+    assert len(runtime.knowledge.snapshot.documents) == staged["document_count"]
+    assert all(
+        document.relative_path.startswith("pre-complete/")
+        for document in runtime.knowledge.snapshot.documents
+    )
+
+    payload = runtime._commit_pre_complete_knowledge()
+
+    assert payload == staged
+    assert not source.exists()
+    assert events[0][1] == "knowledge.pre_complete_consumed"
+    assert (source_root / ".gitkeep").is_file()
+    assert runtime._stage_pre_complete_knowledge(_CharacterTokenizer()) is None
+    assert runtime._commit_pre_complete_knowledge() is None
+
+
+def test_runtime_rolls_back_staged_pre_complete_documents_without_consuming_source(
+    tmp_path,
+):
+    source_root = tmp_path / "pre-complete"
+    source_root.mkdir()
+    source = source_root / "private-reference.txt"
+    source.write_text("private model facts " * 80, encoding="utf-8")
+    runtime = object.__new__(QwenExoRuntime)
+    runtime._pre_complete_directory = source_root
+    runtime.knowledge = KnowledgeRepository(tmp_path / "knowledge")
+    runtime.config = SimpleNamespace(tensor_bank_max_document_tokens=192)
+    runtime.tensor_bank = SimpleNamespace(cognition_token_ids=lambda: ())
+    runtime.telemetry = SimpleNamespace(emit=lambda *_args, **_kwargs: None)
+
+    assert runtime._stage_pre_complete_knowledge(_CharacterTokenizer()) is not None
+    assert runtime.knowledge.snapshot.documents
+
+    runtime._rollback_staged_pre_complete_knowledge()
+
+    assert source.is_file()
+    assert runtime.knowledge.snapshot.documents == ()
+    assert runtime._pending_pre_complete_sources == ()
+    assert runtime._pending_pre_complete_payload is None
+
+
+def test_runtime_keeps_pre_complete_source_when_materialization_fails(tmp_path):
+    source_root = tmp_path / "pre-complete"
+    source_root.mkdir()
+    source = source_root / "broken.json"
+    source.write_text('{"missing":', encoding="utf-8")
+    runtime = object.__new__(QwenExoRuntime)
+    runtime._pre_complete_directory = source_root
+    runtime.knowledge = KnowledgeRepository(tmp_path / "knowledge")
+    runtime.config = SimpleNamespace(tensor_bank_max_document_tokens=256)
+    runtime.tensor_bank = SimpleNamespace(cognition_token_ids=lambda: ())
+    runtime.telemetry = SimpleNamespace(emit=lambda *_args, **_kwargs: None)
+
+    with pytest.raises(KnowledgeIngestError) as error:
+        runtime._stage_pre_complete_knowledge(_CharacterTokenizer())
+    assert error.value.code == "invalid_json"
+    assert source.is_file()
+    assert runtime.knowledge.snapshot.documents == ()
 
 
 class _RuntimeTensorBank:

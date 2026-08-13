@@ -1188,17 +1188,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     created_time,
                 )
             try:
-                result: Union[
-                    ORJSONResponse, ResponsesResponse
-                ] = await self.responses_full_generator(
-                    request,
-                    sampling_params,
-                    result_generator,
-                    context,
-                    model_name,
-                    tokenizer,
-                    request_metadata,
-                    created_time=created_time,
+                result: Union[ORJSONResponse, ResponsesResponse] = (
+                    await self.responses_full_generator(
+                        request,
+                        sampling_params,
+                        result_generator,
+                        context,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        created_time=created_time,
+                    )
                 )
                 return result
             except HTTPException as exc:
@@ -1391,6 +1391,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         if not self.reasoning_parser:
             return False
         effort = request.reasoning.effort if request.reasoning is not None else None
+        template_kwargs = dict(self.default_chat_template_kwargs or {})
+        if effort is None:
+            toggle = (
+                self.template_manager.reasoning_config.toggle_param
+                if self.template_manager.reasoning_config is not None
+                else None
+            )
+            if toggle is not None and toggle in template_kwargs:
+                return bool(template_kwargs[toggle])
+            if "enable_thinking" in template_kwargs:
+                return bool(template_kwargs["enable_thinking"])
+            if "thinking" in template_kwargs:
+                return bool(template_kwargs["thinking"])
         if self.reasoning_parser == "hunyuan":
             return effort not in (None, "none", "no_think")
         if self.template_manager.force_reasoning:

@@ -97,6 +97,52 @@ def _count_markdown(root: Path) -> int:
     )
 
 
+def _runtime_quantization(config: dict[str, Any], variant: str) -> str | None:
+    quantization = config.get("quantization_config")
+    if not isinstance(quantization, dict):
+        return None
+    method = str(quantization.get("quant_method") or "").lower()
+    if method == "fp8":
+        return "fp8"
+    if (
+        variant.startswith("moe-")
+        and method == "gptq"
+        and quantization.get("bits") == 4
+        and quantization.get("desc_act") is False
+    ):
+        return "moe_wna16"
+    raise ValueError(
+        f"unsupported QWEN-EXO checkpoint quantization for {variant}: {quantization!r}"
+    )
+
+
+def _checkpoint_quantization(config: dict[str, Any]) -> dict[str, Any]:
+    quantization = config.get("quantization_config")
+    if not isinstance(quantization, dict):
+        return {
+            "checkpoint_quantization": None,
+            "checkpoint_quantization_bits": None,
+            "checkpoint_quantization_group_size": None,
+            "checkpoint_quantization_exclusions": [],
+        }
+    dynamic = quantization.get("dynamic")
+    exclusions = (
+        sorted(
+            pattern.removeprefix("-:")
+            for pattern in dynamic
+            if isinstance(pattern, str) and pattern.startswith("-:")
+        )
+        if isinstance(dynamic, dict)
+        else []
+    )
+    return {
+        "checkpoint_quantization": quantization.get("quant_method"),
+        "checkpoint_quantization_bits": quantization.get("bits"),
+        "checkpoint_quantization_group_size": quantization.get("group_size"),
+        "checkpoint_quantization_exclusions": exclusions,
+    }
+
+
 class ModelCatalogStore:
     def __init__(
         self,
@@ -196,6 +242,10 @@ class ModelCatalogStore:
                 try:
                     variant = validate_qwen_exo_model_path(candidate)
                     identity = ModelIdentity.from_path(candidate)
+                    config = json.loads(
+                        (candidate / "config.json").read_text(encoding="utf-8")
+                    )
+                    runtime_quantization = _runtime_quantization(config, variant)
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
                 discovered.setdefault(
@@ -212,6 +262,8 @@ class ModelCatalogStore:
                         "linear_attention_layers": identity.linear_attention_layers,
                         "max_position_embeddings": identity.max_position_embeddings,
                         "weight_bytes": identity.weight_bytes,
+                        **_checkpoint_quantization(config),
+                        "runtime_quantization": runtime_quantization,
                         "catalog_root_index": root_index,
                     },
                 )
@@ -390,6 +442,12 @@ class ModelCatalogStore:
         self._write_document(document)
 
         rewritten = _replace_argument(argv, "--model-path", str(model["model_path"]))
+        if model.get("runtime_quantization"):
+            rewritten = _replace_argument(
+                rewritten,
+                "--quantization",
+                str(model["runtime_quantization"]),
+            )
         if not first_catalog_boot:
             state_name = Path(
                 _argument_value(argv, "--qwen-exo-state-dir") or "state"

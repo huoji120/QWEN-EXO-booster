@@ -12,6 +12,7 @@ import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Iterable
 
 
@@ -35,6 +36,8 @@ from qwen_exo_booster.cognition import CognitionRepository
 from qwen_exo_booster.contracts import stable_digest
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
+    is_supported_knowledge_filename,
+    prepare_knowledge_bytes,
     prepare_knowledge_upload,
     validate_prepared_batch,
     validate_upload_batch,
@@ -335,7 +338,10 @@ class QwenExoRuntime:
             if config.feature_flags.adaptive_refresh
             else None
         )
+        self._pending_pre_complete_sources: tuple[Path, ...] = ()
+        self._pending_pre_complete_payload: dict[str, object] | None = None
         self.state = QwenExoRuntimeState.CREATED
+        self._pre_complete_directory = self._resolve_pre_complete_directory()
         self._tensor_bank_admin_lock = asyncio.Lock()
         self._reflection_memory_organize_lock = asyncio.Lock()
         self._reflection_memory_organization_task: asyncio.Task[None] | None = None
@@ -458,6 +464,120 @@ class QwenExoRuntime:
             HybridRuntimePolicy.from_server_args(server_args),
         )
 
+    def _resolve_pre_complete_directory(self) -> Path | None:
+        configured = os.getenv("QWEN_EXO_PRE_COMPLETE_KNOWLEDGE_DIR", "").strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        data_root = os.getenv("QWEN_EXO_MODEL_DATA_ROOT", "").strip()
+        if not data_root:
+            return None
+        return (Path(data_root).expanduser().resolve() / "pre-complete").resolve()
+
+    def _pre_complete_sources(self) -> tuple[Path, ...]:
+        root = self._pre_complete_directory
+        if root is None:
+            return ()
+        root.mkdir(parents=True, exist_ok=True)
+        sources = []
+        for path in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and is_supported_knowledge_filename(path.name)
+            ):
+                sources.append(path)
+        return tuple(sources)
+
+    def _stage_pre_complete_knowledge(self, tokenizer: Any) -> dict[str, object] | None:
+        sources = self._pre_complete_sources()
+        if not sources:
+            return None
+        if self.tensor_bank is None:
+            raise RuntimeError(
+                "Pre-complete Knowledge requires an initialized Native Tensor Bank"
+            )
+        max_source_tokens = self.config.tensor_bank_max_document_tokens - len(
+            self.tensor_bank.cognition_token_ids()
+        )
+        prepared_by_source = tuple(
+            (
+                source,
+                prepare_knowledge_bytes(
+                    source.name,
+                    source.read_bytes(),
+                    tokenizer=tokenizer,
+                    max_source_tokens=max_source_tokens,
+                    relative_path_prefix="pre-complete",
+                    document_group_prefix="pre_complete",
+                ),
+            )
+            for source in sources
+        )
+        prepared = tuple(
+            document for _, documents in prepared_by_source for document in documents
+        )
+        validate_prepared_batch(prepared)
+        relative_paths = [document.relative_path for document in prepared]
+        if len(set(relative_paths)) != len(relative_paths):
+            raise KnowledgeIngestError(
+                "duplicate_document_path",
+                "Pre-complete 文件清洗后生成了重复文档路径，请调整文件名",
+            )
+        existing_paths = {
+            document.relative_path for document in self.knowledge.snapshot.documents
+        }
+        conflicts = sorted(existing_paths.intersection(relative_paths))
+        if conflicts:
+            raise KnowledgeIngestError(
+                "path_conflict",
+                f"Pre-complete 目标路径已存在：{conflicts[0]}",
+            )
+
+        written_paths = []
+        try:
+            for document in prepared:
+                self.knowledge.upsert(document.relative_path, document.content)
+                written_paths.append(document.relative_path)
+        except BaseException:
+            for relative_path in reversed(written_paths):
+                self.knowledge.delete(relative_path)
+            raise
+
+        payload: dict[str, object] = {
+            "source_files": [source.name for source in sources],
+            "document_paths": relative_paths,
+            "document_count": len(prepared),
+            "split_document_count": sum(
+                len(documents) > 1 for _, documents in prepared_by_source
+            ),
+        }
+        self._pending_pre_complete_sources = sources
+        self._pending_pre_complete_payload = payload
+        return payload
+
+    def _rollback_staged_pre_complete_knowledge(self) -> None:
+        payload = self._pending_pre_complete_payload
+        if payload is None:
+            return
+        for relative_path in reversed(tuple(payload["document_paths"])):
+            try:
+                self.knowledge.delete(str(relative_path))
+            except FileNotFoundError:
+                pass
+        self._pending_pre_complete_sources = ()
+        self._pending_pre_complete_payload = None
+
+    def _commit_pre_complete_knowledge(self) -> dict[str, object] | None:
+        payload = self._pending_pre_complete_payload
+        if payload is None:
+            return None
+        for source in self._pending_pre_complete_sources:
+            source.unlink()
+        self._pending_pre_complete_sources = ()
+        self._pending_pre_complete_payload = None
+        self.telemetry.emit("runtime", "knowledge.pre_complete_consumed", payload)
+        return payload
+
     async def start(self) -> None:
         async with self._lifecycle_lock:
             if self.state is QwenExoRuntimeState.READY:
@@ -555,6 +675,7 @@ class QwenExoRuntime:
                         ),
                         span_tokens=self.config.tensor_bank_span_tokens,
                     )
+                    self._stage_pre_complete_knowledge(tokenizer)
                     if self.memory_pipeline is not None:
                         self.memory_pipeline.tensor_bank = self.tensor_bank
                     bank_sources_present = (
@@ -577,6 +698,7 @@ class QwenExoRuntime:
                         self.telemetry.emit(
                             "runtime", "tensor_bank.ready", bank_snapshot.public_dict()
                         )
+                        self._commit_pre_complete_knowledge()
                         runtime_model_config = getattr(
                             self.tokenizer_manager, "model_config", None
                         )
@@ -710,6 +832,7 @@ class QwenExoRuntime:
                 if self.reflection_memory_service is not None:
                     self._ensure_compaction_reflection_worker()
             except Exception:
+                self._rollback_staged_pre_complete_knowledge()
                 self.state = QwenExoRuntimeState.FAILED
                 raise
 
