@@ -1162,5 +1162,11 @@
   "因果回放完成": "Causal Replay completed",
   "因果回放失败关闭": "Causal Replay failed closed",
   "Maybe 门禁完成": "Maybe gate completed",
+  "API 密钥无效或已吊销": "The API key is invalid or revoked",
+  "API 密钥已连接": "API key connected",
+  "保存并重试": "Save and retry",
+  "连接 API 密钥": "Connect API key",
+  "模型列表与 Responses 端点需要有效的 Bearer 密钥。请粘贴已有密钥；如果没有密钥，请先在 API 密钥页面签发。": "The model list and Responses endpoint require a valid bearer key. Paste an existing key, or issue one first on the API Keys page.",
+  "历史上下文已失效，正在重新建立": "The previous server context expired; rebuilding a fresh context",
   "---\ntitle: \nsource_kind: unclassified\nquality: 1.0\n---\n\n# 标题\n\n": "---\ntitle: \nsource_kind: unclassified\nquality: 1.0\n---\n\n# Title\n\n"
 }

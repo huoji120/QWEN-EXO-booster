@@ -30,8 +30,12 @@ export function setManagedApiKey(token: string | null) {
   else window.sessionStorage.removeItem(MANAGED_API_KEY);
 }
 
+export function getManagedApiKey() {
+  return window.sessionStorage.getItem(MANAGED_API_KEY);
+}
+
 function managedAuthorizationHeader(): Record<string, string> {
-  const token = window.sessionStorage.getItem(MANAGED_API_KEY);
+  const token = getManagedApiKey();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 

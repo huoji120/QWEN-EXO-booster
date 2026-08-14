@@ -16,6 +16,14 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -29,8 +37,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { getModelId, getRecallTrace, streamResponse } from "@/lib/api";
+import {
+  ApiError,
+  getManagedApiKey,
+  getModelId,
+  getRecallTrace,
+  setManagedApiKey,
+  streamResponse,
+  type StreamHandlers,
+} from "@/lib/api";
 import { translate as t, translateFor } from "@/lib/i18n";
 import { createSession, loadSessions, saveSessions } from "@/lib/session-store";
 import type {
@@ -193,6 +210,10 @@ export function ChatPage() {
   const abortRef = useRef<AbortController | null>(null);
   const responseIdRef = useRef<string | null>(null);
   const terminalResponseIdRef = useRef<string | null>(null);
+  const [apiKeyOpen, setApiKeyOpen] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeyError, setApiKeyError] = useState("");
+  const [apiKeyChecking, setApiKeyChecking] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const active = useMemo(
@@ -282,11 +303,33 @@ export function ChatPage() {
   const send = async () => {
     const text = prompt.trim();
     if (!text || !active || busy) return;
+    if (!getManagedApiKey()) {
+      setApiKeyError("");
+      setApiKeyOpen(true);
+      return;
+    }
+
+    let modelId: string;
+    try {
+      modelId = await getModelId();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        setManagedApiKey(null);
+        setApiKey("");
+        setApiKeyError(t("API 密钥无效或已吊销"));
+        setApiKeyOpen(true);
+      } else {
+        toast.error(t("无法读取模型列表"), {
+          description: error instanceof Error ? error.message : t("未知错误"),
+        });
+      }
+      return;
+    }
+
     setPrompt("");
     setBusy(true);
     setPhase("准备记忆与调度");
     setRecall(null);
-
     const createdAt = new Date().toISOString();
     const userMessage: ChatMessage = {
       id: makeId("msg"),
@@ -343,7 +386,7 @@ export function ChatPage() {
 
     try {
       const body: Record<string, unknown> = {
-        model: await getModelId(),
+        model: modelId,
         input: text,
         stream: true,
         store: true,
@@ -353,7 +396,7 @@ export function ChatPage() {
       };
       if (previousResponseId) body.previous_response_id = previousResponseId;
 
-      await streamResponse(body, controller.signal, {
+      const handlers: StreamHandlers = {
         onEvent(eventType, payload) {
           if (eventType === "response.created") {
             responseIdRef.current =
@@ -400,7 +443,27 @@ export function ChatPage() {
           }
           updateAssistant();
         },
-      });
+      };
+      try {
+        await streamResponse(body, controller.signal, handlers);
+      } catch (error) {
+        if (
+          error instanceof ApiError &&
+          error.status === 404 &&
+          previousResponseId &&
+          !responseIdRef.current
+        ) {
+          delete body.previous_response_id;
+          commit((draft) => {
+            const session = draft.find((item) => item.id === sessionId);
+            if (session) session.lastResponseId = null;
+          });
+          setPhase("历史上下文已失效，正在重新建立");
+          await streamResponse(body, controller.signal, handlers);
+        } else {
+          throw error;
+        }
+      }
 
       if (!completed) throw new Error(t("流式响应在完成事件前结束"));
       if (!assistantMessage.content && !assistantMessage.tools.length)
@@ -418,6 +481,12 @@ export function ChatPage() {
       setPhase(incomplete ? "达到输出上限" : "生成完成");
       if (finalResponseId) void loadRecallForResponse(finalResponseId);
     } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        setManagedApiKey(null);
+        setApiKey("");
+        setApiKeyError(t("API 密钥无效或已吊销"));
+        setApiKeyOpen(true);
+      }
       if (controller.signal.aborted) {
         const terminalOnServer =
           Boolean(responseIdRef.current) &&
@@ -450,6 +519,34 @@ export function ChatPage() {
       }
       terminalResponseIdRef.current = null;
     }
+  };
+
+  const connectApiKey = async () => {
+    const token = apiKey.trim();
+    if (!token || apiKeyChecking) return;
+    setApiKeyChecking(true);
+    setApiKeyError("");
+    setManagedApiKey(token);
+    let connected = false;
+    try {
+      await getModelId();
+      connected = true;
+      setApiKeyOpen(false);
+      setApiKey("");
+      toast.success(t("API 密钥已连接"));
+    } catch (error) {
+      setManagedApiKey(null);
+      setApiKeyError(
+        error instanceof ApiError && error.status === 401
+          ? t("API 密钥无效或已吊销")
+          : error instanceof Error
+            ? error.message
+            : t("未知错误"),
+      );
+    } finally {
+      setApiKeyChecking(false);
+    }
+    if (connected) await send();
   };
 
   const stop = async () => {
@@ -635,6 +732,58 @@ export function ChatPage() {
           </div>
         </footer>
       </section>
+
+      <Dialog
+        open={apiKeyOpen}
+        onOpenChange={(open) => {
+          if (!apiKeyChecking) setApiKeyOpen(open);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("连接 API 密钥")}</DialogTitle>
+            <DialogDescription>
+              {t(
+                "模型列表与 Responses 端点需要有效的 Bearer 密钥。请粘贴已有密钥；如果没有密钥，请先在 API 密钥页面签发。",
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Input
+              type="password"
+              autoComplete="off"
+              value={apiKey}
+              placeholder="qxk_…"
+              aria-label={t("API 密钥")}
+              onChange={(event) => setApiKey(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void connectApiKey();
+              }}
+            />
+            {apiKeyError ? (
+              <p className="text-sm text-destructive">{apiKeyError}</p>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={apiKeyChecking}
+              onClick={() => setApiKeyOpen(false)}
+            >
+              {t("取消")}
+            </Button>
+            <Button
+              disabled={apiKeyChecking || !apiKey.trim()}
+              onClick={() => void connectApiKey()}
+            >
+              {apiKeyChecking ? (
+                <LoaderCircle className="animate-spin" />
+              ) : null}
+              {t("保存并重试")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
