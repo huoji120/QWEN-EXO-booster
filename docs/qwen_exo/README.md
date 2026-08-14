@@ -61,7 +61,7 @@ weights, raw trajectories, and smoke outputs are runtime artifacts and are
 excluded from Git. Challenge-specific and task-specific trajectory corpora are
 not part of the published memory set.
 
-For the planned dense 27B GPTQ profile, use the catalog-derived `gptq` runtime loader with `kv_cache_dtype=fp8_e4m3`; this is W4A16 plus FP8 Full-Attention KV cache, not FP8 weights layered on top of GPTQ. Hybrid GDN/Mamba recurrent and convolution state remains a separate runtime state and must be validated independently.
+For the Dense 27B GPTQ profile, use the catalog-derived `gptq_marlin` runtime loader with `dtype=float16` and `kv_cache_dtype=fp8_e4m3`; this is W4A16 plus FP8 Full-Attention KV cache, not FP8 weights layered on top of GPTQ. Hybrid GDN/Mamba recurrent and convolution state remains BF16 and must be validated independently.
 
 ## Runtime entry points
 

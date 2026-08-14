@@ -145,7 +145,7 @@ Resolved defaults for unquantized checkpoints:
 ```
 
 For a catalog-selected Dense 27B GPTQ checkpoint, the service launcher replaces
-the compute dtype with `float16` and sets `--quantization gptq`; the hybrid
+the compute dtype with `float16` and sets `--quantization gptq_marlin`; the hybrid
 GDN/Mamba recurrent and convolution state remains BF16 through
 `SGLANG_MAMBA_SSM_DTYPE=bfloat16`. Other unquantized CUDA profiles retain the
 BF16 correctness baseline.

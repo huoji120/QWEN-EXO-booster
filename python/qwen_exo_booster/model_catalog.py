@@ -117,7 +117,7 @@ def _runtime_quantization(config: dict[str, Any], variant: str) -> str | None:
         and quantization.get("desc_act") is False
         and variant in {"dense-27b", "moe-122b-a10b"}
     ):
-        return "gptq" if variant == "dense-27b" else "moe_wna16"
+        return "gptq_marlin" if variant == "dense-27b" else "moe_wna16"
     raise ValueError(
         f"unsupported QWEN-EXO checkpoint quantization for {variant}: {quantization!r}"
     )
@@ -405,8 +405,9 @@ class ModelCatalogStore:
                 "--quantization",
                 str(model["runtime_quantization"]),
             )
-        if model.get("runtime_quantization") == "gptq":
+        if model.get("runtime_quantization") in {"gptq", "gptq_marlin"}:
             rewritten = _replace_argument(rewritten, "--dtype", "float16")
+
 
         state_name = _state_directory_name(argv, model)
         rewritten = _replace_argument(
