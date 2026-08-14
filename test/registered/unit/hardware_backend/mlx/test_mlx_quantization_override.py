@@ -36,6 +36,19 @@ class TestMlxQuantizationOverride(unittest.TestCase):
         )
         self.assertEqual(result, "mlx_q8")
 
+    def test_mlx_mxfp8_dict_config_autodetect(self):
+        """MXFP8 metadata maps to the MLX-native floating-point preset."""
+        result = MlxQuantizationConfig.override_quantization_method(
+            {"group_size": 32, "bits": 8, "mode": "mxfp8"}, None
+        )
+        self.assertEqual(result, "mlx_mxfp8")
+
+    def test_unknown_mlx_mode_not_matched(self):
+        result = MlxQuantizationConfig.override_quantization_method(
+            {"group_size": 32, "bits": 8, "mode": "unknown"}, None
+        )
+        self.assertIsNone(result)
+
     def test_non_mlx_dict_not_matched(self):
         """Dicts with an explicit quant_method belong to that method, not ours."""
         # modelopt-style: explicit quant_method takes priority.

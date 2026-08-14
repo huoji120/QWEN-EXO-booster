@@ -581,6 +581,9 @@ class Envs:
     # Number of decode steps between periodic mx.clear_cache() calls.
     # Set to 0 to disable cache clearing entirely.
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
+    # Upper bound, in GiB, for MLX's pool of inactive reusable buffers.
+    # A small cache avoids retaining prefill temporaries on unified-memory Macs.
+    SGLANG_MLX_CACHE_LIMIT_GIB = EnvInt(2)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)

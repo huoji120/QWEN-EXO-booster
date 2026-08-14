@@ -170,7 +170,7 @@ class MlxModelRunnerStub(ModelRunner):
             requested_per_worker = None
             resolved = min(capacity_cap, 4096)
         else:
-            requested_per_worker = requested // self.dp_size
+            requested_per_worker = requested // int(self.server_args.dp_size)
             resolved = min(requested_per_worker, capacity_cap)
 
         aux_state_size = self.server_args.max_mamba_cache_size

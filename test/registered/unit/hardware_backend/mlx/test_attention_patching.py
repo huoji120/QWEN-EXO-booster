@@ -53,6 +53,7 @@ if _HAS_MLX:
         SchedulerBatchResultProcessor,
     )
     from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.mem_cache.allocation import alloc_req_slots
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
@@ -186,6 +187,28 @@ class TestMlxAttentionPatching(unittest.TestCase):
 
         self.assertEqual(out.shape, (1, 1, 4))
         self.assertEqual(inner.o_proj.last_input_shape, (1, 1, 4))
+
+    def test_bfloat16_decode_casts_float32_qwen_exo_bias_for_sdpa(self):
+        inner = FakeGatedAttention()
+        wrapper = MLXAttentionWrapper(inner, layer_idx=0)
+        cache = ContiguousAttentionKVCache(
+            n_kv_heads=1, head_dim=2, max_seq_len=4, dtype=mx.bfloat16
+        )
+        qwen_exo = SimpleNamespace(
+            observe_attention=lambda *_, **__: None,
+            attention_bias=lambda **_: mx.zeros((1, 1, 1, 1), dtype=mx.float32),
+        )
+        ctx = BatchedDecodeContext(
+            batch_size=1,
+            seq_lens=[0],
+            attention_layer_caches=[[cache]],
+            qwen_exo=qwen_exo,
+        )
+
+        out = wrapper._batched_decode(mx.zeros((1, 1, 4), dtype=mx.bfloat16), ctx)
+        mx.eval(out)
+
+        self.assertEqual(out.dtype, mx.bfloat16)
 
     def test_write_token_grows_buffer_past_max_seq_len(self):
         max_seq_len = 4
@@ -346,7 +369,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
                 }
                 calls = []
 
-                def fake_batched(caches, batched_input, helper_req_ids):
+                def fake_batched(caches, batched_input, helper_req_ids, *args):
                     calls.append(
                         (len(caches), batched_input.tolist(), list(helper_req_ids))
                     )
@@ -384,7 +407,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         calls = []
 
-        def fake_batched(caches, batched_input, helper_req_ids):
+        def fake_batched(caches, batched_input, helper_req_ids, *args):
             calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
             return mx.array([8], dtype=mx.int32)
 
@@ -576,7 +599,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {rid: [idx + 20] for idx, rid in enumerate(req_ids)}
         calls = []
 
-        def fake_hybrid(caches, batched_input, helper_req_ids):
+        def fake_hybrid(caches, batched_input, helper_req_ids, *args):
             calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
             return mx.array([4, 5], dtype=mx.int32)
 
@@ -887,6 +910,126 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertEqual(restored[0].meta_state["seen"].tolist(), [3.0])
 
+    def test_auxiliary_state_pool_supports_scheduler_allocation_groups(self):
+        pool = MlxAuxiliaryStatePool(size=4, device="cpu")
+
+        pool.alloc_group_begin(3)
+        first = pool.alloc(1)
+        second = pool.alloc(1)
+        pool.alloc_group_end()
+
+        self.assertEqual(first.tolist(), [1])
+        self.assertEqual(second.tolist(), [2])
+        self.assertEqual(pool.schedulable_available_size(), 2)
+
+    def test_auxiliary_state_req_pool_exposes_scheduler_allocator_alias(self):
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+
+        self.assertIs(pool.mamba_allocator, pool.auxiliary_state_pool)
+        self.assertEqual(pool.mamba_allocator.available_size(), 4)
+
+    def test_auxiliary_state_req_pool_evicts_cached_slots_before_live_alloc(self):
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=1,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        cached_slots = pool.auxiliary_state_pool.alloc(4)
+
+        class FakeMambaTree:
+            def __init__(self):
+                self.evicted = 0
+
+            @staticmethod
+            def supports_mamba():
+                return True
+
+            def evict(self, params):
+                self.evicted += params.mamba_num
+                pool.auxiliary_state_pool.free(cached_slots[: params.mamba_num])
+
+        tree = FakeMambaTree()
+        req = FakeRequest()
+
+        req_indices = alloc_req_slots(pool, [req], tree)
+
+        self.assertEqual(req_indices, [1])
+        self.assertEqual(tree.evicted, 3)
+        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 2)
+
+    def test_mlx_cache_index_write_uses_cpu_bookkeeping_path(self):
+        from sglang.srt.mem_cache import allocation as allocation_module
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+        pool = ReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        original_use_mlx = allocation_module.use_mlx
+        allocation_module.use_mlx = lambda: True
+        try:
+            allocation_module.write_cache_indices(
+                out_cache_loc=torch.tensor([9, 10], dtype=torch.int64),
+                req_pool_indices_tensor=torch.tensor([1], dtype=torch.int64),
+                req_pool_indices_cpu=torch.tensor([1], dtype=torch.int64),
+                prefix_lens_tensor=torch.tensor([2], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([2], dtype=torch.int64),
+                seq_lens_tensor=torch.tensor([4], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
+                extend_lens_tensor=torch.tensor([2], dtype=torch.int64),
+                extend_lens_cpu=torch.tensor([2], dtype=torch.int64),
+                prefix_tensors=[torch.tensor([7, 8], dtype=torch.int64)],
+                req_to_token_pool=pool,
+            )
+        finally:
+            allocation_module.use_mlx = original_use_mlx
+
+        self.assertEqual(pool.req_to_token[1, :4].tolist(), [7, 8, 9, 10])
+
+    def test_mlx_sampler_unpacks_xgrammar_cpu_bitmask(self):
+        from sglang.srt.hardware_backend.mlx.sampling import _apply_grammar
+
+        class PackedGrammar:
+            finished = False
+
+            @staticmethod
+            def is_terminated():
+                return False
+
+            @staticmethod
+            def allocate_vocab_mask(vocab_size, batch_size, device):
+                return torch.zeros(
+                    (batch_size, (vocab_size + 31) // 32), dtype=torch.int32
+                )
+
+            @staticmethod
+            def fill_vocab_mask(mask, idx):
+                mask[idx, 0] = (1 << 1) | (1 << 3)
+
+            @staticmethod
+            def apply_vocab_mask(*_):
+                raise AssertionError("packed MLX mask must not call a CUDA-only kernel")
+
+        req = SimpleNamespace(grammar=PackedGrammar())
+        masked = _apply_grammar(mx.zeros((8,), dtype=mx.float32), req)
+        mx.eval(masked)
+
+        self.assertEqual(
+            mx.isfinite(masked).tolist(),
+            [False, True, False, True, False, False, False, False],
+        )
+
     def test_auxiliary_state_req_pool_maps_request_indices(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
@@ -1151,10 +1294,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
-        scheduler.get_next_batch_to_run = (
-            lambda running_batch, last_batch: SimpleNamespace(
-                batch_to_run=batch, running_batch=running_batch
-            )
+        scheduler.get_next_batch_to_run = lambda running_batch, last_batch: (
+            SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
         )
 
         with self.assertRaises(_StopLoop):
@@ -1488,6 +1629,25 @@ if _HAS_MLX:
             self.mamba_pool_idx = None
             self.inflight_middle_chunks = 0
             self.kv_committed_len = 0
+            self.origin_input_ids = []
+            self.grammar = None
+            self.sampling_params = SimpleNamespace(
+                sampling_seed=0,
+                repetition_penalty=1.0,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                logit_bias=None,
+                min_new_tokens=0,
+                stop_token_ids=None,
+                temperature=0.0,
+                top_k=-1,
+                top_p=1.0,
+                min_p=0.0,
+            )
+            self.logprob = SimpleNamespace(
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+            )
 
     class FakeTpWorker:
         def __init__(self, next_token_ids):

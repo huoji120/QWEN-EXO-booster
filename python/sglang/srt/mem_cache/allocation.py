@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
     evict_from_tree_cache,
 )
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_cpu,
@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -65,7 +66,7 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_server_args().attention_backend):
+    if not use_mlx() and support_triton(get_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -261,14 +262,19 @@ def alloc_req_slots(
     and should surface rather than be masked.
     """
     num_reqs = len(reqs)
-    if isinstance(req_to_token_pool, HybridReqToTokenPool):
+    # Native MLX hybrid models expose the same scheduler-facing Mamba
+    # allocator contract without inheriting HybridReqToTokenPool.  Key this
+    # admission/eviction path on the contract instead of the CUDA pool class;
+    # otherwise radix-cached MLX auxiliary snapshots can consume the pool and
+    # the next live request asserts in req_to_token_pool.alloc().
+    mamba_allocator = getattr(req_to_token_pool, "mamba_allocator", None)
+    if mamba_allocator is not None:
         # Byte-coordinated for the shared allocator (accounts for the peer full
         # sub-pool's bytes); plain slot free count for the non-shared one.
-        mamba_available_size = (
-            req_to_token_pool.mamba_allocator.schedulable_available_size()
-        )
+        mamba_available_size = mamba_allocator.schedulable_available_size()
         # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
+        supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
+        if supports_mamba:
             factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
                 if req_to_token_pool.enable_mamba_extra_buffer_lazy
@@ -278,7 +284,7 @@ def alloc_req_slots(
             factor = MAMBA_STATE_PER_REQ_NO_CACHE
         mamba_state_needed = num_reqs * factor
         if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and tree_cache.supports_mamba():
+            if supports_mamba:
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
     req_pool_indices = req_to_token_pool.alloc(reqs)

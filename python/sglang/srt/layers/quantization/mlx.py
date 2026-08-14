@@ -7,7 +7,8 @@ path.
 
 This module serves two purposes:
 
-1. Registry registration. Listing ``mlx_q4`` and ``mlx_q8`` in
+1. Registry registration. Listing ``mlx_q4``, ``mlx_q8``, and
+   ``mlx_mxfp8`` in
    ``QUANTIZATION_METHODS`` lets :meth:`ModelConfig._verify_quantization`
    recognize them as known methods without backend-specific exceptions in
    the generic config code.
@@ -29,7 +30,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 import torch
-
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -45,7 +45,8 @@ class MlxQuantizationConfig(QuantizationConfig):
     """
 
     _ERR = (
-        "MLX on-the-fly quantization (--quantization mlx_q4 / mlx_q8) is "
+        "MLX on-the-fly quantization (--quantization mlx_q4 / mlx_q8 / "
+        "mlx_mxfp8) is "
         "handled by the MLX backend at model-load time via mlx_lm.utils."
         "quantize_model, not by this QuantizationConfig class. If you "
         "reached this error, SGLANG_USE_MLX=1 is likely not set."
@@ -111,6 +112,11 @@ class MlxQuantizationConfig(QuantizationConfig):
         bits = hf_quant_cfg.get("bits")
         group_size = hf_quant_cfg.get("group_size")
         if not isinstance(bits, int) or not isinstance(group_size, int):
+            return None
+        mode = hf_quant_cfg.get("mode", "affine")
+        if mode == "mxfp8" and bits == 8 and group_size == 32:
+            return "mlx_mxfp8"
+        if mode != "affine":
             return None
         if bits == 4:
             return "mlx_q4"
