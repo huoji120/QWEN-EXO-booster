@@ -142,6 +142,8 @@ class HybridRuntimePolicy:
     page_size: int
     mamba_strategy: str
     mamba_state_dtype: str
+    mamba_conv_dtype: str = "bfloat16"
+
     logprob_chunk_size: int = _QWEN_EXO_LOGPROB_CHUNK_SIZE
     workspace_safety_reserve_bytes: int = (
         _QWEN_EXO_MIN_WORKSPACE_SAFETY_RESERVE_MIB << 20
@@ -173,6 +175,10 @@ class HybridRuntimePolicy:
             page_size=int(server_args.page_size),
             mamba_strategy=str(server_args.mamba_radix_cache_strategy),
             mamba_state_dtype=os.getenv("SGLANG_MAMBA_SSM_DTYPE", "").lower(),
+            mamba_conv_dtype=os.getenv(
+                "SGLANG_MAMBA_CONV_DTYPE",
+                os.getenv("SGLANG_MAMBA_SSM_DTYPE", ""),
+            ).lower(),
             backend=backend,
             quantization=str(getattr(server_args, "quantization", None) or "none"),
             kv_cache_dtype=str(getattr(server_args, "kv_cache_dtype", None) or "auto"),
@@ -223,6 +229,11 @@ class HybridRuntimePolicy:
             if self.mamba_state_dtype != expected_mamba_state_dtype:
                 raise ValueError(
                     "QWEN-EXO CUDA requires SGLANG_MAMBA_SSM_DTYPE="
+                    f"{expected_mamba_state_dtype} for quantization={self.quantization}"
+                )
+            if self.mamba_conv_dtype != expected_mamba_state_dtype:
+                raise ValueError(
+                    "QWEN-EXO CUDA requires SGLANG_MAMBA_CONV_DTYPE="
                     f"{expected_mamba_state_dtype} for quantization={self.quantization}"
                 )
 
@@ -338,6 +349,7 @@ class HybridRuntimePolicy:
             self.page_size,
             self.mamba_strategy,
             self.mamba_state_dtype,
+            self.mamba_conv_dtype,
         )
         logical_identity = stable_digest(
             layout_fingerprint,

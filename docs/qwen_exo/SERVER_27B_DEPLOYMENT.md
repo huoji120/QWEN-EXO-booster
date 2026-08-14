@@ -146,9 +146,9 @@ Resolved defaults for unquantized checkpoints:
 
 For a Dense 27B GPTQ deployment, set
 `QWEN_EXO_MAMBA_SSM_DTYPE=float16` before invoking the launcher. The catalog
-selects `dtype=float16` and `--quantization gptq_marlin`, while the launcher
-places the matching GDN/Mamba state dtype in the container before Python imports
-the runtime. Other CUDA profiles retain the BF16 model and state baseline.
+selects `dtype=float16` and `--quantization gptq_marlin`; the launcher sets both
+`SGLANG_MAMBA_SSM_DTYPE` and `SGLANG_MAMBA_CONV_DTYPE` before Python imports the
+runtime. Other CUDA profiles retain the BF16 model and state baseline.
 
 
 Override launcher defaults through documented `QWEN_EXO_*` variables rather

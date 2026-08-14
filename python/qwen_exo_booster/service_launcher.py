@@ -78,6 +78,7 @@ def main() -> None:
         )
         os.environ["QWEN_EXO_ACTIVE_MODEL_PATH"] = str(selected_model["model_path"])
         os.environ["SGLANG_MAMBA_SSM_DTYPE"] = _runtime_state_dtype(selected_model)
+        os.environ["SGLANG_MAMBA_CONV_DTYPE"] = _runtime_state_dtype(selected_model)
 
         print(
             "QWEN-EXO selected model profile: "
