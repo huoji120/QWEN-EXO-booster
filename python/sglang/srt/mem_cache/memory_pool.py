@@ -960,10 +960,14 @@ class MambaPool:
             cursors_cpu = None
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
-            conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
-        self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
-            self.mamba_cache.temporal.device, non_blocking=True
+            conv[:, indices] = conv_cpu[i].to(
+                device=conv.device, dtype=conv.dtype, non_blocking=True
+            )
+        temporal = self.mamba_cache.temporal
+        temporal[:, indices] = temporal_cpu.to(
+            device=temporal.device, dtype=temporal.dtype, non_blocking=True
         )
+
         if cursors_cpu is not None and self.replayssm_cache_base is not None:
             wp_cpu, cb_cpu, fl_cpu = cursors_cpu
             self.replayssm_write_pos[indices] = wp_cpu.to(
@@ -1291,12 +1295,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 if req.mamba_ping_pong_track_buffer is None:
                     self._alloc_ping_pong_buffer(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert len(select_index) == len(
-            mamba_indices
+        assert (
+            len(select_index) == len(mamba_indices)
         ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
+            assert (
+                len(select_index) == len(mamba_ping_pong_track_buffers)
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
@@ -1426,10 +1430,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]
             )
             if mamba_ping_pong_track_buffer_to_keep is not None:
-                assert mamba_ping_pong_track_buffer_to_keep in [
-                    0,
-                    1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                assert (
+                    mamba_ping_pong_track_buffer_to_keep
+                    in [
+                        0,
+                        1,
+                    ]
+                ), f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1724,7 +1731,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).

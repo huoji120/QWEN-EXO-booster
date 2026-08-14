@@ -1,5 +1,8 @@
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import patch
+
 
 import torch
 
@@ -722,6 +725,24 @@ class TestMamba(unittest.TestCase):
             torch.all(mamba_pool.mamba_cache.temporal[:, indices] == 2.0),
             "temporal not restored after load_cpu_copy",
         )
+
+    def test_mamba_pool_cpu_load_casts_to_cache_dtype(self):
+        pool = object.__new__(MambaPool)
+        pool.mamba_cache = SimpleNamespace(
+            conv=[torch.zeros(1, 2, 3, dtype=torch.bfloat16)],
+            temporal=torch.zeros(1, 2, 4, dtype=torch.bfloat16),
+        )
+        indices = torch.tensor([1], dtype=torch.long)
+        conv_cpu = [torch.full((1, 1, 3), 1.5, dtype=torch.float16)]
+        temporal_cpu = torch.full((1, 1, 4), 2.5, dtype=torch.float16)
+
+        with patch("sglang.srt.mem_cache.memory_pool.current_platform.synchronize"):
+            pool.load_cpu_copy((conv_cpu, temporal_cpu), indices)
+
+        self.assertEqual(pool.mamba_cache.conv[0].dtype, torch.bfloat16)
+        self.assertEqual(pool.mamba_cache.temporal.dtype, torch.bfloat16)
+        self.assertTrue(torch.all(pool.mamba_cache.conv[0][:, indices] == 1.5))
+        self.assertTrue(torch.all(pool.mamba_cache.temporal[:, indices] == 2.5))
 
     def test_hybrid_kv_pool_cpu_offload(self):
         """HybridLinearKVPool.get_cpu_copy / load_cpu_copy saves and restores both
