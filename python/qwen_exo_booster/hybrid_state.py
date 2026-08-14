@@ -209,18 +209,23 @@ class HybridRuntimePolicy:
                 raise ValueError("QWEN-EXO CUDA supports tp_size=1 or tp_size=2")
             if self.quantization in {"gptq", "gptq_marlin"}:
                 if self.dtype not in {"float16", "half"}:
-                    raise ValueError(
-                        "QWEN-EXO CUDA GPTQ requires float16 activations"
-                    )
+                    raise ValueError("QWEN-EXO CUDA GPTQ requires float16 activations")
             elif self.dtype != "bfloat16":
                 raise ValueError(
                     "QWEN-EXO CUDA correctness baseline requires bfloat16 weights"
                 )
 
-            if self.mamba_state_dtype != "bfloat16":
+            expected_mamba_state_dtype = (
+                "float16"
+                if self.quantization in {"gptq", "gptq_marlin"}
+                else "bfloat16"
+            )
+            if self.mamba_state_dtype != expected_mamba_state_dtype:
                 raise ValueError(
-                    "QWEN-EXO CUDA requires SGLANG_MAMBA_SSM_DTYPE=bfloat16"
+                    "QWEN-EXO CUDA requires SGLANG_MAMBA_SSM_DTYPE="
+                    f"{expected_mamba_state_dtype} for quantization={self.quantization}"
                 )
+
             if self.mamba_strategy not in {"extra_buffer", "extra_buffer_lazy"}:
                 raise ValueError(
                     "QWEN-EXO CUDA hybrid state requires an extra-buffer Mamba radix cache"

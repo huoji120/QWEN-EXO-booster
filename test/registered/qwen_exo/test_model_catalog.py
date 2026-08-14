@@ -233,7 +233,6 @@ def test_gptq_27b_catalog_uses_gptq_runtime(tmp_path: Path):
     assert args.count("--quantization") == 1
     assert args[args.index("--dtype") + 1] == "float16"
 
-
     assert args[args.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
     assert args[args.index("--qwen-exo-state-dir") + 1].endswith(
         "state-cuda-tp2-gptq_marlin-fp8_e4m3"
@@ -475,3 +474,15 @@ def test_service_launcher_uses_selected_model_profile(tmp_path: Path, monkeypatc
     assert str(data / "policydata") in executed["args"]
     assert str(data / "cognition") in executed["args"]
     assert service_launcher.os.environ["QWEN_EXO_ACTIVE_MODEL_PROFILE"] == str(profile)
+
+
+def test_service_launcher_selects_state_dtype_from_runtime_quantization():
+    assert (
+        service_launcher._runtime_state_dtype({"runtime_quantization": "gptq_marlin"})
+        == "float16"
+    )
+    assert (
+        service_launcher._runtime_state_dtype({"runtime_quantization": "moe_wna16"})
+        == "bfloat16"
+    )
+    assert service_launcher._runtime_state_dtype({}) == "bfloat16"

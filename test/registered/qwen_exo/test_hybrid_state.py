@@ -34,16 +34,16 @@ def test_hybrid_policy_accepts_single_gpu_cuda(monkeypatch):
     assert policy.backend == "cuda"
 
 
-def test_hybrid_policy_accepts_cuda_gptq_float16_with_bfloat16_state(monkeypatch):
-    monkeypatch.setenv("SGLANG_MAMBA_SSM_DTYPE", "bfloat16")
+def test_hybrid_policy_accepts_cuda_gptq_float16_state(monkeypatch):
+    monkeypatch.setenv("SGLANG_MAMBA_SSM_DTYPE", "float16")
 
     policy = HybridRuntimePolicy.from_server_args(
-        args(dtype="float16", quantization="gptq")
+        args(dtype="float16", quantization="gptq_marlin")
     )
 
     assert policy.dtype == "float16"
-    assert policy.quantization == "gptq"
-    assert policy.mamba_state_dtype == "bfloat16"
+    assert policy.quantization == "gptq_marlin"
+    assert policy.mamba_state_dtype == "float16"
 
 
 def test_hybrid_policy_rejects_unquantized_cuda_float16(monkeypatch):
@@ -59,6 +59,14 @@ def test_hybrid_policy_rejects_gptq_cuda_bfloat16(monkeypatch):
     with pytest.raises(ValueError, match="GPTQ requires float16 activations"):
         HybridRuntimePolicy.from_server_args(args(quantization="gptq"))
 
+
+def test_hybrid_policy_rejects_gptq_bfloat16_state(monkeypatch):
+    monkeypatch.setenv("SGLANG_MAMBA_SSM_DTYPE", "bfloat16")
+
+    with pytest.raises(ValueError, match="SGLANG_MAMBA_SSM_DTYPE=float16"):
+        HybridRuntimePolicy.from_server_args(
+            args(dtype="float16", quantization="gptq_marlin")
+        )
 
 
 def test_hybrid_policy_rejects_unsupported_cuda_tp(monkeypatch):

@@ -35,6 +35,14 @@ def _validate_qwen_exo_model_arguments(arguments: list[str]) -> str | None:
         raise SystemExit(f"QWEN-EXO startup blocked: {exc}.") from exc
 
 
+def _runtime_state_dtype(selected_model: dict[str, object]) -> str:
+    return (
+        "float16"
+        if selected_model.get("runtime_quantization") in {"gptq", "gptq_marlin"}
+        else "bfloat16"
+    )
+
+
 def main() -> None:
     base_args = sys.argv[1:]
     if base_args[:1] == ["--"]:
@@ -69,6 +77,8 @@ def main() -> None:
             / selected_model["model_fingerprint"]
         )
         os.environ["QWEN_EXO_ACTIVE_MODEL_PATH"] = str(selected_model["model_path"])
+        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = _runtime_state_dtype(selected_model)
+
         print(
             "QWEN-EXO selected model profile: "
             f"{selected_model['name']} ({selected_model['model_fingerprint'][:16]})",
