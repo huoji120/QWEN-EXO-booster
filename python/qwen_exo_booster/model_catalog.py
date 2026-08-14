@@ -5,9 +5,10 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from qwen_exo_booster.fingerprint import ModelIdentity, validate_qwen_exo_model_path
 
@@ -111,6 +112,17 @@ def _runtime_quantization(config: dict[str, Any], variant: str) -> str | None:
         and quantization.get("desc_act") is False
     ):
         return "moe_wna16"
+    if not method:
+        bits = quantization.get("bits")
+        group_size = quantization.get("group_size")
+        mode = str(quantization.get("mode") or "affine").lower()
+        if isinstance(bits, int) and isinstance(group_size, int):
+            if mode == "mxfp8" and bits == 8 and group_size == 32:
+                return "mlx_mxfp8"
+            if mode == "affine" and bits == 4:
+                return "mlx_q4"
+            if mode == "affine" and bits == 8:
+                return "mlx_q8"
     raise ValueError(
         f"unsupported QWEN-EXO checkpoint quantization for {variant}: {quantization!r}"
     )
@@ -136,7 +148,8 @@ def _checkpoint_quantization(config: dict[str, Any]) -> dict[str, Any]:
         else []
     )
     return {
-        "checkpoint_quantization": quantization.get("quant_method"),
+        "checkpoint_quantization": quantization.get("quant_method")
+        or quantization.get("mode"),
         "checkpoint_quantization_bits": quantization.get("bits"),
         "checkpoint_quantization_group_size": quantization.get("group_size"),
         "checkpoint_quantization_exclusions": exclusions,

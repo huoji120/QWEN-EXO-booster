@@ -86,6 +86,10 @@ if [[ ! -d "${QWEN_EXO_MODEL_PATH}" ]]; then
   echo "Model directory not found: ${QWEN_EXO_MODEL_PATH}" >&2
   exit 1
 fi
+: "${QWEN_EXO_MODEL_CATALOG_ROOTS:=$(cd -- "$(dirname -- "${QWEN_EXO_MODEL_PATH}")" && pwd)}"
+: "${QWEN_EXO_MODEL_CATALOG_CONFIG:=${QWEN_EXO_DATA_PATH}/model-catalog.json}"
+: "${QWEN_EXO_MODEL_DATA_ROOT:=${QWEN_EXO_DATA_PATH}}"
+: "${QWEN_EXO_MODEL_PROFILE_SEED_ROOT:=${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/corpus}"
 if [[ ! -x "${QWEN_EXO_PYTHON}" ]]; then
   echo "MLX Python environment not found: ${QWEN_EXO_PYTHON}" >&2
   echo "Run: bash scripts/qwen_exo/install_mlx.sh" >&2
@@ -111,6 +115,10 @@ export SGLANG_QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB=512
 export SGLANG_MLX_CLEAR_CACHE_STEPS
 export SGLANG_MLX_CACHE_LIMIT_GIB
 export QWEN_EXO_SERVICE_CONFIG="${QWEN_EXO_DATA_PATH}/service-config-mlx.json"
+export QWEN_EXO_MODEL_CATALOG_ROOTS
+export QWEN_EXO_MODEL_CATALOG_CONFIG
+export QWEN_EXO_MODEL_DATA_ROOT
+export QWEN_EXO_MODEL_PROFILE_SEED_ROOT
 
 "${QWEN_EXO_PYTHON}" "${QWEN_EXO_SOURCE_PATH}/scripts/qwen_exo/check_mlx.py"
 if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then

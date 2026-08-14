@@ -32,7 +32,10 @@ def test_mlx_launcher_dry_run_freezes_safe_single_gpu_profile(tmp_path):
     _write_executable(
         fake_python,
         "#!/bin/sh\n"
-        'printf "%s | %s\\n" "$QWEN_EXO_SERVICE_CONFIG" "$*" '
+        'printf "%s | %s | %s | %s | %s | %s\\n" '
+        '"$QWEN_EXO_SERVICE_CONFIG" "$QWEN_EXO_MODEL_CATALOG_ROOTS" '
+        '"$QWEN_EXO_MODEL_CATALOG_CONFIG" "$QWEN_EXO_MODEL_DATA_ROOT" '
+        '"$QWEN_EXO_MODEL_PROFILE_SEED_ROOT" "$*" '
         '>> "$QWEN_EXO_TEST_LOG"\n',
     )
 
@@ -100,6 +103,10 @@ def test_mlx_launcher_dry_run_freezes_safe_single_gpu_profile(tmp_path):
 
     invocations = invocation_log.read_text(encoding="utf-8")
     assert str(data_path / "service-config-mlx.json") in invocations
+    assert str(tmp_path) in invocations
+    assert str(data_path / "model-catalog.json") in invocations
+    assert str(data_path) in invocations
+    assert str(SOURCE_ROOT / "scripts" / "qwen_exo" / "corpus") in invocations
     assert "scripts/qwen_exo/check_mlx.py" in invocations
     assert "python/qwen_exo_booster/fingerprint.py" in invocations
 

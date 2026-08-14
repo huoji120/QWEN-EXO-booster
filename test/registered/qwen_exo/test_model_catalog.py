@@ -4,9 +4,8 @@ import json
 from pathlib import Path
 
 import pytest
-
-from qwen_exo_booster.model_catalog import ModelCatalogError, ModelCatalogStore
 from qwen_exo_booster import activation_training, service_launcher
+from qwen_exo_booster.model_catalog import ModelCatalogError, ModelCatalogStore
 from qwen_exo_booster.service_config import ServiceConfigStore
 
 
@@ -183,6 +182,39 @@ def test_gptq_122b_catalog_uses_required_moe_wna16_runtime(tmp_path: Path):
     assert args[quantization_index + 1] == "moe_wna16"
     assert args.count("--quantization") == 1
     assert selected["model_path"] == str(gptq.resolve())
+
+
+@pytest.mark.parametrize(
+    ("quantization_config", "expected_runtime"),
+    [
+        ({"group_size": 64, "bits": 4, "mode": "affine"}, "mlx_q4"),
+        ({"group_size": 64, "bits": 8, "mode": "affine"}, "mlx_q8"),
+        ({"group_size": 32, "bits": 8, "mode": "mxfp8"}, "mlx_mxfp8"),
+    ],
+)
+def test_mlx_catalog_uses_checkpoint_native_runtime_quantization(
+    tmp_path: Path,
+    quantization_config: dict,
+    expected_runtime: str,
+):
+    models = tmp_path / "models"
+    models.mkdir()
+    checkpoint = models / expected_runtime
+    write_model(
+        checkpoint,
+        "Qwen3_5MoeForConditionalGeneration",
+        large_moe=True,
+        quantization_config=quantization_config,
+    )
+
+    model = ModelCatalogStore([models], tmp_path / "data").discover_models()[0]
+
+    assert model["runtime_quantization"] == expected_runtime
+    assert model["checkpoint_quantization"] == quantization_config["mode"]
+    assert model["checkpoint_quantization_bits"] == quantization_config["bits"]
+    assert (
+        model["checkpoint_quantization_group_size"] == quantization_config["group_size"]
+    )
 
 
 def test_gptq_122b_requires_desc_act_false(tmp_path: Path):
