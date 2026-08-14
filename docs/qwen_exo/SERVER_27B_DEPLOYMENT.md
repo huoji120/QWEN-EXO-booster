@@ -119,12 +119,11 @@ the container, and `ServerArgs` validates it again when `--enable-qwen-exo` is
 resolved. With `QWEN_EXO_ENABLED=0`, all three QWEN-EXO structural guards are
 bypassed and the launcher preserves upstream SGLang model compatibility.
 
-Resolved defaults:
+Resolved defaults for unquantized checkpoints:
 
 ```text
 --tp-size 2
 --dtype bfloat16
---quantization fp8
 --kv-cache-dtype fp8_e4m3
 --context-length 102400
 --page-size 64
@@ -145,7 +144,13 @@ Resolved defaults:
 --qwen-exo-max-internal-tokens 12288
 ```
 
-Override these through the documented `QWEN_EXO_*` launcher variables rather
+For a catalog-selected Dense 27B GPTQ checkpoint, the service launcher replaces
+the compute dtype with `float16` and sets `--quantization gptq`; the hybrid
+GDN/Mamba recurrent and convolution state remains BF16 through
+`SGLANG_MAMBA_SSM_DTYPE=bfloat16`. Other unquantized CUDA profiles retain the
+BF16 correctness baseline.
+
+Override launcher defaults through documented `QWEN_EXO_*` variables rather
 than editing the script or relying on a model directory name.
 
 ### Experimental absolute-probability expert addition

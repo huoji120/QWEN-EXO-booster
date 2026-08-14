@@ -231,6 +231,8 @@ def test_gptq_27b_catalog_uses_gptq_runtime(tmp_path: Path):
     quantization_index = args.index("--quantization")
     assert args[quantization_index + 1] == "gptq"
     assert args.count("--quantization") == 1
+    assert args[args.index("--dtype") + 1] == "float16"
+
     assert args[args.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
     assert args[args.index("--qwen-exo-state-dir") + 1].endswith(
         "state-cuda-tp2-gptq-fp8_e4m3"
