@@ -252,8 +252,7 @@ def validate_qwen_exo_model_path(model_path: Path | str) -> str:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(
-            f"model config is not valid JSON: {config_path}. "
-            f"{_COMPATIBILITY_GUIDANCE}"
+            f"model config is not valid JSON: {config_path}. {_COMPATIBILITY_GUIDANCE}"
         ) from exc
     if not isinstance(config, dict):
         raise ValueError(

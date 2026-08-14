@@ -1,18 +1,25 @@
 # Implementation progress and evidence
 
-Updated: 2026-08-10
+Updated: 2026-08-12
 
 ## Status legend
 
 - **Implemented**: code and focused behavior tests pass.
 - **Integrated**: wired into SGLang's request, model, allocator, and scheduler paths.
 - **Server-verified**: exercised with the real Dense 27B and MoE 35B-A3B checkpoints on both RTX 4090s.
+- **MLX-host-verified**: imports, Metal execution, backend wiring, and launcher
+  policy were exercised on a real Apple Silicon host; this does not imply a
+  full checkpoint was loaded.
+- **MLX-server-verified**: a compatible checkpoint was loaded and served through
+  the native MLX path on a real Apple Silicon host; this does not imply
+  cross-backend numerical equivalence or worst-case context/concurrency capacity.
 - **Pending**: no claim until the named evaluation is run.
 
 ## Capability matrix
 
 | Capability | State | Evidence |
 |---|---|---|
+| Native Apple Silicon MLX backend | MLX-server-verified for Dense 27B | Apple M5 Max loaded and served `mlx-community/Qwen3.5-27B-4bit` with MLX 0.32.0 and MLX-LM 0.31.3; health remained ready through Responses and direct-generation smokes plus the complete test suite; the launcher freezes MPS, TP=1, eager execution, one-token pages, MLX quantization, and an MLX-specific state namespace |
 | Qwen-series model structure and fingerprint | Server-verified | compatibility is derived from `config.json`, not release labels or paths; verified layouts are Dense 27B (`Qwen3_5ForConditionalGeneration`, 64 layers: 16 Full Attention + 48 Gated DeltaNet) and MoE 35B-A3B (`Qwen3_5MoeForConditionalGeneration`, 40 layers: 10 + 30, 256 experts with 8 active) |
 | True TP=2, BF16, 64-token pages | Server-verified | two scheduler ranks and two GPU compute processes; runtime status reports TP=2/BF16/page=64 |
 | Atomic Full-Attention/GDN lifecycle | Server-verified | native UnifiedRadixCache stress, eviction/refill recovery, repeated 100K requests, and exact native-path recovery for stale split metadata under batched internal judges |
@@ -73,7 +80,30 @@ Native Bank cutover addendum: the rank-local raw-K/V + complete Section Delta pa
 
 ## Automated verification
 
-Current workstation verification on 2026-08-10:
+Apple Silicon MLX verification on 2026-08-12:
+
+```text
+MLX 0.32.0 / MLX-LM 0.31.3 / PyTorch 2.11.0
+Apple M5 Max / 128 GiB unified memory / PyTorch MPS available
+MLX Metal matrix smoke checksum: 120.0
+Dense checkpoint: mlx-community/Qwen3.5-27B-4bit
+Model load: 1.31 s / 14.09 GB MLX weight memory
+KV pool: 262,144 tokens / approximately 16 GiB
+Direct generation: MLX_READY / 9 output tokens / 0.729 s end to end
+Responses API: HTTP 200 / 1,856 cached native-policy prefix tokens
+Focused MLX routing/pool tests: 29 passed
+Attention/state patching tests: 42 passed, 2 subtests passed
+Complete QWEN-EXO suite: 503 passed, 2 skipped
+```
+
+The service stayed ready throughout the complete suite. This verifies the
+Dense 27B model-load, native state-cache restoration, scheduler, and served
+generation path. MoE 35B-A3B execution, cross-backend numerical equivalence,
+and worst-case eight-request 32K capacity remain unverified. See
+`APPLE_SILICON_MLX_DEPLOYMENT.md` for the reproducible commands and exact
+compatibility boundary.
+
+Previous workstation verification on 2026-08-10:
 
 ```text
 PYTHONPATH=python python -m pytest -q test/registered/qwen_exo

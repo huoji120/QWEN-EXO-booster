@@ -94,6 +94,7 @@ def write_122b_moe_model(root):
             ],
         }
     )
+    text_config.pop("intermediate_size")
     text_config.pop("partial_rotary_factor")
     text_config["rope_parameters"]["partial_rotary_factor"] = 0.25
     config["quantization_config"] = {
@@ -238,6 +239,62 @@ def test_moe_runtime_config_accepts_sglang_normalized_intermediate_size():
     assert validate_qwen_exo_config(config) == "moe-35b-a3b"
 
 
+def test_moe_122b_model_identity_accepts_hybrid_layout(tmp_path):
+    write_122b_moe_model(tmp_path)
+
+    identity = ModelIdentity.from_path(tmp_path)
+    identity.validate_qwen_exo_model()
+
+    assert identity.architecture == "Qwen3_5MoeForConditionalGeneration"
+    assert identity.layer_count == 48
+    assert identity.full_attention_layers == 12
+    assert identity.linear_attention_layers == 36
+    assert validate_qwen_exo_model_path(tmp_path) == "moe-122b-a10b"
+
+
+def test_moe_122b_model_rejects_wrong_expert_dimension(tmp_path):
+    write_122b_moe_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["text_config"]["moe_intermediate_size"] = 512
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="moe_intermediate_size"):
+        validate_qwen_exo_model_path(tmp_path)
+
+
+def test_moe_model_path_accepts_omitted_unused_intermediate_size(tmp_path):
+    write_moe_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["text_config"].pop("intermediate_size")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert validate_qwen_exo_model_path(tmp_path) == "moe-35b-a3b"
+
+
+def test_moe_model_path_accepts_sglang_materialized_unused_intermediate_size(
+    tmp_path,
+):
+    write_moe_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["text_config"]["intermediate_size"] = 5632
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert validate_qwen_exo_model_path(tmp_path) == "moe-35b-a3b"
+
+
+def test_moe_model_path_accepts_null_unused_intermediate_size(tmp_path):
+    write_moe_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["text_config"]["intermediate_size"] = None
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert validate_qwen_exo_model_path(tmp_path) == "moe-35b-a3b"
+
+
 def test_model_identity_freezes_hybrid_layout(tmp_path):
     write_model(tmp_path)
 
@@ -273,6 +330,31 @@ def test_model_path_preflight_uses_config_structure_not_directory_name(tmp_path)
     write_model(model_path)
 
     assert validate_qwen_exo_model_path(model_path) == "dense-27b"
+
+
+def test_model_path_accepts_current_nested_partial_rotary_factor(tmp_path):
+    write_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    text_config = config["text_config"]
+    text_config.pop("partial_rotary_factor")
+    text_config["rope_parameters"]["partial_rotary_factor"] = 0.25
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert validate_qwen_exo_model_path(tmp_path) == "dense-27b"
+
+
+def test_model_path_rejects_conflicting_top_level_partial_rotary_factor(tmp_path):
+    write_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    text_config = config["text_config"]
+    text_config["partial_rotary_factor"] = 0.5
+    text_config["rope_parameters"]["partial_rotary_factor"] = 0.25
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="partial_rotary_factor"):
+        validate_qwen_exo_model_path(tmp_path)
 
 
 def test_model_path_preflight_rejects_false_compatible_directory_name(tmp_path, capsys):

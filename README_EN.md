@@ -18,6 +18,19 @@ Read README_EN.md and docs/qwen_exo/SERVER_27B_DEPLOYMENT.md. Verify that QWEN_E
 
 This is not an unconditional cloud one-click installer. Model weights, GPUs, the NVIDIA driver, and Docker must already be available. The launcher validates the checkpoint structure before occupying the GPUs and rejects unsupported models.
 
+Apple Silicon Macs use the repository's native MLX execution path and do not
+require Docker or CUDA:
+
+```bash
+bash scripts/qwen_exo/install_mlx.sh
+export QWEN_EXO_MODEL_PATH=/path/to/Qwen3.5-27B
+export QWEN_EXO_DATA_PATH=/path/to/qwen-exo-runtime
+bash scripts/qwen_exo/launch_mlx.sh
+```
+
+See [Apple Silicon MLX deployment](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)
+for dependencies, fixed backend parameters, and verification boundaries.
+
 ## What this project adds
 
 Upstream SGLang already provides high-performance inference, continuous batching, Radix Cache, Tensor Parallelism, and OpenAI-compatible APIs. QWEN-EXO adds capabilities for Qwen Hybrid models and long-running agents:
@@ -40,6 +53,7 @@ Upstream SGLang already provides high-performance inference, continuous batching
 |---|---|
 | **SGLang** | Inference scheduling, continuous batching, Radix Cache, scheduler-native internal jobs, and OpenAI-compatible HTTP serving |
 | **PyTorch / CUDA / NCCL** | TP=2 execution, GPU state, cross-rank communication, and model forward passes |
+| **MLX / Metal / MLX-LM** | Single-process native execution, Full-Attention KV, and GDN auxiliary state on Apple Silicon |
 | **Qwen Hybrid Attention** | Full-Attention layers provide KV; Gated DeltaNet layers provide recurrent/conv state |
 | **Tensor Parallelism** | True two-GPU model parallelism through `--tp-size 2` |
 | **FP8 KV Cache / BF16 State** | Reduces KV memory while retaining the reviewed BF16 state baseline |
@@ -69,6 +83,13 @@ Default verified profile:
 - Served model ID: `duckgpt`
 
 Compatibility is determined from the checkpoint's `config.json`, not its directory name, marketing version, or container alias. Startup rejects unsupported structures.
+
+An Apple Silicon MLX profile is also available: macOS arm64, `tp_size=1`,
+`page_size=1`, and the `no_buffer` GDN state-cache strategy. MLX and CUDA model
+artifacts use different topology namespaces and cannot be cross-restored. The
+MLX launcher keeps the release 102400-token QWEN-EXO baseline while using MLX
+Q4 weights and an MXFP8 KV cache; this is not a capacity guarantee for every
+Mac.
 
 ## Installation and startup
 
@@ -245,6 +266,17 @@ python3 scripts/qwen_exo/check_kernels.py
 python3 scripts/qwen_exo/smoke_contracts.py
 ```
 
+Apple Silicon MLX checks:
+
+```bash
+.venv/bin/python scripts/qwen_exo/check_mlx.py
+PYTHONPATH=python .venv/bin/python -m pytest \
+  test/registered/qwen_exo/test_mlx_preflight.py \
+  test/registered/qwen_exo/test_mlx_launcher.py \
+  test/registered/qwen_exo/test_hybrid_state.py \
+  test/registered/qwen_exo/test_config_runtime.py -q
+```
+
 ## Repository layout
 
 ```text
@@ -272,9 +304,10 @@ scripts/qwen_exo/corpus/       Versioned Knowledge, PolicyData, and optional Cog
 
 1. [Architecture and state contracts](docs/qwen_exo/ARCHITECTURE.md)
 2. [Dual RTX 4090 deployment](docs/qwen_exo/SERVER_27B_DEPLOYMENT.md)
-3. [API, telemetry, security, and console](docs/qwen_exo/API.md)
-4. [Implementation progress and verification evidence](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
-5. [Demo-to-runtime migration matrix](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
+3. [Apple Silicon MLX deployment](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)
+4. [API, telemetry, security, and console](docs/qwen_exo/API.md)
+5. [Implementation progress and verification evidence](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
+6. [Demo-to-runtime migration matrix](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
 
 ## Project scope
 

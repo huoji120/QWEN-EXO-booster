@@ -18,6 +18,19 @@
 
 这句话不是无条件的云端一键部署：模型权重、GPU、驱动和 Docker 必须已经准备好；启动脚本会在占用 GPU 前执行结构校验，并拒绝不兼容模型。
 
+Apple Silicon Mac 使用仓库内的原生 MLX 执行链路，不需要 Docker 或
+CUDA。直接执行：
+
+```bash
+bash scripts/qwen_exo/install_mlx.sh
+export QWEN_EXO_MODEL_PATH=/path/to/Qwen3.5-27B
+export QWEN_EXO_DATA_PATH=/path/to/qwen-exo-runtime
+bash scripts/qwen_exo/launch_mlx.sh
+```
+
+MLX 的完整依赖、参数和验证边界见
+[Apple Silicon MLX 部署指南](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)。
+
 ## 项目解决什么问题
 
 上游 SGLang 已经提供高性能推理、连续批处理、Radix Cache、Tensor Parallel 和 OpenAI-compatible API。本项目在此基础上增加面向 Qwen Hybrid 模型和长任务 Agent 的能力：
@@ -40,6 +53,7 @@
 |---|---|
 | **SGLang** | 推理调度、Continuous Batching、Radix Cache、内部 scheduler job 和 OpenAI-compatible HTTP 服务 |
 | **PyTorch / CUDA / NCCL** | TP=2 执行、GPU 状态、跨 rank 通信和模型前向 |
+| **MLX / Metal / MLX-LM** | Apple Silicon 上的单进程原生模型执行、Full-Attention KV 与 GDN 辅助状态 |
 | **Qwen Hybrid Attention** | Full-Attention 层负责 KV；Gated DeltaNet 层负责 recurrent/conv state |
 | **Tensor Parallelism** | 两张 GPU 上的真正模型并行，启动参数为 `--tp-size 2` |
 | **FP8 KV Cache / BF16 State** | 降低 KV 显存占用，同时保留 BF16 模型状态正确性基线 |
@@ -69,6 +83,12 @@
 - 服务模型 ID：`duckgpt`
 
 兼容性由 checkpoint 的 `config.json` 结构判断，不由目录名、营销版本号或容器别名判断。启动会拒绝不支持的模型结构。
+
+另有 Apple Silicon MLX 配置：macOS arm64、`tp_size=1`、`page_size=1`、
+`no_buffer` GDN 状态缓存。该配置与 CUDA 的模型原生产物使用不同 topology
+namespace，不能交叉复用。MLX 启动器保留发布版 `102400` token 的
+QWEN-EXO 基线，同时使用 MLX Q4 权重和 MXFP8 KV Cache；这不代表所有
+Mac 都能承载该容量。
 
 ## 安装与启动
 
@@ -245,6 +265,17 @@ python3 scripts/qwen_exo/check_kernels.py
 python3 scripts/qwen_exo/smoke_contracts.py
 ```
 
+Apple Silicon MLX 验证：
+
+```bash
+.venv/bin/python scripts/qwen_exo/check_mlx.py
+PYTHONPATH=python .venv/bin/python -m pytest \
+  test/registered/qwen_exo/test_mlx_preflight.py \
+  test/registered/qwen_exo/test_mlx_launcher.py \
+  test/registered/qwen_exo/test_hybrid_state.py \
+  test/registered/qwen_exo/test_config_runtime.py -q
+```
+
 ## 目录说明
 
 ```text
@@ -272,9 +303,10 @@ scripts/qwen_exo/corpus/       版本化 Knowledge、PolicyData 和可选 Cognit
 
 1. [架构与状态契约](docs/qwen_exo/ARCHITECTURE.md)
 2. [双 RTX 4090 部署指南](docs/qwen_exo/SERVER_27B_DEPLOYMENT.md)
-3. [API、遥测、安全与控制台](docs/qwen_exo/API.md)
-4. [实现进度与验证证据](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
-5. [Demo 到生产运行时迁移矩阵](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
+3. [Apple Silicon MLX 部署指南](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)
+4. [API、遥测、安全与控制台](docs/qwen_exo/API.md)
+5. [实现进度与验证证据](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
+6. [Demo 到生产运行时迁移矩阵](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
 
 ## 当前定位
 

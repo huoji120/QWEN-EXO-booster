@@ -18,6 +18,12 @@ checkpoint directory name. The verified layouts are Dense 27B
 - `extra_buffer` Mamba radix-cache state;
 - OpenAI-compatible `/v1/responses` semantics.
 
+The Apple Silicon profile keeps the same logical contracts with a different
+native-state owner: one MLX process (`tp_size=1`), MLX Full-Attention KV,
+MLX-LM auxiliary GDN cache state, `page_size=1`, and the `no_buffer` radix
+strategy. CUDA and MLX artifacts are separated by topology key and are never
+cross-restored. See [Apple Silicon MLX deployment](APPLE_SILICON_MLX_DEPLOYMENT.md).
+
 The old Transformers demo remains a behavioral oracle. Its serialized shadow
 forwards, process-local GPU replicas, and recursive HTTP calls are not part of
 this runtime.
