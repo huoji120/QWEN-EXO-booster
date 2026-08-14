@@ -20,8 +20,8 @@ The MLX implementation is native rather than a PyTorch-MPS fallback:
   reused by the CUDA profile.
 
 The checkpoint compatibility gate is unchanged. Only the exact verified Dense
-27B and MoE 35B-A3B Qwen3.5 hybrid structures are accepted. A generic
-`mlx-community` model is not accepted merely because MLX can load it.
+27B, MoE 35B-A3B, and MoE 122B-A10B Qwen3.5 hybrid structures are accepted. A
+generic `mlx-community` model is not accepted merely because MLX can load it.
 
 ## Requirements
 
@@ -173,9 +173,9 @@ output tokens and 0.729 seconds end to end. The complete QWEN-EXO suite passed
 503 tests with 2 platform-conditioned skips while the service remained ready.
 
 This evidence verifies the Dense 27B model-load, cache restoration, scheduler,
-and served-generation path on this host. It does not establish MoE 35B-A3B
-execution, cross-backend numerical equivalence, or the worst-case memory margin
-for eight simultaneous 32K requests.
+and served-generation path on this host. It does not establish MoE 35B-A3B or
+MoE 122B-A10B execution, cross-backend numerical equivalence, or the worst-case
+memory margin for eight simultaneous 32K requests.
 
 ## Failure boundaries
 
