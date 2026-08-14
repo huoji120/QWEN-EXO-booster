@@ -34,9 +34,10 @@ The checkpoint compatibility gate is unchanged. Only the exact verified Dense
 
 The installer pins `mlx>=0.31.2,<0.33` and `mlx-lm>=0.31.2,<0.32`. The lower
 bound includes Qwen3.5 Dense/MoE support and the Qwen3.5 cache-advance fix. The
-launcher defaults to 4-bit load-time quantization and a 32,768-token context;
-these are conservative deployment defaults, not a claim that every Mac can
-serve that context under every workload.
+launcher defaults to 4-bit load-time quantization and retains the release
+baseline of a 102,400-token context. This preserves the original parameter
+baseline; memory-constrained Macs should explicitly select a smaller context,
+and the default is not a claim that every Mac can serve it under every workload.
 
 ## Install
 
