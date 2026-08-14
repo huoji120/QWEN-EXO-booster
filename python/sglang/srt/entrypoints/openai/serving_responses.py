@@ -9,7 +9,7 @@ import copy
 import json
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import replace
 from http import HTTPStatus
@@ -1391,7 +1391,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         if not self.reasoning_parser:
             return False
         effort = request.reasoning.effort if request.reasoning is not None else None
-        template_kwargs = dict(self.default_chat_template_kwargs or {})
+        raw_template_kwargs = getattr(self, "default_chat_template_kwargs", None)
+        template_kwargs = (
+            dict(raw_template_kwargs) if isinstance(raw_template_kwargs, Mapping) else {}
+        )
         if effort is None:
             toggle = (
                 self.template_manager.reasoning_config.toggle_param
@@ -3738,7 +3741,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 continuation_sampling_params = self._phase_two_sampling_params(
                     sampling_params,
                     prompt_length=len(continuation_prompt_ids),
-                    consumed_tokens=len(combined_prefix_ids),
+                    # The forced stop-overthinking instruction is an internal
+                    # control prompt, not user-visible model output. Keep it in
+                    # the continuation prompt while charging only the generated
+                    # reasoning tokens and the synthetic </think> boundary
+                    # against max_new_tokens.
+                    consumed_tokens=(
+                        len(phase_output_ids) + 1
+                        if forced_reasoning_boundary
+                        else len(combined_prefix_ids)
+                    ),
                 )
                 continuation_request = replace(
                     adapted_request,
