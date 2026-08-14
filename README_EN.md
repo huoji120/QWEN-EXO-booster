@@ -40,6 +40,17 @@ Give this repository README to an LLM and ask it to execute the following instru
 Read README_EN.md and docs/qwen_exo/SERVER_27B_DEPLOYMENT.md. Verify that QWEN_EXO_MODEL_PATH points to a compatible Qwen Hybrid checkpoint and QWEN_EXO_DATA_PATH points to a separate runtime-data directory. Then run bash scripts/qwen_exo/build_image.sh followed by bash scripts/qwen_exo/launch_js4090.sh. Wait until http://127.0.0.1:30000/qwen-exo/health reports runtime_state=ready, and access the console through an SSH tunnel.
 ```
 
+Apple Silicon Macs use the repository's native MLX execution path and do not require Docker or CUDA:
+
+```bash
+bash scripts/qwen_exo/install_mlx.sh
+export QWEN_EXO_MODEL_PATH=/path/to/Qwen3.8-27B
+export QWEN_EXO_DATA_PATH=/path/to/qwen-exo-runtime
+bash scripts/qwen_exo/launch_mlx.sh
+```
+
+See [Apple Silicon MLX deployment](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md) for dependencies, fixed backend parameters, and verification boundaries.
+
 ## Installation and startup
 
 ### Open any agent terminal
@@ -152,6 +163,17 @@ python3 scripts/qwen_exo/check_kernels.py
 python3 scripts/qwen_exo/smoke_contracts.py
 ```
 
+Apple Silicon MLX checks:
+
+```bash
+.venv/bin/python scripts/qwen_exo/check_mlx.py
+PYTHONPATH=python .venv/bin/python -m pytest \
+  test/registered/qwen_exo/test_mlx_preflight.py \
+  test/registered/qwen_exo/test_mlx_launcher.py \
+  test/registered/qwen_exo/test_hybrid_state.py \
+  test/registered/qwen_exo/test_config_runtime.py -q
+```
+
 ## Repository layout
 
 ```text
@@ -177,9 +199,10 @@ The model catalog fields `checkpoint_quantization` and `runtime_quantization` mu
 
 1. [Architecture and state contracts](docs/qwen_exo/ARCHITECTURE.md)
 2. [Dual RTX 4090 deployment](docs/qwen_exo/SERVER_27B_DEPLOYMENT.md)
-3. [API, telemetry, security, and console](docs/qwen_exo/API.md)
-4. [Implementation progress and verification evidence](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
-5. [Demo-to-runtime migration matrix](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
+3. [Apple Silicon MLX deployment](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)
+4. [API, telemetry, security, and console](docs/qwen_exo/API.md)
+5. [Implementation progress and verification evidence](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
+6. [Demo-to-runtime migration matrix](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
 
 ## Project scope
 

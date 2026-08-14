@@ -814,6 +814,8 @@ class QwenExoRuntime:
                     {
                         "project": PROJECT_NAME,
                         "model_fingerprint": self.model_identity.fingerprint,
+                        "backend": self.hybrid_policy.backend,
+                        "topology_key": self.hybrid_policy.topology_key,
                         "tp_size": self.hybrid_policy.tp_size,
                         "knowledge_source_digest": self.knowledge.snapshot.source_digest,
                         "policy_data_source_digest": self.policy_data.snapshot.source_digest,
@@ -6673,6 +6675,8 @@ class QwenExoRuntime:
             "scheduler_native_internal_jobs": True,
             "external_learning": False,
             "hybrid_state": {
+                "backend": self.hybrid_policy.backend,
+                "topology_key": self.hybrid_policy.topology_key,
                 "tp_size": self.hybrid_policy.tp_size,
                 "dtype": self.hybrid_policy.dtype,
                 "mamba_state_dtype": self.hybrid_policy.mamba_state_dtype,

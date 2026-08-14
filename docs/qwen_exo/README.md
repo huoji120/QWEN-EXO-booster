@@ -10,7 +10,8 @@ model structure.
 ## Read in this order
 
 1. [Architecture and contracts](ARCHITECTURE.md)
-2. [Dual RTX 4090 deployment](SERVER_27B_DEPLOYMENT.md)
+2. [Apple Silicon MLX deployment](APPLE_SILICON_MLX_DEPLOYMENT.md) or
+   [Dual RTX 4090 deployment](SERVER_27B_DEPLOYMENT.md)
 3. [API, telemetry, security, and console](API.md)
 4. [Implementation progress and evidence](IMPLEMENTATION_PROGRESS.md)
 5. [Demo-to-runtime migration matrix](DEMO_MIGRATION_MATRIX.md)
@@ -25,6 +26,13 @@ export QWEN_EXO_DATA_PATH=/path/to/qwen-exo-runtime
 python3 python/qwen_exo_booster/fingerprint.py "$QWEN_EXO_MODEL_PATH"
 bash scripts/qwen_exo/build_image.sh
 bash scripts/qwen_exo/launch_js4090.sh
+```
+
+Apple Silicon uses the native MLX path instead of the Docker/CUDA profile:
+
+```bash
+bash scripts/qwen_exo/install_mlx.sh
+bash scripts/qwen_exo/launch_mlx.sh
 ```
 
 The preflight reads `config.json`; it does not infer compatibility from the
@@ -69,6 +77,9 @@ For the Dense 27B GPTQ profile, use the catalog-derived `gptq_marlin` runtime lo
 |---|---|
 | Build image | `scripts/qwen_exo/build_image.sh` |
 | Launch dual-4090 server | `scripts/qwen_exo/launch_js4090.sh` |
+| Install Apple Silicon environment | `scripts/qwen_exo/install_mlx.sh` |
+| Launch Apple Silicon MLX server | `scripts/qwen_exo/launch_mlx.sh` |
+| MLX/Metal check | `scripts/qwen_exo/check_mlx.py` |
 | CUDA/device check | `scripts/qwen_exo/check_cuda.py` |
 | GPU kernel check | `scripts/qwen_exo/check_kernels.py` |
 | Behavioral contract smoke | `scripts/qwen_exo/smoke_contracts.py` |

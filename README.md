@@ -28,6 +28,17 @@
 请阅读这个仓库的 README.md 和 docs/qwen_exo/SERVER_27B_DEPLOYMENT.md，确认 QWEN_EXO_MODEL_PATH 指向兼容的 Qwen Hybrid checkpoint、QWEN_EXO_DATA_PATH 指向独立运行数据目录，然后执行 bash scripts/qwen_exo/build_image.sh 和 bash scripts/qwen_exo/launch_js4090.sh；启动后等待 http://127.0.0.1:30000/qwen-exo/health 返回 runtime_state=ready，再通过 SSH 隧道访问控制台。
 ```
 
+Apple Silicon Mac 使用仓库内的原生 MLX 执行链路，不需要 Docker 或 CUDA：
+
+```bash
+bash scripts/qwen_exo/install_mlx.sh
+export QWEN_EXO_MODEL_PATH=/path/to/Qwen3.8-27B
+export QWEN_EXO_DATA_PATH=/path/to/qwen-exo-runtime
+bash scripts/qwen_exo/launch_mlx.sh
+```
+
+完整依赖、固定后端参数和验证边界见 [Apple Silicon MLX 部署指南](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)。
+
 ## 安装与启动
 
 ### 打开任意agent终端
@@ -138,6 +149,17 @@ python3 scripts/qwen_exo/check_kernels.py
 python3 scripts/qwen_exo/smoke_contracts.py
 ```
 
+Apple Silicon MLX 验证：
+
+```bash
+.venv/bin/python scripts/qwen_exo/check_mlx.py
+PYTHONPATH=python .venv/bin/python -m pytest \
+  test/registered/qwen_exo/test_mlx_preflight.py \
+  test/registered/qwen_exo/test_mlx_launcher.py \
+  test/registered/qwen_exo/test_hybrid_state.py \
+  test/registered/qwen_exo/test_config_runtime.py -q
+```
+
 ## 目录说明
 
 ```text
@@ -166,9 +188,10 @@ test/registered/qwen_exo/      注册回归测试
 
 1. [架构与状态契约](docs/qwen_exo/ARCHITECTURE.md)
 2. [双 RTX 4090 部署指南](docs/qwen_exo/SERVER_27B_DEPLOYMENT.md)
-3. [API、遥测、安全与控制台](docs/qwen_exo/API.md)
-4. [实现进度与验证证据](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
-5. [Demo 到生产运行时迁移矩阵](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
+3. [Apple Silicon MLX 部署指南](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)
+4. [API、遥测、安全与控制台](docs/qwen_exo/API.md)
+5. [实现进度与验证证据](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
+6. [Demo 到生产运行时迁移矩阵](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
 
 ## 当前定位
 
