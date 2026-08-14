@@ -74,8 +74,15 @@ bash scripts/qwen_exo/launch_mlx.sh
 The launcher performs the MLX/Metal and checkpoint-structure preflights before
 loading model weights. Its QWEN-EXO behavioral defaults retain the release
 baseline (`context_length=102400`, `max_prefill_tokens=65536`,
-`max_running_requests=64`, and `mem_fraction_static=0.80`). The important
-fixed backend parameters are:
+`max_running_requests=64`, and `mem_fraction_static=0.80`).
+
+The model catalog scans the parent directory of `QWEN_EXO_MODEL_PATH` by
+default, stores `model-catalog.json` under `QWEN_EXO_DATA_PATH`, and keeps each
+model's QWEN-EXO artifacts in an isolated profile. Override
+`QWEN_EXO_MODEL_CATALOG_ROOTS` with a colon-separated list when compatible
+checkpoints live under multiple roots.
+
+The important fixed backend parameters are:
 
 ```text
 SGLANG_USE_MLX=1
