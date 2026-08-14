@@ -6,13 +6,12 @@ from typing import Any, Callable
 
 import mlx.core as mx
 import torch
-
 from qwen_exo_booster.contracts import stable_digest
 from qwen_exo_booster.hybrid_state import qwen_exo_model_state_directory
 from qwen_exo_booster.native_state_bank import (
-    NativeStateBankError,
     _SAFE_DIGEST,
     _SCHEMA,
+    NativeStateBankError,
     _atomic_torch_save,
     _custom_params,
     _dequantize_fp8,
@@ -194,22 +193,19 @@ class MlxNativeStateBankManager:
         full_attention: dict[str, dict[str, Any]] = {}
         for layer_id in self.full_layer_ids:
             cache = caches[layer_id]
-            keys = getattr(cache, "keys", None)
-            values = getattr(cache, "values", None)
             if (
-                keys is None
-                or values is None
+                not hasattr(cache, "get_kv_slice")
                 or int(getattr(cache, "offset", 0)) < capture_start + capture_count
             ):
                 raise NativeStateBankError(
                     f"MLX Full-Attention layer {layer_id} has incomplete KV state"
                 )
-            rotated_key = keys[
-                0, :, capture_start : capture_start + capture_count, :
-            ].transpose(1, 0, 2)
-            value = values[
-                0, :, capture_start : capture_start + capture_count, :
-            ].transpose(1, 0, 2)
+            rotated_key_cache, value_cache = cache.get_kv_slice(
+                capture_start,
+                capture_start + capture_count,
+            )
+            rotated_key = rotated_key_cache[0].transpose(1, 0, 2)
+            value = value_cache[0].transpose(1, 0, 2)
             attention = self.runner._attention_module_for_layer(layer_id)
             raw_key = _rope_key(attention, rotated_key, -positions)
             full_attention[str(layer_id)] = {

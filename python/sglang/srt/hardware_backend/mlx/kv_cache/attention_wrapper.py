@@ -284,6 +284,11 @@ class MLXAttentionWrapper(nn.Module):
                 layer_idx=layer_idx,
             )
             if qwen_exo_bias is not None:
+                # Score-bias math is intentionally accumulated in float32,
+                # while quantized Qwen checkpoints commonly run attention in
+                # bfloat16. MLX SDPA requires the mask to promote exactly to
+                # the output dtype, so cast only at the attention boundary.
+                qwen_exo_bias = qwen_exo_bias.astype(queries.dtype)
                 attn_mask = (
                     qwen_exo_bias if attn_mask is None else attn_mask + qwen_exo_bias
                 )

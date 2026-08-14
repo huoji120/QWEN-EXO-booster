@@ -68,6 +68,10 @@ class _FakeRunner:
         return [op for op, r in self.calls if r == rid]
 
     @staticmethod
+    def sampling_arrays(sampling):
+        return []
+
+    @staticmethod
     def _fake_cache_layer():
         import mlx.core as mx
 
@@ -98,12 +102,18 @@ class _FakeRunner:
         return 3000
 
     # --- async surface ---
-    def extend_start(self, req_id, new_token_ids, new_slot_ids):
+    def extend_start(self, req_id, new_token_ids, new_slot_ids, **kwargs):
         import mlx.core as mx
 
         self.calls.append(("extend_start", req_id))
         self._req_caches[req_id] = [self._fake_cache_layer()]
-        return SimpleNamespace(lazy_token=mx.array([0], dtype=mx.int32), req_id=req_id)
+        return SimpleNamespace(
+            lazy_token=mx.array([0], dtype=mx.int32),
+            req_id=req_id,
+            sampling=None,
+            input_token_logprobs=None,
+            customized_info=None,
+        )
 
     def prefill_start(
         self,
@@ -114,6 +124,7 @@ class _FakeRunner:
         new_slot_ids,
         req_pool_idx,
         req=None,
+        **kwargs,
     ):
         import mlx.core as mx
 
@@ -122,9 +133,12 @@ class _FakeRunner:
             lazy_token=mx.array([0], dtype=mx.int32),
             cache=[self._fake_cache_layer()],
             req_id=req_id,
+            sampling=None,
+            input_token_logprobs=None,
+            customized_info=None,
         )
 
-    def decode_batch_start(self, rids):
+    def decode_batch_start(self, rids, **kwargs):
         import mlx.core as mx
 
         for rid in rids:
@@ -133,7 +147,21 @@ class _FakeRunner:
             lazy_tokens=mx.array([0] * len(rids), dtype=mx.int32),
             caches=[[self._fake_cache_layer()] for _ in rids],
             req_ids=list(rids),
+            sampling=None,
+            customized_info=None,
         )
+
+    @staticmethod
+    def prefill_finalize(pending):
+        return 3000
+
+    @staticmethod
+    def extend_finalize(pending):
+        return 1001
+
+    @staticmethod
+    def decode_batch_finalize(pending):
+        return [2000 + i for i in range(len(pending.req_ids))]
 
 
 class _FakeReq:
@@ -153,6 +181,8 @@ class _FakeBatch:
         self.forward_mode = forward_mode
         self.reqs = reqs
         self.extend_lens = list(extend_lens)
+        self.extend_logprob_start_lens = None
+        self.qwen_exo_final_prefill = None
         self.decoding_reqs = decoding_reqs
         # Arbitrary but correctly-sized token / slot arrays.
         self.input_ids = torch.arange(total, dtype=torch.long)
@@ -170,7 +200,18 @@ class TestMlxExtendRouting(unittest.TestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
+        worker._mlx_pool_initialized = True
         return worker
+
+    def test_worker_skips_pytorch_attention_backend_initialization(self):
+        """Startup must not build Triton/CUDA attention around the MLX stub."""
+        worker = self._worker(known_rids=set())
+        worker.init_attention_backends()
+
+    def test_worker_skips_cuda_graph_initialization(self):
+        """MLX owns lazy graph evaluation and has no CUDA graph runner."""
+        worker = self._worker(known_rids=set())
+        worker.init_cuda_graphs()
 
     # ---------- the shared decision helper ----------
     # The helper takes no seq_len: length cannot distinguish a 1-token
@@ -200,13 +241,13 @@ class TestMlxExtendRouting(unittest.TestCase):
     def test_sync_one_token_continuation_routes_to_extend(self):
         """THE REGRESSION (sync): a 1-token continuation must extend, not decode."""
         runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND)
-        self.assertEqual(runner.ops_for("r1"), ["extend"])
+        self.assertEqual(runner.ops_for("r1"), ["extend_start"])
 
     def test_sync_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
         runner = self._run_sync([p, d], [4, 1], {"d1"}, [d], ForwardMode.MIXED)
-        self.assertEqual(runner.ops_for("p1"), ["prefill"])
-        self.assertEqual(runner.ops_for("d1"), ["decode"])
+        self.assertEqual(runner.ops_for("p1"), ["prefill_start"])
+        self.assertEqual(runner.ops_for("d1"), ["decode_start"])
 
     # ---------- async path: _async_extend_batch ----------
 
@@ -215,6 +256,7 @@ class TestMlxExtendRouting(unittest.TestCase):
 
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
+        worker._mlx_pool_initialized = True
         batch = _FakeBatch(forward_mode, reqs, extend_lens, decoding_reqs)
         # returns (lazy_stacked, pending_prefills, pending_extends,
         #          pending_mixed_decode, mode)

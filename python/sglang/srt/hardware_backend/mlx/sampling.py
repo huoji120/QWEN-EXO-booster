@@ -100,9 +100,21 @@ def _apply_grammar(logits: mx.array, req: Any) -> mx.array:
     if mask is None:
         return logits
     grammar.fill_vocab_mask(mask, 0)
-    probe = torch.zeros((1, vocab_size), dtype=torch.float32)
-    grammar.apply_vocab_mask(probe, mask)
-    blocked = torch.isneginf(probe[0]).tolist()
+    if mask.dtype == torch.int32 and mask.numel() * 32 >= vocab_size:
+        # xgrammar/llguidance use a packed int32 mask where bit=1 means the
+        # token is allowed. Their apply_vocab_mask kernels intentionally only
+        # support CUDA-class devices, so unpack the CPU mask for MLX instead
+        # of invoking a Triton kernel through a fake torch logits tensor.
+        packed = mask.reshape(-1).to(dtype=torch.int64)
+        token_ids = torch.arange(vocab_size, dtype=torch.int64)
+        allowed = ((packed[token_ids // 32] >> (token_ids.remainder(32))) & 1).bool()
+        blocked = (~allowed).tolist()
+    else:
+        # Backends with an ordinary CPU mask (for example outlines) can still
+        # apply their own representation to a probe tensor.
+        probe = torch.zeros((1, vocab_size), dtype=torch.float32)
+        grammar.apply_vocab_mask(probe, mask)
+        blocked = torch.isneginf(probe[0]).tolist()
     return mx.where(
         mx.array(blocked, dtype=mx.bool_),
         mx.array(float("-inf"), dtype=logits.dtype),

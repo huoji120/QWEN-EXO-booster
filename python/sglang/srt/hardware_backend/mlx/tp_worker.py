@@ -17,7 +17,6 @@ from typing import Optional, Union
 
 import mlx.core as mx
 import torch
-
 from sglang.srt.hardware_backend.mlx.model_runner import (
     MlxPendingDecode,
     MlxPendingExtend,
@@ -58,6 +57,7 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
             quantization=self.server_args.quantization,
+            kv_cache_dtype=self.server_args.kv_cache_dtype,
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
@@ -83,6 +83,20 @@ class MlxTpModelWorker(TpModelWorker):
     def get_pad_input_ids_func(self):
         """Override since the stub ModelRunner has no real model."""
         return None
+
+    def init_attention_backends(self):
+        """Skip SGLang's CUDA/Triton attention backend construction.
+
+        The native MLX runner owns attention and its KV cache.  The inherited
+        implementation would try to attach a PyTorch attention backend to the
+        lightweight bookkeeping stub, whose dummy KV cache intentionally does
+        not implement CUDA backend metadata.
+        """
+        logger.info("MLX worker: native runner owns attention; skipping backend init")
+
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        """Skip CUDA graph capture; MLX evaluates its own lazy computation graph."""
+        logger.info("MLX worker: skipping CUDA graph initialization")
 
     def _ensure_mlx_pool_initialized(self):
         """Lazily initialize MLX cache pools after the stub pools are ready."""

@@ -253,7 +253,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -5430,6 +5430,11 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    # macOS uses the spawn start method, so the child cannot inherit the
+    # process-wide runtime context published by the HTTP parent. Publish the
+    # resolved arguments before plugins or model workers access them.
+    get_context().set_server_args(server_args)
+
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = configure_scheduler_process(

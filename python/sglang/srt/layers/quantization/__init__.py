@@ -127,6 +127,7 @@ if is_mps():
         {
             "mlx_q4": MlxQuantizationConfig,
             "mlx_q8": MlxQuantizationConfig,
+            "mlx_mxfp8": MlxQuantizationConfig,
         }
     )
 

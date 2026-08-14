@@ -26,7 +26,6 @@ import psutil
 from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
-
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.aot import (
     MLX_AOT_KERNEL_REGISTRY,
@@ -40,6 +39,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     MLXAttentionWrapper,
     MlxModelCacheLayout,
     PoolBackedAttentionKVCache,
+    QuantizedContiguousAttentionKVCache,
     clear_context,
     find_attention_layers,
     get_head_dim,
@@ -114,10 +114,11 @@ class MlxPendingDecode:
     customized_info: dict[str, mx.array] | None = None
 
 
-_MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
-    # name -> (bits, group_size). group_size=64 matches the mlx-community convention.
-    "mlx_q4": (4, 64),
-    "mlx_q8": (8, 64),
+_MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int, str]] = {
+    # name -> (bits, group_size, mode).
+    "mlx_q4": (4, 64, "affine"),
+    "mlx_q8": (8, 64, "affine"),
+    "mlx_mxfp8": (8, 32, "mxfp8"),
 }
 _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 
@@ -133,6 +134,7 @@ class MlxModelRunner:
         pool_size: int | None = None,
         mem_fraction_static: float = 0.8,
         quantization: str | None = None,
+        kv_cache_dtype: str = "auto",
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
@@ -142,11 +144,21 @@ class MlxModelRunner:
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
         self._clear_steps = envs.SGLANG_MLX_CLEAR_CACHE_STEPS.get()
+        cache_limit_gib = envs.SGLANG_MLX_CACHE_LIMIT_GIB.get()
+        if cache_limit_gib < 0:
+            raise ValueError("SGLANG_MLX_CACHE_LIMIT_GIB cannot be negative")
+        cache_limit_bytes = cache_limit_gib * 1024**3
+        mx.set_cache_limit(cache_limit_bytes)
+        logger.info("MLX inactive cache limit set to %d GiB", cache_limit_gib)
         # On-the-fly quantization preset (e.g. "mlx_q4"). None = no on-load quantization.
         # Pre-quantized HF repos load correctly regardless of this setting:
         # mlx_lm.load() detects the config and instantiates QuantizedLinear
         # modules directly.
         self._quantization: str | None = quantization
+        self._kv_cache_dtype = kv_cache_dtype
+        self._kv_quantization_mode = self._resolve_kv_quantization_mode(
+            kv_cache_dtype
+        )
 
         self._load_model()
 
@@ -204,14 +216,26 @@ class MlxModelRunner:
             return model_output[0]
         return model_output
 
+    @staticmethod
+    def _resolve_kv_quantization_mode(kv_cache_dtype: str) -> str | None:
+        if kv_cache_dtype == "mxfp8":
+            return "mxfp8"
+        if kv_cache_dtype in {"auto", "bf16", "bfloat16"}:
+            return None
+        raise ValueError(
+            "MLX KV cache supports auto, bf16/bfloat16, or mxfp8; "
+            f"got {kv_cache_dtype!r}"
+        )
+
     def _forward_model(
         self,
         input_ids: mx.array,
         cache: list[Any],
         qwen_exo_context: Any | None = None,
     ) -> mx.array:
-        if self._qwen_exo is not None and qwen_exo_context is not None:
-            return self._qwen_exo.forward_model(input_ids, cache, qwen_exo_context)
+        qwen_exo_runtime = getattr(self, "_qwen_exo", None)
+        if qwen_exo_runtime is not None and qwen_exo_context is not None:
+            return qwen_exo_runtime.forward_model(input_ids, cache, qwen_exo_context)
         return self._extract_logits(self.model(input_ids, cache=cache))
 
     def _prefill_qwen_exo_context(
@@ -222,7 +246,7 @@ class MlxModelRunner:
         extend_len: int,
         final_prefill: bool,
     ) -> Any | None:
-        if self._qwen_exo is None:
+        if getattr(self, "_qwen_exo", None) is None:
             return None
         return self._qwen_exo.prefill_context(
             req,
@@ -316,8 +340,21 @@ class MlxModelRunner:
     def _new_native_cache(self) -> list[Any]:
         """Create a model-shaped cache list with attention KV adapters."""
         cache = self._new_cache_skeleton()
+        dtype = (
+            self._attention_kv_pool.dtype
+            if self._attention_kv_pool is not None
+            else self._get_attn_config()[2]
+        )
+        kv_quantization_mode = getattr(self, "_kv_quantization_mode", None)
         for layer_idx in self._cache_layout.attention_layer_indices:
-            cache[layer_idx] = ContiguousAttentionKVCache(max_seq_len=self._max_seq_len)
+            cache[layer_idx] = (
+                QuantizedContiguousAttentionKVCache(
+                    max_seq_len=self._max_seq_len,
+                    dtype=dtype,
+                )
+                if kv_quantization_mode == "mxfp8"
+                else ContiguousAttentionKVCache(max_seq_len=self._max_seq_len)
+            )
         return cache
 
     def _acquire_cache(self) -> list[Any]:
@@ -462,8 +499,9 @@ class MlxModelRunner:
         contiguous_cache = self._acquire_cache()
         for layer_idx in self._cache_layout.attention_layer_indices:
             pbc = cache[layer_idx]
-            contiguous_cache[layer_idx].update_and_fetch(
-                pbc._full_keys, pbc._full_values
+            contiguous_cache[layer_idx] = pbc.to_contiguous(
+                max_seq_len=self._max_seq_len,
+                quantization_mode=getattr(self, "_kv_quantization_mode", None),
             )
         for layer_idx in self._cache_layout.auxiliary_layer_indices:
             contiguous_cache[layer_idx] = cache[layer_idx]
@@ -533,7 +571,7 @@ class MlxModelRunner:
         self.model, _tokenizer, config = loaded
 
         if self._quantization in _MLX_QUANTIZATION_PRESETS:
-            bits, group_size = _MLX_QUANTIZATION_PRESETS[self._quantization]
+            bits, group_size, mode = _MLX_QUANTIZATION_PRESETS[self._quantization]
             # Skip if the model was already loaded quantized (pre-quantized HF repo);
             # mlx_lm.load detects the config and instantiates QuantizedLinear directly,
             # so applying the preset on top would be redundant.
@@ -554,13 +592,15 @@ class MlxModelRunner:
                 q_start = time.time()
                 logger.info(
                     f"Quantizing MLX model on-the-fly: bits={bits} "
-                    f"group_size={group_size} (preset={self._quantization})"
+                    f"group_size={group_size} mode={mode} "
+                    f"(preset={self._quantization})"
                 )
                 self.model, _new_config = mlx_lm_quantize_model(
                     self.model,
                     config or {},
                     group_size=group_size,
                     bits=bits,
+                    mode=mode,
                 )
                 bytes_after = sum(
                     p.size * p.itemsize
@@ -681,7 +721,13 @@ class MlxModelRunner:
             max(mlx_usable - mlx_used, 0),
             int(sys_available * self._mem_fraction_static),
         )
-        bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
+        bytes_per_slot = MlxAttentionKVPool.bytes_per_slot(
+            num_layers=num_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            quantization_mode=self._kv_quantization_mode,
+        )
         pool_size = max(kv_budget // bytes_per_slot, 256)
         logger.info(
             f"Auto-sized attention KV pool: "
@@ -699,6 +745,11 @@ class MlxModelRunner:
 
     def _build_aot_kernels(self) -> MlxAOTKernelSet:
         """Build model-level set of optional registered AOT kernels."""
+        if self._kv_quantization_mode is not None:
+            # The current fused RoPE kernel scatters floating-point K/V
+            # directly into the shared pool. Quantized pools must go through
+            # set_kv() so packed values and scale buffers stay in sync.
+            return MlxAOTKernelSet()
         if self._cache_layout.num_attention_layers == 0:
             return MlxAOTKernelSet()
         layer_idx = self._cache_layout.first_attention_layer_index
@@ -726,6 +777,7 @@ class MlxModelRunner:
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             dtype=dtype,
+            quantization_mode=self._kv_quantization_mode,
         )
         logger.info(
             f"Attention KV pool initialized: pool_size={self._pool_size} "
@@ -805,17 +857,15 @@ class MlxModelRunner:
         slot_ids_mx = mx.array(slot_ids, dtype=mx.int32)
         # TODO: Standardize ContiguousAttentionKVCache size to avoid transpose
         # Transpose cache (1, n_kv_heads, S, head_dim) to pool (S, n_kv_heads, head_dim)
+        slices = [
+            cache[layer_idx].get_kv_slice(cache_start, end)
+            for layer_idx in self._cache_layout.attention_layer_indices
+        ]
         k_all = mx.stack(
-            [
-                cache[layer_idx].keys[0, :, cache_start:end, :].transpose(1, 0, 2)
-                for layer_idx in self._cache_layout.attention_layer_indices
-            ]
+            [key[0].transpose(1, 0, 2) for key, _value in slices]
         )
         v_all = mx.stack(
-            [
-                cache[layer_idx].values[0, :, cache_start:end, :].transpose(1, 0, 2)
-                for layer_idx in self._cache_layout.attention_layer_indices
-            ]
+            [value[0].transpose(1, 0, 2) for _key, value in slices]
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
 
@@ -1460,8 +1510,11 @@ class MlxModelRunner:
         caches = [self._req_caches[rid] for rid in req_ids]
         last_tokens = [self._req_token_ids[rid][-1] for rid in req_ids]
         batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
+        qwen_exo_runtime = getattr(self, "_qwen_exo", None)
         qwen_exo_context = (
-            self._qwen_exo.decode_context(reqs) if self._qwen_exo is not None else None
+            qwen_exo_runtime.decode_context(reqs)
+            if qwen_exo_runtime is not None
+            else None
         )
 
         return_logits = reqs is not None
@@ -1531,9 +1584,10 @@ class MlxModelRunner:
         # So layer-0 offsets reflect the position the NEW token will
         # be written at in step N+1 (and equivalently the RoPE offset).
         batched_input = prev.lazy_tokens[:, None]
+        qwen_exo_runtime = getattr(self, "_qwen_exo", None)
         qwen_exo_context = (
-            self._qwen_exo.decode_context(prev.reqs)
-            if self._qwen_exo is not None
+            qwen_exo_runtime.decode_context(prev.reqs)
+            if qwen_exo_runtime is not None
             else None
         )
         return_logits = prev.reqs is not None

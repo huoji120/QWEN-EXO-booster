@@ -184,6 +184,7 @@ QUANTIZATION_CHOICES = [
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
+    "mlx_mxfp8",  # MXFP8 E4M3 weights, group_size=32
     "unquant",
     "humming",
 ]
@@ -3821,6 +3822,17 @@ class ServerArgs:
     def _handle_qwen_exo_runtime(self):
         if not self.enable_qwen_exo:
             return
+        if envs.SGLANG_USE_MLX.get() and not use_mlx():
+            raise ValueError(
+                "QWEN-EXO MLX was requested through SGLANG_USE_MLX=1, but "
+                "the mlx runtime is unavailable. Install the Apple Silicon "
+                "dependencies with scripts/qwen_exo/install_mlx.sh."
+            )
+        if use_mlx() and self.device not in {None, "mps"}:
+            raise ValueError(
+                "QWEN-EXO MLX requires --device mps on Apple Silicon; "
+                f"received {self.device!r}"
+            )
         if (
             self.qwen_exo_enable_adaptive_refresh
             and self.qwen_exo_observer_mode != "active"
@@ -5634,6 +5646,10 @@ class ServerArgs:
     def _handle_mxfp8_kv_cache_compatibility(self):
         """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
         if self.kv_cache_dtype != "mxfp8":
+            return
+        if is_mps() and use_mlx():
+            # The native MLX path stores E4M3 values plus E8M0 group scales and
+            # dequantizes before Metal SDPA. It does not use FA4/Blackwell ops.
             return
         if not is_blackwell_supported():
             raise ValueError(

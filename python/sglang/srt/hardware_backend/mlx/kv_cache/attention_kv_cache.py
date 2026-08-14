@@ -42,7 +42,7 @@ class ContiguousAttentionKVCache:
     instead of ``mx.concatenate``.  Lazy-allocated on first write.
     """
 
-    __slots__ = ("keys", "values", "offset", "max_seq_len")
+    __slots__ = ("keys", "max_seq_len", "offset", "values")
 
     def __init__(
         self,
@@ -123,6 +123,169 @@ class ContiguousAttentionKVCache:
         """Return valid K/V: (1, n_kv_heads, offset, head_dim)."""
         return self.keys[:, :, : self.offset, :], self.values[:, :, : self.offset, :]
 
+    def get_kv_slice(self, start: int, end: int) -> tuple[mx.array, mx.array]:
+        """Return a token slice without changing the cache offset."""
+        return self.keys[:, :, start:end, :], self.values[:, :, start:end, :]
+
+
+class QuantizedContiguousAttentionKVCache:
+    """Per-request MXFP8 attention cache.
+
+    MLX stores four E4M3 values in each ``uint32`` plus one E8M0 scale per
+    32-value group. Values are dequantized to the model compute dtype only for
+    the valid prefix consumed by attention, keeping the persistent cache close
+    to one byte per element instead of two.
+    """
+
+    __slots__ = (
+        "_bits",
+        "_group_size",
+        "_mode",
+        "dtype",
+        "key_scales",
+        "keys",
+        "max_seq_len",
+        "offset",
+        "value_scales",
+        "values",
+    )
+
+    def __init__(
+        self,
+        n_kv_heads: int | None = None,
+        head_dim: int | None = None,
+        max_seq_len: int = _DEFAULT_MAX_SEQ_LEN,
+        dtype: mx.Dtype = mx.float16,
+        *,
+        group_size: int = 32,
+        bits: int = 8,
+        mode: str = "mxfp8",
+    ):
+        if mode != "mxfp8" or group_size != 32 or bits != 8:
+            raise ValueError("MLX quantized KV cache currently supports mxfp8 only")
+        self.keys = None
+        self.key_scales = None
+        self.values = None
+        self.value_scales = None
+        self.offset = 0
+        self.max_seq_len = max_seq_len
+        self.dtype = dtype
+        # mlx-lm treats any cache exposing a public ``bits`` attribute as its
+        # own affine QuantizedKVCache and routes to affine quantized_matmul.
+        # Keep MXFP8 metadata private because this adapter dequantizes before
+        # returning K/V to SDPA.
+        self._group_size = group_size
+        self._bits = bits
+        self._mode = mode
+        if n_kv_heads is not None and head_dim is not None:
+            self._allocate_shape(1, n_kv_heads, head_dim)
+
+    def _allocate_shape(self, batch: int, n_kv_heads: int, head_dim: int) -> None:
+        if head_dim % self._group_size != 0:
+            raise ValueError(
+                f"MXFP8 KV head_dim={head_dim} must be divisible by "
+                f"group_size={self._group_size}"
+            )
+        packed_dim = head_dim * self._bits // 32
+        scale_dim = head_dim // self._group_size
+        packed_shape = (batch, n_kv_heads, self.max_seq_len, packed_dim)
+        scale_shape = (batch, n_kv_heads, self.max_seq_len, scale_dim)
+        self.keys = mx.zeros(packed_shape, dtype=mx.uint32)
+        self.key_scales = mx.zeros(scale_shape, dtype=mx.uint8)
+        self.values = mx.zeros(packed_shape, dtype=mx.uint32)
+        self.value_scales = mx.zeros(scale_shape, dtype=mx.uint8)
+
+    def _allocate(self, keys: mx.array) -> None:
+        batch, n_kv_heads, _, head_dim = keys.shape
+        self.dtype = keys.dtype
+        self._allocate_shape(batch, n_kv_heads, head_dim)
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return ()
+        return self.keys, self.key_scales, self.values, self.value_scales
+
+    def make_mask(self, N, **kwargs):
+        return None if N == 1 else "causal"
+
+    def _grow(self, required: int) -> None:
+        new_max = self.max_seq_len
+        while new_max < required:
+            new_max *= 2
+
+        def grow(array: mx.array) -> mx.array:
+            shape = list(array.shape)
+            shape[2] = new_max
+            expanded = mx.zeros(tuple(shape), dtype=array.dtype)
+            if self.offset > 0:
+                expanded[:, :, : self.offset, :] = array[:, :, : self.offset, :]
+            return expanded
+
+        self.keys = grow(self.keys)
+        self.key_scales = grow(self.key_scales)
+        self.values = grow(self.values)
+        self.value_scales = grow(self.value_scales)
+        self.max_seq_len = new_max
+
+    def _quantize(self, value: mx.array) -> tuple[mx.array, mx.array]:
+        packed, scales = mx.quantize(
+            value,
+            group_size=self._group_size,
+            bits=self._bits,
+            mode=self._mode,
+        )
+        return packed, scales
+
+    def _dequantize(self, packed: mx.array, scales: mx.array) -> mx.array:
+        return mx.dequantize(
+            packed,
+            scales,
+            group_size=self._group_size,
+            bits=self._bits,
+            mode=self._mode,
+            dtype=self.dtype,
+        )
+
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        self._append(keys, values)
+        return self.get_kv()
+
+    def _append(self, keys: mx.array, values: mx.array) -> None:
+        if self.keys is None:
+            self._allocate(keys)
+        steps = keys.shape[2]
+        end = self.offset + steps
+        if end > self.max_seq_len:
+            self._grow(end)
+        packed_k, scales_k = self._quantize(keys)
+        packed_v, scales_v = self._quantize(values)
+        self.keys[:, :, self.offset : end, :] = packed_k
+        self.key_scales[:, :, self.offset : end, :] = scales_k
+        self.values[:, :, self.offset : end, :] = packed_v
+        self.value_scales[:, :, self.offset : end, :] = scales_v
+        self.offset = end
+
+    def write_token(self, k: mx.array, v: mx.array) -> None:
+        self._append(k, v)
+
+    def get_kv(self) -> tuple[mx.array, mx.array]:
+        return self.get_kv_slice(0, self.offset)
+
+    def get_kv_slice(self, start: int, end: int) -> tuple[mx.array, mx.array]:
+        return (
+            self._dequantize(
+                self.keys[:, :, start:end, :],
+                self.key_scales[:, :, start:end, :],
+            ),
+            self._dequantize(
+                self.values[:, :, start:end, :],
+                self.value_scales[:, :, start:end, :],
+            ),
+        )
+
 
 class PoolBackedAttentionKVCache:
     """Lazily gathers cached attention KV from the shared pool during forward.
@@ -133,14 +296,14 @@ class PoolBackedAttentionKVCache:
     """
 
     __slots__ = (
-        "_pool",
-        "_layer_idx",
-        "_slots",
-        "offset",
         "_full_keys",
         "_full_values",
+        "_layer_idx",
         "_new_keys",
         "_new_values",
+        "_pool",
+        "_slots",
+        "offset",
     )
 
     def __init__(
@@ -202,9 +365,24 @@ class PoolBackedAttentionKVCache:
         self._new_values = values
         return k_all, v_all
 
-    def to_contiguous(self, max_seq_len: int = 4096) -> ContiguousAttentionKVCache:
+    def to_contiguous(
+        self,
+        max_seq_len: int = 4096,
+        quantization_mode: str | None = None,
+    ) -> ContiguousAttentionKVCache | QuantizedContiguousAttentionKVCache:
         """Convert to contiguous attention KV reusing forward-pass arrays."""
-        cache = ContiguousAttentionKVCache(max_seq_len=max_seq_len)
+        cache = (
+            QuantizedContiguousAttentionKVCache(
+                max_seq_len=max_seq_len,
+                dtype=(
+                    self._full_keys.dtype
+                    if self._full_keys is not None
+                    else self._pool.dtype
+                ),
+            )
+            if quantization_mode == "mxfp8"
+            else ContiguousAttentionKVCache(max_seq_len=max_seq_len)
+        )
         if self._full_keys is not None:
             cache.update_and_fetch(self._full_keys, self._full_values)
         return cache

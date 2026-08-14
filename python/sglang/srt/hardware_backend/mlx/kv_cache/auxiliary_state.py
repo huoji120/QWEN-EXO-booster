@@ -10,7 +10,7 @@ storing model-agnostic native cache snapshots.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import mlx.core as mx
 import torch
@@ -95,6 +95,7 @@ class MlxAuxiliaryStatePool:
         self.mamba_cache = None
         self.mem_usage = 0
         self._snapshots: dict[int, dict[int, _CacheSnapshot]] = {}
+        self._alloc_iter: Optional[Iterator[torch.Tensor]] = None
         self.clear()
 
     def _tensor(self, indices: Any) -> torch.Tensor:
@@ -108,7 +109,34 @@ class MlxAuxiliaryStatePool:
     def available_size(self) -> int:
         return int(self.free_slots.numel())
 
+    def schedulable_available_size(self) -> int:
+        """Expose the scheduler allocator contract for native MLX state slots."""
+        return self.available_size()
+
+    def alloc_group_begin(self, num_reqs: int) -> None:
+        """Preallocate scheduler prefix-match slots as one CPU tensor slice."""
+        self._alloc_iter = None
+        if num_reqs > 0:
+            result = self._do_alloc(num_reqs)
+            if result is not None:
+                self._alloc_iter = iter(result.split(1))
+
+    def alloc_group_end(self) -> None:
+        """Return unused slots from the current scheduler allocation group."""
+        if self._alloc_iter is not None:
+            remaining = list(self._alloc_iter)
+            if remaining:
+                self.free(torch.cat(remaining))
+        self._alloc_iter = None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if self._alloc_iter is not None and need_size == 1:
+            slot = next(self._alloc_iter, None)
+            if slot is not None:
+                return slot
+        return self._do_alloc(need_size)
+
+    def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > self.available_size():
             return None
         slots = self.free_slots[:need_size].clone()
@@ -128,6 +156,7 @@ class MlxAuxiliaryStatePool:
         self.free_slots = torch.cat([self.free_slots, indices])
 
     def clear(self) -> None:
+        self._alloc_iter = None
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
@@ -231,6 +260,11 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
         self.auxiliary_state_pool = self.mamba_pool
+        # SGLang's hybrid scheduler, pool telemetry, and unified radix
+        # components address slot bookkeeping through ``mamba_allocator``.
+        # The MLX state pool is both storage and allocator, so expose the same
+        # contract without introducing a second, divergent free list.
+        self.mamba_allocator = self.mamba_pool
         self.enable_mamba_extra_buffer = False
         self.req_index_to_auxiliary_state_index_mapping = torch.zeros(
             self._alloc_size, dtype=torch.int32, device=device
