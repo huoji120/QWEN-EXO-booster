@@ -298,11 +298,26 @@ internal-docs/
 /qwen-exo-native-bank-smoke.json
 /qwen_exo_score_bias_server_sync.tar.gz
 /测试对话/
+
+# QWEN-EXO private sessions and telemetry; keep only on the runtime host.
+/trajectories/
+/sessions/
+/responses/
+/telemetry/
+/telemetry.jsonl
+/telemetry.jsonl.*
+/logs/
+/reports/
 /*.editor.pt
 /scripts/qwen_exo/corpus/knowledge/boeing-fable5-trajectory/
 /scripts/qwen_exo/corpus/knowledge/swe-mashumaro-flattened-targeted.md
 /pre-complete/
 /scripts/qwen_exo/pre-complete/
+
+# QWEN-EXO Reflection Memory is private trajectory-derived runtime data.
+/scripts/qwen_exo/corpus/knowledge/reflection-memory/
+/**/knowledge/reflection-memory/
+/**/reflection-memory.json
 
 # QWEN-EXO model-specific compiled state; publish source Markdown instead
 /model-profiles/
