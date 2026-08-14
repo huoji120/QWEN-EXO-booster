@@ -36,12 +36,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import {
-  createApiKey,
-  getApiKeys,
-  revokeApiKey,
-  setManagedApiKey,
-} from "@/lib/api";
+import { createApiKey, getApiKeys, revokeApiKey } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import type { ApiKeyInfo, ApiKeyListing, CreatedApiKey } from "@/lib/types";
 import { formatTime } from "@/lib/utils";
@@ -79,7 +74,6 @@ export function ApiKeysPage() {
     setCreating(true);
     try {
       const key = await createApiKey(normalized);
-      setManagedApiKey(key.token);
       setCreated(key);
       setLabel("");
       setCopied(false);
@@ -97,7 +91,6 @@ export function ApiKeysPage() {
   const copyToken = async () => {
     if (!created) return;
     await navigator.clipboard.writeText(created.token);
-    setManagedApiKey(created.token);
     setCopied(true);
     toast.success(t("密钥已复制"));
   };

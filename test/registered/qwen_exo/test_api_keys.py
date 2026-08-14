@@ -19,6 +19,11 @@ def test_issue_validate_revoke_without_storing_plaintext(tmp_path):
     assert store.authorize_request("POST", "/v1/responses", f"Bearer {token}")
     assert store.authorize_request("GET", "/v1/models", None) is False
     assert store.authorize_request("GET", "/qwen-exo/status", None) is None
+    assert store.authorize_request("GET", "/qwen-exo/console/v1/models", None) is None
+    assert (
+        store.authorize_request("POST", "/qwen-exo/console/v1/responses", None)
+        is None
+    )
     assert store.authorize_request("OPTIONS", "/v1/responses", None) is True
 
     persisted = path.read_text(encoding="utf-8")

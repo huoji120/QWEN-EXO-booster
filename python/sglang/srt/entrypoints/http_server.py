@@ -1806,6 +1806,11 @@ async def openai_v1_realtime_transcription(ws: WebSocket):
     await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
+@app.get(
+    "/qwen-exo/console/v1/models",
+    response_class=ORJSONResponse,
+    include_in_schema=False,
+)
 @app.get("/v1/models", response_class=ORJSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
@@ -1871,6 +1876,11 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
     )
 
 
+@app.post(
+    "/qwen-exo/console/v1/responses",
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
+)
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
@@ -2035,6 +2045,10 @@ async def v1_retrieve_responses(response_id: str, raw_request: Request):
     )
 
 
+@app.post(
+    "/qwen-exo/console/v1/responses/{response_id}/cancel",
+    include_in_schema=False,
+)
 @app.post("/v1/responses/{response_id}/cancel")
 async def v1_cancel_responses(response_id: str, raw_request: Request):
     """Cancel a background response."""

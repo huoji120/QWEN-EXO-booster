@@ -23,21 +23,6 @@ import type {
 import { translate as t } from "@/lib/i18n";
 
 const API = "/qwen-exo";
-const MANAGED_API_KEY = "qwen-exo-managed-api-key";
-
-export function setManagedApiKey(token: string | null) {
-  if (token) window.sessionStorage.setItem(MANAGED_API_KEY, token);
-  else window.sessionStorage.removeItem(MANAGED_API_KEY);
-}
-
-export function getManagedApiKey() {
-  return window.sessionStorage.getItem(MANAGED_API_KEY);
-}
-
-function managedAuthorizationHeader(): Record<string, string> {
-  const token = getManagedApiKey();
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
 
 export class ApiError extends Error {
   status: number;
@@ -503,8 +488,8 @@ export async function revokeApiKey(keyId: string) {
 }
 
 export async function getModelId() {
-  const response = await fetch("/v1/models", {
-    headers: { Accept: "application/json", ...managedAuthorizationHeader() },
+  const response = await fetch(`${API}/console/v1/models`, {
+    headers: { Accept: "application/json" },
   });
   if (!response.ok) throw new ApiError(t("无法读取模型列表"), response.status);
   const payload = (await response.json()) as { data?: { id?: string }[] };
@@ -545,12 +530,11 @@ export async function streamResponse(
   signal: AbortSignal,
   handlers: StreamHandlers,
 ) {
-  const response = await fetch("/v1/responses", {
+  const response = await fetch(`${API}/console/v1/responses`, {
     method: "POST",
     headers: {
       Accept: "text/event-stream",
       "Content-Type": "application/json",
-      ...managedAuthorizationHeader(),
     },
     body: JSON.stringify(body),
     signal,
