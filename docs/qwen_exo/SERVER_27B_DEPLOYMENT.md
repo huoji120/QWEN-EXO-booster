@@ -144,11 +144,11 @@ Resolved defaults for unquantized checkpoints:
 --qwen-exo-max-internal-tokens 12288
 ```
 
-For a catalog-selected Dense 27B GPTQ checkpoint, the service launcher sets both
-the model compute dtype and GDN/Mamba recurrent/conv state dtype to `float16`,
-then selects `--quantization gptq_marlin`. Other CUDA profiles retain the BF16
-model and state correctness baseline. Keeping the Dense GPTQ state in FP16 avoids
-mixed-dtype GDN cache writes during first-start Bank compilation.
+For a Dense 27B GPTQ deployment, set
+`QWEN_EXO_MAMBA_SSM_DTYPE=float16` before invoking the launcher. The catalog
+selects `dtype=float16` and `--quantization gptq_marlin`, while the launcher
+places the matching GDN/Mamba state dtype in the container before Python imports
+the runtime. Other CUDA profiles retain the BF16 model and state baseline.
 
 
 Override launcher defaults through documented `QWEN_EXO_*` variables rather
