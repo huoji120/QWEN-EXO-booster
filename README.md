@@ -83,7 +83,10 @@ cd QWEN-EXO-booster
 
 ### 2. 设置模型和运行数据目录
 
-运行数据必须放在 checkout 之外。不要把模型权重、Tensor Bank、遥测、请求轨迹和训练产物放进 Git 工作区。
+运行数据必须放在 checkout 之外。不要把模型权重、Tensor Bank、遥测、请求轨迹和训练产物放进 Git 工作区。`knowledge/`、`policydata/`、`cognition/` 与 `trajectories/` 是所有已配置模型共用的唯一源目录；`model-profiles/<模型指纹>/` 只保存该模型、该量化与拓扑生成的状态和 Native Bank。
+
+仓库只发布统一的知识预编译源目录 `scripts/qwen_exo/corpus/knowledge/`：事实知识放在目录根部，可复用反思记忆放在 `reflection-memory/`。启动器把这些 Markdown 复制到共享运行源目录，再由当前模型在首次启动时按自身 tokenizer、模型指纹、量化方式和 TP 拓扑编译 Bank。仓库不提供也不提交预编译 Bank；每个部署必须自行编译。
+
 
 ```bash
 export QWEN_EXO_MODEL_PATH=/data/models/Qwen3.5-27B
@@ -250,17 +253,27 @@ python3 scripts/qwen_exo/smoke_contracts.py
 ```text
 python/qwen_exo_booster/       QWEN-EXO runtime、Memory Pipeline、Judge、Observer、API
 python/sglang/                 SGLang 二开代码和模型/scheduler 集成
-scripts/qwen_exo/              构建、启动、预检、smoke、评测和 Bank 工具
+scripts/qwen_exo/              构建、启动、预检、smoke 和评测工具
+scripts/qwen_exo/corpus/knowledge/  统一知识预编译源（事实知识与 reflection-memory）
+scripts/qwen_exo/corpus/policydata/  版本化 PolicyData 源文件
+scripts/qwen_exo/corpus/cognition/   可选 Cognition 源文件
 docker/                        QWEN-EXO Dockerfile 和部署配置
 frontend/qwen-exo/             React/Vite 中文控制台
 docs/qwen_exo/                 架构、API、部署和验证文档
 test/registered/qwen_exo/      注册回归测试
-scripts/qwen_exo/corpus/       版本化 Knowledge、PolicyData 和可选 Cognition 源文件
+
 ```
+
+运行目录中的 Markdown/JSON 源不按模型复制。模型切换只切换权重路径和 `model-profiles/<模型指纹>/state-*`；目标模型从统一预编译源重新生成自己的 Tensor Bank 和 Native Bank，因而不同模型可使用不同分词、K/V 与 GDN 状态而不会产生内容分叉。生成的 Bank 只属于本地模型、量化与拓扑，不是可移植发布物。
+
+
+模型目录中的 `checkpoint_quantization`、`runtime_quantization` 与运行时 `kv_cache_dtype` 必须分开读取：27B GPTQ 是 W4A16，FP8 只用于 Full-Attention KV cache；GDN/Mamba recurrent/conv state 仍由运行时单独管理，不能把 `--quantization fp8` 当作 GPTQ 叠加压缩。
+
 
 ## 重要安全边界
 
-- 不要把模型权重、Tensor Bank、运行遥测、请求轨迹、训练数据或编辑器权重提交到 Git；
+- 不要把模型权重、Tensor Bank、Native Bank、运行遥测、请求轨迹、训练数据或编辑器权重提交到 Git；Git 只保存 `scripts/qwen_exo/corpus/knowledge/` 下经审阅的 Markdown 预编译源；
+
 - 控制台默认是 loopback-only，不要直接暴露 `/qwen-exo/knowledge`、`/qwen-exo/policydata` 等写接口；
 - `causal_replay` 只比较候选分支，不会改写已经输出的 token；
 - Judge、Native state binding 和 resource admission 都失败关闭；

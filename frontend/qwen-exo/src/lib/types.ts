@@ -58,6 +58,11 @@ export type CatalogModel = {
   linear_attention_layers: number;
   max_position_embeddings: number;
   weight_bytes: number;
+  checkpoint_quantization: string | null;
+  checkpoint_quantization_bits: number | null;
+  checkpoint_quantization_group_size: number | null;
+  checkpoint_quantization_exclusions: string[];
+  runtime_quantization: string | null;
   active: boolean;
   running: boolean;
   profile_initialized: boolean;
@@ -82,6 +87,8 @@ export type ModelCatalog = {
   models: CatalogModel[];
   catalog_roots: string[];
   profiles_root: string;
+  source_root: string;
+  sources_shared: boolean;
 };
 
 export type HealthStatus = {
@@ -197,6 +204,25 @@ export type ServiceConfig = {
   settings: ServiceSetting[];
   values: Record<string, boolean | number | string>;
   restart_requested?: boolean;
+};
+
+export type ApiKeyInfo = {
+  id: string;
+  label: string;
+  created_at: string;
+  revoked_at: string | null;
+};
+
+export type ApiKeyListing = {
+  schema: number;
+  revision: string;
+  updated_at: string | null;
+  keys: ApiKeyInfo[];
+};
+
+export type CreatedApiKey = ApiKeyInfo & {
+  token: string;
+  revision: string;
 };
 
 export type ToolCall = {

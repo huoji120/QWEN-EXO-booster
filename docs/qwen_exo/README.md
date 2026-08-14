@@ -40,20 +40,28 @@ cd frontend/qwen-exo && npm ci && npm run build
 ```
 
 
-## Versioned knowledge and memory
+## Unified knowledge precompile sources
 
-Reviewed source material is committed under `scripts/qwen_exo/corpus/` and is
-copied into the runtime data directory by the launcher:
+The single publishable knowledge source tree is
+`scripts/qwen_exo/corpus/knowledge/`. Factual references live at its root and
+reviewed, reusable execution memories live under `reflection-memory/`. The
+launcher copies this tree into the shared runtime Knowledge lane before startup.
+PolicyData and optional Cognition remain separate typed lanes under
+`scripts/qwen_exo/corpus/`.
 
-- `knowledge/`: factual reference documents;
-- `knowledge/reflection-memory/`: curated, reusable execution memories;
-- `policydata/`: authoritative execution policy;
-- `cognition/`: optional reviewed cognition documents when present.
+All configured models read the same reviewed Markdown. Each selected model then
+compiles its own topology-scoped Tensor Bank and Native Bank under
+`model-profiles/<model-fingerprint>/`, using that checkpoint's tokenizer,
+fingerprint, quantization, and TP layout. Precompiled Banks are deliberately not
+published because they are not portable across those boundaries; every
+deployment compiles its own on first startup or reindex.
 
-Generated Tensor Bank state, caches, telemetry, request traces, training jobs,
-editor weights, raw trajectories, and smoke outputs are runtime artifacts and
-are intentionally excluded from Git. Challenge-specific and task-specific test
-corpora are not part of the published memory set.
+Generated Bank state, caches, telemetry, request traces, training jobs, editor
+weights, raw trajectories, and smoke outputs are runtime artifacts and are
+excluded from Git. Challenge-specific and task-specific trajectory corpora are
+not part of the published memory set.
+
+For the planned dense 27B GPTQ profile, use the catalog-derived `gptq` runtime loader with `kv_cache_dtype=fp8_e4m3`; this is W4A16 plus FP8 Full-Attention KV cache, not FP8 weights layered on top of GPTQ. Hybrid GDN/Mamba recurrent and convolution state remains a separate runtime state and must be validated independently.
 
 ## Runtime entry points
 

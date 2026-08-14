@@ -105,11 +105,10 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
       await selectActiveModel(
         targetModel.model_fingerprint,
         catalog.revision,
-        true,
       );
       toast.success(t("模型切换已提交"), {
         description: t(
-          "服务将重启并加载模型专属知识档案。首次切换会复制当前 Knowledge、PolicyData、Cognition 和轨迹，随后各模型独立维护。",
+          "服务将立即进入受管重启。Knowledge、PolicyData、Cognition 与轨迹保持共享，目标模型会独立编译并使用自己的 Native Bank。",
         ),
       });
       setSelectedModel(null);
@@ -126,8 +125,10 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
           ]);
           setCatalog(nextCatalog);
           if (
-            nextCatalog.healthy_model_fingerprint ===
-              targetModel.model_fingerprint &&
+            nextCatalog.active_model_fingerprint === targetModel.model_fingerprint &&
+            nextCatalog.applied_model_fingerprint === targetModel.model_fingerprint &&
+            nextCatalog.healthy_model_fingerprint === targetModel.model_fingerprint &&
+            nextCatalog.running_model_fingerprint === targetModel.model_fingerprint &&
             nextStatus.runtime_state === "ready"
           ) {
             toast.success(t("模型切换完成"));
@@ -167,7 +168,7 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
         eyebrow={t("部署目录")}
         title={t("模型目录")}
         description={t(
-          "发现服务器模型目录中的兼容模型，查看各自独立的 Knowledge、PolicyData、Cognition、轨迹与 Native Bank，并通过受管重启切换当前模型。",
+          "发现兼容模型并查看模型专属 Native Bank。Knowledge、PolicyData、Cognition 与轨迹使用同一套 Markdown 或 JSON 源；切换后立即受管重启，由目标模型重新编译原生状态。",
         )}
         actions={
           <Button variant="outline" onClick={() => void loadCatalog()}>
@@ -308,7 +309,24 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
                     {entry.model_path}
                   </CardDescription>
                 </div>
-                <Badge variant="outline">{entry.variant}</Badge>
+                <div className="flex flex-wrap justify-end gap-1">
+                  <Badge variant="outline">{entry.variant}</Badge>
+                  <Badge variant="outline">
+                    {entry.checkpoint_quantization === "gptq"
+                      ? `W${entry.checkpoint_quantization_bits || 4}A16`
+                      : entry.checkpoint_quantization === "fp8"
+                        ? t("FP8 权重")
+                        : t("BF16 权重")}
+                  </Badge>
+                  {entry.runtime_quantization ? (
+                    <Badge variant="outline">
+                      {t("加载器 {value}", {
+                        value: entry.runtime_quantization,
+                      })}
+                    </Badge>
+                  ) : null}
+                  <Badge variant="outline">FP8 KV</Badge>
+                </div>
               </div>
             </CardHeader>
             <CardContent className="p-4">
@@ -334,9 +352,12 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
                 <div>
                   <div className="text-muted-foreground">Native Bank</div>
                   <div className="mt-1 font-semibold">
-                    {entry.native_bank_ready ? t("已编译") : t("等待首次编译")}
+                    {entry.native_bank_ready ? t("本模型已编译") : t("等待本模型编译")}
                   </div>
                 </div>
+              </div>
+              <div className="mt-3 rounded-md border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
+                {t("前三项来自所有模型共用的源目录；Native Bank 按模型指纹与运行拓扑独立存储。")}
               </div>
               <div className="mt-4 flex items-center justify-between border-t pt-3">
                 <div className="font-mono text-[10px] text-muted-foreground">
@@ -367,7 +388,7 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
             <DialogTitle>{t("确认切换模型")}</DialogTitle>
             <DialogDescription>
               {t(
-                "切换会中断当前推理并重启模型服务。目标模型首次使用时会复制当前知识源建立独立档案；Native Bank 会由目标模型重新编译，之后两个模型的知识与记忆互不覆盖。",
+                "切换会中断当前推理并立即重启模型服务。Knowledge、PolicyData、Cognition 与轨迹不复制、不分叉；目标模型使用共享源重新编译自己的 Native Bank，其他模型的编译产物不会被覆盖。",
               )}
             </DialogDescription>
           </DialogHeader>

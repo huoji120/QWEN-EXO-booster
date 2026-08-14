@@ -81,16 +81,22 @@ mkdir -p \
   "$QWEN_EXO_DATA_PATH/logs"
 ```
 
-The launcher refreshes canonical source files from `scripts/qwen_exo/corpus/`
-into the corresponding runtime lanes before startup. This includes general
-Knowledge, the canonical WFP reference, curated reflection memory under
-`knowledge/reflection-memory/`, PolicyData, and optional Cognition. Canonical
-filenames may be overwritten by their reviewed source versions; unrelated user
-uploads and subdirectories are never removed or overwritten. The retired
+The launcher refreshes reviewed Markdown from the unified precompile source tree
+`scripts/qwen_exo/corpus/knowledge/` into the shared runtime Knowledge lane before
+startup. Factual references live at that directory's root and reusable reflection
+memory lives under `reflection-memory/`. PolicyData and optional Cognition remain
+separate typed lanes under `scripts/qwen_exo/corpus/`. Canonical filenames may be
+overwritten by their reviewed source versions; unrelated user uploads and nested
+directories are never removed or overwritten. The retired
 `cognition/gpt-identity-card.md` text-injection file is intentionally removed;
-Cognition is native-only. Runtime-created Tensor Banks, telemetry, request
-traces, editor weights, and training jobs stay under `QWEN_EXO_DATA_PATH` and
-are not committed to Git.
+Cognition is native-only.
+
+The repository never ships a precompiled Tensor Bank or Native Bank. On first
+startup, each deployment compiles the reviewed Markdown with its active tokenizer,
+model fingerprint, quantization, and TP topology. Generated Banks, telemetry,
+request traces, editor weights, and training jobs stay under
+`QWEN_EXO_DATA_PATH` and are not committed to Git.
+
 
 Source mutations remain available through the loopback-only control plane.
 Keep the server bound to `127.0.0.1`, expose it only through an
@@ -141,6 +147,27 @@ Resolved defaults:
 
 Override these through the documented `QWEN_EXO_*` launcher variables rather
 than editing the script or relying on a model directory name.
+
+### Experimental absolute-probability expert addition
+
+The experiment is disabled by default. When explicitly enabled, it preserves
+the native Top-8 output and adds the next experts using their absolute
+probability from the full router:
+
+```text
+QWEN_EXO_MOE_TOP_K=                 # preserve checkpoint Top-8
+QWEN_EXO_MOE_EXTRA_EXPERTS=8        # explicit experiment: add ranks 9-16
+QWEN_EXO_ENABLE_RETURN_ROUTED_EXPERTS=0
+```
+
+The native Top-8 is dispatched through the unmodified checkpoint route. The
+full router softmax supplies absolute weights for the disjoint extra experts;
+those outputs are accumulated as an additive path without renormalizing or
+scaling down the native output. Extra experts execute in native-width Top-8
+chunks, so peak fused-MoE temporary width stays unchanged. Set
+`QWEN_EXO_MOE_EXTRA_EXPERTS=0` for native behavior. The result is an inference
+experiment, not a trained checkpoint, and must be evaluated against native
+Top-8 on the same prompts.
 
 Score Bias defaults to `trajectory_active` with a bounded maximum bias. Select
 another mode explicitly when required:
@@ -334,6 +361,7 @@ tail -f /data/qwen-exo-booster/logs/server.log
 docker stop qwen-exo-booster
 ```
 
-The container is ephemeral. Authoritative PolicyData, Knowledge, execution capsules, JSONL traces, smoke reports, and derived rank-local native Bank artifacts live under `/data/qwen-exo-booster` and survive restart.
+The container is ephemeral. Authoritative PolicyData, Knowledge, execution capsules, JSONL traces, smoke reports, and locally derived rank-local Bank artifacts live under `/data/qwen-exo-booster` and survive restart. Only reviewed Markdown under `scripts/qwen_exo/corpus/knowledge/` is published; every deployment builds its own Tensor Bank and Native Bank.
+
 
 Rollback is clean: stop the QWEN-EXO container and restart the unchanged legacy checkout and virtual environment. The new runtime contains no external-learning dependency or credential.

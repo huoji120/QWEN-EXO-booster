@@ -1054,6 +1054,28 @@ class TestDecoupledSpecArgs(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "requires --enable-qwen-exo"):
             server_args._handle_qwen_exo_runtime()
+    def test_qwen_exo_moe_extra_experts_cli_round_trip(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-qwen-exo",
+                "--qwen-exo-moe-extra-experts",
+                "8",
+            ]
+        )
+
+        self.assertEqual(server_args.qwen_exo_moe_extra_experts, 8)
+
+    def test_qwen_exo_moe_extra_experts_rejects_negative_values(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_qwen_exo=True,
+            qwen_exo_moe_extra_experts=-1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            server_args._handle_qwen_exo_runtime()
 
 
 

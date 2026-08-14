@@ -67,7 +67,7 @@ def write_model(
         (root / name).write_text(name, encoding="utf-8")
 
 
-def test_model_catalog_clones_sources_and_keeps_profiles_isolated(tmp_path: Path):
+def test_model_catalog_shares_sources_and_isolates_native_state(tmp_path: Path):
     models = tmp_path / "models"
     models.mkdir()
     dense = models / "dense"
@@ -80,7 +80,7 @@ def test_model_catalog_clones_sources_and_keeps_profiles_isolated(tmp_path: Path
     (data / "policydata").mkdir()
     (data / "cognition").mkdir()
     (data / "trajectories").mkdir()
-    (data / "knowledge" / "dense.md").write_text("# Dense", encoding="utf-8")
+    (data / "knowledge" / "shared.md").write_text("# Shared", encoding="utf-8")
     (data / "policydata" / "policy.md").write_text("# Policy", encoding="utf-8")
 
     store = ModelCatalogStore([models], data)
@@ -96,32 +96,39 @@ def test_model_catalog_clones_sources_and_keeps_profiles_isolated(tmp_path: Path
     selected = store.select(
         moe_fingerprint,
         expected_revision=initial["revision"],
-        clone_sources=True,
     )
     assert selected["active_model_fingerprint"] == moe_fingerprint
-    moe_knowledge = data / "model-profiles" / moe_fingerprint / "knowledge"
-    (moe_knowledge / "moe.md").write_text("# MoE", encoding="utf-8")
-    assert not (
-        data / "model-profiles" / dense_fingerprint / "knowledge" / "moe.md"
-    ).exists()
 
     _, args, selected_model = store.mark_applied(
         [
             "--model-path",
             str(dense),
             "--qwen-exo-state-dir",
-            "/data/qwen-exo/state-cuda",
+            str(data / "state-cuda"),
             "--qwen-exo-knowledge-dir",
-            "/data/qwen-exo/knowledge",
+            str(data / "knowledge"),
             "--qwen-exo-policy-data-dir",
-            "/data/qwen-exo/policydata",
+            str(data / "policydata"),
             "--qwen-exo-cognition-dir",
-            "/data/qwen-exo/cognition",
+            str(data / "cognition"),
         ]
     )
+    moe_profile = data / "model-profiles" / moe_fingerprint
+    dense_profile = data / "model-profiles" / dense_fingerprint
     assert selected_model["model_fingerprint"] == moe_fingerprint
     assert str(moe.resolve()) in args
-    assert str(moe_knowledge) in args
+    assert str(moe_profile / "state-cuda") in args
+    assert str(data / "knowledge") in args
+    assert str(data / "policydata") in args
+    assert str(data / "cognition") in args
+    assert dense_profile.is_dir()
+    assert not (moe_profile / "knowledge").exists()
+
+    public = store.public_document()
+    assert public["sources_shared"] is True
+    assert public["source_root"] == str(data.resolve())
+    assert {model["knowledge_document_count"] for model in public["models"]} == {1}
+    assert {model["policy_document_count"] for model in public["models"]} == {1}
 
 
 def test_gptq_122b_catalog_uses_required_moe_wna16_runtime(tmp_path: Path):
@@ -185,6 +192,51 @@ def test_gptq_122b_catalog_uses_required_moe_wna16_runtime(tmp_path: Path):
     assert selected["model_path"] == str(gptq.resolve())
 
 
+def test_gptq_27b_catalog_uses_gptq_runtime(tmp_path: Path):
+    models = tmp_path / "models"
+    models.mkdir()
+    gptq = models / "gptq-27b"
+    write_model(
+        gptq,
+        "Qwen3_5ForConditionalGeneration",
+        quantization_config={
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 128,
+            "desc_act": False,
+            "sym": True,
+        },
+    )
+    store = ModelCatalogStore([models], tmp_path / "data")
+
+    target = store.discover_models()[0]
+    assert target["variant"] == "dense-27b"
+    assert target["checkpoint_quantization"] == "gptq"
+    assert target["runtime_quantization"] == "gptq"
+
+    _, args, _ = store.mark_applied(
+        [
+            "--model-path",
+            str(gptq),
+            "--quantization",
+            "fp8",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--tp-size",
+            "2",
+            "--qwen-exo-state-dir",
+            str(tmp_path / "data" / "state-cuda"),
+        ]
+    )
+    quantization_index = args.index("--quantization")
+    assert args[quantization_index + 1] == "gptq"
+    assert args.count("--quantization") == 1
+    assert args[args.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
+    assert args[args.index("--qwen-exo-state-dir") + 1].endswith(
+        "state-cuda-tp2-gptq-fp8_e4m3"
+    )
+
+
 def test_gptq_122b_requires_desc_act_false(tmp_path: Path):
     models = tmp_path / "models"
     models.mkdir()
@@ -205,7 +257,7 @@ def test_gptq_122b_requires_desc_act_false(tmp_path: Path):
     assert ModelCatalogStore([models], tmp_path / "data").discover_models() == []
 
 
-def test_first_catalog_boot_keeps_legacy_runtime_paths(tmp_path: Path):
+def test_first_catalog_boot_uses_model_profile_state_and_shared_sources(tmp_path: Path):
     models = tmp_path / "models"
     models.mkdir()
     dense = models / "dense"
@@ -227,8 +279,9 @@ def test_first_catalog_boot_keeps_legacy_runtime_paths(tmp_path: Path):
         ]
     )
 
+    profile = data / "model-profiles" / selected_model["model_fingerprint"]
     assert selected_model["model_path"] == str(dense.resolve())
-    assert str(data / "state-cuda") in args
+    assert str(profile / "state-cuda") in args
     assert str(data / "knowledge") in args
     assert str(data / "policydata") in args
     assert str(data / "cognition") in args
@@ -278,7 +331,7 @@ def test_model_catalog_success_clears_matching_failed_marker(tmp_path: Path):
     assert public["last_rollback_at"] is None
 
 
-def test_catalog_file_without_legacy_marker_uses_model_profile(tmp_path: Path):
+def test_catalog_file_without_legacy_marker_keeps_shared_source_paths(tmp_path: Path):
     models = tmp_path / "models"
     models.mkdir()
     dense = models / "dense"
@@ -307,8 +360,9 @@ def test_catalog_file_without_legacy_marker_uses_model_profile(tmp_path: Path):
     )
 
     profile = data / "model-profiles" / document["active_model_fingerprint"]
-    assert str(profile / "knowledge") in args
-    assert str(profile / "policydata") in args
+    assert str(profile / "state-cuda") in args
+    assert str(data / "knowledge") in args
+    assert str(data / "policydata") in args
 
 
 def test_model_catalog_rejects_stale_revision_without_initializing_target(
@@ -413,7 +467,8 @@ def test_service_launcher_uses_selected_model_profile(tmp_path: Path, monkeypatc
 
     profile = data / "model-profiles" / moe_fingerprint
     assert str(moe.resolve()) in executed["args"]
-    assert str(profile / "knowledge") in executed["args"]
-    assert str(profile / "policydata") in executed["args"]
-    assert str(profile / "cognition") in executed["args"]
+    assert str(profile / "state-cuda") in executed["args"]
+    assert str(data / "knowledge") in executed["args"]
+    assert str(data / "policydata") in executed["args"]
+    assert str(data / "cognition") in executed["args"]
     assert service_launcher.os.environ["QWEN_EXO_ACTIVE_MODEL_PROFILE"] == str(profile)

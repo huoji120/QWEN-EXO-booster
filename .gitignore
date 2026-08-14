@@ -303,3 +303,15 @@ internal-docs/
 /scripts/qwen_exo/corpus/knowledge/swe-mashumaro-flattened-targeted.md
 /pre-complete/
 /scripts/qwen_exo/pre-complete/
+
+# QWEN-EXO model-specific compiled state; publish source Markdown instead
+/model-profiles/
+/state-cuda-*/
+/tensor-bank/
+/native-bank/
+/bank/
+/banks/
+/**/model-profiles/
+/**/state-cuda-*/
+/**/tensor-bank/
+/**/native-bank/

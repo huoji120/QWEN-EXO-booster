@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +13,6 @@ from qwen_exo_booster.fingerprint import ModelIdentity, validate_qwen_exo_model_
 _MODEL_CATALOG_SCHEMA = 1
 _DEFAULT_CATALOG_ROOTS = (Path("/models/catalog"),)
 _DEFAULT_DATA_ROOT = Path("/data/qwen-exo")
-_PROFILE_SOURCE_DIRECTORIES = ("knowledge", "policydata", "cognition", "trajectories")
 
 
 class ModelCatalogError(ValueError):
@@ -79,12 +77,21 @@ def _replace_argument(arguments: Iterable[str], option: str, value: str) -> list
     return cleaned
 
 
-def _copy_directory(source: Path, target: Path) -> None:
-    if not source.is_dir():
-        target.mkdir(parents=True, exist_ok=True)
-        return
-    target.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, target, dirs_exist_ok=True)
+def _state_directory_name(arguments: Iterable[str], model: dict[str, Any]) -> str:
+    existing = Path(_argument_value(arguments, "--qwen-exo-state-dir") or "state").name
+    runtime_quantization = model.get("runtime_quantization")
+    has_topology = any(
+        _argument_value(arguments, option) is not None
+        for option in ("--tp-size", "--kv-cache-dtype")
+    )
+    if runtime_quantization is None and not has_topology:
+        return existing
+    tp_size = _argument_value(arguments, "--tp-size") or "1"
+    quantization = str(
+        runtime_quantization or _argument_value(arguments, "--quantization") or "auto"
+    )
+    kv_cache_dtype = _argument_value(arguments, "--kv-cache-dtype") or "auto"
+    return f"state-cuda-tp{tp_size}-{quantization}-{kv_cache_dtype}"
 
 
 def _count_markdown(root: Path) -> int:
@@ -105,12 +112,12 @@ def _runtime_quantization(config: dict[str, Any], variant: str) -> str | None:
     if method == "fp8":
         return "fp8"
     if (
-        variant.startswith("moe-")
-        and method == "gptq"
+        method == "gptq"
         and quantization.get("bits") == 4
         and quantization.get("desc_act") is False
+        and variant in {"dense-27b", "moe-122b-a10b"}
     ):
-        return "moe_wna16"
+        return "gptq" if variant == "dense-27b" else "moe_wna16"
     raise ValueError(
         f"unsupported QWEN-EXO checkpoint quantization for {variant}: {quantization!r}"
     )
@@ -148,8 +155,6 @@ class ModelCatalogStore:
         self,
         catalog_roots: Iterable[Path | str],
         data_root: Path | str,
-        *,
-        seed_root: Path | str | None = None,
         path: Path | str | None = None,
     ):
         roots = tuple(Path(root).expanduser().resolve() for root in catalog_roots)
@@ -158,9 +163,6 @@ class ModelCatalogStore:
         self.catalog_roots = roots
         self.data_root = Path(data_root).expanduser().resolve()
         self.profiles_root = self.data_root / "model-profiles"
-        self.seed_root = (
-            Path(seed_root).expanduser().resolve() if seed_root is not None else None
-        )
         self.path = (
             Path(path).expanduser().resolve()
             if path is not None
@@ -183,14 +185,9 @@ class ModelCatalogStore:
         data_root = Path(
             os.getenv("QWEN_EXO_MODEL_DATA_ROOT", str(catalog_path.parent))
         )
-        seed_value = os.getenv(
-            "QWEN_EXO_MODEL_PROFILE_SEED_ROOT",
-            "/sgl-workspace/sglang/scripts/qwen_exo/corpus",
-        )
         return cls(
             roots,
             data_root,
-            seed_root=Path(seed_value) if seed_value else None,
             path=catalog_path,
         )
 
@@ -288,41 +285,11 @@ class ModelCatalogStore:
         return self.profiles_root / model_fingerprint
 
     def _profile_initialized(self, model_fingerprint: str) -> bool:
-        profile_root = self._profile_root(model_fingerprint)
-        return all(
-            (profile_root / name).is_dir() for name in _PROFILE_SOURCE_DIRECTORIES
-        )
+        return self._profile_root(model_fingerprint).is_dir()
 
-    def _initialize_profile(
-        self,
-        model_fingerprint: str,
-        *,
-        clone_from_fingerprint: str | None = None,
-        allow_legacy_import: bool = False,
-    ) -> Path:
+    def _initialize_profile(self, model_fingerprint: str) -> Path:
         profile_root = self._profile_root(model_fingerprint)
-        if self._profile_initialized(model_fingerprint):
-            return profile_root
-
-        clone_root = (
-            self._profile_root(clone_from_fingerprint)
-            if clone_from_fingerprint and clone_from_fingerprint != model_fingerprint
-            else None
-        )
-        for name in _PROFILE_SOURCE_DIRECTORIES:
-            target = profile_root / name
-            if clone_root is not None and (clone_root / name).is_dir():
-                _copy_directory(clone_root / name, target)
-                continue
-            legacy = self.data_root / name
-            if allow_legacy_import and legacy.is_dir():
-                _copy_directory(legacy, target)
-                continue
-            seed = self.seed_root / name if self.seed_root is not None else None
-            if seed is not None and seed.is_dir():
-                _copy_directory(seed, target)
-            else:
-                target.mkdir(parents=True, exist_ok=True)
+        profile_root.mkdir(parents=True, exist_ok=True)
         return profile_root
 
     def ensure(self, default_model_path: Path | str | None = None) -> dict[str, Any]:
@@ -362,13 +329,13 @@ class ModelCatalogStore:
                 "last_failed_model_fingerprint": None,
                 "last_rollback_at": None,
             }
-            self._initialize_profile(fingerprint, allow_legacy_import=True)
+            self._initialize_profile(fingerprint)
             self._write_document(document)
             return document
 
         active = str(document.get("active_model_fingerprint") or "")
         self._find_model(active, models)
-        self._initialize_profile(active, allow_legacy_import=True)
+        self._initialize_profile(active)
         return document
 
     def select(
@@ -376,7 +343,6 @@ class ModelCatalogStore:
         model_fingerprint: str,
         *,
         expected_revision: str,
-        clone_sources: bool = True,
     ) -> dict[str, Any]:
         models = self.discover_models()
         document = self.ensure()
@@ -389,10 +355,7 @@ class ModelCatalogStore:
         current_fingerprint = str(document["active_model_fingerprint"])
         if target_fingerprint == current_fingerprint:
             return document
-        self._initialize_profile(
-            target_fingerprint,
-            clone_from_fingerprint=(current_fingerprint if clone_sources else None),
-        )
+        self._initialize_profile(target_fingerprint)
         updated_at = _utc_now()
         document.update(
             previous_model_fingerprint=current_fingerprint,
@@ -426,13 +389,7 @@ class ModelCatalogStore:
             document["revision"] = _revision(active, updated_at)
 
         model = self._find_model(active, models)
-        profile_root = self._initialize_profile(active, allow_legacy_import=True)
-        first_catalog_boot = (
-            document.get("healthy_model_fingerprint") is None
-            and document.get("previous_model_fingerprint") is None
-            and document.get("applied_model_fingerprint") is None
-            and document.get("legacy_model_fingerprint") == active
-        )
+        profile_root = self._initialize_profile(active)
         if document.get("healthy_model_fingerprint") == active:
             document["boot_attempts"] = 0
         else:
@@ -448,24 +405,10 @@ class ModelCatalogStore:
                 "--quantization",
                 str(model["runtime_quantization"]),
             )
-        if not first_catalog_boot:
-            state_name = Path(
-                _argument_value(argv, "--qwen-exo-state-dir") or "state"
-            ).name
-            rewritten = _replace_argument(
-                rewritten, "--qwen-exo-state-dir", str(profile_root / state_name)
-            )
-            rewritten = _replace_argument(
-                rewritten, "--qwen-exo-knowledge-dir", str(profile_root / "knowledge")
-            )
-            rewritten = _replace_argument(
-                rewritten,
-                "--qwen-exo-policy-data-dir",
-                str(profile_root / "policydata"),
-            )
-            rewritten = _replace_argument(
-                rewritten, "--qwen-exo-cognition-dir", str(profile_root / "cognition")
-            )
+        state_name = _state_directory_name(argv, model)
+        rewritten = _replace_argument(
+            rewritten, "--qwen-exo-state-dir", str(profile_root / state_name)
+        )
         return document, rewritten, model
 
     def mark_healthy(self, model_fingerprint: str) -> bool:
@@ -513,13 +456,13 @@ class ModelCatalogStore:
                     "profile_initialized": self._profile_initialized(fingerprint),
                     "profile_root": str(profile_root),
                     "knowledge_document_count": _count_markdown(
-                        profile_root / "knowledge"
+                        self.data_root / "knowledge"
                     ),
                     "policy_document_count": _count_markdown(
-                        profile_root / "policydata"
+                        self.data_root / "policydata"
                     ),
                     "cognition_document_count": _count_markdown(
-                        profile_root / "cognition"
+                        self.data_root / "cognition"
                     ),
                     "native_bank_ready": any(
                         (state / "model-native").is_dir() for state in state_directories
@@ -531,6 +474,8 @@ class ModelCatalogStore:
             "models": public_models,
             "catalog_roots": [str(root) for root in self.catalog_roots],
             "profiles_root": str(self.profiles_root),
+            "source_root": str(self.data_root),
+            "sources_shared": True,
             "running_model_fingerprint": running_model_fingerprint,
             "managed_restart": os.getenv("QWEN_EXO_MANAGED_RESTART", "0") == "1",
         }

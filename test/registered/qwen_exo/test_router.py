@@ -497,6 +497,35 @@ def test_trajectory_preview_requires_explicit_create_then_supports_tagged_edit(
     assert api.get("/qwen-exo/trajectories").json()["trajectories"] == []
 
 
+def test_model_profile_routes_trajectories_to_shared_data_root(tmp_path: Path):
+    runtime = FakeRuntime()
+    data = tmp_path / "data"
+    runtime.config.state_directory = data / "model-profiles" / ("f" * 64) / "state-cuda"
+    api = client(runtime)
+    content = json.dumps(
+        {
+            "session": {
+                "messages": [
+                    {"role": "user", "content": "开始任务"},
+                    {"role": "assistant", "content": "已完成任务"},
+                ]
+            }
+        },
+        ensure_ascii=False,
+    )
+
+    created = api.post(
+        "/qwen-exo/trajectories",
+        json={"name": "shared-run", "content": content, "tags": ["shared"]},
+    )
+
+    assert created.status_code == 201
+    assert (data / "trajectories" / "shared-run.json").is_file()
+    assert not (
+        runtime.config.state_directory.parent / "trajectories" / "shared-run.json"
+    ).exists()
+
+
 def test_training_selection_controls_membership_and_tracks_trajectory_changes(
     tmp_path: Path,
 ):
@@ -815,6 +844,7 @@ def test_model_catalog_routes_switch_revisioned_profile_and_restart(
         if model["model_path"] == str(moe.resolve())
     )
     restart_calls = []
+    restart_delays = []
     monkeypatch.setenv("QWEN_EXO_MODEL_CATALOG_ROOTS", str(models))
     monkeypatch.setenv(
         "QWEN_EXO_MODEL_CATALOG_CONFIG", str(data / "model-catalog.json")
@@ -824,7 +854,10 @@ def test_model_catalog_routes_switch_revisioned_profile_and_restart(
     monkeypatch.setattr(
         router_module,
         "request_managed_restart",
-        lambda: restart_calls.append(True),
+        lambda delay_seconds=1.25: (
+            restart_calls.append(True),
+            restart_delays.append(delay_seconds),
+        ),
     )
     runtime = FakeRuntime()
     runtime.model_identity = SimpleNamespace(
@@ -838,7 +871,6 @@ def test_model_catalog_routes_switch_revisioned_profile_and_restart(
         json={
             "model_fingerprint": moe_fingerprint,
             "expected_revision": initial["revision"],
-            "clone_sources": True,
         },
     )
 
@@ -849,8 +881,16 @@ def test_model_catalog_routes_switch_revisioned_profile_and_restart(
     )
     assert switched.status_code == 202
     assert switched.json()["active_model_fingerprint"] == moe_fingerprint
-    assert switched.json()["restart_requested"] is True
     assert restart_calls == [True]
+    assert restart_delays == [1.25]
+
+    catalog = switched.json()
+    assert catalog["sources_shared"] is True
+    assert catalog["source_root"] == str(data.resolve())
+    assert all(
+        model["profile_root"].startswith(str(data / "model-profiles"))
+        for model in catalog["models"]
+    )
 
 
 def test_model_catalog_route_rejects_stale_revision_without_restart(
@@ -888,7 +928,6 @@ def test_model_catalog_route_rejects_stale_revision_without_restart(
         json={
             "model_fingerprint": moe_fingerprint,
             "expected_revision": "stale",
-            "clone_sources": True,
         },
     )
 

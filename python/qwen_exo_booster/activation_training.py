@@ -99,9 +99,6 @@ class ActivationTrainingStore:
 
     @classmethod
     def from_environment(cls) -> ActivationTrainingStore:
-        model_profile = os.getenv("QWEN_EXO_ACTIVE_MODEL_PROFILE", "").strip()
-        if model_profile:
-            return cls(Path(model_profile).resolve())
         config_path = Path(
             os.getenv("QWEN_EXO_SERVICE_CONFIG", "/data/qwen-exo/service-config.json")
         )
@@ -276,7 +273,11 @@ class ActivationTrainingStore:
                 + "、".join(insufficient),
             )
         state_path = Path(state_directory).resolve()
-        if state_path.parent != self.data_root:
+        state_root = state_path.parent
+        if (
+            state_root != self.data_root
+            and state_root.parent != self.data_root / "model-profiles"
+        ):
             raise ActivationTrainingError(
                 "invalid_state_directory", "编辑器状态目录不属于当前 QWEN EXO 数据目录"
             )
@@ -307,7 +308,7 @@ class ActivationTrainingStore:
                 "editor": COMBINED_EDITOR_NAME,
                 "trajectories": [record["name"] for record in records],
                 "sources": records,
-                "state_directory": state_path.name,
+                "state_directory": str(state_path),
                 "message_count": sum(
                     int(record["message_count"]) for record in records
                 ),
@@ -338,9 +339,16 @@ class ActivationTrainingStore:
             return document
 
     def paths(self, job: dict[str, Any]) -> tuple[list[Path], Path, Path, Path, Path]:
-        state_name = str(job.get("state_directory") or "")
-        state_path = (self.data_root / state_name).resolve()
-        if state_path.parent != self.data_root or state_path.name != state_name:
+        state_value = str(job.get("state_directory") or "")
+        state_path = Path(state_value)
+        if state_path.is_absolute():
+            state_path = state_path.resolve()
+        else:
+            state_path = (self.data_root / state_value).resolve()
+        allowed_root = state_path.parent == self.data_root or (
+            state_path.parent.parent == self.data_root / "model-profiles"
+        )
+        if not allowed_root:
             raise ActivationTrainingError(
                 "invalid_state_directory", "训练任务中的状态目录非法"
             )

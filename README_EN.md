@@ -85,6 +85,9 @@ If you use an internal remote or already have a checkout, enter that repository 
 
 Runtime data must live outside the checkout. Do not place weights, Tensor Bank artifacts, telemetry, request traces, or training outputs inside the Git worktree.
 
+The repository publishes only the unified knowledge precompile source directory, `scripts/qwen_exo/corpus/knowledge/`: factual references live at its root and reusable reflection memories live under `reflection-memory/`. The launcher copies these Markdown sources into the shared runtime source lane, then the active model compiles its own Bank on first startup using its tokenizer, model fingerprint, quantization, and TP topology. No precompiled Bank is published or committed; every deployment compiles its own.
+
+
 ```bash
 export QWEN_EXO_MODEL_PATH=/data/models/Qwen3.5-27B
 export QWEN_EXO_DATA_PATH=/data/qwen-exo-runtime
@@ -250,17 +253,23 @@ python3 scripts/qwen_exo/smoke_contracts.py
 ```text
 python/qwen_exo_booster/       QWEN-EXO runtime, Memory Pipeline, Judge, Observer, APIs
 python/sglang/                 SGLang fork and model/scheduler integration
-scripts/qwen_exo/              Build, launch, preflight, smoke, evaluation, and Bank tools
+scripts/qwen_exo/              Build, launch, preflight, smoke, and evaluation tools
+scripts/qwen_exo/corpus/knowledge/  Unified knowledge precompile sources, including reflection-memory
+scripts/qwen_exo/corpus/policydata/  Versioned PolicyData source
+scripts/qwen_exo/corpus/cognition/   Optional Cognition source
 docker/                        QWEN-EXO Dockerfile and deployment configuration
 frontend/qwen-exo/             React/Vite operations console
 docs/qwen_exo/                 Architecture, API, deployment, and verification documents
 test/registered/qwen_exo/      Registered regression tests
-scripts/qwen_exo/corpus/       Versioned Knowledge, PolicyData, and optional Cognition sources
+
 ```
+Runtime Markdown and JSON sources are not duplicated per model. A model switch changes the checkpoint and `model-profiles/<model-fingerprint>/state-*`; the selected model recompiles Tensor Bank and Native Bank artifacts from the unified precompile sources. Generated Banks are local to that model, quantization, and topology and are not portable release assets.
+
 
 ## Security boundaries
 
-- Never commit model weights, Tensor Bank artifacts, runtime telemetry, request traces, training data, or editor weights.
+- Never commit model weights, Tensor Bank or Native Bank artifacts, runtime telemetry, request traces, training data, or editor weights. Git contains only reviewed Markdown precompile sources under `scripts/qwen_exo/corpus/knowledge/`.
+
 - The control plane is loopback-only by default. Do not expose write routes such as `/qwen-exo/knowledge` or `/qwen-exo/policydata` directly to the Internet.
 - `causal_replay` compares candidate branches and never rewrites already emitted tokens.
 - Judge, native-state binding, and resource admission all fail closed.

@@ -151,6 +151,7 @@ def add_api_key_middleware(
     *,
     api_key: Optional[str],
     admin_api_key: Optional[str],
+    dynamic_authorizer=None,
 ):
     """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
@@ -160,10 +161,13 @@ def add_api_key_middleware(
     class _ApiKeyASGIMiddleware:
         """ASGI-native middleware to preserve client disconnect events."""
 
-        def __init__(self, app, *, api_key, admin_api_key, fastapi_app):
+        def __init__(
+            self, app, *, api_key, admin_api_key, dynamic_authorizer, fastapi_app
+        ):
             self.app = app
             self.api_key = api_key
             self.admin_api_key = admin_api_key
+            self.dynamic_authorizer = dynamic_authorizer
             self.fastapi_app = fastapi_app
 
         async def __call__(self, scope, receive, send):
@@ -174,15 +178,23 @@ def add_api_key_middleware(
             request = Request(scope, receive=receive)
             path = request.url.path
             authz = request.headers.get("Authorization")
-            level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
-            decision = decide_request_auth(
-                method=request.method,
-                path=path,
-                authorization_header=authz,
-                api_key=self.api_key,
-                admin_api_key=self.admin_api_key,
-                auth_level=level,
+            dynamic_decision = (
+                self.dynamic_authorizer(request.method, path, authz)
+                if self.dynamic_authorizer is not None
+                else None
             )
+            if dynamic_decision is None:
+                level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
+                decision = decide_request_auth(
+                    method=request.method,
+                    path=path,
+                    authorization_header=authz,
+                    api_key=self.api_key,
+                    admin_api_key=self.admin_api_key,
+                    auth_level=level,
+                )
+            else:
+                decision = AuthDecision(allowed=bool(dynamic_decision))
 
             if not decision.allowed:
                 response = ORJSONResponse(
@@ -204,5 +216,6 @@ def add_api_key_middleware(
         _ApiKeyASGIMiddleware,
         api_key=api_key,
         admin_api_key=admin_api_key,
+        dynamic_authorizer=dynamic_authorizer,
         fastapi_app=app,
     )

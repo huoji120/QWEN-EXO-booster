@@ -2878,10 +2878,25 @@ class ServerArgs:
             ),
         ),
     ] = None
+    qwen_exo_moe_extra_experts: A[
+        int,
+        Arg(
+            help=(
+                "Additional Qwen3.5 MoE experts evaluated as a residual "
+                "alongside native Top-K; zero disables the experiment."
+            ),
+        ),
+    ] = 0
     qwen_exo_state_dir: A[
         str,
         "Directory for QWEN-EXO authoritative runtime state and traces.",
     ] = "./qwen-exo-data/state"
+    qwen_exo_api_key_store: A[
+        Optional[str],
+        "Path to the QWEN-EXO dynamic API-key registry. When configured, valid "
+        "keys are required for /v1/models, /v1/responses, and "
+        "/v1/responses/compact.",
+    ] = None
     qwen_exo_knowledge_dir: A[
         str,
         "Directory containing the QWEN-EXO read-only knowledge sources.",
@@ -3813,24 +3828,24 @@ class ServerArgs:
                     "serve launch path does not start the native gRPC server."
                 )
             if self.encoder_only:
-                raise ValueError(
-                    "--grpc-port is not supported with --encoder-only: "
-                    "encoder disaggregation uses its own server."
-                )
+                raise ValueError("--grpc-port is not supported with --encoder-only.")
             if self.tokenizer_worker_num > 1:
                 raise ValueError(
                     "Native gRPC does not yet support --tokenizer-worker-num > 1. "
                     "Unset --grpc-port or set --tokenizer-worker-num 1."
                 )
-            if self.api_key or self.admin_api_key:
+            if self.api_key or self.admin_api_key or self.qwen_exo_api_key_store:
                 raise ValueError(
-                    "--grpc-port is incompatible with --api-key/--admin-api-key: "
-                    "the native gRPC listener bypasses HTTP auth middleware."
+                    "--grpc-port is incompatible with --api-key/--admin-api-key/"
+                    "--qwen-exo-api-key-store: the native gRPC listener bypasses "
+                    "HTTP auth middleware."
                 )
 
     def _handle_qwen_exo_runtime(self):
         if self.qwen_exo_moe_top_k is not None and not self.enable_qwen_exo:
             raise ValueError("--qwen-exo-moe-top-k requires --enable-qwen-exo")
+        if self.qwen_exo_moe_extra_experts < 0:
+            raise ValueError("--qwen-exo-moe-extra-experts must be non-negative")
         if not self.enable_qwen_exo:
             return
         if (

@@ -5,6 +5,7 @@ import { getStatus } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { useTheme } from "@/lib/theme";
 import type { RuntimeStatus } from "@/lib/types";
+import { ApiKeysPage } from "@/pages/api-keys-page";
 import { CatalogPage } from "@/pages/catalog-page";
 import { ChatPage } from "@/pages/chat-page";
 import { EditorPage } from "@/pages/editor-page";
@@ -75,6 +76,7 @@ export default function App() {
     reflection: <ReflectionPage />,
     editor: <EditorPage />,
     catalog: <CatalogPage status={status} />,
+    "api-keys": <ApiKeysPage />,
     settings: <SettingsPage status={status} onStatusRefresh={loadStatus} />,
   };
 

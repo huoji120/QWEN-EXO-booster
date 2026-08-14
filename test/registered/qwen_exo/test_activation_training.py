@@ -103,6 +103,31 @@ def _runner(
     return run
 
 
+def test_environment_store_uses_shared_data_root(tmp_path: Path, monkeypatch):
+    data = tmp_path / "data"
+    profile = data / "model-profiles" / ("f" * 64)
+    monkeypatch.setenv("QWEN_EXO_SERVICE_CONFIG", str(data / "service-config.json"))
+    monkeypatch.setenv("QWEN_EXO_ACTIVE_MODEL_PROFILE", str(profile))
+
+    store = ActivationTrainingStore.from_environment()
+
+    assert store.data_root == data.resolve()
+    assert store.root == data.resolve() / "activation-training"
+
+
+def test_model_profile_state_writes_editor_but_reads_shared_trajectory(tmp_path: Path):
+    data = tmp_path / "data"
+    _trajectory(data / "trajectories" / "first.json", "first")
+    state = data / "model-profiles" / ("f" * 64) / "state-cuda"
+    store = ActivationTrainingStore(data)
+
+    job = store.enqueue(["first"], state_directory=state)
+    sources, _, _, _, target = store.paths(job)
+
+    assert sources == [data / "trajectories" / "first.json"]
+    assert target == state / "activation-editors" / f"{COMBINED_EDITOR_NAME}.editor.pt"
+
+
 def test_selection_and_enqueue_preserve_multiple_trajectory_boundaries(tmp_path: Path):
     _trajectory(tmp_path / "trajectories" / "first.json", "first")
     _trajectory(tmp_path / "trajectories" / "second.json", "second")

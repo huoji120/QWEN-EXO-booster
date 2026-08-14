@@ -61,9 +61,35 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         device: str,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
+        server_args = get_server_args()
         topk_size = model_config.hf_text_config.num_experts_per_tok
+        if (
+            server_args.qwen_exo_moe_top_k is not None
+            and getattr(model_config.hf_text_config, "model_type", None)
+            == "qwen3_5_moe_text"
+        ):
+            topk_size = int(server_args.qwen_exo_moe_top_k)
         num_layers = model_config.hf_text_config.num_hidden_layers
 
+        # The QWEN-EXO experiment can replace the checkpoint Top-K at model
+        # construction time; the capture buffers must use that same width.
+        # Otherwise CUDA-graph capture sees an 8-wide buffer for a 256-wide
+        # router output and aborts before the server becomes ready.
+        if not 1 <= topk_size <= int(model_config.hf_text_config.num_experts):
+            raise ValueError(
+                "routed-expert capture Top-K must be between 1 and the model's "
+                f"{model_config.hf_text_config.num_experts} experts; got {topk_size}"
+            )
+
+        # Top-256 capture costs 40 KiB per token for this 40-layer model.
+        # Keep the experiment's pinned host buffer bounded; the normal 2.2M-token
+        # pool would require about 2.66 GiB per TP rank and prevents startup.
+        if (
+            server_args.qwen_exo_moe_top_k is not None
+            and int(server_args.qwen_exo_moe_top_k)
+            != int(model_config.hf_text_config.num_experts_per_tok)
+        ):
+            num_tokens = min(num_tokens, 16384)
         server_args = get_server_args()
         # Scale by dp_size so the buffer covers the full DP-concatenated batch.
         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)

@@ -5,6 +5,7 @@ import {
   Bot,
   BrainCircuit,
   Boxes,
+  KeyRound,
   ChevronDown,
   Gauge,
   MessageSquareText,
@@ -45,6 +46,7 @@ export const NAV_ITEMS = [
   { id: "reflection", label: "反思记忆", icon: BrainCircuit },
   { id: "editor", label: "轨迹微调", icon: SlidersHorizontal },
   { id: "catalog", label: "模型目录", icon: Boxes },
+  { id: "api-keys", label: "API 密钥", icon: KeyRound },
   { id: "settings", label: "设置", icon: Settings },
 ] as const;
 

@@ -9,9 +9,14 @@ set -euo pipefail
 : "${QWEN_EXO_TP_SIZE:=2}"
 : "${QWEN_EXO_DOCKER_GPUS:=all}"
 : "${QWEN_EXO_DTYPE:=bfloat16}"
-: "${QWEN_EXO_QUANTIZATION:=fp8}"
+: "${QWEN_EXO_QUANTIZATION:=}"
 : "${QWEN_EXO_KV_CACHE_DTYPE:=fp8_e4m3}"
-: "${QWEN_EXO_STATE_DIRECTORY_NAME:=state-cuda-tp${QWEN_EXO_TP_SIZE}-${QWEN_EXO_QUANTIZATION}-${QWEN_EXO_KV_CACHE_DTYPE}}"
+if [[ -n "${QWEN_EXO_QUANTIZATION}" ]]; then
+  QWEN_EXO_QUANTIZATION_LABEL="${QWEN_EXO_QUANTIZATION}"
+else
+  QWEN_EXO_QUANTIZATION_LABEL=unquant
+fi
+: "${QWEN_EXO_STATE_DIRECTORY_NAME:=state-cuda-tp${QWEN_EXO_TP_SIZE}-${QWEN_EXO_QUANTIZATION_LABEL}-${QWEN_EXO_KV_CACHE_DTYPE}}"
 : "${QWEN_EXO_USE_JIT_FP8_QUANT:=1}"
 : "${QWEN_EXO_LOGPROB_CHUNK_SIZE:=512}"
 : "${QWEN_EXO_MEM_FRACTION_STATIC:=0.80}"
@@ -50,6 +55,9 @@ set -euo pipefail
 : "${QWEN_EXO_QK_EXPANSION_MARGIN:=0.02}"
 : "${QWEN_EXO_QK_RECALL_PRESET:=balanced}"
 : "${QWEN_EXO_QK_PREFILTER_MODE:=active}"
+: "${QWEN_EXO_MOE_TOP_K:=}"
+: "${QWEN_EXO_MOE_EXTRA_EXPERTS:=0}"
+: "${QWEN_EXO_ENABLE_RETURN_ROUTED_EXPERTS:=0}"
 : "${QWEN_EXO_CONSOLE_TRACE_DEFAULT_SCOPE:=activity}"
 : "${QWEN_EXO_CONTEXT_EVIDENCE_MODE:=active}"
 : "${QWEN_EXO_CONTEXT_INTEGRITY_MODE:=active}"
@@ -146,8 +154,10 @@ if [[ -n "${active_pids}" ]]; then
   exit 1
 fi
 
-# Seed only canonical source paths. Existing canonical files are refreshed, while
-# unrelated user uploads and nested directories remain untouched.
+# Seed only reviewed precompile sources. Existing canonical files are refreshed,
+# while unrelated user uploads and nested directories remain untouched. Compiled
+# Tensor Bank and Native Bank artifacts are always generated in the runtime data
+# root and are never copied from the repository.
 seed_corpus() {
   local source_directory="$1"
   local target_directory="$2"
@@ -195,6 +205,7 @@ docker_args=(
   -e "SGLANG_LOGPROB_CHUNK_SIZE=${QWEN_EXO_LOGPROB_CHUNK_SIZE}"
   -e "SGLANG_QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB=${QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB}"
   -e QWEN_EXO_SERVICE_CONFIG=/data/qwen-exo/service-config.json
+  -e QWEN_EXO_API_KEY_STORE=/data/qwen-exo/api-keys.json
   -e QWEN_EXO_MANAGED_RESTART=1
   -e "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR:-}"
   -e "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH:-}"
@@ -202,7 +213,6 @@ docker_args=(
   -e "QWEN_EXO_MODEL_CATALOG_CONFIG=${QWEN_EXO_MODEL_CATALOG_CONFIG}"
   -e "QWEN_EXO_MODEL_DATA_ROOT=${QWEN_EXO_MODEL_DATA_ROOT}"
   -e QWEN_EXO_PRE_COMPLETE_KNOWLEDGE_DIR=/data/qwen-exo-pre-complete
-  -e QWEN_EXO_MODEL_PROFILE_SEED_ROOT=/sgl-workspace/sglang/scripts/qwen_exo/corpus
   -v "${QWEN_EXO_DATA_PATH}:/data/qwen-exo"
   -v "${QWEN_EXO_PRE_COMPLETE_PATH}:/data/qwen-exo-pre-complete"
   -v "${QWEN_EXO_SOURCE_PATH}/python:/sgl-workspace/sglang/python:ro"
@@ -232,7 +242,6 @@ server_args=(
   --served-model-name duckgpt
   --tp-size "${QWEN_EXO_TP_SIZE}"
   --dtype "${QWEN_EXO_DTYPE}"
-  --quantization "${QWEN_EXO_QUANTIZATION}"
   --kv-cache-dtype "${QWEN_EXO_KV_CACHE_DTYPE}"
   --context-length "${QWEN_EXO_CONTEXT_LENGTH}"
   --mem-fraction-static "${QWEN_EXO_MEM_FRACTION_STATIC}"
@@ -255,6 +264,12 @@ server_args=(
   --host 127.0.0.1
   --port "${QWEN_EXO_PORT}"
 )
+if [[ -n "${QWEN_EXO_QUANTIZATION}" ]]; then
+  server_args+=( --quantization "${QWEN_EXO_QUANTIZATION}" )
+fi
+if [[ "${QWEN_EXO_ENABLE_RETURN_ROUTED_EXPERTS}" == "1" ]]; then
+  server_args+=( --enable-return-routed-experts )
+fi
 if [[ "${QWEN_EXO_CPU_OFFLOAD_GB}" != "0" ]]; then
   server_args+=( --cpu-offload-gb "${QWEN_EXO_CPU_OFFLOAD_GB}" )
 fi
@@ -262,6 +277,7 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
   server_args+=(
     --enable-qwen-exo
     --qwen-exo-state-dir "/data/qwen-exo/${QWEN_EXO_STATE_DIRECTORY_NAME}"
+    --qwen-exo-api-key-store /data/qwen-exo/api-keys.json
     --qwen-exo-knowledge-dir /data/qwen-exo/knowledge
     --qwen-exo-enable-policy-data
     --qwen-exo-policy-data-dir /data/qwen-exo/policydata
@@ -305,6 +321,12 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-reflection-memory-max-history-tokens "${QWEN_EXO_REFLECTION_MEMORY_MAX_HISTORY_TOKENS}"
     --qwen-exo-response-compaction-mode "${QWEN_EXO_RESPONSE_COMPACTION_MODE}"
   )
+  if [[ -n "${QWEN_EXO_MOE_TOP_K}" ]]; then
+    server_args+=( --qwen-exo-moe-top-k "${QWEN_EXO_MOE_TOP_K}" )
+  fi
+  if [[ "${QWEN_EXO_MOE_EXTRA_EXPERTS}" != "0" ]]; then
+    server_args+=( --qwen-exo-moe-extra-experts "${QWEN_EXO_MOE_EXTRA_EXPERTS}" )
+  fi
   if [[ "${QWEN_EXO_IMMEDIATE_UNCERTAINTY_RETRIEVAL}" == "1" ]]; then
     server_args+=( --qwen-exo-immediate-uncertainty-retrieval )
   fi

@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.utils.auth import (
     AuthDecision,
     AuthLevel,
+    add_api_key_middleware,
     auth_level,
     decide_request_auth,
 )
@@ -302,6 +303,42 @@ class TestDecideRequestAuth(CustomTestCase):
             auth_level=AuthLevel.NORMAL,
         )
         self.assertTrue(decision.allowed)
+
+
+class TestDynamicAuthorizer(CustomTestCase):
+    def test_dynamic_authorizer_protects_selected_path(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+
+        @app.get("/v1/models")
+        async def models():
+            return {"data": [{"id": "duckgpt"}]}
+
+        @app.get("/qwen-exo/status")
+        async def status():
+            return {"runtime_state": "ready"}
+
+        def authorize(method, path, authorization):
+            if path != "/v1/models":
+                return None
+            return method == "GET" and authorization == "Bearer dynamic"
+
+        add_api_key_middleware(
+            app,
+            api_key=None,
+            admin_api_key=None,
+            dynamic_authorizer=authorize,
+        )
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/v1/models").status_code, 401)
+            response = client.get(
+                "/v1/models", headers={"Authorization": "Bearer dynamic"}
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["data"][0]["id"], "duckgpt")
+            self.assertEqual(client.get("/qwen-exo/status").status_code, 200)
 
 
 if __name__ == "__main__":

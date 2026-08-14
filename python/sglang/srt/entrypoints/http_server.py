@@ -770,9 +770,9 @@ async def get_server_info():
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
-    internal_states: List[
-        Dict[Any, Any]
-    ] = await _global_state.tokenizer_manager.get_internal_state()
+    internal_states: List[Dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
 
     server_args = _global_state.tokenizer_manager.server_args
 
@@ -2631,9 +2631,17 @@ def _setup_and_run_http_server(
         # - api_key only: behavior matches legacy (all endpoints require api_key)
         # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
         #   admin_api_key is not configured.
+        dynamic_authorizer = None
+        if server_args.qwen_exo_api_key_store:
+            from qwen_exo_booster.api_keys import ApiKeyStore
+
+            dynamic_authorizer = ApiKeyStore(
+                server_args.qwen_exo_api_key_store
+            ).authorize_request
         if (
             server_args.api_key
             or server_args.admin_api_key
+            or dynamic_authorizer is not None
             or app_has_admin_force_endpoints(app)
         ):
             from sglang.srt.utils.auth import add_api_key_middleware
@@ -2642,6 +2650,7 @@ def _setup_and_run_http_server(
                 app,
                 api_key=server_args.api_key,
                 admin_api_key=server_args.admin_api_key,
+                dynamic_authorizer=dynamic_authorizer,
             )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory

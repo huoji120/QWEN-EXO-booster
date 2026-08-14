@@ -63,7 +63,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -511,14 +511,69 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
-        # router_logits: (num_tokens, n_experts)
+        # Preserve the checkpoint Top-K output exactly. The optional experts
+        # are an additive path weighted by their absolute probability from the
+        # full router softmax; they must not dilute the native Top-K output.
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
-            topk_output
-        ):
-            topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
-        return self.experts(hidden_states, topk_output)
+        native_topk = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, native_topk)
+
+        server_args = get_server_args()
+        extra_count = int(getattr(server_args, "qwen_exo_moe_extra_experts", 0))
+        if extra_count <= 0 or hidden_states.shape[0] == 0:
+            return final_hidden_states
+
+        native_k = int(self.topk.topk_config.top_k)
+        routed_experts = int(router_logits.shape[-1])
+        if native_k + extra_count > routed_experts:
+            raise ValueError(
+                "native Top-K plus qwen_exo_moe_extra_experts exceeds the "
+                "routed expert count"
+            )
+
+        # Qwen3.5 uses plain softmax routing. Native Top-K ids are recovered
+        # from the same logits only to exclude duplicates; native weights and
+        # dispatch remain entirely owned by self.topk/native_topk above.
+        _, native_ids = torch.topk(router_logits, native_k, dim=-1)
+        router_probs = torch.softmax(router_logits.float(), dim=-1)
+        blocked_probs = router_probs.scatter(
+            1, native_ids.to(torch.long), float("-inf")
+        )
+        extra_weights, extra_ids = torch.topk(
+            blocked_probs, extra_count, dim=-1
+        )
+        extra_weights = extra_weights.to(hidden_states.dtype)
+
+        # Every invocation stays at the checkpoint-native width. Zero padding
+        # is used only for the final partial chunk when extra_count is not a
+        # multiple of native_k; its weights contribute no output.
+        padded_ids = native_ids.new_zeros((hidden_states.shape[0], native_k))
+        padded_weights = torch.zeros(
+            (hidden_states.shape[0], native_k),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        for start in range(0, extra_count, native_k):
+            width = min(native_k, extra_count - start)
+            padded_ids[:, :width] = extra_ids[:, start : start + width].to(
+                padded_ids.dtype
+            )
+            padded_weights[:, :width] = extra_weights[
+                :, start : start + width
+            ]
+            extra_output = self.experts(
+                hidden_states,
+                StandardTopKOutput(
+                    topk_weights=padded_weights,
+                    topk_ids=padded_ids,
+                    router_logits=router_logits,
+                ),
+            )
+            final_hidden_states.add_(extra_output)
+            del extra_output
+            padded_ids.zero_()
+            padded_weights.zero_()
+        return final_hidden_states
 
     def forward_normal_dual_stream(
         self,

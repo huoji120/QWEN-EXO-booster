@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -15,6 +16,7 @@ from fastapi.responses import (
 from pydantic import BaseModel, Field
 from typing import Literal
 
+from qwen_exo_booster.api_keys import ApiKeyStore, ApiKeyStoreError
 from qwen_exo_booster.activation_training import (
     COMBINED_EDITOR_NAME,
     ActivationTrainingError,
@@ -71,7 +73,6 @@ class ServiceConfigWriteRequest(BaseModel):
 class ModelSelectionRequest(BaseModel):
     model_fingerprint: str = Field(min_length=64, max_length=64)
     expected_revision: str = Field(min_length=1)
-    clone_sources: bool = True
 
 
 class SourceSelectionRequest(BaseModel):
@@ -81,6 +82,15 @@ class SourceSelectionRequest(BaseModel):
 
 class ReflectionSelectionRequest(BaseModel):
     conversation_keys: list[str] = Field(min_length=1, max_length=1000)
+
+
+class ApiKeyCreateRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+
+
+def _api_key_store() -> ApiKeyStore:
+    path = Path(os.getenv("QWEN_EXO_API_KEY_STORE", "/data/qwen-exo/api-keys.json"))
+    return ApiKeyStore(path)
 
 
 def _runtime(request: Request):
@@ -119,6 +129,33 @@ async def recall_trace_console(request: Request):
         html,
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.get("/api-keys")
+async def list_api_keys():
+    try:
+        return await asyncio.to_thread(_api_key_store().listing)
+    except ApiKeyStoreError as exc:
+        return JSONResponse(status_code=500, content={"detail": exc.public_dict()})
+
+
+@router.post("/api-keys", status_code=201)
+async def create_api_key(payload: ApiKeyCreateRequest):
+    try:
+        return await asyncio.to_thread(_api_key_store().create, payload.label)
+    except ApiKeyStoreError as exc:
+        return JSONResponse(status_code=422, content={"detail": exc.public_dict()})
+
+
+@router.delete("/api-keys/{key_id}")
+async def revoke_api_key(key_id: str):
+    try:
+        return await asyncio.to_thread(_api_key_store().revoke, key_id)
+    except ApiKeyStoreError as exc:
+        status_code = 404 if exc.code == "key_not_found" else 422
+        return JSONResponse(
+            status_code=status_code, content={"detail": exc.public_dict()}
+        )
 
 
 @router.get("/status")
@@ -167,7 +204,6 @@ async def select_active_model(payload: ModelSelectionRequest, request: Request):
             store.select,
             payload.model_fingerprint,
             expected_revision=payload.expected_revision,
-            clone_sources=payload.clone_sources,
         )
         request_managed_restart()
     except ModelCatalogError as exc:
@@ -188,10 +224,10 @@ async def select_active_model(payload: ModelSelectionRequest, request: Request):
             {
                 "revision": document["revision"],
                 "model_fingerprint": document["active_model_fingerprint"],
-                "clone_sources": payload.clone_sources,
             },
         )
-    return {**document, "restart_requested": True}
+    public_document = await asyncio.to_thread(store.public_document)
+    return {**public_document, "restart_requested": True}
 
 
 @router.get("/service-config")
@@ -388,14 +424,21 @@ class TrainingSelectionRequest(BaseModel):
     names: list[str] = Field(default_factory=list, max_length=16)
 
 
-def _trajectory_store(request: Request) -> TrajectoryStore:
+def _shared_data_root(request: Request) -> Path:
     runtime = _runtime(request)
-    return TrajectoryStore(runtime.config.state_directory.parent / "trajectories")
+    state_directory = runtime.config.state_directory.resolve()
+    profiles_root = state_directory.parent.parent
+    if profiles_root.name == "model-profiles":
+        return profiles_root.parent
+    return state_directory.parent
+
+
+def _trajectory_store(request: Request) -> TrajectoryStore:
+    return TrajectoryStore(_shared_data_root(request) / "trajectories")
 
 
 def _activation_training_store(request: Request) -> ActivationTrainingStore:
-    runtime = _runtime(request)
-    return ActivationTrainingStore(runtime.config.state_directory.parent)
+    return ActivationTrainingStore(_shared_data_root(request))
 
 
 def _editors_root(request: Request) -> Path:

@@ -1,5 +1,8 @@
 import type {
   ActiveEditor,
+  ApiKeyListing,
+  ApiKeyInfo,
+  CreatedApiKey,
   EditorInfo,
   EditorTrainingStatus,
   HealthStatus,
@@ -20,6 +23,17 @@ import type {
 import { translate as t } from "@/lib/i18n";
 
 const API = "/qwen-exo";
+const MANAGED_API_KEY = "qwen-exo-managed-api-key";
+
+export function setManagedApiKey(token: string | null) {
+  if (token) window.sessionStorage.setItem(MANAGED_API_KEY, token);
+  else window.sessionStorage.removeItem(MANAGED_API_KEY);
+}
+
+function managedAuthorizationHeader(): Record<string, string> {
+  const token = window.sessionStorage.getItem(MANAGED_API_KEY);
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 export class ApiError extends Error {
   status: number;
@@ -92,7 +106,6 @@ export async function getModelCatalog() {
 export async function selectActiveModel(
   modelFingerprint: string,
   expectedRevision: string,
-  cloneSources: boolean,
 ) {
   return (await (
     await apiFetch("/models/active", {
@@ -100,7 +113,6 @@ export async function selectActiveModel(
       body: JSON.stringify({
         model_fingerprint: modelFingerprint,
         expected_revision: expectedRevision,
-        clone_sources: cloneSources,
       }),
     })
   ).json()) as ModelCatalog & { restart_requested: boolean };
@@ -465,9 +477,30 @@ export async function updateServiceConfig(
   ).json()) as ServiceConfig;
 }
 
+export async function getApiKeys() {
+  return (await (await apiFetch("/api-keys")).json()) as ApiKeyListing;
+}
+
+export async function createApiKey(label: string) {
+  return (await (
+    await apiFetch("/api-keys", {
+      method: "POST",
+      body: JSON.stringify({ label }),
+    })
+  ).json()) as CreatedApiKey;
+}
+
+export async function revokeApiKey(keyId: string) {
+  return (await (
+    await apiFetch(`/api-keys/${encodeURIComponent(keyId)}`, {
+      method: "DELETE",
+    })
+  ).json()) as ApiKeyInfo;
+}
+
 export async function getModelId() {
   const response = await fetch("/v1/models", {
-    headers: { Accept: "application/json" },
+    headers: { Accept: "application/json", ...managedAuthorizationHeader() },
   });
   if (!response.ok) throw new ApiError(t("无法读取模型列表"), response.status);
   const payload = (await response.json()) as { data?: { id?: string }[] };
@@ -513,6 +546,7 @@ export async function streamResponse(
     headers: {
       Accept: "text/event-stream",
       "Content-Type": "application/json",
+      ...managedAuthorizationHeader(),
     },
     body: JSON.stringify(body),
     signal,
