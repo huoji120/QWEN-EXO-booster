@@ -1907,9 +1907,7 @@ class ServerArgs:
     speculative_ngram_capacity: A[
         int,
         "The cache capacity for ngram speculative decoding.",
-    ] = (
-        10 * 1000 * 1000
-    )
+    ] = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: A[
         Optional[str],
         "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
@@ -5292,14 +5290,17 @@ class ServerArgs:
             # Attention backend auto-select moved to the override registry
             # (arg_groups/overrides.py: _llama4_overrides).
             attention_backend = resolved_view(self).attention_backend
-            assert attention_backend in {
-                "fa3",
-                "aiter",
-                "triton",
-                "ascend",
-                "trtllm_mha",
-                "intel_xpu",
-            }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
+            assert (
+                attention_backend
+                in {
+                    "fa3",
+                    "aiter",
+                    "triton",
+                    "ascend",
+                    "trtllm_mha",
+                    "intel_xpu",
+                }
+            ), f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
             # The moe_runner_backend selection moved to the override registry
             # (arg_groups/overrides.py: _llama4_overrides).
         # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
@@ -5430,9 +5431,7 @@ class ServerArgs:
 
     def _validate_mamba_no_buffer(self, view, model_arch: str):
         assert view.page_size in (1, None), "no_buffer only supports page_size=1."
-        assert (
-            view.disable_overlap_schedule
-        ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
+        assert view.disable_overlap_schedule, "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
         assert (
             view.attention_backend != "trtllm_mha"
         ), "no_buffer do not support trtllm_mha attention backend."
@@ -6267,16 +6266,22 @@ class ServerArgs:
 
         view = resolved_view(self)
         if view.moe_runner_backend == "flashinfer_cutlass":
-            assert view.quantization in [
-                "modelopt_fp4",
-                "modelopt_fp8",
-                "modelopt_mixed",
-                None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
-            assert view.ep_size in [
-                1,
-                self.tp_size,
-            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            assert (
+                view.quantization
+                in [
+                    "modelopt_fp4",
+                    "modelopt_fp8",
+                    "modelopt_mixed",
+                    None,
+                ]
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            assert (
+                view.ep_size
+                in [
+                    1,
+                    self.tp_size,
+                ]
+            ), "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
             # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
@@ -6284,10 +6289,13 @@ class ServerArgs:
                 view.quantization in ["modelopt_fp4", "modelopt_mixed"]
                 or self.get_model_config().nvfp4_moe_meta is not None
             ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
-            assert view.ep_size in [
-                1,
-                self.tp_size,
-            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            assert (
+                view.ep_size
+                in [
+                    1,
+                    self.tp_size,
+                ]
+            ), "The expert parallel size must be 1 or the same as the tensor parallel size"
             assert view.moe_a2a_backend in [
                 "none",
                 "deepep",
@@ -6298,26 +6306,32 @@ class ServerArgs:
             )
 
         if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
-            assert view.quantization in [
-                "modelopt_fp4",
-                "nvfp4_online",
-                "fp8",
-                "mxfp8",
-                "modelopt_fp8",
-                "modelopt_mixed",
-                "compressed-tensors",
-                None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            assert (
+                view.quantization
+                in [
+                    "modelopt_fp4",
+                    "nvfp4_online",
+                    "fp8",
+                    "mxfp8",
+                    "modelopt_fp8",
+                    "modelopt_mixed",
+                    "compressed-tensors",
+                    None,
+                ]
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
 
         if view.moe_runner_backend == "flashinfer_trtllm_routed":
-            assert view.quantization in [
-                "fp8",
-                "mxfp8",
-                "modelopt_fp4",
-                "modelopt_mixed",
-                "nvfp4_online",
-                None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
+            assert (
+                view.quantization
+                in [
+                    "fp8",
+                    "mxfp8",
+                    "modelopt_fp4",
+                    "modelopt_mixed",
+                    "nvfp4_online",
+                    None,
+                ]
+            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
@@ -6492,11 +6506,14 @@ class ServerArgs:
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
-            assert resolved_view(self).moe_runner_backend in [
-                "flashinfer_cutlass",
-                "flashinfer_cutedsl",
-                "flashinfer_trtllm_routed",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
+            assert (
+                resolved_view(self).moe_runner_backend
+                in [
+                    "flashinfer_cutlass",
+                    "flashinfer_cutedsl",
+                    "flashinfer_trtllm_routed",
+                ]
+            ), "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
 
         if a2a_backend == "mori":
             if self.deepep_mode == "auto":
@@ -6553,10 +6570,13 @@ class ServerArgs:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
                     self.eplb_algorithm = "elasticity_aware"
-                assert self.eplb_algorithm in [
-                    "elasticity_aware",
-                    "elasticity_aware_hierarchical",
-                ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+                assert (
+                    self.eplb_algorithm
+                    in [
+                        "elasticity_aware",
+                        "elasticity_aware_hierarchical",
+                    ]
+                ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
             assert self.pp_size == 1, "PP size should be set to 1 under elastic EP"
 
@@ -8284,10 +8304,13 @@ class ServerArgs:
 
         # Check scheduling policy
         if self.enable_priority_scheduling:
-            assert self.schedule_policy in [
-                "fcfs",
-                "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            assert (
+                self.schedule_policy
+                in [
+                    "fcfs",
+                    "lof",
+                ]
+            ), f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
             if self.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
@@ -8487,8 +8510,8 @@ class ServerArgs:
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
 
             # Ensure sufficient information is provided for LoRA initialization.
-            assert self.lora_paths or (
-                self.max_lora_rank and self.lora_target_modules
+            assert (
+                self.lora_paths or (self.max_lora_rank and self.lora_target_modules)
             ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
             # Validate max_loaded_loras
@@ -8521,11 +8544,14 @@ class ServerArgs:
 
         assert len(buckets_rule) > 0, f"{arg_name} cannot be empty list"
         rule = buckets_rule[0]
-        assert rule in [
-            "tse",
-            "default",
-            "custom",
-        ], f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
+        assert (
+            rule
+            in [
+                "tse",
+                "default",
+                "custom",
+            ]
+        ), f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
 
         if rule == "tse":
             assert (
@@ -8536,9 +8562,7 @@ class ServerArgs:
                 base = float(buckets_rule[2])
                 count = int(buckets_rule[3])
             except (ValueError, IndexError):
-                assert (
-                    False
-                ), f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
+                assert False, f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
             assert base > 1, f"{arg_name} TSE base must be larger than 1, got: {base}"
             assert count > 0, f"{arg_name} TSE count must be positive, got: {count}"
             assert middle > 0, f"{arg_name} TSE middle must be positive, got: {middle}"

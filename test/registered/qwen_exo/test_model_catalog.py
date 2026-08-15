@@ -237,6 +237,7 @@ def test_gptq_27b_catalog_uses_gptq_runtime(tmp_path: Path):
         "state-cuda-tp2-gptq_marlin-fp8_e4m3"
     )
 
+
 @pytest.mark.parametrize(
     ("quantization_config", "expected_runtime"),
     [

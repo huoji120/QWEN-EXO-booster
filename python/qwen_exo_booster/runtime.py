@@ -3412,7 +3412,9 @@ class QwenExoRuntime:
             item = (
                 raw_item
                 if isinstance(raw_item, dict)
-                else raw_item.model_dump() if hasattr(raw_item, "model_dump") else None
+                else raw_item.model_dump()
+                if hasattr(raw_item, "model_dump")
+                else None
             )
             if isinstance(item, dict):
                 items.append(item)

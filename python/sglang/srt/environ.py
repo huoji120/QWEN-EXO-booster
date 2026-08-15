@@ -211,7 +211,6 @@ class ToolStrictLevel(IntEnum):
 
 
 class Envs:
-
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)

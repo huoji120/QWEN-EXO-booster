@@ -421,7 +421,6 @@ class ModelCatalogStore:
         if model.get("runtime_quantization") in {"gptq", "gptq_marlin"}:
             rewritten = _replace_argument(rewritten, "--dtype", "float16")
 
-
         state_name = _state_directory_name(argv, model)
         rewritten = _replace_argument(
             rewritten, "--qwen-exo-state-dir", str(profile_root / state_name)

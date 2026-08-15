@@ -1188,17 +1188,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     created_time,
                 )
             try:
-                result: Union[ORJSONResponse, ResponsesResponse] = (
-                    await self.responses_full_generator(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                        created_time=created_time,
-                    )
+                result: Union[
+                    ORJSONResponse, ResponsesResponse
+                ] = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time=created_time,
                 )
                 return result
             except HTTPException as exc:
@@ -1393,7 +1393,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         effort = request.reasoning.effort if request.reasoning is not None else None
         raw_template_kwargs = getattr(self, "default_chat_template_kwargs", None)
         template_kwargs = (
-            dict(raw_template_kwargs) if isinstance(raw_template_kwargs, Mapping) else {}
+            dict(raw_template_kwargs)
+            if isinstance(raw_template_kwargs, Mapping)
+            else {}
         )
         if effort is None:
             toggle = (

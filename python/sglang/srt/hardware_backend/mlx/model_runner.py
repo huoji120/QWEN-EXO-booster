@@ -156,9 +156,7 @@ class MlxModelRunner:
         # modules directly.
         self._quantization: str | None = quantization
         self._kv_cache_dtype = kv_cache_dtype
-        self._kv_quantization_mode = self._resolve_kv_quantization_mode(
-            kv_cache_dtype
-        )
+        self._kv_quantization_mode = self._resolve_kv_quantization_mode(kv_cache_dtype)
 
         self._load_model()
 
@@ -861,12 +859,8 @@ class MlxModelRunner:
             cache[layer_idx].get_kv_slice(cache_start, end)
             for layer_idx in self._cache_layout.attention_layer_indices
         ]
-        k_all = mx.stack(
-            [key[0].transpose(1, 0, 2) for key, _value in slices]
-        )
-        v_all = mx.stack(
-            [value[0].transpose(1, 0, 2) for _key, value in slices]
-        )
+        k_all = mx.stack([key[0].transpose(1, 0, 2) for key, _value in slices])
+        v_all = mx.stack([value[0].transpose(1, 0, 2) for _key, value in slices])
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
 
     def _sync_decode_kv_to_pool(self, req_id: str) -> None:
