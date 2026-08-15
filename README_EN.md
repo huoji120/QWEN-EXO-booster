@@ -4,152 +4,56 @@
   <a href="README.md">简体中文</a> · <strong>English</strong>
 </p>
 
-QWEN-EXO-booster is a **second-stage SGLang development project** for Qwen hybrid-attention inference. It targets Qwen3.5-style Hybrid Full-Attention / Gated DeltaNet models and extends the OpenAI-compatible Responses API with model-native state, knowledge recall, long-context execution, tool calls, and runtime observability in one inference pipeline.
+![img](/banner.png)
 
-> This is not a conventional RAG demo or a script that merely splits model layers across GPUs. The default deployment uses real SGLang Tensor Parallelism (`TP=2`) and maintains a consistent lifecycle across Full-Attention K/V and Gated DeltaNet recurrent/conv state.
+A Qwen hybrid-attention inference backend built as an **SGLang fork**, designed to substantially extend the capabilities of Qwen-family models.
+
+> Supports macOS and Linux. SGLang does not support native Windows deployment; use WSL on Windows. Supports Qwen3.5 through Qwen3.8, including derivative checkpoints and MoE models. We recommend Qwen3.8-27B.
+
+## Why QWEN-EXO
+
+### Model-native knowledge injection
+
+Unlike RAG, QWEN-EXO provides an attention-based knowledge-recall mechanism that lets the model retrieve relevant knowledge without depending on a conventional RAG architecture. This substantially expands the knowledge available to Qwen-family models.
+
+Adding knowledge is simple and does not require fine-tuning: write knowledge documents and ingest them into the knowledge base.
+
+![img](/images/1.png)
+
+### Reflection Memory
+
+QWEN-EXO includes server-side Reflection Memory. Successful and failed task trajectories can be reviewed and distilled into reusable memories, allowing the system to improve from prior execution evidence.
+
+![img](/images/2.png)
+
+### Observability
+
+You can inspect the knowledge recalled and injected for each request, helping detect irrelevant recall or behavioral drift.
+
+![img](/images/3.png)
 
 ## One-sentence installation
 
-Give this repository README to an LLM and ask it to run the following instruction on a Linux host with **Docker, NVIDIA Container Toolkit, two RTX 4090 GPUs, and NVIDIA driver 550+**:
+Give this repository README to an LLM and ask it to execute the following instruction on a Linux host with **Docker, NVIDIA Container Toolkit, two RTX 4090 GPUs, and NVIDIA driver 550+**:
 
 ```text
 Read README_EN.md and docs/qwen_exo/SERVER_27B_DEPLOYMENT.md. Verify that QWEN_EXO_MODEL_PATH points to a compatible Qwen Hybrid checkpoint and QWEN_EXO_DATA_PATH points to a separate runtime-data directory. Then run bash scripts/qwen_exo/build_image.sh followed by bash scripts/qwen_exo/launch_js4090.sh. Wait until http://127.0.0.1:30000/qwen-exo/health reports runtime_state=ready, and access the console through an SSH tunnel.
 ```
 
-This is not an unconditional cloud one-click installer. Model weights, GPUs, the NVIDIA driver, and Docker must already be available. The launcher validates the checkpoint structure before occupying the GPUs and rejects unsupported models.
-
-## What this project adds
-
-Upstream SGLang already provides high-performance inference, continuous batching, Radix Cache, Tensor Parallelism, and OpenAI-compatible APIs. QWEN-EXO adds capabilities for Qwen Hybrid models and long-running agents:
-
-- **Long-context inference**: the default target is 102,400 tokens.
-- **Hybrid-state restoration**: Full-Attention KV and Gated DeltaNet recurrent/conv state are managed together, preventing KV-only restoration from losing linear-attention state.
-- **Model-native knowledge recall**: Markdown knowledge is compiled into Tensor Bank K/V plus complete GDN state. Eligible requests can restore native state instead of concatenating every document into the prompt.
-- **Attention-Q × Tensor-Bank-K retrieval**: candidate ranking uses the model's final Full-Attention query heads and persisted Bank K heads. Knowledge and PolicyData use physically separate lanes.
-- **Semantic Judge as the final gate**: Q×K only generates candidates. Every candidate must pass the constrained Reference Judge; invalid, stale, rejected, or unjudged candidates fail closed.
-- **In-Flight Observer**: selected-token surprisal, Q signals, and local uncertainty are monitored during decode to trigger Self-Ask and bounded refresh when needed.
-- **Causal Replay / Maybe gate**: baseline and candidate branches are scored against the same future tokens. NLL gain, switching margin, and KL decide whether a candidate may be scheduled for next-turn restoration.
-- **Execution Capsule**: coarse execution state can be retained across turns for long-running tasks.
-- **Tool calls and Responses semantics**: Qwen thinking, structured tool calls, SSE/Responses events, and cancellation propagation remain supported.
-- **Unified resource admission**: KV tokens, request slots, Mamba slots, and temporary logprob workspace are estimated before scheduler-native work, with atomic admission across TP ranks.
-- **Operations console**: health, Q×K candidates, Judge decisions, native restore, Self-Ask, Causal Replay, Maybe, and raw telemetry are visible from one console.
-
-## Core technologies
-
-| Technology | Purpose |
-|---|---|
-| **SGLang** | Inference scheduling, continuous batching, Radix Cache, scheduler-native internal jobs, and OpenAI-compatible HTTP serving |
-| **PyTorch / CUDA / NCCL** | TP=2 execution, GPU state, cross-rank communication, and model forward passes |
-| **Qwen Hybrid Attention** | Full-Attention layers provide KV; Gated DeltaNet layers provide recurrent/conv state |
-| **Tensor Parallelism** | True two-GPU model parallelism through `--tp-size 2` |
-| **FP8 KV Cache / BF16 State** | Reduces KV memory while retaining the reviewed BF16 state baseline |
-| **Tensor Bank** | Persists document-native K/V, salient token positions, and complete GDN state |
-| **Raw Attention-Q × K** | Performs retrieval using model-native attention signals without an external embedding service |
-| **16-token local windows** | Requires support inside a contiguous local window to reduce isolated-token extrema |
-| **Median/MAD relative evidence** | Records robust per-query background, relative scores, and margins as shadow audit evidence |
-| **Reference Judge** | Produces the final semantic-admission decision through constrained JSON output |
-| **Scheduler-native internal jobs** | Judge, Self-Ask, Self-Answer, Capsule, and Replay do not recursively call HTTP |
-| **Observer / Self-Ask** | Detects persistent uncertainty during decode and creates an internal question |
-| **Causal Replay / Maybe** | Compares baseline and candidate branches on shared future tokens; fails closed and never rewrites emitted tokens |
-| **FastAPI / Uvicorn** | QWEN-EXO control plane, health, knowledge management, and telemetry APIs |
-| **React / Vite / Tailwind** | Operations console and recall-trace visualization |
-| **Docker** | Pins the reviewed SGLang/CUDA/Torch runtime baseline |
-
-## Requirements
-
-Default verified profile:
-
-- Linux x86_64
-- Docker and NVIDIA Container Toolkit
-- 2 × NVIDIA RTX 4090, approximately 48 GiB per GPU
-- NVIDIA driver 550.78 or a deployment-validated compatible version
-- CUDA 12.6 base image
-- Qwen Hybrid Dense 27B or MoE 35B-A3B structure
-- Runtime service at `127.0.0.1:30000`
-- Served model ID: `duckgpt`
-
-Compatibility is determined from the checkpoint's `config.json`, not its directory name, marketing version, or container alias. Startup rejects unsupported structures.
-
 ## Installation and startup
 
-### 1. Clone the repository
+### Open any agent terminal
+
+Enter: `Help me deploy this QWEN-EXO SGLang fork:`
 
 ```bash
 git clone https://github.com/huoji120/QWEN-EXO-booster.git
 cd QWEN-EXO-booster
 ```
 
-If you use an internal remote or already have a checkout, enter that repository instead.
+## Accessing the web console
 
-### 2. Set model and runtime-data paths
-
-Runtime data must live outside the checkout. Do not place weights, Tensor Bank artifacts, telemetry, request traces, or training outputs inside the Git worktree.
-
-The repository publishes only the unified knowledge precompile source directory, `scripts/qwen_exo/corpus/knowledge/`: factual references live at its root and reusable reflection memories live under `reflection-memory/`. The launcher copies these Markdown sources into the shared runtime source lane, then the active model compiles its own Bank on first startup using its tokenizer, model fingerprint, quantization, and TP topology. No precompiled Bank is published or committed; every deployment compiles its own.
-
-
-```bash
-export QWEN_EXO_MODEL_PATH=/data/models/Qwen3.5-27B
-export QWEN_EXO_DATA_PATH=/data/qwen-exo-runtime
-export QWEN_EXO_IMAGE=qwen-exo-booster:sglang-v0.5.16-driver550
-
-mkdir -p "$QWEN_EXO_DATA_PATH"
-```
-
-### 3. Build the image and run preflight checks
-
-```bash
-bash scripts/qwen_exo/build_image.sh
-```
-
-The build script performs:
-
-1. CUDA and GPU checks;
-2. SGLang and QWEN-EXO import checks;
-3. GPU kernel checks;
-4. Docker image creation using the pinned base image and current Git revision.
-
-### 4. Launch the service
-
-```bash
-bash scripts/qwen_exo/launch_js4090.sh
-```
-
-Key defaults:
-
-```text
-TP=2
-weights dtype=BF16
-quantization=FP8
-KV cache=FP8 E4M3
-context length=102400
-page size=64
-observer=active
-adaptive refresh=enabled
-```
-
-The launcher checks for active GPU compute PIDs before Docker startup. Do not run two inference backends on the same GPUs.
-
-### 5. Wait for readiness
-
-```bash
-curl -f http://127.0.0.1:30000/qwen-exo/health
-curl -s http://127.0.0.1:30000/qwen-exo/status
-curl -s http://127.0.0.1:30000/v1/models
-```
-
-The service is ready only when `/qwen-exo/health` returns:
-
-```json
-{
-  "status": "ok",
-  "runtime_state": "ready"
-}
-```
-
-## Accessing the console
-
-The control plane is bound to `127.0.0.1` by default and must not be exposed directly to the public Internet. Use SSH local port forwarding for remote access.
+The console is bound to `127.0.0.1` by default and must not be exposed directly to the public Internet. Use SSH local port forwarding for remote access.
 
 ### Verify the service on the GPU host
 
@@ -157,13 +61,13 @@ The control plane is bound to `127.0.0.1` by default and must not be exposed dir
 ssh <gpu-host> 'curl -f http://127.0.0.1:30000/qwen-exo/health'
 ```
 
-### Create the SSH tunnel locally
+### Create an SSH tunnel locally
 
 ```bash
 ssh -N -L 30000:127.0.0.1:30000 <gpu-user>@<gpu-host>
 ```
 
-Keep that terminal open and visit:
+Keep that terminal open, then visit:
 
 ```text
 http://127.0.0.1:30000/qwen-exo/
@@ -186,7 +90,7 @@ The console can inspect and manage:
 - Reflection Memory jobs;
 - Observer, Adaptive Refresh, Score Bias, and Causal Replay state.
 
-Knowledge and PolicyData mutations are loopback control-plane operations. Access them only through an SSH tunnel or trusted operator-controlled reverse proxy.
+Knowledge and PolicyData mutations are loopback control-plane operations. Access them only through an SSH tunnel or a trusted operator-controlled reverse proxy.
 
 ## API quick start
 
@@ -197,7 +101,7 @@ curl --no-buffer http://127.0.0.1:30000/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "duckgpt",
-    "input": "Explain how this service restores hybrid attention state.",
+    "input": "Explain how this service restores hybrid-attention state.",
     "stream": true,
     "max_output_tokens": 256
   }'
@@ -221,7 +125,7 @@ curl 'http://127.0.0.1:30000/qwen-exo/recall-trace?limit=10'
 curl 'http://127.0.0.1:30000/qwen-exo/telemetry?limit=100'
 ```
 
-Telemetry is redacted by default: prompts, outputs, reasoning, tool arguments, references, and secrets are not written verbatim. See [API, telemetry, security, and console](docs/qwen_exo/API.md) for the full contract.
+Telemetry is redacted by default: prompts, outputs, reasoning, tool arguments, references, and secrets are not written verbatim. See [API, telemetry, security, and console](docs/qwen_exo/API.md) for the detailed contract.
 
 ## Local verification
 
@@ -254,28 +158,20 @@ python3 scripts/qwen_exo/smoke_contracts.py
 python/qwen_exo_booster/       QWEN-EXO runtime, Memory Pipeline, Judge, Observer, APIs
 python/sglang/                 SGLang fork and model/scheduler integration
 scripts/qwen_exo/              Build, launch, preflight, smoke, and evaluation tools
-scripts/qwen_exo/corpus/knowledge/  Unified knowledge precompile sources, including reflection-memory
+scripts/qwen_exo/corpus/knowledge/  Unified knowledge precompile sources: factual knowledge and Reflection Memory
 scripts/qwen_exo/corpus/policydata/  Versioned PolicyData source
 scripts/qwen_exo/corpus/cognition/   Optional Cognition source
 docker/                        QWEN-EXO Dockerfile and deployment configuration
-frontend/qwen-exo/             React/Vite operations console
+frontend/qwen-exo/             React/Vite web console
 docs/qwen_exo/                 Architecture, API, deployment, and verification documents
 test/registered/qwen_exo/      Registered regression tests
-
 ```
-Runtime Markdown and JSON sources are not duplicated per model. A model switch changes the checkpoint and `model-profiles/<model-fingerprint>/state-*`; the selected model recompiles Tensor Bank and Native Bank artifacts from the unified precompile sources. Generated Banks are local to that model, quantization, and topology and are not portable release assets.
 
+Runtime Markdown and JSON sources are not duplicated per model. A model switch changes only the checkpoint path and `model-profiles/<model-fingerprint>/state-*`. The selected model recompiles its Tensor Bank and Native Bank from the unified precompile sources, so models can use different tokenization, K/V, and GDN states without content forks. Generated Banks are local to that model, quantization, and topology and are not portable release assets.
 
-## Security boundaries
+The model catalog fields `checkpoint_quantization` and `runtime_quantization` must be interpreted separately from the runtime `kv_cache_dtype`. Dense 27B GPTQ is W4A16, while FP8 applies only to the Full-Attention KV cache. GDN/Mamba recurrent and convolution states are managed separately by the runtime; `--quantization fp8` is not an additional compression layer for a GPTQ checkpoint.
 
-- Never commit model weights, Tensor Bank or Native Bank artifacts, runtime telemetry, request traces, training data, or editor weights. Git contains only reviewed Markdown precompile sources under `scripts/qwen_exo/corpus/knowledge/`.
-
-- The control plane is loopback-only by default. Do not expose write routes such as `/qwen-exo/knowledge` or `/qwen-exo/policydata` directly to the Internet.
-- `causal_replay` compares candidate branches and never rewrites already emitted tokens.
-- Judge, native-state binding, and resource admission all fail closed.
-- The project does not call an external LLM and performs no implicit external learning.
-- Do not infer model compatibility from a checkpoint directory name.
-- Do not run the legacy backend and QWEN-EXO on the same GPUs simultaneously.
+## Important safety boundaries
 
 ## Further reading
 
@@ -287,4 +183,4 @@ Runtime Markdown and JSON sources are not duplicated per model. A model switch c
 
 ## Project scope
 
-QWEN-EXO-booster is an SGLang-based model-runtime development project focused on **model-native state management for Qwen Hybrid models, long-context memory recall, internal task scheduling, agent continuity, and verifiable operations**. Any claim of better model capability or accuracy must be supported by controlled evaluation with fixed model, context, concurrency, and output length; a single demonstration is not sufficient evidence.
+QWEN-EXO-booster is an SGLang-based model-runtime development project focused on **model-native state management for Qwen Hybrid models, long-context memory recall, internal task scheduling, agent continuity, and verifiable operations**. Any claim of improved model capability or accuracy must be supported by controlled evaluation with a fixed model, context, concurrency, and output length; a single demonstration is not sufficient evidence.
