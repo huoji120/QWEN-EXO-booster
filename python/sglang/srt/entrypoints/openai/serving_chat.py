@@ -76,6 +76,32 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+_QWEN38_REASONING_EFFORT_MARKER = (
+    "Supported types are xhigh (default), medium, and low."
+)
+_QWEN38_REASONING_EFFORT_ALIASES = {
+    "minimal": "low",
+    "high": "xhigh",
+    "max": "xhigh",
+}
+
+
+def _normalize_model_reasoning_effort(tokenizer: Any, effort):
+    """Map generic effort aliases only for Qwen3.8-style templates.
+
+    Qwen3.8 exposes ``low``, ``medium``, and ``xhigh`` in its chat template,
+    while the OpenAI-compatible protocol also accepts ``minimal``, ``high``,
+    and ``max``. Detect the model capability from the template contract rather
+    than its path or marketing name so other Qwen checkpoints are unchanged.
+    """
+    if not isinstance(effort, str) or effort not in _QWEN38_REASONING_EFFORT_ALIASES:
+        return effort
+    template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, dict):
+        template = "\n".join(str(value) for value in template.values())
+    if _QWEN38_REASONING_EFFORT_MARKER not in str(template or ""):
+        return effort
+    return _QWEN38_REASONING_EFFORT_ALIASES[effort]
 
 
 def normalize_tool_content(role: str, content):
@@ -882,6 +908,22 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+
+        template_effort = (
+            request.chat_template_kwargs.get("reasoning_effort")
+            if request.chat_template_kwargs
+            and "reasoning_effort" in request.chat_template_kwargs
+            else request.reasoning_effort
+        )
+        normalized_effort = _normalize_model_reasoning_effort(
+            self.tokenizer_manager.tokenizer, template_effort
+        )
+        if (
+            request.chat_template_kwargs
+            and "reasoning_effort" in request.chat_template_kwargs
+        ):
+            request.chat_template_kwargs["reasoning_effort"] = normalized_effort
+        request.reasoning_effort = normalized_effort
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:

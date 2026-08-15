@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
+    _normalize_model_reasoning_effort,
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -405,6 +406,50 @@ class ServingChatTestCase(unittest.TestCase):
         self.chat._process_messages(req, is_multimodal=False)
 
         self.assertEqual(req.reasoning_effort, "high")
+
+    def test_qwen38_effort_aliases_are_template_scoped(self):
+        self.tm.tokenizer.chat_template = (
+            "Supported types are xhigh (default), medium, and low."
+        )
+        for effort, expected in {
+            "minimal": "low",
+            "high": "xhigh",
+            "max": "xhigh",
+            "low": "low",
+            "medium": "medium",
+            "xhigh": "xhigh",
+        }.items():
+            with self.subTest(effort=effort):
+                self.assertEqual(
+                    _normalize_model_reasoning_effort(self.tm.tokenizer, effort),
+                    expected,
+                )
+
+        self.tm.tokenizer.chat_template = "generic template"
+        self.assertEqual(
+            _normalize_model_reasoning_effort(self.tm.tokenizer, "high"), "high"
+        )
+
+    def test_qwen38_effort_alias_is_forwarded_to_template(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.chat_template = (
+            "Supported types are xhigh (default), medium, and low."
+        )
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            reasoning_effort="high",
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.reasoning_effort, "xhigh")
+        self.assertEqual(
+            self.tm.tokenizer.apply_chat_template.call_args.kwargs["reasoning_effort"],
+            "xhigh",
+        )
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None
