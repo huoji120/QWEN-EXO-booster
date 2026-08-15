@@ -175,24 +175,3 @@ docs/qwen_exo/                 架构、API、部署和验证文档
 test/registered/qwen_exo/      注册回归测试
 
 ```
-
-运行目录中的 Markdown/JSON 源不按模型复制。模型切换只切换权重路径和 `model-profiles/<模型指纹>/state-*`；目标模型从统一预编译源重新生成自己的 Tensor Bank 和 Native Bank，因而不同模型可使用不同分词、K/V 与 GDN 状态而不会产生内容分叉。生成的 Bank 只属于本地模型、量化与拓扑，不是可移植发布物。
-
-
-模型目录中的 `checkpoint_quantization`、`runtime_quantization` 与运行时 `kv_cache_dtype` 必须分开读取：27B GPTQ 是 W4A16，FP8 只用于 Full-Attention KV cache；GDN/Mamba recurrent/conv state 仍由运行时单独管理，不能把 `--quantization fp8` 当作 GPTQ 叠加压缩。
-
-
-## 重要安全边界
-
-## 深入阅读
-
-1. [架构与状态契约](docs/qwen_exo/ARCHITECTURE.md)
-2. [双 RTX 4090 部署指南](docs/qwen_exo/SERVER_27B_DEPLOYMENT.md)
-3. [Apple Silicon MLX 部署指南](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)
-4. [API、遥测、安全与控制台](docs/qwen_exo/API.md)
-5. [实现进度与验证证据](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
-6. [Demo 到生产运行时迁移矩阵](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
-
-## 当前定位
-
-QWEN-EXO-booster 是一个围绕 SGLang 的模型运行时二开项目。它重点解决的是 **Qwen Hybrid 模型的原生状态管理、长上下文记忆召回、内部任务调度、Agent 连续性和可验证运维**。任何“模型能力提升”或“准确率提升”结论，都必须由固定模型、固定上下文、固定并发和固定输出长度的对照评测证明，不能只根据单次演示推断。

@@ -188,22 +188,3 @@ frontend/qwen-exo/             React/Vite web console
 docs/qwen_exo/                 Architecture, API, deployment, and verification documents
 test/registered/qwen_exo/      Registered regression tests
 ```
-
-Runtime Markdown and JSON sources are not duplicated per model. A model switch changes only the checkpoint path and `model-profiles/<model-fingerprint>/state-*`. The selected model recompiles its Tensor Bank and Native Bank from the unified precompile sources, so models can use different tokenization, K/V, and GDN states without content forks. Generated Banks are local to that model, quantization, and topology and are not portable release assets.
-
-The model catalog fields `checkpoint_quantization` and `runtime_quantization` must be interpreted separately from the runtime `kv_cache_dtype`. Dense 27B GPTQ is W4A16, while FP8 applies only to the Full-Attention KV cache. GDN/Mamba recurrent and convolution states are managed separately by the runtime; `--quantization fp8` is not an additional compression layer for a GPTQ checkpoint.
-
-## Important safety boundaries
-
-## Further reading
-
-1. [Architecture and state contracts](docs/qwen_exo/ARCHITECTURE.md)
-2. [Dual RTX 4090 deployment](docs/qwen_exo/SERVER_27B_DEPLOYMENT.md)
-3. [Apple Silicon MLX deployment](docs/qwen_exo/APPLE_SILICON_MLX_DEPLOYMENT.md)
-4. [API, telemetry, security, and console](docs/qwen_exo/API.md)
-5. [Implementation progress and verification evidence](docs/qwen_exo/IMPLEMENTATION_PROGRESS.md)
-6. [Demo-to-runtime migration matrix](docs/qwen_exo/DEMO_MIGRATION_MATRIX.md)
-
-## Project scope
-
-QWEN-EXO-booster is an SGLang-based model-runtime development project focused on **model-native state management for Qwen Hybrid models, long-context memory recall, internal task scheduling, agent continuity, and verifiable operations**. Any claim of improved model capability or accuracy must be supported by controlled evaluation with a fixed model, context, concurrency, and output length; a single demonstration is not sufficient evidence.
