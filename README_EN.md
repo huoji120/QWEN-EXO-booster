@@ -136,8 +136,6 @@ curl 'http://127.0.0.1:30000/qwen-exo/recall-trace?limit=10'
 curl 'http://127.0.0.1:30000/qwen-exo/telemetry?limit=100'
 ```
 
-Telemetry is redacted by default: prompts, outputs, reasoning, tool arguments, references, and secrets are not written verbatim. See [API, telemetry, security, and console](docs/qwen_exo/API.md) for the detailed contract.
-
 ## Local verification
 
 Run Python regression tests without loading the production model:

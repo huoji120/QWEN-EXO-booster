@@ -122,8 +122,6 @@ curl 'http://127.0.0.1:30000/qwen-exo/recall-trace?limit=10'
 curl 'http://127.0.0.1:30000/qwen-exo/telemetry?limit=100'
 ```
 
-默认遥测会脱敏：prompt、输出、reasoning、工具参数、参考文档和密钥不会直接写入遥测。需要详细 API 字段时，阅读 [API 与控制台说明](docs/qwen_exo/API.md)。
-
 ## 本地验证
 
 不加载线上模型时，可以运行 Python 回归：
