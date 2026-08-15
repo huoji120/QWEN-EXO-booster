@@ -199,6 +199,7 @@ work_dirs/
 
 !logo.png
 !docs_new/images/*.png
+!images/*.png
 
 # Prerequisites
 *.d
