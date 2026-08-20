@@ -603,7 +603,7 @@ async def test_reflection_template_tokens_are_not_searchable_but_native_state_is
 
 
 @pytest.mark.asyncio
-async def test_tensor_bank_interleaves_source_families_without_group_score_inheritance(
+async def test_tensor_bank_bounds_source_families_without_hiding_reflections(
     tmp_path,
 ):
     root = tmp_path / "diverse-ranking"
@@ -612,14 +612,13 @@ async def test_tensor_bank_interleaves_source_families_without_group_score_inher
         "---\nsource_kind: trajectory_reflection\n"
         "document_group: reflection_memory\n---\n"
     )
-    (root / "reflection-a.md").write_text(
-        reflection_header + "WFP reflection A " * 8, encoding="utf-8"
-    )
-    (root / "reflection-b.md").write_text(
-        reflection_header + "WFP reflection B " * 8, encoding="utf-8"
-    )
+    for suffix in ("a", "b", "c", "d"):
+        (root / f"reflection-{suffix}.md").write_text(
+            reflection_header + f"WFP reflection {suffix.upper()} " * 8,
+            encoding="utf-8",
+        )
     (root / "curated.md").write_text(
-        "---\nsource_kind: curated_reference\n---\n" + "WFP curated C " * 8,
+        "---\nsource_kind: curated_reference\n---\n" + "WFP curated E " * 8,
         encoding="utf-8",
     )
     repository = KnowledgeRepository(root)
@@ -638,6 +637,8 @@ async def test_tensor_bank_interleaves_source_families_without_group_score_inher
     score_by_path = {
         "reflection-a.md": 1.0,
         "reflection-b.md": 0.95,
+        "reflection-c.md": 0.93,
+        "reflection-d.md": 0.91,
         "curated.md": 0.90,
     }
     raw_key_heads = []
@@ -654,7 +655,7 @@ async def test_tensor_bank_interleaves_source_families_without_group_score_inher
         (((1.0, 0.0),),),
         query_states=_query_states(1),
         query_identity="diverse-ranking",
-        limit=3,
+        limit=5,
         min_document_margin=0.0,
         audit=audit,
     )
@@ -663,14 +664,18 @@ async def test_tensor_bank_interleaves_source_families_without_group_score_inher
         "reflection-a.md",
         "curated.md",
         "reflection-b.md",
+        "reflection-c.md",
+        "reflection-d.md",
     ]
     rows = {row["relative_path"]: row for row in audit["scored_documents"]}
-    assert (
-        rows["reflection-a.md"]["semantic_group"]
-        != rows["reflection-b.md"]["semantic_group"]
-    )
-    assert rows["reflection-b.md"]["pre_diversity_rank"] == 2
-    assert rows["reflection-b.md"]["post_diversity_rank"] == 3
+    reflection_groups = {
+        rows[f"reflection-{suffix}.md"]["semantic_group"]
+        for suffix in ("a", "b", "c", "d")
+    }
+    assert len(reflection_groups) == 4
+    assert rows["curated.md"]["post_diversity_rank"] == 2
+    assert rows["reflection-d.md"]["pre_diversity_rank"] == 4
+    assert rows["reflection-d.md"]["post_diversity_rank"] == 5
     assert audit["relative_score_active"] is False
 
 
@@ -1103,7 +1108,7 @@ async def test_tensor_bank_keeps_policy_and_knowledge_pages_in_separate_lanes(tm
 
 
 @pytest.mark.asyncio
-async def test_tensor_bank_document_group_allows_close_shards_to_rank(tmp_path):
+async def test_tensor_bank_document_group_collapses_shards_before_top_n(tmp_path):
     root = tmp_path / "knowledge"
     root.mkdir()
     frontmatter = (
@@ -1150,9 +1155,15 @@ async def test_tensor_bank_document_group_allows_close_shards_to_rank(tmp_path):
         "trajectory-a.md": "shared-trajectory",
         "trajectory-b.md": "shared-trajectory",
     }
-    assert {candidate.relative_path for candidate in candidates[:2]} == {
-        "trajectory-a.md",
-        "trajectory-b.md",
+    trajectory_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.relative_path.startswith("trajectory-")
+    ]
+    assert len(trajectory_candidates) == 1
+    assert {candidate.relative_path for candidate in candidates} == {
+        trajectory_candidates[0].relative_path,
+        "unrelated.md",
     }
 
 
@@ -1210,14 +1221,19 @@ async def test_tensor_bank_margin_uses_individual_document_scores_at_boundary(
         audit=audit,
     )
 
-    assert bool(candidates) is accepted
+    expected_acceptance = True if same_group else accepted
+    assert bool(candidates) is expected_acceptance
     assert audit["reason"] == (
-        "candidates_ready" if accepted else "document_margin_too_small"
+        "candidates_ready" if expected_acceptance else "document_margin_too_small"
     )
-    assert audit["top_score"] == pytest.approx(0.5 + document_margin, abs=1e-6)
-    assert audit["runner_up_score"] == pytest.approx(0.5, abs=1e-6)
-    if accepted:
-        assert candidates[0].relative_path == "top.md"
+    if same_group:
+        assert audit["top_score"] == pytest.approx(0.5 + document_margin / 2, abs=1e-6)
+        assert audit["runner_up_score"] == pytest.approx(0.1, abs=1e-6)
+    else:
+        assert audit["top_score"] == pytest.approx(0.5 + document_margin, abs=1e-6)
+        assert audit["runner_up_score"] == pytest.approx(0.5, abs=1e-6)
+    if expected_acceptance:
+        assert candidates
 
 
 @pytest.mark.asyncio
@@ -1267,9 +1283,8 @@ async def test_tensor_bank_group_score_rejects_single_page_outlier(tmp_path):
     )
 
     assert [candidate.relative_path for candidate in candidates] == [
-        "shared-a.md",
         "unrelated.md",
-        "shared-b.md",
+        "shared-a.md",
     ]
 
 

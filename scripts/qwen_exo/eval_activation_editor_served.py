@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from transformers import AutoTokenizer
+from qwen_exo_booster.activation_training import pack_trajectory_context
 
 
 def post(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -43,19 +44,9 @@ def build_eval_samples(
         content = message["content"]
         if not isinstance(content, str) or len(content.strip()) < 20:
             continue
-        context_ids = tokenizer.apply_chat_template(
-            messages[:index],
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=False,
+        context_ids = pack_trajectory_context(
+            messages[:index], tokenizer, max_context_tokens
         )
-        if hasattr(context_ids, "get"):
-            context_ids = context_ids.get("input_ids")
-        if hasattr(context_ids, "tolist"):
-            context_ids = context_ids.tolist()
-        if context_ids and isinstance(context_ids[0], list):
-            context_ids = context_ids[0]
-        context_ids = [int(v) for v in context_ids][-max_context_tokens:]
         target_ids = tokenizer.encode(content, add_special_tokens=False)[
             :max_target_tokens
         ]

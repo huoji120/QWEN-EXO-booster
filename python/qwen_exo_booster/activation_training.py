@@ -28,10 +28,73 @@ _DEFAULT_RANK = 8
 _DEFAULT_WINDOW = 16
 _DEFAULT_EPOCHS = 0.25
 _DEFAULT_LEARNING_RATE = 5e-4
-_DEFAULT_MAX_CONTEXT_TOKENS = 512
+_DEFAULT_MAX_CONTEXT_TOKENS = 1024
 _DEFAULT_MAX_TARGET_TOKENS = 2048
-_DEFAULT_MAX_SEQUENCE_TOKENS = 2560
+_DEFAULT_MAX_SEQUENCE_TOKENS = 3072
 _JOB_LOCK = threading.Lock()
+
+
+def _chat_template_ids(tokenizer: Any, messages: Sequence[dict[str, Any]]) -> list[int]:
+    encoded = tokenizer.apply_chat_template(
+        list(messages),
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        preserve_thinking=True,
+    )
+    if hasattr(encoded, "get"):
+        encoded = encoded.get("input_ids")
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    if encoded and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    return [int(value) for value in (encoded or ())]
+
+
+def pack_trajectory_context(
+    messages: Sequence[dict[str, Any]], tokenizer: Any, max_tokens: int
+) -> list[int]:
+    """Keep conversation anchors and recent messages without arbitrary cuts."""
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be positive")
+    if not messages:
+        return []
+
+    def render(indices: set[int]) -> list[int]:
+        return _chat_template_ids(
+            tokenizer, [messages[index] for index in sorted(indices)]
+        )
+
+    pinned: set[int] = set()
+    for index, message in enumerate(messages):
+        if str(message.get("role") or "") == "system":
+            pinned.add(index)
+            continue
+        if str(message.get("role") or "") == "user":
+            pinned.add(index)
+        break
+
+    selected = set(pinned)
+    packed = render(selected) if selected else []
+    if len(packed) > max_tokens:
+        # A single oversized anchor cannot be represented whole; retain the
+        # deterministic tail only as a last-resort compatibility fallback.
+        return packed[-max_tokens:]
+
+    for index in range(len(messages) - 1, -1, -1):
+        if index in selected:
+            continue
+        candidate = selected | {index}
+        candidate_ids = render(candidate)
+        if len(candidate_ids) > max_tokens:
+            if not selected:
+                return candidate_ids[-max_tokens:]
+            break
+        selected = candidate
+        packed = candidate_ids
+    return packed
+
+
 COMBINED_EDITOR_NAME = "combined-trajectories"
 
 

@@ -56,7 +56,9 @@ _REFERENCE_SELECTOR_SYSTEM = (
     "or when there is no defensible best candidate. Return only exactly one JSON object "
     "with the single field winner."
 )
-_REFERENCE_SELECTION_ALIASES = ("A", "B", "C", "D")
+# The pipeline sends the full eight-item Q/K shortlist so the judge can reject
+# unrelated high-scoring families instead of never seeing the relevant memory.
+_REFERENCE_SELECTION_ALIASES = ("A", "B", "C", "D", "E", "F", "G", "H")
 
 
 def parse_reference_support(value: str) -> bool | None:
@@ -149,7 +151,7 @@ class ReferenceJudge:
         max_reference_tokens: int = 4096,
         cache_size: int = 1024,
         max_selection_tokens: int = 6144,
-        max_selection_candidates: int = 4,
+        max_selection_candidates: int = 8,
     ):
         if (
             token_budget < 1
@@ -527,9 +529,7 @@ class ReferenceJudge:
         )
 
     def _bounded_question(self, question: str) -> _BoundedQuestion:
-        token_ids = tuple(
-            self.tokenizer.encode(question, add_special_tokens=False)
-        )
+        token_ids = tuple(self.tokenizer.encode(question, add_special_tokens=False))
         original_tokens = len(token_ids)
         if original_tokens <= self.max_question_tokens:
             return _BoundedQuestion(

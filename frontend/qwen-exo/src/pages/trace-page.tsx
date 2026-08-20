@@ -160,6 +160,7 @@ type TraceEvidence = {
   qkRecall: QkRecallAudit;
   selfAsk: RequestTrace["self_ask"];
   causalReplay: CausalReplayEvidence[];
+  reasoningText: string;
   maybe: MaybeEvidence[];
   events: TelemetryEvent[];
 };
@@ -423,6 +424,7 @@ function dateTime(value?: string | number | null) {
 function hasActualKnowledge(trace: RequestTrace) {
   return (
     Number(trace.attached_tokens || 0) > 0 ||
+    (trace.selected_document_ids || []).length > 0 ||
     trace.native_restore?.lane === "knowledge"
   );
 }
@@ -692,9 +694,28 @@ function buildEvidence(
     (left, right) => Number(left.event_id || 0) - Number(right.event_id || 0),
   );
   const reversed = [...ordered].reverse();
-  const memory = eventPayload(
-    reversed.find((event) => eventType(event) === "memory.prepared"),
+  const memoryPrepared = ordered.filter(
+    (event) => eventType(event) === "memory.prepared",
   );
+  const memoryEvent = memoryPrepared
+    .map((event, index) => {
+      const payload = eventPayload(event);
+      const restore = asObject(payload.native_prefix_restore);
+      const selected = strings(payload.selected_document_ids);
+      const candidates = asObjects(payload.proposed_candidates);
+      return {
+        event,
+        index,
+        score:
+          selected.length * 100 +
+          (restore.active ? 50 : 0) +
+          Number(payload.attached_tokens || 0) +
+          candidates.length,
+      };
+    })
+    .sort((left, right) => left.score - right.score || left.index - right.index)
+    .at(-1)?.event;
+  const memory = eventPayload(memoryEvent);
   const probeStarted = eventPayload(
     ordered.find((event) => eventType(event) === "query_probe.started"),
   );
@@ -705,13 +726,22 @@ function buildEvidence(
   const policyData = asObject(memory.policy_data);
   const nativeRestore = asObject(memory.native_prefix_restore);
   const qkRetrieval = asObject(memory.qk_retrieval);
+  const proposalEvents = ordered.filter(
+    (event) => eventType(event) === "tensor.candidates_proposed",
+  );
   const candidateProposal = eventPayload(
-    reversed.find((event) => eventType(event) === "tensor.candidates_proposed"),
+    proposalEvents
+      .map((event, index) => ({ event, index, count: asObjects(eventPayload(event).candidates).length }))
+      .sort((left, right) => left.count - right.count || left.index - right.index)
+      .at(-1)?.event,
   );
   const requestJudgeEvent = reversed.find(
     (event) =>
       eventType(event) === "semantic_judge.completed" &&
       String(eventPayload(event).purpose || "") === "request_start_admission",
+  );
+  const completionEvent = eventPayload(
+    reversed.find((event) => eventType(event) === "request.completed"),
   );
   const requestJudge = eventPayload(requestJudgeEvent);
   const memoryRankAudit = asObject(qkRetrieval.audit);
@@ -865,22 +895,23 @@ function buildEvidence(
         eventId: numberOrNull(event.event_id),
         timestamp: event.timestamp ?? null,
         status: String(payload.status || "not_recorded"),
-        decision: String(
-          payload.maybe_decision ||
-            payload.maybe_gate_decision ||
-            "not_recorded",
-        ),
+        decision: String(payload.maybe_decision || payload.maybe_gate_decision || "not_recorded"),
         scheduledNextTurn:
           booleanOrNull(payload.maybe_scheduled_next_turn) ??
           booleanOrNull(payload.scheduled_next_turn),
       };
     });
   return {
+    reasoningText: String(
+      completionEvent.reasoning || completionEvent.think || "",
+    ),
     requestStatus: requestStatus(ordered),
     promptTokens:
-      numberOrNull(probeStarted.prompt_tokens) ??
-      numberOrNull(memoryProbe.prompt_tokens),
-    queryTokens: numberOrNull(probeStarted.query_tokens),
+      numberOrNull(memoryProbe.prompt_tokens) ??
+      numberOrNull(trace.prompt_tokens) ??
+      numberOrNull(probeStarted.prompt_tokens),
+    queryTokens:
+      numberOrNull(memoryProbe.query_tokens) ?? numberOrNull(trace.query_tokens),
     cognitionProbeTokens: numberOrNull(probeStarted.cognition_tokens),
     probeLatencySeconds: numberOrNull(probeCompleted.latency_seconds),
     attachedTokens: Number(
@@ -898,8 +929,12 @@ function buildEvidence(
     },
     selectedKnowledgeIds,
     selectedPolicyIds,
-    retrievalSeconds: numberOrNull(memory.retrieval_latency_seconds),
-    judgeSeconds: numberOrNull(memory.judge_latency_seconds),
+    retrievalSeconds:
+      numberOrNull(memory.retrieval_latency_seconds) ??
+      numberOrNull(trace.retrieval_seconds),
+    judgeSeconds:
+      numberOrNull(memory.judge_latency_seconds) ??
+      numberOrNull(trace.judge_seconds),
     judgeQuestionTruncated: Boolean(requestJudge.question_truncated),
     judgeQuestionOriginalTokens: numberOrNull(
       requestJudge.question_original_tokens,
@@ -1832,6 +1867,17 @@ function EvidencePanel({
           </summary>
           <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted/50 p-3 text-xs leading-5">
             {trace.output_text}
+          </pre>
+        </details>
+      ) : null}
+
+      {evidence.reasoningText ? (
+        <details className="border-b px-5 py-3">
+          <summary className="cursor-pointer text-xs font-semibold text-muted-foreground hover:text-foreground">
+            {t("查看 THINK / 推理通道")}
+          </summary>
+          <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted/50 p-3 text-xs leading-5">
+            {evidence.reasoningText}
           </pre>
         </details>
       ) : null}

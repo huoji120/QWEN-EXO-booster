@@ -67,6 +67,7 @@ _QUERY_SCORE_TOP_R = 4
 _DOCUMENT_PAGE_TOP_R = 2
 _ROBUST_SCALE_FACTOR = 1.4826
 _ROBUST_SCALE_EPSILON = 1e-6
+_MAX_PER_RETRIEVAL_DIVERSITY_BUCKET = 3
 _REFLECTION_TEMPLATE_MARKERS = (
     "**结果：** 成功",
     "**结果：** 失败",
@@ -523,7 +524,9 @@ class TensorBank:
                 qualifier_text = (
                     _COGNITION_INDEX_PREFIX
                     if lane == "cognition"
-                    else _POLICY_INDEX_PREFIX if lane == "policydata" else _INDEX_PREFIX
+                    else _POLICY_INDEX_PREFIX
+                    if lane == "policydata"
+                    else _INDEX_PREFIX
                 )
                 qualifier_ids = tuple(
                     int(token)
@@ -564,7 +567,9 @@ class TensorBank:
                     cognition_token_count = (
                         len(raw_document_ids)
                         if lane == "cognition"
-                        else 0 if lane == "policydata" else len(cognition_ids)
+                        else 0
+                        if lane == "policydata"
+                        else len(cognition_ids)
                     )
                     required_prefix_token_count = (
                         len(document_ids)
@@ -1004,10 +1009,17 @@ class TensorBank:
         self,
         ranked: list[tuple[tuple[str, str], list[tuple[float, TensorBankPage]]]],
     ) -> list[tuple[tuple[str, str], list[tuple[float, TensorBankPage]]]]:
-        buckets: OrderedDict[
+        """Interleave source families before admitting additional siblings.
+
+        Raw Q/K scores still order documents within each family. The first pass
+        emits one document per family, followed by second and third passes. Any
+        remaining siblings retain their raw order after the bounded diverse set.
+        """
+        buckets: dict[
             tuple[str, str],
             list[tuple[tuple[str, str], list[tuple[float, TensorBankPage]]]],
-        ] = OrderedDict()
+        ] = {}
+        bucket_order: list[tuple[str, str]] = []
         for item in ranked:
             lane, document_id = item[0]
             repository = self.repositories.get(lane)
@@ -1017,13 +1029,20 @@ class TensorBank:
                     bucket = retrieval_diversity_bucket(repository.get(document_id))
                 except KeyError:
                     pass
-            buckets.setdefault((lane, bucket), []).append(item)
-        diversified = []
-        while any(buckets.values()):
-            for entries in buckets.values():
-                if entries:
-                    diversified.append(entries.pop(0))
-        return diversified
+            key = (lane, bucket)
+            if key not in buckets:
+                buckets[key] = []
+                bucket_order.append(key)
+            buckets[key].append(item)
+
+        selected = []
+        for sibling_rank in range(_MAX_PER_RETRIEVAL_DIVERSITY_BUCKET):
+            for key in bucket_order:
+                family = buckets[key]
+                if sibling_rank < len(family):
+                    selected.append(family[sibling_rank])
+        selected_ids = {item[0] for item in selected}
+        return [*selected, *(item for item in ranked if item[0] not in selected_ids)]
 
     def _rank_key_heads(
         self, page: TensorBankPage, raw_key_heads: torch.Tensor
@@ -1200,14 +1219,65 @@ class TensorBank:
             key: self._top_mean(scores, _DOCUMENT_PAGE_TOP_R)
             for key, scores in relative_pages.items()
         }
-        ranked_by_score = sorted(
-            per_document.items(),
-            key=lambda item: (
-                -document_scores[item[0]],
-                item[0][0],
-                item[0][1],
+        semantic_group_by_document: dict[tuple[str, str], tuple[str, str]] = {}
+        grouped_documents: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for lane, document_id in per_document:
+            semantic_group = document_id
+            repository = self.repositories.get(lane)
+            if repository is not None:
+                try:
+                    semantic_group = semantic_document_group(
+                        repository.get(document_id)
+                    )
+                except KeyError:
+                    pass
+            group_key = (lane, semantic_group)
+            semantic_group_by_document[(lane, document_id)] = group_key
+            grouped_documents.setdefault(group_key, []).append((lane, document_id))
+
+        group_scores = {
+            group_key: self._top_mean(
+                [document_scores[key] for key in members], _DOCUMENT_PAGE_TOP_R
+            )
+            for group_key, members in grouped_documents.items()
+        }
+        relative_group_scores = {
+            group_key: self._top_mean(
+                [relative_document_scores[key] for key in members],
+                _DOCUMENT_PAGE_TOP_R,
+            )
+            for group_key, members in grouped_documents.items()
+        }
+        representative_by_group = {
+            group_key: min(
+                members,
+                key=lambda key: (-document_scores[key], key[0], key[1]),
+            )
+            for group_key, members in grouped_documents.items()
+        }
+        ranked_groups = sorted(
+            grouped_documents,
+            key=lambda group_key: (
+                -group_scores[group_key],
+                group_key[0],
+                group_key[1],
             ),
         )
+        ranked_by_score = [
+            (
+                representative_by_group[group_key],
+                per_document[representative_by_group[group_key]],
+            )
+            for group_key in ranked_groups
+        ]
+        effective_document_scores = {
+            representative_by_group[group_key]: group_scores[group_key]
+            for group_key in grouped_documents
+        }
+        effective_relative_scores = {
+            representative_by_group[group_key]: relative_group_scores[group_key]
+            for group_key in grouped_documents
+        }
         ranked_documents = self._diversify_ranked_documents(list(ranked_by_score))
         pre_diversity_rank = {
             key: index + 1 for index, (key, _pages) in enumerate(ranked_by_score)
@@ -1216,9 +1286,9 @@ class TensorBank:
             key: index + 1 for index, (key, _pages) in enumerate(ranked_documents)
         }
         relative_ranked_keys = sorted(
-            relative_document_scores,
+            effective_relative_scores,
             key=lambda key: (
-                -relative_document_scores[key],
+                -effective_relative_scores[key],
                 key[0],
                 key[1],
             ),
@@ -1234,7 +1304,9 @@ class TensorBank:
             )
             for key in relative_ranked_keys
         }
-        ranked_document_scores = sorted(document_scores.values(), reverse=True)
+        ranked_document_scores = sorted(
+            effective_document_scores.values(), reverse=True
+        )
         top_score = ranked_document_scores[0]
         runner_up_score = (
             ranked_document_scores[1] if len(ranked_document_scores) > 1 else None
@@ -1242,7 +1314,9 @@ class TensorBank:
         observed_margin = (
             top_score - runner_up_score if runner_up_score is not None else None
         )
-        ranked_relative_scores = sorted(relative_document_scores.values(), reverse=True)
+        ranked_relative_scores = sorted(
+            effective_relative_scores.values(), reverse=True
+        )
         relative_top_score = ranked_relative_scores[0]
         relative_runner_up_score = (
             ranked_relative_scores[1] if len(ranked_relative_scores) > 1 else None
@@ -1267,18 +1341,20 @@ class TensorBank:
                     relative_path = document.relative_path
                     semantic_group = semantic_document_group(document)
                     diversity_bucket = retrieval_diversity_bucket(document)
-            tensor_score = document_scores[(lane, document_id)]
+            key = (lane, document_id)
+            group_key = semantic_group_by_document[key]
+            tensor_score = effective_document_scores[key]
             scored_documents.append(
                 {
                     "lane": lane,
                     "document_id": document_id,
                     "relative_path": relative_path,
                     "tensor_score": tensor_score,
-                    "relative_tensor_score": relative_document_scores[
-                        (lane, document_id)
-                    ],
-                    "score_percentile": relative_percentiles[(lane, document_id)],
+                    "representative_raw_tensor_score": document_scores[key],
+                    "relative_tensor_score": effective_relative_scores[key],
+                    "score_percentile": relative_percentiles[key],
                     "semantic_group": semantic_group,
+                    "semantic_group_member_count": len(grouped_documents[group_key]),
                     "diversity_bucket": diversity_bucket,
                     "pre_diversity_rank": pre_diversity_rank[(lane, document_id)],
                     "post_diversity_rank": post_diversity_rank[(lane, document_id)],
@@ -1359,7 +1435,7 @@ class TensorBank:
         for (lane, document_id), page_scores in ranked_documents:
             if len(candidates) >= limit:
                 break
-            tensor_score = document_scores[(lane, document_id)]
+            tensor_score = effective_document_scores[(lane, document_id)]
             if tensor_score < float(min_tensor_score):
                 continue
             repository = self.repositories.get(lane)
@@ -1432,7 +1508,9 @@ class TensorBank:
                     score=tensor_score + candidate.quality_prior,
                     lexical_score=0.0,
                     tensor_score=tensor_score,
-                    relative_tensor_score=relative_document_scores[(lane, document_id)],
+                    relative_tensor_score=effective_relative_scores[
+                        (lane, document_id)
+                    ],
                     score_percentile=relative_percentiles[(lane, document_id)],
                     anchor_support_count=len(supported_anchor_rows),
                     anchor_role_count=len(supported_roles),

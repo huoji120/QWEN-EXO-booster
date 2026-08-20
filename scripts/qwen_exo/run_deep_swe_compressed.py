@@ -65,6 +65,11 @@ def _parser() -> argparse.ArgumentParser:
         default="/data/QWEN-EXO-booster/scripts/qwen_exo/agents",
     )
     parser.add_argument("--api-base", default="http://172.17.0.1:30001/v1")
+    parser.add_argument(
+        "--api-key",
+        default=os.getenv("QWEN_EXO_DEEPSWE_API_KEY", "qwen-exo-local"),
+        help="Bearer key for the OpenAI-compatible QWEN-EXO endpoint",
+    )
     parser.add_argument("--runtime-url", default="http://127.0.0.1:30000")
     parser.add_argument(
         "--agent-timeout-multiplier",
@@ -126,7 +131,7 @@ def build_command(args: argparse.Namespace) -> list[str]:
         "--ae",
         f"OPENAI_API_BASE={args.api_base}",
         "--ae",
-        "OPENAI_API_KEY=qwen-exo-local",
+        f"OPENAI_API_KEY={args.api_key}",
         "--ae",
         "PYTHONPATH=/tmp/qwen-exo-agent",
     ]

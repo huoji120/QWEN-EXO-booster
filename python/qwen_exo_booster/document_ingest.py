@@ -100,6 +100,7 @@ class PreparedKnowledgeDocument:
     original_filename: str
     relative_path: str
     document_group: str
+    retrieval_category: str
     content: str
     token_count: int
     byte_count: int
@@ -111,6 +112,7 @@ class PreparedKnowledgeDocument:
             "original_filename": self.original_filename,
             "relative_path": self.relative_path,
             "document_group": self.document_group,
+            "retrieval_category": self.retrieval_category,
             "token_count": self.token_count,
             "byte_count": self.byte_count,
             "sha256": self.sha256,
@@ -125,6 +127,7 @@ class KnowledgeUploadPreview:
     content: str
     tags: tuple[str, ...]
     source_kind: str
+    retrieval_category: str
     byte_count: int
     changes: tuple[str, ...]
 
@@ -135,6 +138,7 @@ class KnowledgeUploadPreview:
             "content": self.content,
             "tags": list(self.tags),
             "source_kind": self.source_kind,
+            "retrieval_category": self.retrieval_category,
             "byte_count": self.byte_count,
             "changes": list(self.changes),
         }
@@ -172,6 +176,7 @@ def preview_knowledge_upload(
     text, decoding_change = _decode_text(raw, safe_name)
     source_tags = tuple(str(tag) for tag in markdown_metadata(text).get("tags", ()))
     body, changes, source_kind = _clean_body(text, suffix, safe_name)
+    retrieval_category = source_kind
     if decoding_change is not None:
         changes.insert(0, decoding_change)
     slug = _slug(Path(safe_name).stem, raw)
@@ -180,6 +185,7 @@ def preview_knowledge_upload(
         "canonical: false\n"
         "quality: 0.65\n"
         f"source_kind: {source_kind}\n"
+        f"retrieval_category: {retrieval_category}\n"
         "---\n\n"
     )
     content = metadata + body.strip() + "\n"
@@ -189,12 +195,13 @@ def preview_knowledge_upload(
         content=content,
         tags=source_tags,
         source_kind=source_kind,
+        retrieval_category=retrieval_category,
         byte_count=len(content.encode("utf-8")),
         changes=tuple(changes),
     )
 
 
-def validate_upload_batch(files: list[dict[str, str]]) -> None:
+def validate_upload_batch(files: list[dict[str, object]]) -> None:
     if not files:
         raise KnowledgeIngestError("empty_upload", "至少选择一个文件")
     if len(files) > _MAX_FILES:
@@ -242,6 +249,7 @@ def prepare_knowledge_bytes(
     max_source_tokens: int,
     relative_path_prefix: str = "uploads",
     document_group_prefix: str = "upload",
+    retrieval_category: str | None = None,
 ) -> tuple[PreparedKnowledgeDocument, ...]:
     safe_name = Path(str(filename)).name.strip()
     validate_knowledge_source_bytes(safe_name, raw)
@@ -258,6 +266,7 @@ def prepare_knowledge_bytes(
         slug=slug,
         group=f"{document_group_prefix}_{slug}",
         source_kind=source_kind,
+        retrieval_category=(retrieval_category or source_kind),
         original_filename=safe_name,
         tokenizer=tokenizer,
         max_source_tokens=max_source_tokens,
@@ -272,6 +281,7 @@ def prepare_knowledge_upload(
     *,
     tokenizer: Any,
     max_source_tokens: int,
+    retrieval_category: str | None = None,
 ) -> tuple[PreparedKnowledgeDocument, ...]:
     safe_name = Path(str(filename)).name.strip()
     try:
@@ -285,6 +295,7 @@ def prepare_knowledge_upload(
         raw,
         tokenizer=tokenizer,
         max_source_tokens=max_source_tokens,
+        retrieval_category=retrieval_category,
     )
 
 
@@ -403,6 +414,7 @@ def _split_documents(
     slug: str,
     group: str,
     source_kind: str,
+    retrieval_category: str,
     original_filename: str,
     tokenizer: Any,
     max_source_tokens: int,
@@ -428,6 +440,7 @@ def _split_documents(
                 body=body,
                 group=group,
                 source_kind=source_kind,
+                retrieval_category=retrieval_category,
                 original_filename=original_filename,
                 tokenizer=tokenizer,
                 max_source_tokens=max_source_tokens,
@@ -488,6 +501,7 @@ def _split_documents(
             body=part,
             group=group,
             source_kind=source_kind,
+            retrieval_category=retrieval_category,
             original_filename=original_filename,
             tokenizer=tokenizer,
             max_source_tokens=max_source_tokens,
@@ -503,6 +517,7 @@ def _prepared_document(
     body: str,
     group: str,
     source_kind: str,
+    retrieval_category: str,
     original_filename: str,
     tokenizer: Any,
     max_source_tokens: int,
@@ -514,6 +529,7 @@ def _prepared_document(
         "quality: 0.65\n"
         f"source_kind: {source_kind}\n"
         f"document_group: {group}\n"
+        f"retrieval_category: {retrieval_category}\n"
         f"original_filename: {json.dumps(original_filename, ensure_ascii=False)}\n"
         "---\n\n"
     )
@@ -531,6 +547,7 @@ def _prepared_document(
         original_filename=original_filename,
         relative_path=relative_path,
         document_group=group,
+        retrieval_category=retrieval_category,
         content=content,
         token_count=token_count,
         byte_count=len(encoded),

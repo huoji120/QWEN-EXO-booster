@@ -6,12 +6,14 @@ from dataclasses import replace
 import pytest
 from qwen_exo_booster.internal_jobs import InternalJobResult
 
+from qwen_exo_booster.knowledge import KnowledgeRepository, retrieval_diversity_bucket
 from qwen_exo_booster.reflection_memory import (
     REFLECTION_MEMORY_TOOL_NAME,
     ReflectionMemory,
     ReflectionMemoryCandidate,
     ReflectionMemoryService,
     ReflectionMemoryStore,
+    _reflection_task_category,
 )
 from qwen_exo_booster.telemetry import TelemetryStore
 
@@ -23,7 +25,10 @@ class _CharacterTokenizer:
 
     def decode(self, values, skip_special_tokens=True):
         del skip_special_tokens
-        return "".join(values)
+        values = tuple(values)
+        if values == (999,):
+            return "</think>"
+        return "".join(str(value) for value in values)
 
     def apply_chat_template(self, messages, **kwargs):
         del kwargs
@@ -46,6 +51,30 @@ class _ReflectionRunner:
                 prompt_tokens=256,
                 completion_tokens=512,
                 finish_reason="stop",
+                latency_seconds=0.01,
+            ),
+        )
+
+
+class _SequencedReflectionRunner:
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.prompts: list[str] = []
+        self.jobs = []
+        self.sampling_params = []
+
+    async def run_batch(self, jobs, prompts, sampling_params, **_kwargs):
+        self.jobs.extend(jobs)
+        self.prompts.extend(str(prompt) for prompt in prompts)
+        self.sampling_params.append(dict(sampling_params))
+        text, completion_tokens, finish_reason = self.outputs.pop(0)
+        return (
+            InternalJobResult(
+                job=jobs[0],
+                text=text,
+                prompt_tokens=256,
+                completion_tokens=completion_tokens,
+                finish_reason=finish_reason,
                 latency_seconds=0.01,
             ),
         )
@@ -117,7 +146,6 @@ def _tool_call(name: str, fields: dict[str, str]) -> str:
         name,
         "".join(f"<{key}>{value}</{key}>" for key, value in fields.items()),
     )
-
 
 
 def _short_fields() -> dict[str, str]:
@@ -203,6 +231,21 @@ def test_reflection_memory_rejects_duplicate_required_field():
     with pytest.raises(ValueError, match="duplicated field: evidence"):
         ReflectionMemoryService.parse_tool_call(body)
 
+
+def test_reflection_task_category_is_stable_and_task_specific():
+    first = _reflection_task_category(
+        "Please solve this issue:  Implement AutoToc\nwith stable markers"
+    )
+    equivalent = _reflection_task_category(
+        "please solve this issue: implement autotoc with stable markers"
+    )
+    different = _reflection_task_category("Implement a broken doc-link checker")
+
+    assert first == equivalent
+    assert first.startswith("reflection-task-implement-autotoc-with-stable-markers-")
+    assert different != first
+
+
 def test_reflection_memory_uses_renamed_tool_and_knowledge_metadata():
     fields = _fields()
     parsed = ReflectionMemoryService.parse_tool_call(
@@ -217,6 +260,7 @@ def test_reflection_memory_uses_renamed_tool_and_knowledge_metadata():
         attempts=1,
         created_at=0.0,
         target_document_sha256=None,
+        retrieval_category="reflection-task-auto-toc-deadbeef",
         **parsed,
     )
 
@@ -224,6 +268,7 @@ def test_reflection_memory_uses_renamed_tool_and_knowledge_metadata():
 
     assert "source_kind: trajectory_reflection" in markdown
     assert "document_group: reflection_memory" in markdown
+    assert 'retrieval_category: "reflection-task-auto-toc-deadbeef"' in markdown
     assert '"reflection-memory"' in markdown
     assert "WFP_LAYER_ALE_AUTH_CONNECT_V4" in markdown
     with pytest.raises(ValueError, match="unexpected tool"):
@@ -407,6 +452,77 @@ def test_reflection_update_must_target_a_qk_candidate():
         )
 
 
+def test_reflection_generation_caps_reasoning_before_tool_phase(tmp_path):
+    runner = _SequencedReflectionRunner(
+        (
+            ("<think>逐项分析轨迹证据。", 32, {"type": "length"}),
+            (
+                _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()),
+                512,
+                {"type": "stop"},
+            ),
+        )
+    )
+    service = ReflectionMemoryService(
+        runner,
+        _CharacterTokenizer(),
+        TelemetryStore(tmp_path / "trace.jsonl"),
+        model_fingerprint="model",
+        mode="active",
+        max_attempts=1,
+        max_output_tokens=1024,
+        max_reasoning_tokens=32,
+        reasoning_end_token_id=999,
+    )
+
+    result = asyncio.run(
+        service._run(
+            parent_id="reflection-parent",
+            source_digest="source-digest",
+            prompt="反思提示：",
+            attempt=1,
+        )
+    )
+
+    assert len(runner.jobs) == 2
+    assert runner.jobs[0].token_budget == 32
+    assert runner.jobs[1].token_budget == 992
+    assert runner.sampling_params[0]["stop_token_ids"] == [999]
+    assert "</think>" in runner.prompts[1]
+    assert result.completion_tokens == 544
+    assert ReflectionMemoryService.parse_tool_call(result.text) is not None
+
+
+def test_reflection_accepts_complete_tool_call_at_length_boundary():
+    result = InternalJobResult(
+        job=None,
+        text=_tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()),
+        prompt_tokens=256,
+        completion_tokens=4096,
+        finish_reason={"type": "length"},
+        latency_seconds=0.01,
+    )
+
+    parsed = ReflectionMemoryService._parse_completed_tool_result(result, "reflection")
+
+    assert parsed is not None
+    assert parsed["title"] == _fields()["title"]
+
+
+def test_reflection_rejects_incomplete_tool_call_at_length_boundary():
+    result = InternalJobResult(
+        job=None,
+        text="<think>尚未完成",
+        prompt_tokens=256,
+        completion_tokens=4096,
+        finish_reason={"type": "length"},
+        latency_seconds=0.01,
+    )
+
+    with pytest.raises(ValueError, match="did not stop normally"):
+        ReflectionMemoryService._parse_completed_tool_result(result, "reflection")
+
+
 def test_reflection_generation_updates_retrieved_memory_instead_of_inserting(tmp_path):
     candidate = ReflectionMemoryCandidate(
         document_path="reflection-memory/network-probe.md",
@@ -473,6 +589,9 @@ def test_reflection_generation_updates_retrieved_memory_instead_of_inserting(tmp
     assert result.memory_action == "update"
     assert result.target_document_path == candidate.document_path
     assert result.target_document_sha256 == candidate.document_sha256
+    assert result.retrieval_category == _reflection_task_category(
+        "Diagnose repeated localhost failures"
+    )
     assert result.document_path == candidate.document_path
     assert retrieval_queries and "WinError 10106" in retrieval_queries[0]
     assert candidate.content in runner.prompts[0]
@@ -481,10 +600,34 @@ def test_reflection_generation_updates_retrieved_memory_instead_of_inserting(tmp
     assert not runner.jobs[0].is_cancelled_or_expired(now=1e300)
     assert len(published) == 1
     assert published[0].memory_action == "update"
+    assert published[0].retrieval_category == result.retrieval_category
     assert published[0].target_document_path == candidate.document_path
     assert published[0].target_document_sha256 == candidate.document_sha256
     assert published[0].document_path is None
     assert len(store.list()) == 1
+
+
+def test_reflection_markdown_uses_stable_task_category(tmp_path):
+    record = ReflectionMemory(
+        trajectory_id="resp-category",
+        conversation_key="conversation-category",
+        source_digest="source-category",
+        source_event_count=1,
+        source_token_count=64,
+        attempts=1,
+        created_at=0.0,
+        target_document_sha256=None,
+        retrieval_category=_reflection_task_category("Implement AutoToc"),
+        **_fields(),
+    )
+
+    markdown = record.markdown()
+
+    assert f"retrieval_category: {json.dumps(record.retrieval_category)}" in markdown
+    repository = KnowledgeRepository(tmp_path / "knowledge")
+    document = repository.upsert("reflection-memory/auto-toc.md", markdown)
+    assert retrieval_diversity_bucket(document) == record.retrieval_category
+    assert record.retrieval_category.startswith("reflection-task-implement-autotoc-")
 
 
 def test_reflection_organizer_merges_model_selected_qk_candidates(tmp_path):

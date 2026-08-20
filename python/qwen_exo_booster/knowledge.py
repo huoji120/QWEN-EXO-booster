@@ -55,6 +55,7 @@ def markdown_metadata(text: str) -> dict[str, object]:
     quality = min(max(quality, 0.0), 1.0)
     source_kind = str(raw.get("source_kind", "unclassified")).strip()
     document_group = str(raw.get("document_group", "")).strip() or None
+    retrieval_category = str(raw.get("retrieval_category", "")).strip() or None
     title = str(raw.get("title", "")).strip()
     if not title:
         body = text[match.end() :] if match else text
@@ -69,6 +70,7 @@ def markdown_metadata(text: str) -> dict[str, object]:
         "quality": quality,
         "source_kind": source_kind or "unclassified",
         "document_group": document_group,
+        "retrieval_category": retrieval_category,
         "title": title or None,
         "tags": tags,
     }
@@ -101,6 +103,27 @@ def set_markdown_tags(text: str, tags: object) -> str:
     if tag_line is None:
         return text
     return f"---\n{tag_line}\n---\n\n{text.lstrip()}"
+
+
+def set_markdown_retrieval_category(text: str, category: object) -> str:
+    normalized_category = str(category or "").strip()
+    if not normalized_category:
+        raise ValueError("Retrieval category cannot be empty")
+    match = _YAML_FRONT_MATTER.match(text)
+    category_line = (
+        f"retrieval_category: {json.dumps(normalized_category, ensure_ascii=False)}"
+    )
+    if match:
+        lines = [
+            line
+            for line in match.group(1).splitlines()
+            if line.split(":", 1)[0].strip().lower() != "retrieval_category"
+        ]
+        lines.append(category_line)
+        frontmatter = "\n".join(lines)
+        body = text[match.end() :]
+        return f"---\n{frontmatter}\n---\n\n{body.lstrip()}"
+    return f"---\n{category_line}\n---\n\n{text.lstrip()}"
 
 
 def normalize_markdown(text: str) -> str:
@@ -144,6 +167,7 @@ class KnowledgeDocument:
     quality: float
     source_kind: str
     document_group: str | None
+    retrieval_category: str | None
     title: str | None
     content: str
     normalized_content: str
@@ -160,8 +184,10 @@ class KnowledgeDocument:
             "quality": self.quality,
             "source_kind": self.source_kind,
             "document_group": self.document_group,
+            "retrieval_category": self.retrieval_category,
             "title": self.title,
             "tags": list(self.tags),
+            "retrieval_diversity_bucket": retrieval_diversity_bucket(self),
         }
         if include_content:
             payload["content"] = self.content
@@ -178,8 +204,11 @@ def semantic_document_group(document: KnowledgeDocument) -> str:
 
 
 def retrieval_diversity_bucket(document: KnowledgeDocument) -> str:
-    """Keep collection families from monopolizing the first retrieval wave."""
+    """Return a user-extensible retrieval category with a source fallback."""
 
+    category = str(document.retrieval_category or "").strip()
+    if category:
+        return category
     source_kind = str(document.source_kind or "unclassified").strip()
     return source_kind or "unclassified"
 
@@ -585,6 +614,11 @@ class KnowledgeRepository:
                 else None
             ),
             title=(str(metadata["title"]) if metadata["title"] is not None else None),
+            retrieval_category=(
+                str(metadata["retrieval_category"])
+                if metadata["retrieval_category"] is not None
+                else None
+            ),
             tags=tuple(str(tag) for tag in metadata["tags"]),
             content=text,
             normalized_content=normalize_markdown(text),

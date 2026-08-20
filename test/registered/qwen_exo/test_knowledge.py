@@ -4,11 +4,13 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from qwen_exo_booster.document_categories import DocumentCategoryStore
 from qwen_exo_booster.knowledge import (
     KnowledgeRepository,
     lexical_terms,
     markdown_metadata,
     normalize_markdown,
+    set_markdown_retrieval_category,
 )
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
@@ -38,6 +40,7 @@ WFP_ALE_AUTH_CONNECT   permits identifiers.
         "quality": 0.9,
         "source_kind": "local_verified",
         "document_group": None,
+        "retrieval_category": None,
         "tags": (),
         "title": "Title",
     }
@@ -48,15 +51,31 @@ WFP_ALE_AUTH_CONNECT   permits identifiers.
     assert "wfp_ale_auth_connect" in lexical_terms(source)
 
 
+def test_retrieval_category_update_preserves_existing_front_matter():
+    updated = set_markdown_retrieval_category(
+        "---\ntitle: WFP\nsource_kind: local_sdk_verified\n---\n\n# WFP\n",
+        "windows-networking",
+    )
+
+    assert markdown_metadata(updated)["retrieval_category"] == "windows-networking"
+    assert markdown_metadata(updated)["source_kind"] == "local_sdk_verified"
+    assert updated.count("retrieval_category:") == 1
+
+
 def test_repository_upsert_refresh_and_delete(tmp_path):
     repository = KnowledgeRepository(tmp_path)
-    first = repository.upsert("network/wfp.md", "# WFP\nAppID filter guidance")
+    first = repository.upsert(
+        "network/wfp.md",
+        "---\nretrieval_category: windows-networking\n---\n# WFP\nAppID filter guidance",
+    )
     digest = repository.snapshot.source_digest
 
     assert first.relative_path == "network/wfp.md"
     assert first.title == "WFP"
     assert first.public_dict()["title"] == "WFP"
-    assert repository.get(first.document_id).content.startswith("# WFP")
+    assert first.public_dict()["retrieval_category"] == "windows-networking"
+    assert first.public_dict()["retrieval_diversity_bucket"] == "windows-networking"
+    assert repository.get(first.document_id).normalized_content.startswith("# WFP")
     assert repository.refresh().source_digest == digest
 
     repository.delete("network/wfp.md")
@@ -327,6 +346,8 @@ def test_uploaded_text_is_cleaned_and_converted_to_managed_markdown():
     assert document.relative_path == "uploads/sdk-notes.md"
     assert document.document_group == "upload_sdk-notes"
     assert "# SDK notes" in document.content
+    assert document.retrieval_category == "uploaded_text"
+    assert "retrieval_category: uploaded_text" in document.content
     assert "\x00" not in document.content
     assert "line_endings_normalized" in document.changes
     assert "control_characters_removed" in document.changes
@@ -340,6 +361,11 @@ def test_oversized_upload_is_split_below_model_token_limit():
         _encoded("# Large reference\n\n" + "reliable evidence " * 80),
         tokenizer=_CharacterTokenizer(),
         max_source_tokens=192,
+        retrieval_category="api-guides",
+    )
+    assert {document.retrieval_category for document in documents} == {"api-guides"}
+    assert all(
+        "retrieval_category: api-guides" in document.content for document in documents
     )
 
     assert len(documents) > 1
@@ -843,11 +869,16 @@ async def test_runtime_reflection_update_replaces_existing_document_atomically(
 ):
     runtime = object.__new__(QwenExoRuntime)
     runtime.knowledge = KnowledgeRepository(tmp_path / "knowledge")
+    runtime.document_categories = DocumentCategoryStore(
+        tmp_path / "state" / "document-categories.sqlite3"
+    )
+    runtime.policy_data = SimpleNamespace(snapshot=SimpleNamespace(documents=()))
     previous = runtime.knowledge.upsert(
         "reflection-memory/network.md",
         """---
 source_kind: trajectory_reflection
 document_group: reflection_memory
+retrieval_category: network-debugging
 title: Old network probe
 tags: [reflection-memory]
 ---
@@ -878,6 +909,7 @@ Old process lesson.
         source_token_count=1024,
         attempts=1,
         created_at=1.0,
+        retrieval_category="reflection-task-new-run-deadbeef",
     )
 
     payload = await runtime._publish_reflection_memory(reflection)
@@ -886,6 +918,12 @@ Old process lesson.
     assert len(documents) == 1
     assert documents[0].relative_path == previous.relative_path
     assert "Observe before changing HTTP clients" in documents[0].content
+    assert documents[0].retrieval_category == "network-debugging"
+    categories = {
+        category["category_id"]: category
+        for category in runtime.document_categories.categories()
+    }
+    assert categories["network-debugging"]["parent_id"] == "reflection-memory"
     assert payload["memory_action"] == "update"
     assert payload["replaced_document_sha256"] == previous.sha256
 

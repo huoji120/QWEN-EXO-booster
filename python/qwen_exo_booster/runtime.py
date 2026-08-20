@@ -33,7 +33,9 @@ from qwen_exo_booster.compaction import (
 from qwen_exo_booster.causal_replay import CausalReplayService
 from qwen_exo_booster.config import PROJECT_NAME, QwenExoConfig, qk_recall_gates
 from qwen_exo_booster.cognition import CognitionRepository
+from qwen_exo_booster.document_categories import DocumentCategoryStore
 from qwen_exo_booster.contracts import stable_digest
+from qwen_exo_booster.knowledge import set_markdown_retrieval_category
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
     is_supported_knowledge_filename,
@@ -268,6 +270,9 @@ class QwenExoRuntime:
         self.tokenizer_manager = tokenizer_manager
         self.hybrid_policy = hybrid_policy
         self.knowledge = KnowledgeRepository(config.knowledge_directory)
+        self.document_categories = DocumentCategoryStore(
+            config.state_directory / "document-categories.sqlite3"
+        )
         if config.policy_data_directory is None:
             raise ValueError("QWEN-EXO PolicyData directory is required")
         self.policy_data = PolicyDataRepository(config.policy_data_directory)
@@ -598,6 +603,7 @@ class QwenExoRuntime:
                 self.knowledge.refresh()
                 self.policy_data.refresh()
                 self.cognition.refresh()
+                self._sync_document_categories()
                 self.model_identity = ModelIdentity.from_path(self.config.model_path)
                 self.model_identity.validate_qwen_exo_model()
                 tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
@@ -789,6 +795,8 @@ class QwenExoRuntime:
                         max_attempts=self.config.reflection_memory_max_attempts,
                         max_output_tokens=self.config.reflection_memory_max_output_tokens,
                         max_history_tokens=self.config.reflection_memory_max_history_tokens,
+                        max_reasoning_tokens=self.config.max_reasoning_tokens,
+                        reasoning_end_token_id=self._reasoning_end_token_id,
                         store=self.reflection_memory_store,
                         publish=self._publish_reflection_memory,
                         retrieve_similar=self._retrieve_reflection_memory_candidates,
@@ -5980,10 +5988,15 @@ class QwenExoRuntime:
                 )
                 previous = snapshot_by_path.get(relative_path)
                 previous_documents = {relative_path: previous}
+            markdown = reflection.markdown()
+            effective_category = reflection.retrieval_category
+            if previous is not None and previous.retrieval_category:
+                effective_category = previous.retrieval_category
+                markdown = set_markdown_retrieval_category(markdown, effective_category)
             try:
                 document = self.knowledge.upsert(
                     relative_path,
-                    reflection.markdown(),
+                    markdown,
                     tags=["reflection-memory", f"outcome-{reflection.outcome}"],
                 )
                 for merged_path in previous_documents:
@@ -6003,6 +6016,14 @@ class QwenExoRuntime:
                         max_prompt_tokens=self.config.max_internal_tokens,
                         cognition_token_ids=self.tensor_bank.cognition_token_ids(),
                     )
+                if effective_category:
+                    self.document_categories.ensure(
+                        effective_category,
+                        title=f"反思任务：{reflection.title}"[:128],
+                        parent_id="reflection-memory",
+                        origin="observed",
+                    )
+                self._sync_document_categories()
             except BaseException:
                 try:
                     for affected_path in previous_documents:
@@ -6127,7 +6148,13 @@ class QwenExoRuntime:
             "duration_seconds": None,
             "input_text": "",
             "output_text": "",
+            "reasoning_text": "",
             "output_tokens": None,
+            "prompt_tokens": None,
+            "query_tokens": None,
+            "retrieval_seconds": None,
+            "judge_seconds": None,
+            "selected_document_ids": [],
             "candidates": [],
             "native_restore": None,
             "cognition_active": False,
@@ -6138,6 +6165,7 @@ class QwenExoRuntime:
         }
         started_ts = None
         completed_ts = None
+        best_memory_score = -1
         for event in events:
             payload = event.payload or {}
             kind = event.event_type
@@ -6149,38 +6177,53 @@ class QwenExoRuntime:
             elif kind == "request.completed":
                 completed_ts = event.timestamp
                 card["output_text"] = self._trace_text(payload.get("output"))
+                card["reasoning_text"] = self._trace_text(
+                    payload.get("reasoning") or payload.get("think")
+                )
                 card["output_tokens"] = payload.get("output_tokens")
             elif kind == "memory.prepared":
+                selected = payload.get("selected_document_ids") or ()
+                restore = payload.get("native_prefix_restore") or {}
+                candidates = payload.get("proposed_candidates") or ()
+                evidence_score = (
+                    len(selected) * 100
+                    + (50 if restore.get("active") else 0)
+                    + int(payload.get("attached_tokens") or 0)
+                    + len(candidates)
+                )
+                if evidence_score < best_memory_score:
+                    continue
+                best_memory_score = evidence_score
                 card["attached_tokens"] = payload.get("attached_tokens") or 0
+                card["selected_document_ids"] = list(selected)
+                card["prompt_tokens"] = (
+                    payload.get("query_probe", {}).get("prompt_tokens")
+                    if isinstance(payload.get("query_probe"), dict)
+                    else None
+                )
+                card["retrieval_seconds"] = payload.get("retrieval_latency_seconds")
+                card["judge_seconds"] = payload.get("judge_latency_seconds")
                 cognition = payload.get("cognition") or {}
                 card["cognition_active"] = bool(cognition.get("active"))
-                restore = payload.get("native_prefix_restore") or {}
                 if restore.get("active"):
                     card["native_restore"] = {
                         "lane": restore.get("lane"),
                         "tokens": restore.get("tokens"),
                         "selection_reason": restore.get("selection_reason"),
                     }
-                candidates = []
-                for candidate in payload.get("proposed_candidates") or ():
-                    relative_path = str(candidate.get("relative_path") or "")
-                    candidates.append(
-                        {
-                            "relative_path": relative_path,
-                            "lane": candidate.get("lane"),
-                            "tensor_score": candidate.get("tensor_score"),
-                            "lexical_score": candidate.get("lexical_score"),
-                            "excerpt": self._candidate_excerpt(
-                                str(candidate.get("lane") or ""), relative_path
-                            ),
-                        }
-                    )
-                card["candidates"] = candidates
-            elif kind == "latent_transplant.applied":
-                card["latent_transplant"] = {
-                    "artifact": payload.get("artifact"),
-                    "strength": payload.get("strength"),
-                }
+                card["candidates"] = [
+                    {
+                        "relative_path": str(candidate.get("relative_path") or ""),
+                        "lane": candidate.get("lane"),
+                        "tensor_score": candidate.get("tensor_score"),
+                        "lexical_score": candidate.get("lexical_score"),
+                        "excerpt": self._candidate_excerpt(
+                            str(candidate.get("lane") or ""),
+                            str(candidate.get("relative_path") or ""),
+                        ),
+                    }
+                    for candidate in candidates
+                ]
             elif kind.startswith("self_ask") or kind.startswith("refresh"):
                 entry = {
                     "event_type": kind,
@@ -6270,12 +6313,26 @@ class QwenExoRuntime:
             )
             if record.get("document_path") and record.get("created_at") is not None
         }
+        self._sync_document_categories()
+        category_store = getattr(self, "document_categories", None)
+        category_titles = (
+            {
+                str(category["category_id"]): str(category["title"])
+                for category in category_store.categories()
+            }
+            if category_store is not None
+            else {}
+        )
         payloads = []
         for document in repository.snapshot.documents:
             if not self._document_matches_query(document, query):
                 continue
             compiled_page = compiled_pages.get((document.document_id, document.sha256))
             payload = document.public_dict(include_content=include_content)
+            payload["retrieval_category_title"] = category_titles.get(
+                str(payload.get("retrieval_category") or payload["source_kind"]),
+                str(payload.get("retrieval_category") or payload["source_kind"]),
+            )
             payload.update(
                 {
                     "token_count": self._document_token_count(
@@ -6311,10 +6368,72 @@ class QwenExoRuntime:
                 return document
         raise KeyError(relative_path)
 
+    def _sync_document_categories(self) -> None:
+        store = getattr(self, "document_categories", None)
+        if store is None:
+            return
+        store.sync_documents("knowledge", self.knowledge.snapshot.documents)
+        store.sync_documents("policydata", self.policy_data.snapshot.documents)
+
+    def document_category_listing(self) -> list[dict[str, object]]:
+        self._sync_document_categories()
+        return self.document_categories.categories()
+
+    def create_document_category(
+        self, category_id: str, title: str, parent_id: str | None
+    ) -> dict[str, object]:
+        category = self.document_categories.create(category_id, title, parent_id)
+        self.telemetry.emit(
+            "admin", "document_category.created", category.public_dict()
+        )
+        return category.public_dict()
+
+    def update_document_category(
+        self, category_id: str, title: str, parent_id: str | None
+    ) -> dict[str, object]:
+        category = self.document_categories.update(
+            category_id, title=title, parent_id=parent_id
+        )
+        self.telemetry.emit(
+            "admin", "document_category.updated", category.public_dict()
+        )
+        return category.public_dict()
+
+    async def assign_document_category(
+        self, category_id: str, relative_paths: list[str]
+    ) -> dict[str, object]:
+        self.document_categories.get(category_id)
+        paths = tuple(dict.fromkeys(str(path) for path in relative_paths))
+        documents = {
+            document.relative_path: document
+            for document in self.knowledge.snapshot.documents
+        }
+        missing = [path for path in paths if path not in documents]
+        if missing:
+            raise FileNotFoundError(missing[0])
+        async with self._tensor_bank_admin_lock:
+            for path in paths:
+                document = documents[path]
+                self.knowledge.upsert(
+                    path,
+                    set_markdown_retrieval_category(document.content, category_id),
+                )
+            bank_snapshot = await self._reindex_tensor_bank_unlocked()
+            self._sync_document_categories()
+        payload = {
+            "category_id": category_id,
+            "assigned_count": len(paths),
+            "relative_paths": list(paths),
+            "tensor_bank": bank_snapshot,
+        }
+        self.telemetry.emit("admin", "document_category.assigned", payload)
+        return payload
+
     def upsert_knowledge(
         self, relative_path: str, content: str, tags: object = None
     ) -> dict[str, object]:
         document = self.knowledge.upsert(relative_path, content, tags=tags)
+        self._sync_document_categories()
         self.telemetry.emit(
             "admin",
             "knowledge.upserted",
@@ -6341,6 +6460,7 @@ class QwenExoRuntime:
             and document.source_kind == "trajectory_reflection"
             and self.reflection_memory_store.delete_document(relative_path)
         )
+        self._sync_document_categories()
         self.telemetry.emit(
             "admin",
             "knowledge.deleted",
@@ -6358,11 +6478,12 @@ class QwenExoRuntime:
             "document_count": len(snapshot.documents),
             "compiled": True,
         }
+        self._sync_document_categories()
         self.telemetry.emit("admin", "knowledge.reindexed", payload)
         return payload
 
     async def ingest_knowledge_files(
-        self, files: list[dict[str, str]]
+        self, files: list[dict[str, object]]
     ) -> dict[str, object]:
         validate_upload_batch(files)
         if self.tensor_bank is None:
@@ -6387,6 +6508,11 @@ class QwenExoRuntime:
                     str(item["content_base64"]),
                     tokenizer=tokenizer,
                     max_source_tokens=max_source_tokens,
+                    retrieval_category=(
+                        str(item["retrieval_category"])
+                        if item.get("retrieval_category")
+                        else None
+                    ),
                 ),
             )
             for item in files
@@ -6439,6 +6565,7 @@ class QwenExoRuntime:
                 for document in replaced:
                     self.knowledge.upsert(document.relative_path, document.content)
                 self.knowledge.refresh()
+                self._sync_document_categories()
                 self.telemetry.emit(
                     "admin",
                     "knowledge.ingest_failed",

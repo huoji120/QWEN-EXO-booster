@@ -57,6 +57,18 @@ _REFLECTION_MEMORY_OUTCOME_LABELS = {
 }
 
 
+def _reflection_task_category(original_task: str) -> str:
+    normalized = " ".join(str(original_task).split()).casefold()
+    digest = stable_digest("reflection-memory-task-category-v1", normalized)[:16]
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+    for prefix in ("please-solve-this-issue-", "solve-this-issue-"):
+        if slug.startswith(prefix):
+            slug = slug[len(prefix) :]
+            break
+    slug = slug[:64].rstrip("-")
+    return f"reflection-task-{slug + '-' if slug else ''}{digest}"
+
+
 @dataclass(frozen=True, slots=True)
 class ReflectionMemoryCandidate:
     document_path: str
@@ -95,6 +107,7 @@ class ReflectionMemory:
     source_token_count: int
     attempts: int
     created_at: float
+    retrieval_category: str | None = None
     conflict_resolution: str = "无已知冲突。"
     merge_document_paths: tuple[str, ...] = ()
     merge_document_sha256s: tuple[tuple[str, str], ...] = ()
@@ -121,6 +134,11 @@ class ReflectionMemory:
 
     def markdown(self) -> str:
         tags = ["reflection-memory", f"outcome-{self.outcome}"]
+        retrieval_category = (
+            f"retrieval_category: {json.dumps(self.retrieval_category, ensure_ascii=False)}\n"
+            if self.retrieval_category
+            else ""
+        )
         return (
             "---\n"
             "canonical: false\n"
@@ -128,6 +146,7 @@ class ReflectionMemory:
             "quality: 0.7\n"
             "source_kind: trajectory_reflection\n"
             "document_group: reflection_memory\n"
+            f"{retrieval_category}"
             f"tags: {json.dumps(tags, ensure_ascii=False)}\n"
             "---\n\n"
             f"# {self.title}\n\n"
@@ -149,6 +168,7 @@ class ReflectionMemory:
             "reusable_experience": self.reusable_experience,
             "avoid": self.avoid,
             "next_time": self.next_time,
+            "retrieval_category": self.retrieval_category,
             "memory_action": self.memory_action,
             "target_document_path": self.target_document_path,
             "target_document_sha256": self.target_document_sha256,
@@ -264,6 +284,8 @@ class ReflectionMemoryService:
         max_attempts: int = REFLECTION_MEMORY_MAX_ATTEMPTS,
         max_output_tokens: int = 3072,
         max_history_tokens: int = 8192,
+        max_reasoning_tokens: int = 3072,
+        reasoning_end_token_id: int | None = None,
         store: ReflectionMemoryStore | None = None,
         publish: Callable[[ReflectionMemory], Awaitable[dict[str, Any]]] | None = None,
         retrieve_similar: (
@@ -279,6 +301,8 @@ class ReflectionMemoryService:
             raise ValueError("Reflection memory output budget must be at least 512")
         if int(max_history_tokens) < 1024:
             raise ValueError("Reflection memory history budget must be at least 1024")
+        if int(max_reasoning_tokens) < 1:
+            raise ValueError("Reflection memory reasoning budget must be positive")
         self.runner = runner
         self.tokenizer = tokenizer
         self.telemetry = telemetry
@@ -287,6 +311,10 @@ class ReflectionMemoryService:
         self.max_attempts = int(max_attempts)
         self.max_output_tokens = int(max_output_tokens)
         self.max_history_tokens = int(max_history_tokens)
+        self.max_reasoning_tokens = int(max_reasoning_tokens)
+        self.reasoning_end_token_id = (
+            int(reasoning_end_token_id) if reasoning_end_token_id is not None else None
+        )
         self.store = store
         self.publish = publish
         self.retrieve_similar = retrieve_similar
@@ -332,6 +360,7 @@ class ReflectionMemoryService:
                 "history_budget_tokens": self.max_history_tokens,
                 "mode": self.mode,
                 "max_attempts": self.max_attempts,
+                "max_reasoning_tokens": self.max_reasoning_tokens,
                 "think_enabled": True,
             },
         )
@@ -395,9 +424,7 @@ class ReflectionMemoryService:
                     prompt=prompt,
                     attempt=attempt,
                 )
-                if not self._normal(result):
-                    raise ValueError("reflection tool call did not stop normally")
-                parsed = self.parse_tool_call(result.text)
+                parsed = self._parse_completed_tool_result(result, "reflection")
                 if parsed is None:
                     self.telemetry.emit(
                         parent_id,
@@ -436,6 +463,7 @@ class ReflectionMemoryService:
                     created_at=time.time(),
                     source_event_count=len(rows),
                     source_token_count=int(source_token_count),
+                    retrieval_category=_reflection_task_category(original_task),
                     target_document_sha256=(
                         target.document_sha256 if target is not None else None
                     ),
@@ -544,9 +572,7 @@ class ReflectionMemoryService:
                     prompt=prompt,
                     attempt=attempt,
                 )
-                if not self._normal(result):
-                    raise ValueError("organization tool call did not stop normally")
-                parsed = self.parse_tool_call(result.text)
+                parsed = self._parse_completed_tool_result(result, "organization")
                 if parsed is None:
                     self.telemetry.emit(
                         parent_id,
@@ -1046,37 +1072,137 @@ class ReflectionMemoryService:
     async def _run(
         self, *, parent_id: str, source_digest: str, prompt: str, attempt: int
     ) -> InternalJobResult:
-        job_id = f"{parent_id}:attempt:{attempt}"
+        total_budget = max(
+            1,
+            self.max_output_tokens - (1 if self.retrieve_similar is not None else 0),
+        )
+        if self.reasoning_end_token_id is None or total_budget < 2:
+            return await self._run_phase(
+                parent_id=parent_id,
+                source_digest=source_digest,
+                prompt=prompt,
+                attempt=attempt,
+                phase="complete",
+                token_budget=total_budget,
+                stop_token_ids=(),
+            )
+
+        reasoning_budget = min(
+            self.max_reasoning_tokens,
+            max(1, total_budget - min(512, total_budget - 1)),
+        )
+        reasoning = await self._run_phase(
+            parent_id=parent_id,
+            source_digest=source_digest,
+            prompt=prompt,
+            attempt=attempt,
+            phase="reasoning",
+            token_budget=reasoning_budget,
+            stop_token_ids=(self.reasoning_end_token_id,),
+        )
+        if tuple(self._tool_blocks(reasoning.text)):
+            return reasoning
+
+        remaining_budget = max(1, total_budget - reasoning.completion_tokens)
+        boundary = self.tokenizer.decode(
+            [self.reasoning_end_token_id], skip_special_tokens=False
+        )
+        boundary = str(boundary or "</think>")
+        continuation_prompt = prompt + reasoning.text
+        if boundary not in reasoning.text:
+            continuation_prompt += boundary
+        tool_result = await self._run_phase(
+            parent_id=parent_id,
+            source_digest=source_digest,
+            prompt=continuation_prompt,
+            attempt=attempt,
+            phase="tool",
+            token_budget=remaining_budget,
+            stop_token_ids=(),
+        )
+        self.telemetry.emit(
+            parent_id,
+            "reflection_memory.reasoning_budget_applied",
+            {
+                "attempt": attempt,
+                "max_reasoning_tokens": reasoning_budget,
+                "reasoning_tokens": reasoning.completion_tokens,
+                "reasoning_finish_reason": reasoning.finish_reason,
+                "tool_tokens": tool_result.completion_tokens,
+                "tool_finish_reason": tool_result.finish_reason,
+            },
+        )
+        combined_text = reasoning.text
+        if boundary not in combined_text:
+            combined_text += boundary
+        combined_text += tool_result.text
+        return replace(
+            tool_result,
+            text=combined_text,
+            prompt_tokens=reasoning.prompt_tokens,
+            completion_tokens=(
+                reasoning.completion_tokens + tool_result.completion_tokens
+            ),
+            latency_seconds=(reasoning.latency_seconds + tool_result.latency_seconds),
+            metadata={
+                **tool_result.metadata,
+                "qwen_exo_reasoning_tokens": reasoning.completion_tokens,
+                "qwen_exo_reasoning_finish_reason": reasoning.finish_reason,
+            },
+        )
+
+    async def _run_phase(
+        self,
+        *,
+        parent_id: str,
+        source_digest: str,
+        prompt: str,
+        attempt: int,
+        phase: str,
+        token_budget: int,
+        stop_token_ids: tuple[int, ...],
+    ) -> InternalJobResult:
+        job_id = f"{parent_id}:attempt:{attempt}:{phase}"
         job = InternalJob(
             parent_request_id=parent_id,
-            turn_id=f"{parent_id}:attempt:{attempt}",
+            turn_id=job_id,
             job_id=job_id,
             job_type=InternalJobType.REFLECTION_MEMORY,
             priority=-25,
             shared_prefix_key="qwen-exo:v1:reflection-memory:" + source_digest[:24],
-            token_budget=max(
-                1,
-                self.max_output_tokens
-                - (1 if self.retrieve_similar is not None else 0),
-            ),
+            token_budget=int(token_budget),
             state_budget_bytes=0,
             deadline_monotonic=None,
             cancellation_token=CancellationToken(f"cancel-{job_id}"),
             telemetry_correlation_id=parent_id,
             max_fanout=1,
         )
+        sampling_params = {
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "top_k": -1,
+            "skip_special_tokens": True,
+        }
+        if stop_token_ids:
+            sampling_params["stop_token_ids"] = list(stop_token_ids)
         return (
             await self.runner.run_batch(
                 (job,),
                 (prompt,),
-                {
-                    "temperature": 0.2,
-                    "top_p": 0.95,
-                    "top_k": -1,
-                    "skip_special_tokens": True,
-                },
+                sampling_params,
             )
         )[0]
+
+    @classmethod
+    def _parse_completed_tool_result(
+        cls, result: InternalJobResult, label: str
+    ) -> dict[str, Any] | None:
+        try:
+            return cls.parse_tool_call(result.text)
+        except ValueError as exc:
+            if not cls._normal(result):
+                raise ValueError(f"{label} tool call did not stop normally") from exc
+            raise
 
     @staticmethod
     def _normal(result: InternalJobResult) -> bool:

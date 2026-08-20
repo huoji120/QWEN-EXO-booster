@@ -139,6 +139,7 @@ export type SourceDocument = {
   tags?: string[];
   source_kind?: string;
   document_group?: string | null;
+  retrieval_diversity_bucket?: string;
   canonical?: boolean;
   quality?: number;
   compiled?: boolean;
@@ -153,6 +154,14 @@ export type SourceListing = {
   source_digest?: string;
   document_count?: number;
   documents: SourceDocument[];
+};
+
+export type DocumentCategory = {
+  category_id: string;
+  title: string;
+  parent_id: string | null;
+  origin: "system" | "user" | "observed";
+  document_count: number;
 };
 
 export type PendingReflectionMemory = {
@@ -361,6 +370,7 @@ export type KnowledgeDraft = {
   suggested_path: string;
   content: string;
   tags: string[];
+  retrieval_category: string;
   source_kind: string;
   byte_count: number;
   changes: string[];
@@ -380,6 +390,12 @@ export type RequestTrace = {
   duration_seconds: number | null;
   input_text: string;
   output_text: string;
+  reasoning_text?: string;
+  prompt_tokens?: number | null;
+  query_tokens?: number | null;
+  retrieval_seconds?: number | null;
+  judge_seconds?: number | null;
+  selected_document_ids?: string[];
   output_tokens: number | null;
   candidates: TraceCandidate[];
   native_restore: {

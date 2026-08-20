@@ -7,6 +7,7 @@ import type {
   EditorTrainingStatus,
   HealthStatus,
   ModelCatalog,
+  DocumentCategory,
   KnowledgeDraft,
   RecallTrace,
   RequestTraceListing,
@@ -123,6 +124,29 @@ export async function getRequestTraces(limit = 50, q = "") {
   return (await (
     await apiFetch(`/request-traces?${params}`)
   ).json()) as RequestTraceListing;
+}
+
+export async function listDocumentCategories() {
+  return (await (await apiFetch("/knowledge/categories")).json()) as {
+    categories: DocumentCategory[];
+  };
+}
+
+export async function createDocumentCategory(
+  categoryId: string,
+  title: string,
+  parentId: string | null,
+) {
+  return (await (
+    await apiFetch("/knowledge/categories", {
+      method: "POST",
+      body: JSON.stringify({
+        category_id: categoryId,
+        title,
+        parent_id: parentId,
+      }),
+    })
+  ).json()) as DocumentCategory;
 }
 
 export async function getRecallTrace(limit = 10) {
@@ -266,7 +290,11 @@ export type KnowledgeIngestResult = {
 };
 
 export async function ingestKnowledgeFiles(
-  files: { filename: string; content_base64: string }[],
+  files: {
+    filename: string;
+    content_base64: string;
+    retrieval_category?: string;
+  }[],
 ) {
   return (await (
     await apiFetch("/knowledge/ingest", {
@@ -301,6 +329,8 @@ export async function getSource(
     relative_path: string;
     content: string;
     tags: string[];
+    source_kind?: string;
+    retrieval_category?: string | null;
   };
 }
 

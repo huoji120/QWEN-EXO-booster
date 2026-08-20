@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from qwen_exo_booster.activation_training import pack_trajectory_context
 
 _TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
@@ -146,23 +147,9 @@ def build_samples(
         content = message["content"]
         if not isinstance(content, str) or len(content.strip()) < 20:
             continue
-        # This slice is intentionally local to one source trajectory. Sources
-        # are never concatenated into a synthetic conversation.
+        # Keep each source conversation isolated; pack context by message
+        # boundaries so the original task and recent evidence survive truncation.
         context_messages = messages[:index]
-        context_ids = tokenizer.apply_chat_template(
-            context_messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=True,
-            preserve_thinking=True,
-        )
-        if hasattr(context_ids, "get"):
-            context_ids = context_ids.get("input_ids")
-        if hasattr(context_ids, "tolist"):
-            context_ids = context_ids.tolist()
-        if context_ids and isinstance(context_ids[0], list):
-            context_ids = context_ids[0]
-        context_ids = [int(value) for value in context_ids][-max_context_tokens:]
         target_ids = tokenizer.encode(content, add_special_tokens=False)
         tool_calls = parse_complete_tool_calls(content)
         has_tool_marker = "<tool_call>" in content or "</tool_call>" in content
@@ -175,7 +162,9 @@ def build_samples(
         context_budget = min(max_context_tokens, max_sequence_tokens - len(target_ids))
         if context_budget < 1:
             continue
-        context_ids = context_ids[-context_budget:]
+        context_ids = pack_trajectory_context(
+            context_messages, tokenizer, context_budget
+        )
         samples.append(
             {
                 "index": index,
@@ -326,14 +315,14 @@ def main() -> int:
     )
     parser.add_argument("--model", default="/models/qwen-exo")
     parser.add_argument("--layer", type=int, default=47)
-    parser.add_argument("--rank", type=int, default=4)
+    parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--window", type=int, default=16)
     parser.add_argument("--steps", type=int, default=120)
     parser.add_argument("--epochs", type=float, default=None)
     parser.add_argument("--editor-out", type=Path, default=None)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--max-sequence-tokens", type=int, default=2560)
-    parser.add_argument("--max-context-tokens", type=int, default=512)
+    parser.add_argument("--max-sequence-tokens", type=int, default=3072)
+    parser.add_argument("--max-context-tokens", type=int, default=1024)
     parser.add_argument("--max-target-tokens", type=int, default=2048)
     parser.add_argument("--holdout-ratio", type=float, default=0.2)
     parser.add_argument("--smoke", action="store_true")

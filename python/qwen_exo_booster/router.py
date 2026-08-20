@@ -24,6 +24,7 @@ from qwen_exo_booster.activation_training import (
 )
 
 from qwen_exo_booster.config import PROJECT_NAME
+from qwen_exo_booster.document_categories import DocumentCategoryError
 from qwen_exo_booster.tags import TagValidationError, normalize_tags
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
@@ -59,10 +60,26 @@ class KnowledgeWriteRequest(BaseModel):
 class KnowledgeUploadItem(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content_base64: str = Field(min_length=1, max_length=6_000_000)
+    retrieval_category: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class KnowledgeIngestRequest(BaseModel):
     files: list[KnowledgeUploadItem] = Field(min_length=1, max_length=20)
+
+
+class DocumentCategoryWriteRequest(BaseModel):
+    category_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=128)
+    parent_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class DocumentCategoryUpdateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=128)
+    parent_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class DocumentCategoryAssignmentRequest(BaseModel):
+    relative_paths: list[str] = Field(min_length=1, max_length=1000)
 
 
 class ServiceConfigWriteRequest(BaseModel):
@@ -907,6 +924,50 @@ async def ingest_knowledge(payload: KnowledgeIngestRequest, request: Request):
             status_code=422,
             content={"detail": error.public_dict()},
         )
+
+
+@router.get("/knowledge/categories")
+async def list_document_categories(request: Request):
+    return {"categories": _runtime(request).document_category_listing()}
+
+
+@router.post("/knowledge/categories", status_code=201)
+async def create_document_category(
+    payload: DocumentCategoryWriteRequest, request: Request
+):
+    try:
+        return _runtime(request).create_document_category(
+            payload.category_id, payload.title, payload.parent_id
+        )
+    except DocumentCategoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.patch("/knowledge/categories/{category_id}")
+async def update_document_category(
+    category_id: str, payload: DocumentCategoryUpdateRequest, request: Request
+):
+    try:
+        return _runtime(request).update_document_category(
+            category_id, payload.title, payload.parent_id
+        )
+    except DocumentCategoryError as exc:
+        status_code = 404 if str(exc) == "分类不存在" else 422
+        raise HTTPException(status_code=status_code, detail=str(exc))
+
+
+@router.post("/knowledge/categories/{category_id}/assign")
+async def assign_document_category(
+    category_id: str, payload: DocumentCategoryAssignmentRequest, request: Request
+):
+    try:
+        return await _runtime(request).assign_document_category(
+            category_id, payload.relative_paths
+        )
+    except DocumentCategoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"未找到知识文档：{exc}")
 
 
 @router.post("/knowledge/reindex")

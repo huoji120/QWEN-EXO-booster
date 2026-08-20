@@ -13,6 +13,7 @@ from qwen_exo_booster.activation_training import (
     ActivationTrainingError,
     ActivationTrainingStore,
     run_pending_activation_training,
+    pack_trajectory_context,
 )
 
 
@@ -44,6 +45,57 @@ def _trajectory(path: Path, label: str = "sample") -> None:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class _MessageTokenizer:
+    def __init__(self):
+        self.call_lengths = []
+
+    def apply_chat_template(self, messages, **_kwargs):
+        self.call_lengths.append(len(messages))
+        return {
+            "input_ids": [
+                int(message["content"].rsplit("-", 1)[-1]) for message in messages
+            ]
+            + [999]
+        }
+
+
+def test_trajectory_context_keeps_full_message_sequence_when_it_fits():
+    messages = [
+        {"role": "system", "content": "message-0"},
+        {"role": "user", "content": "message-1"},
+        {"role": "assistant", "content": "message-2"},
+    ]
+
+    assert pack_trajectory_context(messages, _MessageTokenizer(), 4) == [0, 1, 2, 999]
+
+
+def test_trajectory_context_preserves_anchors_and_recent_message_on_truncation():
+    messages = [
+        {"role": "system", "content": "message-0"},
+        {"role": "user", "content": "message-1"},
+        {"role": "assistant", "content": "message-2"},
+        {"role": "tool", "content": "message-3"},
+        {"role": "user", "content": "message-4"},
+    ]
+
+    assert pack_trajectory_context(messages, _MessageTokenizer(), 4) == [0, 1, 4, 999]
+
+
+def test_trajectory_context_never_renders_the_full_long_history():
+    messages = [
+        {"role": "system", "content": "message-0"},
+        {"role": "user", "content": "message-1"},
+        *(
+            {"role": "assistant", "content": f"message-{index}"}
+            for index in range(2, 100)
+        ),
+    ]
+    tokenizer = _MessageTokenizer()
+
+    assert pack_trajectory_context(messages, tokenizer, 4) == [0, 1, 99, 999]
+    assert max(tokenizer.call_lengths) == 4
 
 
 def _runner(
@@ -150,9 +202,9 @@ def test_selection_and_enqueue_preserve_multiple_trajectory_boundaries(tmp_path:
         "window": 16,
         "epochs": 0.25,
         "learning_rate": 5e-4,
-        "max_context_tokens": 512,
+        "max_context_tokens": 1024,
         "max_target_tokens": 2048,
-        "max_sequence_tokens": 2560,
+        "max_sequence_tokens": 3072,
     }
     assert "state_directory" not in store.public_status()["job"]
 
@@ -192,9 +244,9 @@ def test_successful_joint_training_publishes_and_applies_one_editor(tmp_path: Pa
     assert command[command.index("--trajectory") + 1] == str(first)
     second_index = command.index("--trajectory", command.index("--trajectory") + 1)
     assert command[second_index + 1] == str(second)
-    assert command[command.index("--max-context-tokens") + 1] == "512"
+    assert command[command.index("--max-context-tokens") + 1] == "1024"
     assert command[command.index("--max-target-tokens") + 1] == "2048"
-    assert command[command.index("--max-sequence-tokens") + 1] == "2560"
+    assert command[command.index("--max-sequence-tokens") + 1] == "3072"
     assert command[command.index("--lr") + 1] == "0.0005"
     active = json.loads((old_target.parent / "active.json").read_text("utf-8"))
     assert active["editor"] == COMBINED_EDITOR_NAME

@@ -35,7 +35,9 @@ _MEMORY_HEADER = (
     "private context unless the user explicitly asks about system internals."
 )
 
-_COMPARATIVE_CANDIDATE_LIMIT = 4
+# Preserve the complete native shortlist for listwise judging; a four-item cap
+# let unrelated high-volume trajectory families crowd out task-specific memory.
+_COMPARATIVE_CANDIDATE_LIMIT = 8
 
 
 def response_memory_metadata(
@@ -518,18 +520,7 @@ class MemoryPipeline:
                     used_pages.add(primary_page)
             dropped += len(group) - len(selected)
             kept.extend(selected)
-        merged = tuple(
-            sorted(
-                kept,
-                key=lambda candidate: (
-                    -self._raw_tensor_score(candidate),
-                    candidate.lane,
-                    candidate.document_id,
-                    candidate.candidate_id,
-                ),
-            )
-        )
-        return merged, dropped
+        return tuple(kept), dropped
 
     def _qk_prefilter_decision(
         self, judged: tuple[KnowledgeCandidate, ...]

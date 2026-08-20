@@ -142,6 +142,37 @@ def test_select_best_compares_candidates_in_one_bounded_job(tmp_path):
     assert '"score"' not in runner.prompts[0]
 
 
+def test_select_best_presents_eight_candidates(tmp_path):
+    repository = KnowledgeRepository(tmp_path)
+    documents = [
+        repository.upsert(f"reference-{index}.md", f"reference content {index}")
+        for index in range(8)
+    ]
+    candidates = tuple(repository.rank(document.content)[0] for document in documents)
+    runner = FakeRunner(fixed_text='{"winner":"H"}')
+    judge = ReferenceJudge(
+        runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
+    )
+
+    result = asyncio.run(
+        judge.select_best(
+            parent_request_id="parent-eight",
+            turn_id="turn-eight",
+            question="Which reference is relevant?",
+            candidates=candidates,
+            telemetry_correlation_id="trace-eight",
+        )
+    )
+
+    assert result.presented_candidate_count == 8
+    assert result.valid_count == 8
+    assert result.eligible_count == 1
+    assert result.selected_candidate_id == candidates[7].candidate_id
+    assert json.loads(runner.sampling_params["json_schema"])["properties"]["winner"][
+        "enum"
+    ] == [None, "A", "B", "C", "D", "E", "F", "G", "H"]
+
+
 def test_select_best_can_reject_every_candidate(tmp_path):
     repository, candidates = repository_with_candidates(tmp_path)
     judge = ReferenceJudge(

@@ -52,6 +52,8 @@ import {
   deleteSourceDocuments,
   getReflectionMemoryOrganizationStatus,
   getSource,
+  createDocumentCategory,
+  listDocumentCategories,
   listSources,
   previewKnowledgeFiles,
   reindexSource,
@@ -61,7 +63,7 @@ import {
   type ReflectionOrganizationJobStatus,
 } from "@/lib/api";
 import { translate as t, translateFor, useI18n } from "@/lib/i18n";
-import type { SourceDocument, SourceListing } from "@/lib/types";
+import type { DocumentCategory, SourceDocument, SourceListing } from "@/lib/types";
 import {
   cn,
   formatBytes,
@@ -125,6 +127,34 @@ const SYSTEM_TAG_LABELS: Record<string, string> = {
 function tagLabel(tag: string) {
   const systemLabel = SYSTEM_TAG_LABELS[tag.toLowerCase()];
   return systemLabel ? t(systemLabel) : tag;
+}
+
+const SOURCE_FAMILY_LABELS: Record<string, string> = {
+  trajectory_reflection: "反思记忆",
+  boeing_fable5_agent_trajectory: "Fable 轨迹",
+  uploaded_markdown: "上传 Markdown",
+  uploaded_structured_text: "上传结构化文本",
+  uploaded_text: "上传文本",
+  curated_reference: "整理参考",
+  coding_agent_execution_policy: "执行策略",
+  unclassified: "未分类",
+};
+
+function sourceFamily(document: SourceDocument) {
+  return (
+    document.retrieval_diversity_bucket ||
+    document.source_kind ||
+    "unclassified"
+  );
+}
+
+function sourceFamilyLabel(sourceKind: string) {
+  return t(SOURCE_FAMILY_LABELS[sourceKind] || sourceKind);
+}
+
+function markdownSourceFamily(content: string) {
+  const match = content.match(/^source_kind:\s*["']?([^\n"']+)["']?\s*$/im);
+  return match?.[1]?.trim() || "unclassified";
 }
 
 const ORGANIZATION_STEPS = [
@@ -277,7 +307,7 @@ function organizationMessage(status: ReflectionOrganizationJobStatus) {
 }
 
 const NEW_DOCUMENT_TEMPLATE =
-  "---\ntitle: \nsource_kind: unclassified\nquality: 1.0\n---\n\n# 标题\n\n";
+  "---\ntitle: \nsource_kind: unclassified\nretrieval_category: unclassified\nquality: 1.0\n---\n\n# 标题\n\n";
 
 const MAX_UPLOAD_FILE_BYTES = 4 * 1024 * 1024;
 
@@ -298,6 +328,18 @@ function readFileAsBase64(file: File) {
   });
 }
 
+function withRetrievalCategory(content: string, category: string) {
+  const value = category.trim() || "unclassified";
+  const frontMatter = /^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)/;
+  const match = content.match(frontMatter);
+  if (!match) return `---\nretrieval_category: ${value}\n---\n\n${content}`;
+  const rows = match[1]
+    .split("\n")
+    .filter((row) => !/^retrieval_category\s*:/i.test(row));
+  rows.push(`retrieval_category: ${value}`);
+  return content.replace(frontMatter, `---\n${rows.join("\n")}\n---\n\n`);
+}
+
 export function KnowledgePage() {
   const { language, locale } = useI18n();
   const [lane, setLane] = useState<SourceView>("policydata");
@@ -316,7 +358,14 @@ export function KnowledgePage() {
   const [suggestedPath, setSuggestedPath] = useState("");
   const [editorContent, setEditorContent] = useState("");
   const [editorTags, setEditorTags] = useState<string[]>([]);
+  const [editorCategory, setEditorCategory] = useState("unclassified");
   const [editorMode, setEditorMode] = useState<"create" | "edit">("edit");
+  const [categories, setCategories] = useState<DocumentCategory[]>([]);
+  const [categoryOpen, setCategoryOpen] = useState(false);
+  const [newCategoryId, setNewCategoryId] = useState("");
+  const [newCategoryTitle, setNewCategoryTitle] = useState("");
+  const [newCategoryParent, setNewCategoryParent] = useState<string | null>(null);
+  const [savingCategory, setSavingCategory] = useState(false);
   const [editorLoading, setEditorLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deleteTargets, setDeleteTargets] = useState<SourceDocument[]>([]);
@@ -324,6 +373,10 @@ export function KnowledgePage() {
   const [sortOrder, setSortOrder] = useState<SortOrder>("time-desc");
   const [uploading, setUploading] = useState(false);
   const [selectedTag, setSelectedTag] = useState("");
+  const categorySuggestions = useMemo(
+    () => categories.map((category) => category.category_id),
+    [categories],
+  );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const activeOrganizationJobRef = useRef<string | null>(null);
   const notifiedOrganizationJobsRef = useRef(new Set<string>());
@@ -333,6 +386,8 @@ export function KnowledgePage() {
   const load = async (targetView = lane, targetQuery = query) => {
     setLoading(true);
     try {
+      const categoryListing = await listDocumentCategories();
+      setCategories(categoryListing.categories);
       const next = await listSources(
         storageLane(targetView),
         targetView === "policydata" ? "" : targetQuery,
@@ -534,6 +589,7 @@ export function KnowledgePage() {
     setSuggestedPath("");
     setEditorTags([]);
     setEditorContent(t(NEW_DOCUMENT_TEMPLATE));
+    setEditorCategory("unclassified");
     setEditorOpen(true);
   };
 
@@ -544,6 +600,7 @@ export function KnowledgePage() {
     setEditorLoading(true);
     setEditorPath(document.relative_path);
     setEditorTags(document.tags || []);
+    setEditorCategory(sourceFamily(document));
     setEditorContent("");
     try {
       const payload = await getSource(
@@ -551,6 +608,9 @@ export function KnowledgePage() {
         document.relative_path,
       );
       setEditorContent(payload.content);
+      setEditorCategory(
+        payload.retrieval_category || payload.source_kind || "unclassified",
+      );
       setEditorTags(payload.tags || []);
     } catch (error) {
       toast.error(t("文档读取失败"), {
@@ -577,11 +637,15 @@ export function KnowledgePage() {
       return;
     }
     setSaving(true);
+    const savedContent =
+      lane === "policydata"
+        ? editorContent
+        : withRetrievalCategory(editorContent, editorCategory);
     try {
       await saveSource(
         storageLane(lane),
         path,
-        editorContent,
+        savedContent,
         lane === "policydata" ? [] : editorTags,
       );
       await load(lane);
@@ -673,6 +737,33 @@ export function KnowledgePage() {
     }
   };
 
+  const createCategory = async () => {
+    if (!newCategoryId.trim() || !newCategoryTitle.trim()) {
+      toast.error(t("请填写分类标识和显示名称"));
+      return;
+    }
+    setSavingCategory(true);
+    try {
+      await createDocumentCategory(
+        newCategoryId.trim(),
+        newCategoryTitle.trim(),
+        newCategoryParent,
+      );
+      const categoryListing = await listDocumentCategories();
+      setCategories(categoryListing.categories);
+      setNewCategoryId("");
+      setNewCategoryTitle("");
+      setNewCategoryParent(null);
+      toast.success(t("分类已创建"));
+    } catch (error) {
+      toast.error(t("创建分类失败"), {
+        description: error instanceof Error ? error.message : t("未知错误"),
+      });
+    } finally {
+      setSavingCategory(false);
+    }
+  };
+
   const organizeMemories = async () => {
     try {
       const accepted = await startReflectionMemoryOrganization();
@@ -715,6 +806,7 @@ export function KnowledgePage() {
       setEditorPath("");
       setSuggestedPath(draft.suggested_path);
       setEditorTags(draft.tags || []);
+      setEditorCategory(draft.retrieval_category || draft.source_kind);
       setEditorContent(draft.content);
       setEditorLoading(false);
       setEditorOpen(true);
@@ -815,6 +907,10 @@ export function KnowledgePage() {
                   <Upload />
                 )}
                 {uploading ? t("解析中…") : t("导入")}
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setCategoryOpen(true)}>
+                <Database />
+                {t("分类")}
               </Button>
               <Button size="sm" onClick={openNew}>
                 <Plus />
@@ -1117,6 +1213,7 @@ export function KnowledgePage() {
                     </TableHead>
                   ) : null}
                   <TableHead>{t("文档")}</TableHead>
+                  <TableHead className="w-40">{t("来源族")}</TableHead>
                   <TableHead className="w-28">{t("状态")}</TableHead>
                   <TableHead className="w-28">{t("令牌数")}</TableHead>
                   <TableHead className="w-40">{t("入库时间")}</TableHead>
@@ -1182,6 +1279,11 @@ export function KnowledgePage() {
                           ) : null}
                         </div>
                       </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="secondary" className="font-mono text-[10px]">
+                        {sourceFamilyLabel(sourceFamily(document))}
+                      </Badge>
                     </TableCell>
                     <TableCell>
                       <Badge
@@ -1269,6 +1371,92 @@ export function KnowledgePage() {
         </CardContent>
       </Card>
 
+      <Dialog open={categoryOpen} onOpenChange={setCategoryOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>{t("文档分类")}</DialogTitle>
+            <DialogDescription>
+              {t("分类保存在服务端数据库；分类标识稳定用于检索，显示名称可按需要调整。")}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-64 overflow-y-auto rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t("分类")}</TableHead>
+                  <TableHead>{t("父级")}</TableHead>
+                  <TableHead className="text-right">{t("文档数")}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {categories.map((category) => (
+                  <TableRow key={category.category_id}>
+                    <TableCell>
+                      <div className="font-medium">{category.title}</div>
+                      <div className="font-mono text-[10px] text-muted-foreground">
+                        {category.category_id}
+                      </div>
+                    </TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">
+                      {category.parent_id || "—"}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      {formatNumber(category.document_count)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor="category-id">{t("分类标识")}</Label>
+              <Input
+                id="category-id"
+                value={newCategoryId}
+                onChange={(event) => setNewCategoryId(event.target.value)}
+                placeholder="fastapi-routing"
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="category-title">{t("显示名称")}</Label>
+              <Input
+                id="category-title"
+                value={newCategoryTitle}
+                onChange={(event) => setNewCategoryTitle(event.target.value)}
+                placeholder={t("FastAPI 路由")}
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label>{t("父级分类")}</Label>
+              <Select
+                value={newCategoryParent || "root"}
+                onValueChange={(value) => setNewCategoryParent(value === "root" ? null : value)}
+              >
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="root">{t("顶级")}</SelectItem>
+                  {categories.map((category) => (
+                    <SelectItem key={category.category_id} value={category.category_id}>
+                      {category.title}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCategoryOpen(false)}>
+              {t("关闭")}
+            </Button>
+            <Button disabled={savingCategory} onClick={() => void createCategory()}>
+              {savingCategory ? <LoaderCircle className="animate-spin" /> : <Plus />}
+              {t("新建分类")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog
         open={editorOpen}
         onOpenChange={(open) => {
@@ -1337,6 +1525,27 @@ export function KnowledgePage() {
               </div>
             ) : null}
           </div>
+          {lane !== "policydata" ? (
+            <div className="grid gap-2">
+              <Label htmlFor="retrieval-category">{t("检索分类")}</Label>
+              <Input
+                id="retrieval-category"
+                list="retrieval-category-options"
+                value={editorCategory}
+                onChange={(event) => setEditorCategory(event.target.value)}
+                placeholder={t("输入已有分类或直接创建新分类")}
+                disabled={editorLoading || saving}
+              />
+              <datalist id="retrieval-category-options">
+                {categorySuggestions.map((category) => (
+                  <option key={category} value={category} />
+                ))}
+              </datalist>
+              <p className="text-[10px] leading-4 text-muted-foreground">
+                {t("上传时自动建议；可输入任意新分类。长文切片会继承同一分类。")}
+              </p>
+            </div>
+          ) : null}
           <div className="grid gap-2">
             <div className="flex items-center justify-between">
               <Label htmlFor="source-content">{t("Markdown 内容")}</Label>

@@ -1028,7 +1028,7 @@ def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):
     assert judge_event["question_review_tokens"] == 2048
 
 
-def test_comparative_selector_score_filters_to_top_four_candidates(tmp_path):
+def test_comparative_selector_score_filters_to_top_eight_candidates(tmp_path):
     repo = repository(tmp_path)
     for index in range(3):
         repo.upsert(f"extra-{index}.md", f"Distinct reference number {index}")
@@ -1055,16 +1055,16 @@ def test_comparative_selector_score_filters_to_top_four_candidates(tmp_path):
 
     _prepared, state = prepare(
         pipeline,
-        FakeRequest(request_id="resp-top-four", input="Choose the best reference"),
+        FakeRequest(request_id="resp-top-eight", input="Choose the best reference"),
     )
 
     judged = judge.selection_calls[0][2]
-    assert [candidate.relative_path for candidate in judged] == list(paths[:4])
-    assert len(state.decisions) == 4
+    assert [candidate.relative_path for candidate in judged] == list(paths)
+    assert len(state.decisions) == 5
     (prefilter,) = telemetry.by_type("qk.prefilter")
     assert prefilter["candidate_count"] == 5
-    assert prefilter["sent_to_judge"] == 4
-    assert prefilter["score_filtered_count"] == 1
+    assert prefilter["sent_to_judge"] == 5
+    assert prefilter["score_filtered_count"] == 0
 
 
 def test_second_distinct_page_candidate_kept_when_configured(tmp_path):
