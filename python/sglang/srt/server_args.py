@@ -3060,6 +3060,27 @@ class ServerArgs:
             choices=["sentence", "windows"],
         ),
     ] = "windows"
+    qwen_exo_pmi_gate_mode: A[
+        str,
+        Arg(
+            help=(
+                "QWEN-EXO pointwise-mutual-information gate before the Semantic "
+                "Judge. active: score each shortlisted memory's rule-card head "
+                "with the target model under the question versus a neutral "
+                "question in one teacher-forced batch, and skip the judge when "
+                "no candidate exceeds --qwen-exo-pmi-gate-threshold. off: always "
+                "run the judge."
+            ),
+            choices=["off", "active"],
+        ),
+    ] = "off"
+    qwen_exo_pmi_gate_threshold: A[
+        float,
+        (
+            "Maximum PMI (mean log-prob gain per token) at which every shortlist "
+            "candidate is considered unrelated and the Semantic Judge is skipped."
+        ),
+    ] = 0.0
     qwen_exo_console_trace_default_scope: A[
         str,
         Arg(

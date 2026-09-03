@@ -1438,6 +1438,132 @@ def test_prefilter_passes_strong_candidate_to_judge(tmp_path):
     assert prefilter["evidence_candidate_count"] == 0
 
 
+class FakePmiGate:
+    def __init__(self, *, skip, error=None):
+        self.skip = skip
+        self.error = error
+        self.calls = []
+
+    async def evaluate(self, *, parent_request_id, question, candidates):
+        self.calls.append((parent_request_id, question, tuple(candidates)))
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(
+            skip_judge=self.skip,
+            public_dict=lambda: {
+                "status": "skipped" if self.skip else "passed",
+                "max_pmi": -0.2 if self.skip else 0.4,
+            },
+        )
+
+
+def _pmi_config(tmp_path):
+    return replace(config(tmp_path, policy_data=False), pmi_gate_mode="active")
+
+
+def test_pmi_gate_skips_judge_when_no_memory_is_predictable(tmp_path):
+    """Unrelated questions must not pay for judge rounds.
+
+    A request like "write me a snake game" used to run two listwise judge
+    rounds (first wave rejected, expansion rejected). When no shortlist
+    candidate gains probability under the question, the judge is skipped and
+    nothing is attached, which is the outcome the judge would have reached.
+    """
+    repo = repository(tmp_path)
+    candidate = native_candidate(repo, "wfp.md", page_id=3, score=0.91)
+    judge = FakeReferenceJudge()
+    gate = FakePmiGate(skip=True)
+    telemetry = FakeTelemetry()
+    pipeline = build_pipeline(
+        _pmi_config(tmp_path),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=FakeQKTensorBank((candidate,)),
+        reference_judge=judge,
+        telemetry=telemetry,
+        pmi_gate=gate,
+    )
+
+    _prepared, state = prepare(
+        pipeline, FakeRequest(request_id="resp-pmi-skip", input="write a snake game")
+    )
+
+    assert judge.calls == []
+    assert len(gate.calls) >= 1
+    assert gate.calls[0][2][0].candidate_id == candidate.candidate_id
+    assert state.selected_document_ids == ()
+    evaluated = telemetry.by_type("pmi_gate.evaluated")
+    assert evaluated and evaluated[0]["status"] == "skipped"
+
+
+def test_pmi_gate_passes_related_candidates_to_the_judge_unchanged(tmp_path):
+    repo = repository(tmp_path)
+    candidate = native_candidate(repo, "wfp.md", page_id=3, score=0.91)
+    judge = FakeReferenceJudge()
+    pipeline = build_pipeline(
+        _pmi_config(tmp_path),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=FakeQKTensorBank((candidate,)),
+        reference_judge=judge,
+        telemetry=FakeTelemetry(),
+        pmi_gate=FakePmiGate(skip=False),
+    )
+
+    _prepared, state = prepare(
+        pipeline, FakeRequest(request_id="resp-pmi-pass", input="Which WFP layer?")
+    )
+
+    assert len(judge.calls) == 1
+    assert state.selected_document_ids == (candidate.document_id,)
+
+
+def test_pmi_gate_failure_fails_open_to_the_judge(tmp_path):
+    repo = repository(tmp_path)
+    candidate = native_candidate(repo, "wfp.md", page_id=3, score=0.91)
+    judge = FakeReferenceJudge()
+    telemetry = FakeTelemetry()
+    pipeline = build_pipeline(
+        _pmi_config(tmp_path),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=FakeQKTensorBank((candidate,)),
+        reference_judge=judge,
+        telemetry=telemetry,
+        pmi_gate=FakePmiGate(skip=True, error=RuntimeError("scheduler busy")),
+    )
+
+    _prepared, state = prepare(
+        pipeline, FakeRequest(request_id="resp-pmi-open", input="Which WFP layer?")
+    )
+
+    assert len(judge.calls) == 1
+    assert state.selected_document_ids == (candidate.document_id,)
+    (failed,) = telemetry.by_type("pmi_gate.failed_open")
+    assert failed["error_type"] == "RuntimeError"
+
+
+def test_pmi_gate_is_inert_when_mode_is_off(tmp_path):
+    repo = repository(tmp_path)
+    candidate = native_candidate(repo, "wfp.md", page_id=3, score=0.91)
+    judge = FakeReferenceJudge()
+    gate = FakePmiGate(skip=True)
+    pipeline = build_pipeline(
+        config(tmp_path, policy_data=False),
+        repo,
+        FakeTokenizer(),
+        tensor_bank=FakeQKTensorBank((candidate,)),
+        reference_judge=judge,
+        telemetry=FakeTelemetry(),
+        pmi_gate=gate,
+    )
+
+    prepare(pipeline, FakeRequest(request_id="resp-pmi-off", input="Which WFP layer?"))
+
+    assert gate.calls == []
+    assert len(judge.calls) == 1
+
+
 def test_prefilter_evidence_blocks_active_skip(tmp_path):
     repo = repository(tmp_path)
     weak = native_candidate(repo, "wfp.md", page_id=3, score=0.30)

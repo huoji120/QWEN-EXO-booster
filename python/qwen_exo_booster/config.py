@@ -173,6 +173,8 @@ class QwenExoConfig:
     qk_layer_id: int | None = None
     qk_query_heads: tuple[int, ...] = ()
     qk_query_pooling: str = "windows"
+    pmi_gate_mode: str = "off"
+    pmi_gate_threshold: float = 0.0
 
     @property
     def qk_admission_gates(self) -> tuple[float, float]:
@@ -418,6 +420,10 @@ class QwenExoConfig:
             raise ValueError(
                 f"qk_query_pooling must be one of {sorted(_QK_QUERY_POOLINGS)}"
             )
+        if self.pmi_gate_mode not in {"off", "active"}:
+            raise ValueError("pmi_gate_mode must be off/active")
+        if not math.isfinite(self.pmi_gate_threshold):
+            raise ValueError("pmi_gate_threshold must be finite")
         if self.backend == "mlx" and (
             self.qk_layer_id is not None or self.qk_query_heads
         ):
@@ -609,6 +615,10 @@ class QwenExoConfig:
             ),
             qk_query_pooling=str(
                 getattr(server_args, "qwen_exo_qk_query_pooling", "windows")
+            ),
+            pmi_gate_mode=str(getattr(server_args, "qwen_exo_pmi_gate_mode", "off")),
+            pmi_gate_threshold=float(
+                getattr(server_args, "qwen_exo_pmi_gate_threshold", 0.0)
             ),
             telemetry_include_text=bool(
                 getattr(server_args, "qwen_exo_telemetry_include_text", False)
@@ -830,6 +840,8 @@ class QwenExoConfig:
             "qk_layer_id": self.qk_layer_id,
             "qk_query_heads": list(self.qk_query_heads),
             "qk_query_pooling": self.qk_query_pooling,
+            "pmi_gate_mode": self.pmi_gate_mode,
+            "pmi_gate_threshold": self.pmi_gate_threshold,
             "observer_mode": self.observer_mode,
             "telemetry_include_text": self.telemetry_include_text,
             "context_evidence_mode": self.context_evidence_mode,

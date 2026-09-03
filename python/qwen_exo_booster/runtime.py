@@ -77,6 +77,7 @@ from qwen_exo_booster.observer import (
     ObserverResult,
 )
 from qwen_exo_booster.pipeline import MemoryPipeline, MemoryPreparationState
+from qwen_exo_booster.pmi_gate import PmiJudgeGate
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.query_probe import QueryProbePlan, QueryProbeService
 from qwen_exo_booster.recall_trace import recall_trace_payload
@@ -1345,6 +1346,16 @@ class QwenExoRuntime:
                         policy_data=self.policy_data,
                         reference_judge=self.reference_judge,
                         telemetry=self.telemetry,
+                        pmi_gate=(
+                            PmiJudgeGate(
+                                self.internal_jobs,
+                                tokenizer,
+                                threshold=self.config.pmi_gate_threshold,
+                            )
+                            if self.config.pmi_gate_mode == "active"
+                            and tokenizer is not None
+                            else None
+                        ),
                     )
                 if tokenizer is not None and (
                     self.config.feature_flags.external_memory

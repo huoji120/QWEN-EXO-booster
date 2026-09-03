@@ -306,6 +306,7 @@ class MemoryPipeline:
         tensor_bank: Any | None = None,
         reference_judge: Any | None = None,
         telemetry: Any | None = None,
+        pmi_gate: Any | None = None,
         max_states: int = 2048,
     ):
         self.config = config
@@ -315,6 +316,7 @@ class MemoryPipeline:
         self.tensor_bank = tensor_bank
         self.reference_judge = reference_judge
         self.telemetry = telemetry
+        self.pmi_gate = pmi_gate
         self.max_states = int(max_states)
         self._states: OrderedDict[str, MemoryPreparationState] = OrderedDict()
         self._lock = asyncio.Lock()
@@ -605,6 +607,41 @@ class MemoryPipeline:
             kept.extend(selected)
         return tuple(kept), dropped
 
+    async def _pmi_gate_skips_judge(
+        self,
+        request_id: str,
+        question: str,
+        judged: tuple[KnowledgeCandidate, ...],
+    ) -> bool:
+        """Skip the judge when no shortlisted memory is predictable from the question.
+
+        Knowledge-lane candidates only: PolicyData is always-on and never
+        judged for relevance here. Any scoring failure fails open (the judge
+        still runs), so the gate can only remove judge rounds, never add
+        rejections the judge would not have produced.
+        """
+        if self.pmi_gate is None or self.config.pmi_gate_mode != "active":
+            return False
+        if not judged or any(c.lane != "knowledge" for c in judged):
+            return False
+        try:
+            result = await self.pmi_gate.evaluate(
+                parent_request_id=request_id, question=question, candidates=judged
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self.telemetry is not None:
+                self.telemetry.emit(
+                    request_id,
+                    "pmi_gate.failed_open",
+                    {"error_type": type(exc).__name__},
+                )
+            return False
+        if self.telemetry is not None:
+            self.telemetry.emit(request_id, "pmi_gate.evaluated", result.public_dict())
+        return bool(result.skip_judge)
+
     def _qk_prefilter_decision(
         self, judged: tuple[KnowledgeCandidate, ...]
     ) -> dict[str, Any]:
@@ -818,6 +855,9 @@ class MemoryPipeline:
                 qk_sent_to_judge=0 if skip_judge else len(qk_judged),
                 qk_score_filtered_count=qk_score_filtered_count,
             )
+
+        if judged and judge_available and not skip_judge:
+            skip_judge = await self._pmi_gate_skips_judge(request_id, question, judged)
 
         batches: list[Any] = []
         selection_method = "not_run"
