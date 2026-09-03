@@ -86,6 +86,7 @@ _QWEN38_REASONING_EFFORT_ALIASES = {
     "max": "xhigh",
 }
 _QWEN_EXO_DFLASH_THINK_PHASE = "qwen_exo_dflash_think_phase"
+_DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 def _normalize_model_reasoning_effort(tokenizer: Any, effort):
@@ -823,7 +824,8 @@ class OpenAIServingChat(OpenAIServingBase):
         so the same text becomes the first system message, ahead of any client
         system prompt so the client can still refine the task.
         """
-        if raw_request is None:
+        if raw_request is None or request.input_ids is not None:
+            # Pre-tokenized prompts bypass the chat template entirely.
             return request
         try:
             runtime = raw_request.app.state.qwen_exo_runtime
@@ -832,9 +834,13 @@ class OpenAIServingChat(OpenAIServingBase):
             logger.warning(
                 "QWEN_EXO_CHAT_PERSONALITY_SKIPPED reason=%s", type(exc).__name__
             )
-            return request
+            personality = None
         if not isinstance(personality, str) or not personality.strip():
-            return request
+            if any(message.role == "system" for message in request.messages):
+                return request
+            # GPT-style clients send only user turns; without a system turn the
+            # Qwen template injects its vendor identity prompt.
+            personality = _DEFAULT_SYSTEM_PROMPT
         messages = [
             ChatCompletionMessageGenericParam(role="system", content=personality),
             *request.messages,

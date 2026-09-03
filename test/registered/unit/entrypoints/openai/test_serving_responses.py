@@ -14,6 +14,7 @@ from utils import collect_stream_events, event_payloads, make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
     MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
@@ -144,6 +145,7 @@ class InputMessageConstructionTestCase(unittest.TestCase):
         self.assertEqual(
             messages,
             [
+                {"role": "system", "content": "You are a helpful assistant."},
                 {
                     "role": "user",
                     "content": [
@@ -156,9 +158,45 @@ class InputMessageConstructionTestCase(unittest.TestCase):
                             },
                         },
                     ],
-                }
+                },
             ],
         )
+
+    def test_user_only_input_gets_a_neutral_system_turn_and_codex_image_detail(self):
+        """GPT-style clients send user-only input with Codex image detail.
+
+        Without a system turn the Qwen template injects its vendor identity
+        prompt; ``detail: "original"`` is not an OpenAI level and used to fail
+        the whole request with a pydantic 400. Both must render as a valid
+        Chat Completions request.
+        """
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "what is in this image?"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/jpeg;base64,AAAA",
+                            "detail": "original",
+                        },
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages(request)
+        chat_request = ChatCompletionRequest(model="x", messages=messages)
+
+        self.assertEqual(
+            messages[0], {"role": "system", "content": "You are a helpful assistant."}
+        )
+        image_part = chat_request.messages[1].content[1]
+        self.assertEqual(image_part.image_url.detail, "high")
 
     def test_previous_multimodal_tool_history_is_normalized(self):
         serving = make_serving()
@@ -186,9 +224,10 @@ class InputMessageConstructionTestCase(unittest.TestCase):
 
         messages = serving._construct_input_messages(request, previous)
 
-        self.assertEqual(messages[0]["role"], "tool")
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "tool")
         self.assertEqual(
-            messages[0]["content"],
+            messages[1]["content"],
             [
                 {"type": "text", "text": "Took a screenshot."},
                 {
@@ -250,6 +289,7 @@ class InputMessageConstructionTestCase(unittest.TestCase):
         self.assertEqual(
             messages,
             [
+                {"role": "system", "content": "You are a helpful assistant."},
                 {
                     "role": "assistant",
                     "content": [
@@ -345,7 +385,13 @@ class ChatToolForwardingTestCase(unittest.TestCase):
             serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
         )
 
-        self.assertEqual(messages, [{"role": "user", "content": "call the tool"}])
+        self.assertEqual(
+            messages,
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "call the tool"},
+            ],
+        )
         self.assertEqual(request_prompts, [[1, 2, 3]])
         self.assertEqual(engine_prompts, [[1, 2, 3]])
         self.assertEqual(seen["tools"][0].function.name, "lookup")

@@ -97,6 +97,10 @@ _QWEN_EXO_SELF_CHECK_START = "<qwen_exo_self_check>"
 _QWEN_EXO_SELF_CHECK_END = "</qwen_exo_self_check>"
 
 _QWEN_EXO_DFLASH_THINK_PHASE = "qwen_exo_dflash_think_phase"
+# Qwen chat templates inject a vendor identity system prompt when a
+# conversation has no system message; GPT-style clients often send only user
+# turns. A neutral system turn keeps the template from adding its own.
+_DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 _CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
 
 
@@ -1896,11 +1900,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 system_chunks.append(text)
             else:
                 other_msgs.append(m)
-        if system_chunks:
-            return [
-                {"role": "system", "content": "\n\n".join(system_chunks)}
-            ] + other_msgs
-        return other_msgs
+        system_content = (
+            "\n\n".join(system_chunks) if system_chunks else _DEFAULT_SYSTEM_PROMPT
+        )
+        return [{"role": "system", "content": system_content}] + other_msgs
 
     def _construct_input_messages_with_harmony(
         self,

@@ -508,9 +508,26 @@ class ChatCompletionMessageContentThinkingPart(BaseModel):
 
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
-    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    detail: Optional[str] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+
+    @field_validator("detail", mode="before")
+    @classmethod
+    def _normalize_detail(cls, value):
+        """Accept vendor detail levels instead of rejecting the whole request.
+
+        OpenAI documents auto/low/high; Codex sends ``original`` for full
+        resolution. Unknown levels fall back to ``auto``.
+        """
+        if value is None:
+            return "auto"
+        level = str(value).strip().lower()
+        if level in {"auto", "low", "high"}:
+            return level
+        if level in {"original", "full", "max"}:
+            return "high"
+        return "auto"
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
