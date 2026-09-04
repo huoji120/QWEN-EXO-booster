@@ -101,6 +101,7 @@ class QwenExoConfig:
     kv_cache_dtype: str = "auto"
     max_running_requests: int = 10
     context_length: int = 131072
+    internal_mamba_reserve: int = 6
     policy_data_directory: Path | None = None
     cognition_directory: Path | None = None
     max_policy_tokens: int = 4096
@@ -149,6 +150,7 @@ class QwenExoConfig:
     observer_surprisal_threshold: float = 0.8
     observer_surprisal_window: int = 8
     observer_surprisal_margin: float = 0.2
+    observer_surprisal_sustain: int = 1
     observer_q_drift_threshold: float = 0.35
     observer_cooldown_tokens: int = 64
     observer_max_triggers: int = 1
@@ -156,6 +158,11 @@ class QwenExoConfig:
     observer_q_post_tokens: int = 4
     observer_recovery_tokens: int = 8
     immediate_uncertainty_retrieval: bool = False
+    # When think generation hits ``max_reasoning_tokens`` and is truncated, inject
+    # this many short, concrete self-check questions before the stop-and-go line
+    # so the model reconsiders before committing. ``0`` disables the questions and
+    # keeps the plain reasoning-budget cutoff.
+    reasoning_cutoff_question_count: int = 3
     replay_observation_tokens: int = 8
     replay_prefix_tokens: int = 1024
     replay_max_candidates: int = 2
@@ -207,6 +214,8 @@ class QwenExoConfig:
             )
         if self.max_internal_fanout < 1:
             raise ValueError("qwen_exo_max_internal_fanout must be positive")
+        if self.internal_mamba_reserve < 0:
+            raise ValueError("qwen_exo_internal_mamba_reserve must be non-negative")
         if self.max_internal_tokens < 1:
             raise ValueError("qwen_exo_max_internal_tokens must be positive")
         if self.max_candidates < 1:
@@ -349,6 +358,11 @@ class QwenExoConfig:
         if self.response_compaction_max_output_tokens < 256:
             raise ValueError("Response compaction output budget must be at least 256")
 
+        if self.reasoning_cutoff_question_count < 0:
+            raise ValueError(
+                "qwen_exo_reasoning_cutoff_question_count must be non-negative"
+            )
+
         if self.score_bias_mode not in _SCORE_BIAS_MODES:
             raise ValueError(
                 "qwen_exo_score_bias_mode must be one of "
@@ -370,6 +384,7 @@ class QwenExoConfig:
             self.observer_surprisal_threshold < 0
             or self.observer_surprisal_window < 2
             or self.observer_surprisal_margin < 0
+            or self.observer_surprisal_sustain < 1
             or self.observer_q_drift_threshold < 0
         ):
             raise ValueError("Observer thresholds and windows are invalid")
@@ -518,6 +533,7 @@ class QwenExoConfig:
                 )
             ).expanduser(),
             max_internal_fanout=int(server_args.qwen_exo_max_internal_fanout),
+            internal_mamba_reserve=int(server_args.qwen_exo_internal_mamba_reserve),
             max_internal_tokens=int(server_args.qwen_exo_max_internal_tokens),
             max_candidates=int(server_args.qwen_exo_max_candidates),
             max_memory_tokens=int(server_args.qwen_exo_max_memory_tokens),
@@ -745,6 +761,9 @@ class QwenExoConfig:
             observer_surprisal_margin=float(
                 getattr(server_args, "qwen_exo_observer_surprisal_margin", 0.2)
             ),
+            observer_surprisal_sustain=int(
+                getattr(server_args, "qwen_exo_observer_surprisal_sustain", 1)
+            ),
             observer_q_drift_threshold=float(
                 getattr(server_args, "qwen_exo_observer_q_drift_threshold", 0.35)
             ),
@@ -765,6 +784,11 @@ class QwenExoConfig:
             ),
             immediate_uncertainty_retrieval=bool(
                 getattr(server_args, "qwen_exo_immediate_uncertainty_retrieval", False)
+            ),
+            reasoning_cutoff_question_count=int(
+                getattr(
+                    server_args, "qwen_exo_reasoning_cutoff_question_count", 3
+                )
             ),
             replay_observation_tokens=int(
                 getattr(server_args, "qwen_exo_replay_observation_tokens", 8)
@@ -818,6 +842,7 @@ class QwenExoConfig:
             "policy_data_directory": str(self.policy_data_directory),
             "cognition_directory": str(self.cognition_directory),
             "max_internal_fanout": self.max_internal_fanout,
+            "internal_mamba_reserve": self.internal_mamba_reserve,
             "max_internal_tokens": self.max_internal_tokens,
             "max_candidates": self.max_candidates,
             "max_memory_tokens": self.max_memory_tokens,
@@ -873,6 +898,7 @@ class QwenExoConfig:
             "observer_surprisal_threshold": self.observer_surprisal_threshold,
             "observer_surprisal_window": self.observer_surprisal_window,
             "observer_surprisal_margin": self.observer_surprisal_margin,
+            "observer_surprisal_sustain": self.observer_surprisal_sustain,
             "observer_q_drift_threshold": self.observer_q_drift_threshold,
             "observer_cooldown_tokens": self.observer_cooldown_tokens,
             "observer_max_triggers": self.observer_max_triggers,
@@ -880,6 +906,7 @@ class QwenExoConfig:
             "observer_q_post_tokens": self.observer_q_post_tokens,
             "observer_recovery_tokens": self.observer_recovery_tokens,
             "immediate_uncertainty_retrieval": self.immediate_uncertainty_retrieval,
+            "reasoning_cutoff_question_count": self.reasoning_cutoff_question_count,
             "replay_observation_tokens": self.replay_observation_tokens,
             "replay_prefix_tokens": self.replay_prefix_tokens,
             "replay_max_candidates": self.replay_max_candidates,

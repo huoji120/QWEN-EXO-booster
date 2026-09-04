@@ -441,6 +441,48 @@ class InputItemNormalizationTestCase(unittest.TestCase):
             },
         )
 
+    def test_memory_attachment_renders_last_and_stays_out_of_stored_history(self):
+        """Retrieved memory is a trailing tool message, and only for this turn.
+
+        Position matters twice over: the Qwen template refuses a system message
+        anywhere but position 0, and a leading system message is the prompt's
+        cached prefix, so knowledge placed there re-prefills the whole
+        conversation whenever retrieval changes its mind. It must also stay out
+        of the stored history, or a ``previous_response_id`` chain replays it
+        forever and the context accumulates every document ever retrieved.
+        """
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            instructions="Be terse.",
+            input=[
+                {"role": "user", "content": "what broke?"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "exit 1",
+                },
+            ],
+            store=False,
+        )
+
+        with_memory = serving._construct_input_messages(
+            request, memory_attachment="<memory>rule card</memory>"
+        )
+        without_memory = serving._construct_input_messages(request)
+
+        self.assertEqual(
+            with_memory[-1],
+            {
+                "role": "tool",
+                "tool_call_id": "qwen_exo_memory",
+                "content": "<memory>rule card</memory>",
+            },
+        )
+        # Everything before the attachment renders identically, so the prompt
+        # prefix that precedes it stays reusable.
+        self.assertEqual(with_memory[:-1], without_memory)
+
     def test_developer_role_becomes_system(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {"role": "developer", "content": "Be terse."}
@@ -1566,10 +1608,10 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
             async def await_think_context(self, _request_id):
                 raise AssertionError("Forced reasoning boundary must skip Self-Ask")
 
-            async def discard_think_context_for_reasoning_budget(
-                self, request_id, **kwargs
-            ):
+            async def build_reasoning_cutoff_injection(self, request_id, **kwargs):
+                # Feature disabled (count == 0): plain cutoff, no questions.
                 self.discarded.append((request_id, kwargs))
+                return None
 
             def record_reasoning_boundary(self, request_id, **kwargs):
                 self.boundaries.append((request_id, kwargs))
@@ -1618,6 +1660,124 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
         )
         self.assertEqual(runtime.discarded[0][1]["observed_tokens"], 4)
         self.assertIsNone(runtime.boundaries[0][1]["injection"])
+
+    def test_reasoning_budget_injects_cutoff_questions_before_stop(self):
+        # When the cutoff feature is enabled, the forced boundary renders the
+        # self-check questions FIRST, then the stop-and-go line, then </think>.
+        class FakeTokenizer:
+            @staticmethod
+            def encode(text, add_special_tokens=False):
+                del add_special_tokens
+                return [200 + index for index, _ in enumerate(text.split())]
+
+            @staticmethod
+            def decode(token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return "</think>" if token_ids == [99] else ""
+
+        class FakeTokenizerManager:
+            def __init__(self):
+                self.tokenizer = FakeTokenizer()
+                self.server_args = SimpleNamespace(incremental_streaming_output=False)
+                self.model_config = SimpleNamespace(context_len=1024)
+                self.num_reserved_tokens = 0
+                self.requests = []
+
+            def generate_request(self, request, _raw_request):
+                self.requests.append(request)
+                request_index = len(self.requests)
+
+                async def generate():
+                    if request_index == 1:
+                        yield {
+                            "text": "<think>bounded reasoning",
+                            "output_ids": [10, 11, 12, 13],
+                            "meta_info": {
+                                "prompt_tokens": 2,
+                                "completion_tokens": 4,
+                                "finish_reason": {"type": "length"},
+                            },
+                        }
+                    else:
+                        yield {
+                            "text": "final action",
+                            "output_ids": [20, 21],
+                            "meta_info": {
+                                "prompt_tokens": len(request.input_ids),
+                                "completion_tokens": 2,
+                                "finish_reason": {"type": "stop", "matched": 0},
+                            },
+                        }
+
+                return generate()
+
+        injection = SimpleNamespace(
+            text="\n\n[自检] 收束前先核对：\n1. did I verify the load-bearing assumption?\n"
+        )
+
+        class FakeRuntime:
+            reasoning_end_token_id = 99
+            think_context_enabled = True
+            max_reasoning_tokens = 4
+
+            def __init__(self):
+                self.boundaries = []
+
+            def register_generation_prompt(self, *_args, **_kwargs):
+                pass
+
+            def observe_generation_result(self, *_args, **_kwargs):
+                pass
+
+            async def await_think_context(self, _request_id):
+                raise AssertionError("Forced reasoning boundary must not await Self-Ask")
+
+            async def build_reasoning_cutoff_injection(self, _request_id, **_kwargs):
+                return injection
+
+            def record_reasoning_boundary(self, request_id, **kwargs):
+                self.boundaries.append((request_id, kwargs))
+
+        serving = object.__new__(OpenAIServingResponses)
+        serving.tokenizer_manager = FakeTokenizerManager()
+        runtime = FakeRuntime()
+        raw_request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(qwen_exo_runtime=runtime))
+        )
+        adapted_request = GenerateReqInput(
+            input_ids=[1, 2],
+            sampling_params={"max_new_tokens": 10},
+            stream=False,
+            rid="resp-reasoning-cutoff",
+        )
+        context = SimpleContext()
+
+        async def collect():
+            snapshots = []
+            async for current in serving._generate_with_builtin_tools(
+                "resp-reasoning-cutoff",
+                [1, 2],
+                adapted_request,
+                {"max_new_tokens": 10},
+                context,
+                raw_request=raw_request,
+            ):
+                snapshots.append(dict(current.last_output))
+            return snapshots
+
+        snapshots = asyncio.run(collect())
+
+        boundary_text = snapshots[1]["text"]
+        # Questions appear, then the stop-and-go line, then </think>, in order.
+        self.assertIn("load-bearing assumption", boundary_text)
+        self.assertIn("stop over thinking", boundary_text)
+        self.assertLess(
+            boundary_text.index("load-bearing assumption"),
+            boundary_text.index("stop over thinking"),
+        )
+        self.assertTrue(boundary_text.endswith("</think>"))
+        self.assertTrue(snapshots[1]["meta_info"]["qwen_exo_self_ask_boundary"])
+        self.assertIs(runtime.boundaries[0][1]["injection"], injection)
 
 
 class ContinuationCacheRegressionTestCase(CustomTestCase):

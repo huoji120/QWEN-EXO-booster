@@ -46,11 +46,18 @@ class SchedulerAdmission:
         *,
         page_size: int,
         consensus: Callable[[bool], bool] | None = None,
+        internal_mamba_reserve: int = 0,
     ):
         if page_size < 1:
             raise ValueError("Admission page size must be positive")
+        if internal_mamba_reserve < 0:
+            raise ValueError("Internal mamba reserve must be non-negative")
         self.page_size = int(page_size)
         self.consensus = consensus or (lambda accepted: accepted)
+        # Mamba slots kept out of reach of internal (fan-out) jobs so they can
+        # never be admitted by planning to evict a live user session's
+        # recurrent state. User requests ignore this floor.
+        self.internal_mamba_reserve = int(internal_mamba_reserve)
         self._reservations: dict[str, SchedulerResourceEstimate] = {}
 
     def estimate(
@@ -85,6 +92,7 @@ class SchedulerAdmission:
         available_request_slots: int,
         available_mamba_slots: int | None,
         available_workspace_bytes: int | None = None,
+        is_internal: bool = False,
     ) -> SchedulerAdmissionDecision:
         request_id = str(request_id)
         if request_id in self._reservations:
@@ -115,6 +123,19 @@ class SchedulerAdmission:
             (item.workspace_bytes for item in self._reservations.values()),
             default=0,
         )
+        # Internal jobs must leave a floor of mamba slots untouched: they may
+        # only consume free/internal-evictable capacity, never the reserve that
+        # protects a live user session's recurrent state from eviction. User
+        # requests see the full pool.
+        effective_mamba_slots = available_mamba_slots
+        if (
+            is_internal
+            and available_mamba_slots is not None
+            and self.internal_mamba_reserve
+        ):
+            effective_mamba_slots = max(
+                0, int(available_mamba_slots) - self.internal_mamba_reserve
+            )
         local_reason = "admitted"
         if estimate.kv_tokens > int(available_kv_tokens) - reserved_kv:
             local_reason = "kv_capacity"
@@ -122,8 +143,8 @@ class SchedulerAdmission:
             local_reason = "request_slots"
         elif (
             estimate.mamba_slots
-            and available_mamba_slots is not None
-            and estimate.mamba_slots > int(available_mamba_slots) - reserved_mamba
+            and effective_mamba_slots is not None
+            and estimate.mamba_slots > int(effective_mamba_slots) - reserved_mamba
         ):
             local_reason = "mamba_slots"
         elif available_workspace_bytes is not None and max(

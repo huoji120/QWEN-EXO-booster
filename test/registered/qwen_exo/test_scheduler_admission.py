@@ -87,6 +87,81 @@ def test_admission_rejects_without_partial_commit():
     assert admission.reservation_count == 0
 
 
+def test_internal_mamba_reserve_blocks_internal_from_user_floor():
+    # Regression: internal fan-out (judge) jobs were admitted against the whole
+    # mamba pool (free + evictable, which includes a live user session's state),
+    # so they evicted user radix nodes and forced a full re-prefill next turn.
+    # With a reserve, an internal job that would dip into the floor is rejected
+    # while the identical user request is admitted.
+    admission = SchedulerAdmission(page_size=64, internal_mamba_reserve=6)
+    estimate = admission.estimate(
+        prompt_tokens=100, max_new_tokens=32, needs_mamba=True
+    )  # needs 1 mamba slot
+
+    # 8 available, reserve 6 -> internal sees effective 2. A single-slot internal
+    # job fits (2 >= 1); make it need more than the floor leaves by stacking two.
+    first_internal = admission.reserve(
+        "internal:parent:a",
+        estimate,
+        available_kv_tokens=10_000,
+        available_request_slots=8,
+        available_mamba_slots=8,
+        is_internal=True,
+    )
+    second_internal = admission.reserve(
+        "internal:parent:b",
+        estimate,
+        available_kv_tokens=10_000,
+        available_request_slots=8,
+        available_mamba_slots=8,
+        is_internal=True,
+    )
+    third_internal = admission.reserve(
+        "internal:parent:c",
+        estimate,
+        available_kv_tokens=10_000,
+        available_request_slots=8,
+        available_mamba_slots=8,
+        is_internal=True,
+    )
+
+    # effective pool for internal = 8 - 6 = 2 slots -> only two admit, third hits
+    # the reserved floor.
+    assert first_internal.admitted
+    assert second_internal.admitted
+    assert not third_internal.admitted
+    assert third_internal.reason == "mamba_slots"
+
+    # A user request ignores the floor: it may use up to the full pool.
+    user = admission.reserve(
+        "user-req",
+        estimate,
+        available_kv_tokens=10_000,
+        available_request_slots=8,
+        available_mamba_slots=8,
+        is_internal=False,
+    )
+    assert user.admitted
+
+
+def test_zero_reserve_leaves_internal_and_user_identical():
+    # Default (no reserve) must not change legacy behaviour: an internal job may
+    # use the whole reported mamba pool exactly like a user request.
+    admission = SchedulerAdmission(page_size=64, internal_mamba_reserve=0)
+    estimate = admission.estimate(
+        prompt_tokens=100, max_new_tokens=32, needs_mamba=True
+    )
+    decision = admission.reserve(
+        "internal:parent:x",
+        estimate,
+        available_kv_tokens=10_000,
+        available_request_slots=8,
+        available_mamba_slots=1,
+        is_internal=True,
+    )
+    assert decision.admitted
+
+
 def test_internal_queue_estimate_does_not_consume_user_request_slots():
     admission = SchedulerAdmission(page_size=64)
     estimate = admission.estimate(

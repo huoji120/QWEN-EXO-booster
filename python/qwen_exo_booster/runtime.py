@@ -73,11 +73,11 @@ from qwen_exo_booster.observer import (
     AdaptiveRetrievalPhase,
     AdaptiveRetrievalStateMachine,
     InFlightObserver,
-    MidThinkEvent,
     ObserverResult,
 )
 from qwen_exo_booster.pipeline import MemoryPipeline, MemoryPreparationState
 from qwen_exo_booster.pmi_gate import PmiJudgeGate
+from qwen_exo_booster.mid_think_questions import MidThinkQuestionService
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.query_probe import QueryProbePlan, QueryProbeService
 from qwen_exo_booster.recall_trace import recall_trace_payload
@@ -385,6 +385,7 @@ class QwenExoRuntime:
         self.reference_judge: ReferenceJudge | None = None
         self.capsules: ExecutionCapsuleService | None = None
         self.refresh_service: SelfAskRefreshService | None = None
+        self.mid_think_questions: MidThinkQuestionService | None = None
         self.reflection_memory_service: ReflectionMemoryService | None = None
         self.memory_pipeline: MemoryPipeline | None = None
         self.query_probe: QueryProbeService | None = None
@@ -411,6 +412,7 @@ class QwenExoRuntime:
             surprisal_threshold=config.observer_surprisal_threshold,
             surprisal_window=config.observer_surprisal_window,
             surprisal_margin=config.observer_surprisal_margin,
+            surprisal_sustain=config.observer_surprisal_sustain,
             q_drift_threshold=config.observer_q_drift_threshold,
             cooldown_tokens=config.observer_cooldown_tokens,
             max_triggers=config.observer_max_triggers,
@@ -1486,17 +1488,19 @@ class QwenExoRuntime:
                         qk_admission_margin=self.config.qk_admission_margin,
                         qk_min_tensor_score=self.config.qk_admission_gates[0],
                     )
-                    self.causal_replay = CausalReplayService(
+                if (
+                    self.config.reasoning_cutoff_question_count > 0
+                    and tokenizer is not None
+                ):
+                    cutoff_count = self.config.reasoning_cutoff_question_count
+                    self.mid_think_questions = MidThinkQuestionService(
                         self.internal_jobs,
                         tokenizer,
                         self.telemetry,
-                        observation_tokens=self.config.replay_observation_tokens,
-                        prefix_tokens=self.config.replay_prefix_tokens,
-                        max_candidates=self.config.replay_max_candidates,
-                        reference_tokens=self.config.replay_reference_tokens,
-                        minimum_gain=self.config.replay_minimum_gain,
-                        switch_margin=self.config.replay_switch_margin,
-                        maybe_kl_cap=self.config.replay_maybe_kl_cap,
+                        question_count=cutoff_count,
+                        # Generated synchronously at the reasoning cutoff, so keep
+                        # the output tight to minimise the added boundary latency.
+                        max_output_tokens=max(160, 40 * cutoff_count),
                     )
                 if (
                     self.config.reflection_memory_mode != "off"
@@ -2830,6 +2834,10 @@ class QwenExoRuntime:
                     if include_policy
                     else state.policy_cache_namespace
                 ),
+                # Knowledge lives in the trailing attachment, so dropping it for
+                # context budget means clearing the field, never the leading
+                # instructions.
+                "qwen_exo_memory_attachment": None,
             }
         )
         self.telemetry.emit(
@@ -3078,18 +3086,6 @@ class QwenExoRuntime:
             reasoning_end_token_id=observer_reasoning_end_token_id,
             thinking_enabled=thinking_enabled,
         )
-        persistent_event = next(
-            (
-                event
-                for event in observation.events
-                if event.uncertainty_state
-                in {
-                    "persistent_uncertainty",
-                    "uncertainty_detected",
-                }
-            ),
-            None,
-        )
         for resolved_event in observation.events:
             if resolved_event.uncertainty_state == "resolved_by_continuation":
                 self.telemetry.emit(
@@ -3101,157 +3097,10 @@ class QwenExoRuntime:
                         "generation_index": resolved_event.generation_index,
                     },
                 )
-        if (
-            persistent_event is not None
-            and self.refresh_service is not None
-            and request_id not in self._refresh_tasks
-        ):
-            event = persistent_event
-            self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.TRIGGERED,
-                event_id=event.event_id,
-                decision="observer_trigger",
-            )
-            self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.REFRESHING,
-                event_id=event.event_id,
-            )
-            task = asyncio.create_task(
-                self.refresh_service.refresh(
-                    parent_request_id=request_id,
-                    turn_id=request_id,
-                    user_question=self._request_questions.get(request_id, ""),
-                    partial_output=self._request_outputs.get(request_id, output_text),
-                    event=event,
-                    purpose="mid_think",
-                )
-            )
-            self._refresh_tasks[request_id] = task
-            if self.causal_replay is not None:
-                replay_task = asyncio.create_task(
-                    self._finish_mid_think_replay(request_id, event, task)
-                )
-                self._replay_tasks[request_id] = replay_task
+        # Mid-think self-questions are no longer triggered by observer drift; they
+        # are generated synchronously at the reasoning-budget cutoff (see
+        # build_reasoning_cutoff_injection).
         return observation
-
-    async def _finish_mid_think_replay(
-        self,
-        request_id: str,
-        event: MidThinkEvent,
-        refresh_task: asyncio.Task[Any],
-    ) -> None:
-        try:
-            record = await refresh_task
-            if (
-                record.status != "semantic_ready"
-                or self.refresh_service is None
-                or self.causal_replay is None
-            ):
-                self._adaptive_transition(
-                    request_id,
-                    AdaptiveRetrievalPhase.REJECTED,
-                    event_id=event.event_id,
-                    decision=record.status,
-                )
-                return
-            self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.SEMANTIC_READY,
-                event_id=event.event_id,
-                decision="eligible_reference",
-            )
-            self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.REPLAY_SCORING,
-                event_id=event.event_id,
-            )
-            key = (str(request_id), int(event.generation_index))
-            prompt_ids = self._request_prompt_ids.get(key, ())
-            output_ids = self._request_generation_output_ids.get(key, ())
-            if not prompt_ids:
-                await self.refresh_service.complete_replay(
-                    request_id,
-                    replay_decision="failed_closed:missing_generation_prompt",
-                    winner_candidate_id=None,
-                    gain=None,
-                    kl=None,
-                    maybe_decision="not_compiled",
-                    scheduled_next_turn=False,
-                )
-                self._adaptive_transition(
-                    request_id,
-                    AdaptiveRetrievalPhase.REJECTED,
-                    event_id=event.event_id,
-                    decision="missing_generation_prompt",
-                )
-                return
-            replay = await self.causal_replay.evaluate(
-                parent_request_id=request_id,
-                event=event,
-                prompt_ids=prompt_ids,
-                output_ids=output_ids,
-                candidates=self.refresh_service.eligible_candidates(request_id),
-                decisions=self.refresh_service.eligibility_decisions(request_id),
-            )
-            updated = await self.refresh_service.complete_replay(
-                request_id,
-                replay_decision=replay.decision,
-                winner_candidate_id=replay.winner_candidate_id,
-                gain=replay.winner_gain,
-                kl=replay.winner_kl,
-                maybe_decision=replay.maybe_decision,
-                scheduled_next_turn=replay.scheduled_next_turn,
-            )
-            admitted = bool(
-                updated is not None
-                and updated.status == "ready_for_safe_replay"
-                and updated.maybe_scheduled_next_turn
-            )
-            self._adaptive_transition(
-                request_id,
-                (
-                    AdaptiveRetrievalPhase.NEXT_TURN_READY
-                    if admitted
-                    else AdaptiveRetrievalPhase.REJECTED
-                ),
-                event_id=event.event_id,
-                decision=replay.maybe_decision,
-            )
-        except asyncio.CancelledError:
-            self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.CANCELLED,
-                event_id=event.event_id,
-                decision="cancelled",
-            )
-            raise
-        except Exception as exc:
-            if self.refresh_service is not None:
-                await self.refresh_service.complete_replay(
-                    request_id,
-                    replay_decision=f"failed_closed:{type(exc).__name__}",
-                    winner_candidate_id=None,
-                    gain=None,
-                    kl=None,
-                    maybe_decision="not_compiled",
-                    scheduled_next_turn=False,
-                )
-            self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.FAILED_CLOSED,
-                event_id=event.event_id,
-                decision=type(exc).__name__,
-            )
-            self.telemetry.emit(
-                request_id,
-                "adaptive.failed_closed",
-                {
-                    "event_id": event.event_id,
-                    "error_type": type(exc).__name__,
-                },
-            )
 
     def record_tool_event(
         self,
@@ -5513,17 +5362,24 @@ class QwenExoRuntime:
     def max_reasoning_tokens(self) -> int:
         return self.config.max_reasoning_tokens
 
-    async def discard_think_context_for_reasoning_budget(
+    async def build_reasoning_cutoff_injection(
         self,
         request_id: str,
         *,
         observed_tokens: int,
         generation_index: int,
-    ) -> None:
+    ) -> ThinkContextInjection | None:
+        """At the reasoning-budget cutoff, synchronously build the self-question
+        injection (if enabled) that precedes the stop-and-go boundary.
+
+        Returns the injection to render before ``</think>``, or ``None`` to fall
+        back to the plain cutoff. Any stale pending context and in-flight
+        refresh/replay tasks for this request are cleared either way.
+        """
         request_id = str(request_id)
-        injection = self._pending_think_contexts.pop(request_id, None)
-        if injection is not None:
-            self._consumed_think_contexts.add(injection.turn_id)
+        stale = self._pending_think_contexts.pop(request_id, None)
+        if stale is not None:
+            self._consumed_think_contexts.add(stale.turn_id)
         tasks = tuple(
             task
             for task in (
@@ -5536,6 +5392,27 @@ class QwenExoRuntime:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        questions = None
+        if self.mid_think_questions is not None:
+            try:
+                questions = await self.mid_think_questions.generate(
+                    parent_request_id=request_id,
+                    turn_id=request_id,
+                    event_id=None,
+                    user_question=self._request_questions.get(request_id, ""),
+                    partial_output=self._request_outputs.get(request_id, ""),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.telemetry.emit(
+                    request_id,
+                    "reasoning_cutoff.questions_failed_closed",
+                    {"error_type": type(exc).__name__},
+                )
+                questions = None
+
         self.telemetry.emit(
             request_id,
             "reasoning.budget_forced",
@@ -5543,19 +5420,24 @@ class QwenExoRuntime:
                 "max_reasoning_tokens": self.max_reasoning_tokens,
                 "observed_tokens": int(observed_tokens),
                 "generation_index": int(generation_index),
-                "self_ask_skipped": True,
-                "had_pending_context": injection is not None,
+                "cutoff_questions": questions is not None,
+                "had_pending_context": stale is not None,
                 "cancelled_refresh_tasks": len(tasks),
             },
         )
-        self.telemetry.emit(
-            request_id,
-            "self_ask.think_context_skipped",
-            {
-                "reason": "reasoning_budget_forced",
-                "had_pending_context": injection is not None,
-                "generation_index": int(generation_index),
-            },
+        if questions is None:
+            return None
+        turn_id = (
+            f"{request_id}:reasoning_cutoff_questions:"
+            f"{stable_digest(questions.injection_text)[:16]}"
+        )
+        return ThinkContextInjection(
+            turn_id=turn_id,
+            event_id=questions.event_id,
+            purpose="reasoning_cutoff_questions",
+            question="",
+            answer="",
+            text=questions.injection_text,
         )
 
     async def await_think_context(
@@ -5577,7 +5459,12 @@ class QwenExoRuntime:
                         {"error_type": type(exc).__name__},
                     )
                     return None
-                injection = self._think_context_from_record(record)
+                # The divergent-questions task stages its injection in
+                # _pending_think_contexts and returns None, so re-check there
+                # before deriving one from a (non-existent) refresh record.
+                injection = self._pending_think_contexts.pop(request_id, None)
+                if injection is None and record is not None:
+                    injection = self._think_context_from_record(record)
         if injection is None or injection.turn_id in self._consumed_think_contexts:
             return None
         self._consumed_think_contexts.add(injection.turn_id)

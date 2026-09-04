@@ -167,7 +167,7 @@ def test_second_unhealthy_boot_rolls_back_to_last_healthy_revision(tmp_path: Pat
     assert failed_attempt["revision"] != initial["revision"]
     assert rolled_back["revision"] == initial["revision"]
     assert rolled_back["last_failed_revision"] == failed_attempt["revision"]
-    assert values_from_args(effective_args)["qwen_exo_max_candidates"] == 8
+    assert values_from_args(effective_args)["qwen_exo_max_candidates"] == 4
 
 
 def test_validation_rejects_incompatible_runtime_contract():

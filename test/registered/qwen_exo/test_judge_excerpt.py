@@ -6,11 +6,15 @@ from qwen_exo_booster.tensor_bank import TensorBank
 class _WordTokenizer:
     def __init__(self):
         self._vocab: dict[int, str] = {}
+        self._ids: dict[str, int] = {}
 
     def encode(self, text, add_special_tokens=False):
+        # Hand out ids sequentially rather than hashing the word: ``hash`` is
+        # seeded per process, so hash-derived ids collide for ~18% of seeds and
+        # decode one word as another.
         ids = []
         for word in str(text).split():
-            token = abs(hash(word)) % 100000
+            token = self._ids.setdefault(word, len(self._ids) + 1)
             self._vocab[token] = word
             ids.append(token)
         return ids

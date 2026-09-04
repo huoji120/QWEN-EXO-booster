@@ -102,6 +102,8 @@ _QWEN_EXO_DFLASH_THINK_PHASE = "qwen_exo_dflash_think_phase"
 # turns. A neutral system turn keeps the template from adding its own.
 _DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 _CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
+# Identifies the synthetic tool message that carries retrieved QWEN-EXO memory.
+_MEMORY_ATTACHMENT_TOOL_CALL_ID = "qwen_exo_memory"
 
 
 class _QwenExoSelfAskSpillRouter:
@@ -1074,7 +1076,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             assert len(generators) == 1
             (result_generator,) = generators
 
-            # Store the input messages
+            # Store the input messages. The retrieved-memory attachment is
+            # deliberately left out: it is evidence for this turn only, and
+            # storing it would replay it as permanent history on every later
+            # turn of a ``previous_response_id`` chain.
             if request.store:
                 public_messages = (
                     self._construct_input_messages_with_harmony(request, prev_response)
@@ -1195,7 +1200,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         prev_response: Optional[ResponsesResponse],
         tokenizer: Any,
     ):
-        messages = self._construct_input_messages(request, prev_response)
+        messages = self._construct_input_messages(
+            request,
+            prev_response,
+            memory_attachment=request.qwen_exo_memory_attachment,
+        )
 
         chat_tools = self._response_tools_to_chat_tools(request)
         chat_request = ChatCompletionRequest(
@@ -1844,7 +1853,16 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse] = None,
+        *,
+        memory_attachment: Optional[str] = None,
     ) -> list[ChatCompletionMessageParam]:
+        """Render one Responses request as chat messages.
+
+        ``memory_attachment`` is appended as a trailing tool message so that
+        retrieved knowledge lands at the end of the prompt. Callers building the
+        *stored* history pass nothing: the attachment belongs to a single turn
+        and must not accumulate into the conversation transcript.
+        """
         messages: list[ChatCompletionMessageParam] = []
         if request.instructions:
             messages.append(
@@ -1882,6 +1900,21 @@ class OpenAIServingResponses(OpenAIServingChat):
         # (message + function_call(s)); collapse them into one chat message
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
+
+        # Retrieved memory goes last, as a ``tool`` message. The Qwen template
+        # rejects a system message anywhere but position 0, and a trailing
+        # *user* message would move ``last_query_index`` to the end and restrip
+        # the reasoning blocks of the whole history; a ``tool`` message renders
+        # inside ``<tool_response>`` and is skipped by that scan, so the history
+        # renders byte-identically with and without the attachment.
+        if memory_attachment:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": _MEMORY_ATTACHMENT_TOOL_CALL_ID,
+                    "content": memory_attachment,
+                }
+            )
 
         # Most chat templates expect a single leading ``system`` message;
         # coalesce any ``instructions`` + interleaved ``developer`` entries.
@@ -3453,7 +3486,9 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> tuple[str, tuple[int, ...]]:
         injected_text = injection.text if injection is not None else ""
         if forced:
-            injected_text = "\nlet me do this now stop over thinking\n"
+            # Reasoning budget cutoff: any self-check questions come first, then
+            # the stop-and-go instruction, then the </think> boundary.
+            injected_text = f"{injected_text}\nlet me do this now stop over thinking\n"
         injected_ids = self.tokenizer_manager.tokenizer.encode(
             injected_text, add_special_tokens=False
         )
@@ -3734,12 +3769,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 assert reasoning_end_token_id is not None
                 assert qwen_exo_runtime is not None
                 if forced_reasoning_boundary:
-                    await qwen_exo_runtime.discard_think_context_for_reasoning_budget(
-                        request_id,
-                        observed_tokens=len(phase_output_ids),
-                        generation_index=generation_index,
+                    injection = (
+                        await qwen_exo_runtime.build_reasoning_cutoff_injection(
+                            request_id,
+                            observed_tokens=len(phase_output_ids),
+                            generation_index=generation_index,
+                        )
                     )
-                    injection = None
                 else:
                     injection = await qwen_exo_runtime.await_think_context(request_id)
                 boundary_text, boundary_ids = self._reasoning_boundary_tokens(

@@ -291,6 +291,7 @@ class ObserverRequestState:
     trigger_count: int = 0
     last_trigger_token: int = -1
     last_emitted_token: int = 0
+    sustained_count: int = 0
     trigger_tokens: list[int] = field(default_factory=list)
     surprisal_values: deque[float] = field(default_factory=lambda: deque(maxlen=32))
     # Full history is retained only for the request lifetime. Runtime snapshots
@@ -333,6 +334,7 @@ class InFlightObserver:
         surprisal_threshold: float = 0.8,
         surprisal_window: int = 8,
         surprisal_margin: float = 0.2,
+        surprisal_sustain: int = 1,
         q_drift_threshold: float = 0.35,
         cooldown_tokens: int = 64,
         max_triggers: int = 1,
@@ -349,6 +351,7 @@ class InFlightObserver:
             surprisal_threshold < 0
             or surprisal_window < 2
             or surprisal_margin < 0
+            or surprisal_sustain < 1
             or q_drift_threshold < 0
             or cooldown_tokens < 1
             or max_triggers < 0
@@ -366,6 +369,7 @@ class InFlightObserver:
         self.surprisal_threshold = float(surprisal_threshold)
         self.surprisal_window = int(surprisal_window)
         self.surprisal_margin = float(surprisal_margin)
+        self.surprisal_sustain = int(surprisal_sustain)
         self.q_drift_threshold = float(q_drift_threshold)
         self.cooldown_tokens = int(cooldown_tokens)
         self.max_triggers = int(max_triggers)
@@ -490,15 +494,29 @@ class InFlightObserver:
                 and state.local_window_mean - state.history_mean
                 >= self.surprisal_margin
             )
-            if (
+            # Continuous-drift confirmation: a single elevated window is a spike
+            # and produced almost all of the false triggers. Require the drift
+            # signal to persist for `surprisal_sustain` consecutive tokens before
+            # trusting it. With sustain=1 this reduces to the old per-token test,
+            # so each reason keeps its original threshold (window uses the
+            # absolute surprisal threshold; q-drift does not).
+            if relative_uncertainty:
+                state.sustained_count += 1
+            else:
+                state.sustained_count = 0
+            drift_confirmed = (
                 relative_uncertainty
+                and state.sustained_count >= self.surprisal_sustain
+            )
+            if (
+                drift_confirmed
                 and state.local_window_mean >= self.surprisal_threshold
             ):
                 token_reasons.append("selected_token_surprisal_window")
             if (
                 q_drift is not None
                 and q_drift >= self.q_drift_threshold
-                and relative_uncertainty
+                and drift_confirmed
             ):
                 token_reasons.append("attention_q_drift")
             cooldown_ready = (

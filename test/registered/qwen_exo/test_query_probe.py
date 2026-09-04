@@ -91,6 +91,7 @@ class FakeRequest:
     instructions: str | None = None
     previous_response_id: str | None = None
     extra_key: str | None = None
+    qwen_exo_memory_attachment: str | None = None
 
     def model_copy(self, update):
         return replace(self, **update)
@@ -632,7 +633,7 @@ def test_request_memory_uses_only_query_q_and_skips_text_rankers(tmp_path):
     )
 
     assert request.instructions in prepared.instructions
-    assert "WFP native query key material" in prepared.instructions
+    assert "WFP native query key material" in prepared.qwen_exo_memory_attachment
     assert state.knowledge_admission_mode == "semantic_eligibility"
     assert len(state.decisions) == 1
     assert state.radix_prefix_page_id is None

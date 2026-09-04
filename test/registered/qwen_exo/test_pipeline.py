@@ -26,6 +26,7 @@ class FakeRequest:
     instructions: str | None = None
     previous_response_id: str | None = None
     extra_key: str | None = None
+    qwen_exo_memory_attachment: str | None = None
 
     def model_copy(self, update):
         return replace(self, **update)
@@ -597,6 +598,46 @@ def test_no_q_signal_restores_policydata_as_the_default_personality(tmp_path):
     assert state.public_dict()["cognition"]["source_tokens"] == 0
 
 
+def test_retrieval_result_moves_neither_instructions_nor_cache_namespace(tmp_path):
+    """Two turns that retrieve different documents must agree on their prefix.
+
+    ``instructions`` renders as the prompt's leading system message and
+    ``extra_key`` selects the radix subtree, so if either tracked the retrieved
+    document set, an agentic loop whose retrieval flips between turns would
+    re-prefill its entire context every time it flipped -- measured at ~90K
+    tokens per flip on the live server, against ~4K when only the trailing
+    attachment moves.
+    """
+    repo = repository(tmp_path)
+    wfp = native_candidate(repo, "wfp.md", page_id=3, score=0.91)
+    ctf = native_candidate(repo, "ctf.md", page_id=4, score=0.93)
+    policy = policy_repository(tmp_path)
+
+    def prepared_turn(request_id, candidate, question):
+        pipeline = build_pipeline(
+            config(tmp_path, policy_data=True),
+            repo,
+            FakeTokenizer(),
+            policy_data=policy,
+            tensor_bank=FakeQKTensorBank((candidate,)),
+        )
+        return prepare(
+            pipeline,
+            FakeRequest(
+                request_id=request_id, input=question, instructions="Answer briefly."
+            ),
+        )
+
+    first, first_state = prepared_turn("resp-ns-1", wfp, "Which WFP layer?")
+    second, second_state = prepared_turn("resp-ns-2", ctf, "How does the heap CTF go?")
+
+    assert first_state.selected_document_ids != second_state.selected_document_ids
+    assert first.instructions == second.instructions
+    assert first.extra_key == second.extra_key
+    # ...while the evidence itself did change, in the carrier that is allowed to.
+    assert first.qwen_exo_memory_attachment != second.qwen_exo_memory_attachment
+
+
 def test_qk_knowledge_page_requires_semantic_judge(tmp_path):
     repo = repository(tmp_path)
     candidate = native_candidate(repo, "wfp.md", page_id=3, score=0.91)
@@ -616,7 +657,10 @@ def test_qk_knowledge_page_requires_semantic_judge(tmp_path):
     prepared, state = prepare(pipeline, request)
 
     assert request.instructions in prepared.instructions
-    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.instructions
+    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.qwen_exo_memory_attachment
+    # Knowledge must stay out of the leading system message: it changes between
+    # turns, and the leading message is the prompt's cached prefix.
+    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" not in prepared.instructions
     assert len(state.decisions) == 1
     assert state.decisions[0].status is EligibilityStatus.ELIGIBLE
     assert state.selected_document_ids == (candidate.document_id,)
@@ -1665,7 +1709,7 @@ def test_qk_knowledge_is_text_attached_while_policy_stays_always_on(tmp_path):
     assert state.selected_document_ids == (knowledge.document_id,)
     assert state.policy_attachment is not None
     assert state.policy_attachment.active is True
-    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.instructions
+    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.qwen_exo_memory_attachment
     assert "NATIVE_ONLY_41C9" in prepared.instructions
     assert state.radix_prefix_page_id is None
     assert state.section_delta_mode == "none"
@@ -1737,7 +1781,7 @@ def test_turn_end_finalization_disables_native_attractor_and_rejudges_text(tmp_p
     assert followup.restoration_status == "not_requested"
     assert followup.radix_prefix_page_id is None
     assert first_candidate.document_id in followup.selected_document_ids
-    assert "CTF heap exploitation" in prepared.instructions
+    assert "CTF heap exploitation" in prepared.qwen_exo_memory_attachment
     assert len(followup.decisions) == 2
 
 
@@ -1779,8 +1823,8 @@ def test_next_turn_restoration_rechecks_semantic_eligibility(tmp_path):
     assert state.radix_prefix_page_id is None
     assert state.hybrid_restoration_mode == "text_reference_context"
     assert state.private_attachment is not None
-    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.instructions
-    assert "private answer" in prepared.instructions
+    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prepared.qwen_exo_memory_attachment
+    assert "private answer" in prepared.qwen_exo_memory_attachment
 
 
 def test_stale_restoration_digest_fails_closed(tmp_path):

@@ -471,3 +471,63 @@ def test_telemetry_clear_truncates_disk_and_memory(tmp_path):
     status = store.persistence_status()
     assert status["disk_events"] == 0
     assert status["ok"] is True
+
+
+def _drifting_stream():
+    # Four low-surprisal warmup tokens, then a sustained high-surprisal run.
+    return [(-1.0, i + 1) for i in range(4)] + [(-8.0, 100 + i) for i in range(6)]
+
+
+def _observer(tmp_path, **kwargs):
+    base = dict(
+        mode="shadow",
+        surprisal_window=2,
+        surprisal_threshold=6.0,
+        surprisal_margin=2.0,
+        cooldown_tokens=1,
+        max_triggers=1,
+    )
+    base.update(kwargs)
+    return InFlightObserver(TelemetryStore(tmp_path / "trace.jsonl"), **base)
+
+
+def test_sustain_one_reproduces_single_window_trigger(tmp_path):
+    observer = _observer(tmp_path, surprisal_sustain=1)
+    result = observer.observe_generation_result(
+        "r",
+        {"meta_info": {"output_token_logprobs": _drifting_stream(),
+                       "finish_reason": {"type": "stop"}}},
+    )
+    assert result.triggered
+
+
+def test_high_sustain_suppresses_the_same_drift(tmp_path):
+    """The false-trigger fix: an elevated run that fires at sustain=1 must not
+    fire when the continuous-drift requirement is longer than the run. On live
+    traffic single-window spikes drove nearly every mid-think event, all of
+    which recalled nothing."""
+    observer = _observer(tmp_path, surprisal_sustain=1000)
+    result = observer.observe_generation_result(
+        "r",
+        {"meta_info": {"output_token_logprobs": _drifting_stream(),
+                       "finish_reason": {"type": "stop"}}},
+    )
+    assert not result.triggered
+    assert observer.state("r").trigger_tokens == []
+
+
+def test_sustained_count_resets_when_drift_lapses(tmp_path):
+    """A low-surprisal tail must clear the accumulated drift count so two
+    separated bursts never add up to a false confirmation."""
+    observer = _observer(tmp_path, surprisal_sustain=1000)
+    stream = (
+        [(-1.0, i + 1) for i in range(4)]
+        + [(-8.0, 100 + i) for i in range(4)]
+        + [(-1.0, 200 + i) for i in range(4)]
+    )
+    observer.observe_generation_result(
+        "r",
+        {"meta_info": {"output_token_logprobs": stream,
+                       "finish_reason": {"type": "stop"}}},
+    )
+    assert observer.state("r").sustained_count == 0

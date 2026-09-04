@@ -18,6 +18,7 @@ def server_args(tmp_path, **overrides):
         "qwen_exo_knowledge_dir": str(tmp_path / "knowledge"),
         "qwen_exo_policy_data_dir": str(tmp_path / "policydata"),
         "qwen_exo_max_internal_fanout": 32,
+        "qwen_exo_internal_mamba_reserve": 6,
         "qwen_exo_max_internal_tokens": 4096,
         "qwen_exo_max_candidates": 8,
         "qwen_exo_max_memory_tokens": 8192,

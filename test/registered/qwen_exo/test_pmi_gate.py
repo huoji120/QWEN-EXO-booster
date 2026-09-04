@@ -90,6 +90,28 @@ def test_pmi_gate_scores_one_batch_and_caches_the_neutral_term(tmp_path):
     assert "memory_schema" not in gate.rule_card_head(cands[0].normalized_reference_content)
 
 
+def test_pmi_gate_declines_a_question_longer_than_its_budget(tmp_path):
+    """A long question must cost nothing rather than score and always pass.
+
+    Agentic tool turns ask with the original task plus the execution
+    trajectory. That prefix overlaps lexically with every rule card, so on live
+    traffic all 17 evaluations passed the gate while each spent 5-7s on a
+    teacher-forced batch. Declining keeps the judge running (fail open) and
+    stops the gate from being pure latency on those turns.
+    """
+    _repo, cands = _candidates(tmp_path)
+    runner = _ScoreRunner()
+    gate = PmiJudgeGate(runner, _Tokenizer(), head_tokens=64, max_question_tokens=32)
+
+    result = asyncio.run(
+        gate.evaluate(parent_request_id="r", question="笔记" * 200, candidates=cands)
+    )
+
+    assert result.status == "not_run_question_too_long"
+    assert result.skip_judge is False
+    assert runner.calls == []  # nothing was scored
+
+
 def test_pmi_gate_threshold_and_empty_heads(tmp_path):
     repo, cands = _candidates(tmp_path)
     gate = PmiJudgeGate(_ScoreRunner(), _Tokenizer(), threshold=10.0)

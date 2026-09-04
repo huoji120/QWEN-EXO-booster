@@ -1008,6 +1008,7 @@ class Scheduler(
             SchedulerAdmission(
                 page_size=self.page_size,
                 consensus=self._qwen_exo_admission_consensus,
+                internal_mamba_reserve=self.server_args.qwen_exo_internal_mamba_reserve,
             )
             if self.server_args.enable_qwen_exo
             else None
@@ -2661,6 +2662,7 @@ class Scheduler(
                 else None
             ),
             available_workspace_bytes=self._qwen_exo_available_workspace_bytes(),
+            is_internal=is_internal,
         )
         if decision.admitted:
             req.qwen_exo_admitted_once = True

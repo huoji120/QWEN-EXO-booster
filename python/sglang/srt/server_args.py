@@ -2915,6 +2915,12 @@ class ServerArgs:
         int,
         "Maximum scheduler-native child jobs owned by one user request.",
     ] = 32
+    qwen_exo_internal_mamba_reserve: A[
+        int,
+        "Mamba (recurrent-state) slots reserved for live user sessions that internal "
+        "child jobs may never consume; prevents fan-out judge jobs from evicting a "
+        "user session's recurrent state and forcing a full re-prefill next turn.",
+    ] = 6
     qwen_exo_max_internal_tokens: A[
         int,
         "Maximum generation tokens reserved for all internal child jobs of one request.",
@@ -3328,6 +3334,11 @@ class ServerArgs:
         float,
         "Minimum local-window surprisal increase over history.",
     ] = 0.2
+    qwen_exo_observer_surprisal_sustain: A[
+        int,
+        "Consecutive elevated-window tokens required before a Mid-Think trigger "
+        "(continuous-drift confirmation; 1 = single-spike trigger).",
+    ] = 1
     qwen_exo_observer_q_drift_threshold: A[
         float,
         "Attention-Q drift threshold for QWEN-EXO triggers.",
@@ -3361,6 +3372,12 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
     ] = False
+    qwen_exo_reasoning_cutoff_question_count: A[
+        int,
+        "When think generation is truncated at --qwen-exo-max-reasoning-tokens, "
+        "inject this many short concrete self-check questions before the "
+        "stop-and-go boundary. 0 disables the questions (plain cutoff).",
+    ] = 3
     qwen_exo_replay_observation_tokens: A[
         int,
         "Real future reasoning tokens scored by causal replay.",
@@ -4047,6 +4064,10 @@ class ServerArgs:
                 "--qwen-exo-reflection-memory-max-history-tokens must be between "
                 "1024 and 96256"
             )
+        if self.qwen_exo_internal_mamba_reserve < 0:
+            raise ValueError(
+                "--qwen-exo-internal-mamba-reserve must be non-negative"
+            )
         if (
             self.qwen_exo_reflection_memory_mode == "active"
             and self.qwen_exo_reflection_memory_max_output_tokens
@@ -4096,6 +4117,12 @@ class ServerArgs:
             or self.qwen_exo_observer_q_drift_threshold < 0
         ):
             raise ValueError("QWEN-EXO observer thresholds must be non-negative")
+        if self.qwen_exo_observer_surprisal_sustain < 1:
+            raise ValueError("QWEN-EXO observer surprisal sustain must be at least 1")
+        if self.qwen_exo_reasoning_cutoff_question_count < 0:
+            raise ValueError(
+                "QWEN-EXO reasoning cutoff question count must be non-negative"
+            )
         if self.qwen_exo_max_output_tokens < 1:
             raise ValueError("QWEN-EXO max output tokens must be positive")
         if self.qwen_exo_max_reasoning_tokens < 1:

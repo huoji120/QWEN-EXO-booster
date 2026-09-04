@@ -16,6 +16,11 @@ document, so it is computed once per document digest and cached.
 Measured on 23 labelled questions against the live bank: fusing PMI with the
 existing Q/K + BM25 order raised hit@1 from 0.70 to 0.87; PMI alone matched
 the baseline. This module only uses PMI as a negative gate.
+
+The contrast needs a focused question. Past ``max_question_tokens`` the gate
+declines to run: an agentic tool turn asks with the original task plus the
+recent execution trajectory, which overlaps lexically with every rule card, so
+every candidate clears the threshold and the batch buys nothing.
 """
 
 from __future__ import annotations
@@ -79,10 +84,13 @@ class PmiJudgeGate:
         threshold: float = 0.0,
         head_tokens: int = 200,
         max_candidates: int = 16,
+        max_question_tokens: int = 1024,
         neutral_cache_size: int = 512,
         timeout_seconds: float = 60.0,
     ) -> None:
         if head_tokens < 8 or max_candidates < 1 or timeout_seconds <= 0:
+            raise ValueError("PMI gate limits must be positive")
+        if max_question_tokens < 1:
             raise ValueError("PMI gate limits must be positive")
         if not math.isfinite(threshold):
             raise ValueError("PMI gate threshold must be finite")
@@ -91,6 +99,7 @@ class PmiJudgeGate:
         self.threshold = float(threshold)
         self.head_tokens = int(head_tokens)
         self.max_candidates = int(max_candidates)
+        self.max_question_tokens = int(max_question_tokens)
         self.timeout_seconds = float(timeout_seconds)
         self._neutral_prefix: tuple[int, ...] | None = None
         self._neutral_cache: OrderedDict[str, float] = OrderedDict()
@@ -147,9 +156,25 @@ class PmiJudgeGate:
             return PmiGateResult(
                 "not_run", {}, None, self.threshold, 0.0, 0, len(self._neutral_cache)
             )
+        question_prefix = self._prefix_ids(question)
+        # The contrast only discriminates for a focused question. An agentic
+        # tool turn asks with the original task plus the whole recent execution
+        # trajectory -- thousands of tokens that overlap lexically with every
+        # rule card, so every candidate scores well above the threshold and the
+        # gate never skips while still paying a full teacher-forced batch.
+        # Measured on live traffic: 17 evaluations, 0 skips, 5-7s each.
+        if len(question_prefix) > self.max_question_tokens:
+            return PmiGateResult(
+                "not_run_question_too_long",
+                {},
+                None,
+                self.threshold,
+                time.perf_counter() - started,
+                0,
+                len(self._neutral_cache),
+            )
         if self._neutral_prefix is None:
             self._neutral_prefix = self._prefix_ids(_NEUTRAL_QUESTION)
-        question_prefix = self._prefix_ids(question)
 
         inputs: list[tuple[int, ...]] = []
         starts: list[int] = []

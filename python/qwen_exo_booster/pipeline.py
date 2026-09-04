@@ -1574,28 +1574,36 @@ class MemoryPipeline:
                 stable_digest(restored_answer) if restored_answer else "",
             )
 
-        instruction_parts = [str(policy_instructions or "").strip()]
-        if private_instruction:
-            instruction_parts.append(private_instruction)
-        instructions = "\n\n".join(part for part in instruction_parts if part) or None
-        if policy_active or private_instruction:
-            cache_namespace = HybridRuntimePolicy.namespace_key(
+        # ``instructions`` renders as the prompt's leading system message, so it
+        # must stay byte-stable across the turns of a conversation or every turn
+        # re-prefills the whole history. Only PolicyData -- which is stable for a
+        # given document set -- goes there; the retrieved knowledge travels
+        # separately and renders as a trailing block, where swapping or dropping
+        # it costs one turn's worth of tokens instead of the entire context.
+        # For the same reason the radix namespace must not depend on which
+        # documents were retrieved: a per-selection namespace puts otherwise
+        # identical prefixes into disjoint subtrees and defeats the tree even
+        # when the tokens do match.
+        instructions = policy_instructions
+        cache_namespace = (
+            HybridRuntimePolicy.namespace_key(
                 HybridStateNamespace.EXTERNAL_MEMORY,
                 stable_digest(
                     policy.attachment_digest if policy is not None else "",
-                    attachment_digest or "",
                     original_extra_key or "",
                 ),
             )
-            prepared_request = request.model_copy(
-                update={"instructions": instructions, "extra_key": cache_namespace}
-            )
-        else:
-            cache_namespace = original_extra_key
-            prepared_request = request
-        policy_cache_namespace = (
-            cache_namespace if policy_active else original_extra_key
+            if policy_active
+            else original_extra_key
         )
+        prepared_request = request.model_copy(
+            update={
+                "instructions": instructions,
+                "extra_key": cache_namespace,
+                "qwen_exo_memory_attachment": private_instruction or None,
+            }
+        )
+        policy_cache_namespace = cache_namespace
 
         has_cognition_document = bool(
             self.tensor_bank is not None

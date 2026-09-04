@@ -35,6 +35,7 @@ class FakeRequest:
     user: str | None = None
     session_id: str | None = None
     prompt_cache_key: str | None = None
+    qwen_exo_memory_attachment: str | None = None
 
     def model_copy(self, update):
         return replace(self, **update)
@@ -515,7 +516,10 @@ def test_resolved_observer_event_does_not_schedule_hidden_refresh(tmp_path):
     assert "adaptive.transition" not in event_types
 
 
-def test_mixed_observer_events_selects_persistent_uncertainty(tmp_path):
+def test_persistent_uncertainty_no_longer_schedules_observer_refresh(tmp_path):
+    # Mid-think self-questions moved to the reasoning-budget cutoff, so the
+    # observer must NOT spawn a hidden refresh/self-ask task on drift anymore
+    # (this used to fire Q*K retrieval mid-stream). Guards against re-adding it.
     value = runtime(tmp_path)
     resolved = observer_event("resolved_by_continuation", event_id="resolved-event")
     persistent = observer_event("persistent_uncertainty", event_id="persistent-event")
@@ -532,13 +536,10 @@ def test_mixed_observer_events_selects_persistent_uncertainty(tmp_path):
         observer_result(resolved, persistent)
     )
 
-    async def exercise():
-        value.observe_generation_result("resp-observer", {"meta_info": {}})
-        await value._refresh_tasks["resp-observer"]
+    value.observe_generation_result("resp-observer", {"meta_info": {}})
 
-    asyncio.run(exercise())
-
-    assert refresh_events == ["persistent-event"]
+    assert "resp-observer" not in value._refresh_tasks
+    assert refresh_events == []
 
 
 def test_previous_turn_capsule_is_privately_restored(tmp_path):
@@ -997,30 +998,30 @@ async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
     value._replay_tasks[request_id] = replay_task
     await asyncio.sleep(0)
 
-    await value.discard_think_context_for_reasoning_budget(
+    # No MidThinkQuestionService is wired in this bare fixture, so the cutoff
+    # falls back to the plain stop-and-go boundary (returns None) while still
+    # clearing the stale pending context and cancelling in-flight tasks.
+    injection = await value.build_reasoning_cutoff_injection(
         request_id,
         observed_tokens=3072,
         generation_index=2,
     )
 
+    assert injection is None
     assert request_id not in value._pending_think_contexts
     assert turn_id in value._consumed_think_contexts
     assert refresh_task.cancelled()
     assert replay_task.cancelled()
     events = value.telemetry.events(request_id, limit=10)
-    assert [event.event_type for event in events] == [
-        "reasoning.budget_forced",
-        "self_ask.think_context_skipped",
-    ]
+    assert [event.event_type for event in events] == ["reasoning.budget_forced"]
     assert events[0].payload == {
         "max_reasoning_tokens": 3072,
         "observed_tokens": 3072,
         "generation_index": 2,
-        "self_ask_skipped": True,
+        "cutoff_questions": False,
         "had_pending_context": True,
         "cancelled_refresh_tasks": 2,
     }
-    assert events[1].payload["reason"] == "reasoning_budget_forced"
 
 
 def test_response_trajectory_context_keeps_recent_model_and_tool_evidence(tmp_path):

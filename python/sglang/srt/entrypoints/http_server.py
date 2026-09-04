@@ -1894,6 +1894,9 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
             return validation_error
         raw_request.state.qwen_exo_original_instructions = request.instructions
         raw_request.state.qwen_exo_original_extra_key = request.extra_key
+        # Server-internal channel for the retrieved-memory block: never trust a
+        # client-supplied value.
+        request.qwen_exo_memory_attachment = None
         try:
             request, memory_state = await qwen_exo_runtime.prepare_responses_request(
                 request

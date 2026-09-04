@@ -1507,6 +1507,12 @@ class ResponsesRequest(BaseModel):
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
     )
+    # QWEN-EXO retrieved memory, rendered as a trailing ``tool_response`` block
+    # rather than folded into ``instructions``: the leading system message is the
+    # prompt's first tokens, so changing it invalidates the radix prefix for the
+    # entire conversation, while a trailing block only invalidates the last turn.
+    # Server-internal — the HTTP boundary clears whatever a client sends.
+    qwen_exo_memory_attachment: Optional[str] = Field(default=None, exclude=True)
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
