@@ -13,9 +13,12 @@ import type {
   RecallTrace,
   RequestTraceListing,
   PendingReflectionMemory,
-  ReflectionMemoryRecord,
-  ReflectionRegenerationJobStatus,
+  ReflectionEvidenceEventResponse,
   ReflectionSourceDetail,
+  ReflectionMemoryRecord,
+  ReflectionMemoryListing,
+  ReflectionMemoryListQuery,
+  ReflectionRegenerationJobStatus,
   RuntimeStatus,
   ServiceConfig,
   SourceListing,
@@ -112,26 +115,36 @@ export async function selectActiveModel(
   ).json()) as ModelCatalog & { restart_requested: boolean };
 }
 
-export async function getTelemetry(limit = 100, requestId?: string) {
+export async function getTelemetry(
+  limit = 100,
+  requestId?: string,
+  signal?: AbortSignal,
+) {
   const params = new URLSearchParams({ limit: String(limit) });
   if (requestId) params.set("request_id", requestId);
-  const response = await apiFetch(`/telemetry?${params}`);
+  const response = await apiFetch(`/telemetry?${params}`, { signal });
   return (await response.json()) as {
     events?: TelemetryEvent[];
     redacted?: boolean;
   };
 }
 
-export async function getRequestTraces(limit = 50, q = "") {
+export async function getRequestTraces(
+  limit = 50,
+  q = "",
+  signal?: AbortSignal,
+) {
   const params = new URLSearchParams({ limit: String(limit) });
   if (q) params.set("q", q);
   return (await (
-    await apiFetch(`/request-traces?${params}`)
+    await apiFetch(`/request-traces?${params}`, { signal })
   ).json()) as RequestTraceListing;
 }
 
-export async function listDocumentCategories() {
-  return (await (await apiFetch("/knowledge/categories")).json()) as {
+export async function listDocumentCategories(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/knowledge/categories", { signal })
+  ).json()) as {
     categories: DocumentCategory[];
   };
 }
@@ -168,11 +181,14 @@ export async function clearTelemetry() {
 export async function listSources(
   lane: "knowledge" | "policydata",
   query = "",
+  signal?: AbortSignal,
 ) {
   const params = new URLSearchParams();
   if (query.trim()) params.set("q", query.trim());
   const suffix = params.size ? `?${params}` : "";
-  return (await (await apiFetch(`/${lane}${suffix}`)).json()) as SourceListing;
+  return (await (
+    await apiFetch(`/${lane}${suffix}`, { signal })
+  ).json()) as SourceListing;
 }
 
 export type ReflectionOrganizationResult = {
@@ -220,29 +236,66 @@ export async function startReflectionMemoryOrganization() {
   ).json()) as ReflectionOrganizationJobStatus;
 }
 
-export async function getReflectionMemoryOrganizationStatus() {
+export async function getReflectionMemoryOrganizationStatus(
+  signal?: AbortSignal,
+) {
   return (await (
-    await apiFetch("/reflection-memory/organize")
+    await apiFetch("/reflection-memory/organize", { signal })
   ).json()) as ReflectionOrganizationJobStatus;
 }
 
-export async function listReflectionMemories() {
-  return (await (await apiFetch("/reflection-memory")).json()) as {
-    reflections: ReflectionMemoryRecord[];
-  };
+export async function listReflectionMemories(
+  { limit, offset, q }: ReflectionMemoryListQuery,
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  if (q) params.set("q", q);
+  return (await (
+    await apiFetch(`/reflection-memory?${params}`, { signal })
+  ).json()) as ReflectionMemoryListing;
 }
 
-export async function getReflectionSource(sourceDigest: string) {
+export async function getReflectionMemory(
+  sourceDigest: string,
+  signal?: AbortSignal,
+) {
+  return (await (
+    await apiFetch(`/reflection-memory/${encodeURIComponent(sourceDigest)}`, {
+      signal,
+    })
+  ).json()) as { reflection: ReflectionMemoryRecord };
+}
+
+export async function getReflectionSource(
+  sourceDigest: string,
+  signal?: AbortSignal,
+) {
   return (await (
     await apiFetch(
       `/reflection-memory/${encodeURIComponent(sourceDigest)}/source`,
+      { signal },
     )
   ).json()) as ReflectionSourceDetail;
 }
 
-export async function getReflectionRegenerationStatus() {
+export async function getReflectionEvidence(
+  eventId: string,
+  signal?: AbortSignal,
+) {
   return (await (
-    await apiFetch("/reflection-memory/regeneration")
+    await apiFetch(
+      `/reflection-memory/evidence/${encodeURIComponent(eventId)}`,
+      { signal },
+    )
+  ).json()) as ReflectionEvidenceEventResponse;
+}
+
+export async function getReflectionRegenerationStatus(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/reflection-memory/regeneration", { signal })
   ).json()) as ReflectionRegenerationJobStatus;
 }
 
@@ -265,8 +318,10 @@ export async function regenerateReflectionMemory(
   ).json()) as ReflectionRegenerationJobStatus;
 }
 
-export async function listPendingReflectionMemories() {
-  return (await (await apiFetch("/reflection-memory/pending")).json()) as {
+export async function listPendingReflectionMemories(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/reflection-memory/pending", { signal })
+  ).json()) as {
     pending: PendingReflectionMemory[];
   };
 }

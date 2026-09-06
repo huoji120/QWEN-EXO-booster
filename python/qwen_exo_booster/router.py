@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import (
@@ -14,37 +15,35 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from pydantic import BaseModel, Field
-from typing import Literal
 
-from qwen_exo_booster.api_keys import ApiKeyStore, ApiKeyStoreError
 from qwen_exo_booster.activation_training import (
     COMBINED_EDITOR_NAME,
     ActivationTrainingError,
     ActivationTrainingStore,
 )
-
+from qwen_exo_booster.api_keys import ApiKeyStore, ApiKeyStoreError
 from qwen_exo_booster.config import PROJECT_NAME
 from qwen_exo_booster.document_categories import DocumentCategoryError
-from qwen_exo_booster.tags import TagValidationError, normalize_tags
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
     preview_knowledge_upload,
     validate_upload_batch,
 )
-from qwen_exo_booster.trajectory_store import (
-    TrajectoryStore,
-    TrajectoryStoreError,
-    parse_trajectory_upload,
-)
+from qwen_exo_booster.model_catalog import ModelCatalogError, ModelCatalogStore
 from qwen_exo_booster.recall_visualization import render_recall_trace_html
 from qwen_exo_booster.runtime import QwenExoRuntimeState
-from qwen_exo_booster.tensor_bank import TensorBankCompileError
 from qwen_exo_booster.service_config import (
     ServiceConfigError,
     ServiceConfigStore,
     request_managed_restart,
 )
-from qwen_exo_booster.model_catalog import ModelCatalogError, ModelCatalogStore
+from qwen_exo_booster.tags import TagValidationError, normalize_tags
+from qwen_exo_booster.tensor_bank import TensorBankCompileError
+from qwen_exo_booster.trajectory_store import (
+    TrajectoryStore,
+    TrajectoryStoreError,
+    parse_trajectory_upload,
+)
 
 _STATIC_DIRECTORY = Path(__file__).resolve().parent / "static"
 _APP_DIRECTORY = _STATIC_DIRECTORY / "app"
@@ -104,9 +103,8 @@ class ReflectionSelectionRequest(BaseModel):
 class ReflectionRegenerationRequest(BaseModel):
     verifier_feedback: str = Field(min_length=1, max_length=131_072)
     expected_document_sha256: str = Field(
-        min_length=64,
         max_length=64,
-        pattern=r"^[0-9a-f]{64}$",
+        pattern=r"^(?:[0-9a-f]{64})?$",
     )
 
 
@@ -828,8 +826,15 @@ async def train_editor(request: Request):
 
 
 @router.get("/reflection-memory")
-async def list_reflection_memories(request: Request):
-    return {"reflections": _runtime(request).reflection_memories()}
+def list_reflection_memories(
+    request: Request,
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    q: str = Query("", max_length=256),
+):
+    return JSONResponse(
+        content=_runtime(request).reflection_memories(limit=limit, offset=offset, q=q)
+    )
 
 
 @router.get("/reflection-memory/regeneration")
@@ -837,10 +842,20 @@ async def reflection_memory_regeneration_status(request: Request):
     return _runtime(request).reflection_memory_regeneration_status()
 
 
+@router.get("/reflection-memory/evidence/{event_id}")
+async def get_reflection_evidence(event_id: str, request: Request):
+    event = await asyncio.to_thread(
+        _runtime(request).reflection_evidence_store.get_event, event_id
+    )
+    if event is None:
+        raise HTTPException(status_code=404, detail="证据未保存或已按保留策略清理")
+    return event
+
+
 @router.get("/reflection-memory/{source_digest}/source")
-async def get_reflection_memory_source(source_digest: str, request: Request):
+def get_reflection_memory_source(source_digest: str, request: Request):
     try:
-        return _runtime(request).reflection_source(source_digest)
+        return JSONResponse(content=_runtime(request).reflection_source(source_digest))
     except KeyError:
         raise HTTPException(status_code=404, detail="关联轨迹不存在")
 
@@ -907,6 +922,15 @@ async def cancel_pending_reflection_memories(
         raise HTTPException(status_code=404, detail="待反思轨迹不存在或已经完成")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/reflection-memory/{source_digest}")
+def get_reflection_memory(source_digest: str, request: Request):
+    try:
+        reflection = _runtime(request).reflection_memory(source_digest)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Reflection Memory 不存在")
+    return JSONResponse(content={"reflection": reflection})
 
 
 @router.post("/sources/delete")

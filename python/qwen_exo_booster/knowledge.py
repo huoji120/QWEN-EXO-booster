@@ -257,8 +257,14 @@ def reflection_task_category(original_task: str) -> str:
 
 CROSS_TASK_REFLECTION_NOTE = (
     "This reflection memory was distilled from a different task than the current "
-    "one. Select it only when its reusable rule, evidence, or stop condition "
-    "directly applies to the question; shared topic alone is insufficient."
+    "one. Exact task wording or domain need not match. Select it only when its "
+    "reusable rule, observed failure, evidence-backed hypothesis, or diagnostic "
+    "next check materially helps with a specific shared problem, mechanism, or "
+    "diagnostic pattern of symptoms and conditions. A verified root cause is not "
+    "required; preserve supported/unresolved uncertainty, missing evidence, and "
+    "applicability boundaries. Do not promote hypotheses to established causation "
+    "or automatically transfer original-task facts. Shared topic or tool name "
+    "alone is insufficient."
 )
 _TITLE_SEGMENT_SPLIT = re.compile(r"[：:｜|—\-–,，、;；()（）\[\]【】/]+")
 
@@ -266,10 +272,8 @@ _TITLE_SEGMENT_SPLIT = re.compile(r"[：:｜|—\-–,，、;；()（）\[\]【�
 def question_names_document(question: str, document: KnowledgeDocument) -> bool:
     """True when the question quotes a whole segment of the document title.
 
-    The task-scope gate keeps task-specific reflections out of unrelated
-    tasks. A user who names the memory ("what went wrong when we organized the
-    notes?" against the title "笔记资料整理：交付物观测与验收边界") is asking
-    for it, so a verbatim title segment lifts the gate for that document.
+    Naming a memory makes its original evidence the subject of the question,
+    so no cross-task scope note is needed. It still requires normal admission.
     """
     question_terms = set(lexical_terms(question))
     if not question_terms:
@@ -293,7 +297,7 @@ def reflection_memory_matches_task(
 
 
 def is_compatible_reflection_memory(document: KnowledgeDocument) -> bool:
-    """Accept only bounded, schema-versioned reflection rule cards."""
+    """Accept only bounded, schema-versioned reflection evidence cards."""
     if not is_reflection_memory_document(document):
         return False
     value = markdown_metadata(document.content).get("reflection_memory_schema")

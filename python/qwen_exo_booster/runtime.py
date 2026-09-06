@@ -69,6 +69,7 @@ from qwen_exo_booster.latent_transplant import (
     LatentArtifactStore,
     validate_artifact_name,
 )
+from qwen_exo_booster.mid_think_questions import MidThinkQuestionService
 from qwen_exo_booster.observer import (
     AdaptiveRetrievalPhase,
     AdaptiveRetrievalStateMachine,
@@ -77,10 +78,13 @@ from qwen_exo_booster.observer import (
 )
 from qwen_exo_booster.pipeline import MemoryPipeline, MemoryPreparationState
 from qwen_exo_booster.pmi_gate import PmiJudgeGate
-from qwen_exo_booster.mid_think_questions import MidThinkQuestionService
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.query_probe import QueryProbePlan, QueryProbeService
 from qwen_exo_booster.recall_trace import recall_trace_payload
+from qwen_exo_booster.reflection_evidence import (
+    ReflectionEvidenceStore,
+    merge_causal_entries,
+)
 from qwen_exo_booster.reflection_memory import (
     REFLECTION_MEMORY_SCHEMA,
     ReflectionMemory,
@@ -158,9 +162,7 @@ _SESSION_INITIAL_GDN_MEMORY_SECTIONS = (
 
 
 def _xml_attribute(value: object) -> str:
-    return (
-        str(value).replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
-    )
+    return str(value).replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
 
 def _finish_reason_type(value: object) -> str:
@@ -300,6 +302,8 @@ class PendingReflectionMemory:
     due_at: float
     status: str = "waiting"
     started_at: float | None = None
+    error: str | None = None
+    coverage: dict[str, Any] | None = None
 
     def public_dict(self, now: float) -> dict[str, Any]:
         return {
@@ -319,6 +323,8 @@ class PendingReflectionMemory:
                 max(0.0, self.due_at - now) if self.status == "waiting" else 0.0
             ),
             "started_at": self.started_at,
+            "error": self.error,
+            "coverage": self.coverage,
         }
 
 
@@ -382,6 +388,9 @@ class QwenExoRuntime:
         self.reflection_source_store = ReflectionSourceStore(
             config.state_directory / "reflection-sources.sqlite3"
         )
+        self.reflection_evidence_store = ReflectionEvidenceStore(
+            config.state_directory / "reflection-evidence.sqlite3"
+        )
         self.reference_judge: ReferenceJudge | None = None
         self.capsules: ExecutionCapsuleService | None = None
         self.refresh_service: SelfAskRefreshService | None = None
@@ -441,9 +450,7 @@ class QwenExoRuntime:
         # global state only applies to new conversations; continuing ones keep
         # their identity so their radix-cached prefix (up to ~100K tokens) is
         # not invalidated by a namespace change mid-conversation.
-        self._session_initial_gdn_pins: OrderedDict[str, dict[str, Any]] = (
-            OrderedDict()
-        )
+        self._session_initial_gdn_pins: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._session_initial_gdn_status: dict[str, Any] = {
             "schema": _SESSION_INITIAL_GDN_SCHEMA,
             "status": "not_started",
@@ -521,6 +528,7 @@ class QwenExoRuntime:
         self._seen_tool_events: OrderedDict[str, None] = OrderedDict()
         self._max_seen_tool_events = self.capsule_store.max_records * 32
         self._conversation_keys_by_response_id: OrderedDict[str, str] = OrderedDict()
+        self._response_head_crc32: OrderedDict[str, str] = OrderedDict()
         self._canonical_payload_digests: OrderedDict[str, str] = OrderedDict()
         self._conversation_keys_by_call_association: OrderedDict[
             str, tuple[str, ...]
@@ -756,6 +764,21 @@ class QwenExoRuntime:
             for key, label in _SESSION_INITIAL_GDN_MEMORY_SECTIONS
             if str(record.get(key) or "").strip()
         )
+        entry = record.get("causal_entry")
+        if entry is not None:
+            sections = [
+                f"条目: {entry['entry_id']} / 版本 {entry['version']}",
+                f"标题: {entry.get('title', '')}",
+                f"适用条件: {entry.get('scope', '')}",
+                f"问题: {entry.get('problem', '')}",
+                f"行动: {entry.get('action', '')}",
+                f"观察: {entry.get('observation', '')}",
+                f"因果机制: {entry.get('mechanism', '')}",
+                f"可执行规则: {entry.get('rule', '')}",
+                f"下次判别: {entry.get('next_check', '')}",
+                "竞争解释: " + "; ".join(entry.get("alternatives", ())),
+                "反证边界: " + "; ".join(entry.get("counterevidence", ())),
+            ]
         return (
             f"<reflection_memory {rendered_attributes}>\n"
             + "\n\n".join(sections)
@@ -794,8 +817,29 @@ class QwenExoRuntime:
         tokenizer = self.tokenizer_manager.tokenizer
         if tokenizer is None:
             return None
+        admitted_records = []
+        for record in self.reflection_memory_store.list():
+            if not record.get("causal_schema"):
+                admitted_records.append(record)
+                continue
+            for entry in record.get("causal_entries", ()):
+                if (
+                    entry.get("admission_status") == "active"
+                    and entry.get("causal_status") == "verified"
+                ):
+                    admitted_records.append(
+                        {
+                            "created_at": record.get("created_at"),
+                            "outcome": record.get("outcome"),
+                            "retrieval_category": record.get("retrieval_category"),
+                            "source_digest": stable_digest(
+                                entry["entry_id"], entry["version"]
+                            ),
+                            "causal_entry": entry,
+                        }
+                    )
         records = sorted(
-            self.reflection_memory_store.list(),
+            admitted_records,
             key=lambda item: (
                 float(item.get("created_at") or 0.0),
                 str(item.get("source_digest") or ""),
@@ -1047,17 +1091,13 @@ class QwenExoRuntime:
             prompt = await asyncio.to_thread(self._build_session_initial_gdn_prompt)
             if prompt is None:
                 with self._session_initial_gdn_value_lock:
-                    current = (
-                        dict(self._session_initial_gdn_value)
-                        if self._session_initial_gdn_value is not None
-                        else None
-                    )
+                    self._session_initial_gdn_value = None
                     self._session_initial_gdn_status = {
                         **self._session_initial_gdn_status,
                         "status": "no_memory",
                         "reason": reason,
                     }
-                return current
+                return None
             with self._session_initial_gdn_value_lock:
                 current = self._session_initial_gdn_value
                 if (
@@ -1157,9 +1197,7 @@ class QwenExoRuntime:
                     "truncated": finish_reason == "length",
                     "generation_seconds": time.perf_counter() - started,
                 }
-                self._persist_session_initial_gdn_reflection(
-                    prompt, result, generation
-                )
+                self._persist_session_initial_gdn_reflection(prompt, result, generation)
                 value = self._adopt_session_initial_gdn(
                     prompt,
                     artifact_stats
@@ -1256,7 +1294,9 @@ class QwenExoRuntime:
             )
             logger.warning("QWEN_EXO_STARTUP_GENERATION_WARMUP failed closed: %s", exc)
 
-    def _schedule_session_initial_gdn_refresh(self, *, reason: str) -> asyncio.Task[None]:
+    def _schedule_session_initial_gdn_refresh(
+        self, *, reason: str
+    ) -> asyncio.Task[None]:
         """Refresh in the background, coalescing bursts of stored memories.
 
         Consolidation prefills every memory and decodes a full reflection, so
@@ -1520,6 +1560,7 @@ class QwenExoRuntime:
                         reasoning_end_token_id=self._reasoning_end_token_id,
                         store=self.reflection_memory_store,
                         source_store=self.reflection_source_store,
+                        evidence_store=self.reflection_evidence_store,
                         publish=self._publish_reflection_memory,
                         retrieve_similar=self._retrieve_reflection_memory_candidates,
                         on_memory_stored=self._on_reflection_memory_stored,
@@ -1656,6 +1697,7 @@ class QwenExoRuntime:
             self._conversation_keys_by_call_association.clear()
             self._memory_parents_by_conversation.clear()
             self._request_conversation_keys.clear()
+            self._response_head_crc32.clear()
             self._request_tool_event_marks.clear()
             self._request_score_bias_steps.clear()
             self._score_bias_step_counts.clear()
@@ -1726,8 +1768,7 @@ class QwenExoRuntime:
             if response_id and selection is not None:
                 self._session_initial_gdn_pins[str(response_id)] = dict(selection)
                 while (
-                    len(self._session_initial_gdn_pins)
-                    > _SESSION_INITIAL_GDN_MAX_PINS
+                    len(self._session_initial_gdn_pins) > _SESSION_INITIAL_GDN_MAX_PINS
                 ):
                     self._session_initial_gdn_pins.popitem(last=False)
         return selection
@@ -1881,10 +1922,9 @@ class QwenExoRuntime:
             for tool_call, _observation in tool_events
             if tool_call.get("call_id")
         )
-        canonical_identity = (
-            self._canonical_response_identity(request)
-            if previous_response_id is None
-            else None
+        canonical_identity = self._canonical_response_identity(request)
+        current_head_crc32 = (
+            canonical_identity.crc32 if canonical_identity is not None else None
         )
         conversation_key = self._response_conversation_key(
             request_id=request.request_id,
@@ -1893,6 +1933,28 @@ class QwenExoRuntime:
             canonical_identity=canonical_identity,
             call_ids=call_ids,
         )
+        head_changed = False
+        if current_head_crc32 is not None:
+            prior_head = self._response_head_crc32.get(conversation_key)
+            if prior_head is None and previous_response_id is not None:
+                prior_head = self._response_head_crc32.get(str(previous_response_id))
+            head_changed = prior_head is not None and prior_head != current_head_crc32
+            self._response_head_crc32[conversation_key] = current_head_crc32
+            self._response_head_crc32[str(request.request_id)] = current_head_crc32
+            self._response_head_crc32.move_to_end(conversation_key)
+            self._response_head_crc32.move_to_end(str(request.request_id))
+            while len(self._response_head_crc32) > self._max_conversation_keys * 2:
+                self._response_head_crc32.popitem(last=False)
+            if head_changed:
+                self.telemetry.emit(
+                    request.request_id,
+                    "reflection_memory.client_compaction_detected",
+                    {
+                        "conversation_key": conversation_key,
+                        "reason": "response_head_crc32_changed",
+                        "head_crc32": current_head_crc32,
+                    },
+                )
         self._request_conversation_keys[request.request_id] = conversation_key
         effective_memory_previous_response_id = previous_response_id or (
             self._memory_parents_by_conversation.get(conversation_key)
@@ -1903,6 +1965,26 @@ class QwenExoRuntime:
             )
             if parent_finalization is not None:
                 await asyncio.shield(parent_finalization)
+        if head_changed:
+            checkpoint = self._build_compaction_reflection_checkpoint(
+                response_id=str(request.request_id),
+                previous_response_id=effective_memory_previous_response_id,
+                conversation_key=conversation_key,
+                original_items=[],
+                tokenizer=getattr(self.tokenizer_manager, "tokenizer", None),
+            )
+            checkpoint_queued = await self._enqueue_compaction_reflection_checkpoint(
+                checkpoint
+            )
+            if not checkpoint_queued:
+                self.telemetry.emit(
+                    request.request_id,
+                    "reflection_memory.client_compaction_checkpoint_skipped",
+                    {
+                        "conversation_key": conversation_key,
+                        "reason": "reflection_service_unavailable_or_disabled",
+                    },
+                )
         self._raise_if_cancelled(request.request_id)
         if previous_response_id:
             self._parent_response_ids[request.request_id] = str(previous_response_id)
@@ -1982,6 +2064,7 @@ class QwenExoRuntime:
                 conversation_key,
                 request.request_id,
                 self._reflection_memory_input_rows(request.input),
+                replay=True,
             )
         if self.config.feature_flags.score_bias:
             score_bias_step = self._score_bias_step_counts.get(conversation_key, 0)
@@ -2186,10 +2269,21 @@ class QwenExoRuntime:
                     "reflection_memory.compaction_checkpoint_completed",
                     {
                         "checkpoint_id": checkpoint.checkpoint_id,
-                        "status": "published" if reflection is not None else "skipped",
+                        "status": (
+                            "failed_closed"
+                            if getattr(reflection, "analysis_status", None)
+                            in {"partial", "failed_closed"}
+                            else (
+                                getattr(reflection, "publication_status", "published")
+                                if reflection is not None
+                                else "skipped"
+                            )
+                        ),
                         "document_path": (
                             reflection.document_path if reflection is not None else None
                         ),
+                        "analysis_status": getattr(reflection, "analysis_status", None),
+                        "coverage": getattr(reflection, "coverage", None),
                     },
                 )
             except asyncio.CancelledError:
@@ -2248,11 +2342,9 @@ class QwenExoRuntime:
             conversation_key,
             response_id,
             self._reflection_memory_input_rows(original_items),
+            replay=True,
         )
-        trajectory_history = tuple(
-            dict(row)
-            for row in self._reflection_memory_trajectories.get(conversation_key, ())
-        )
+        trajectory_history = self._reflection_memory_history(conversation_key)
         tool_ledger = [
             dict(row)
             for row in self._context_integrity_ledgers.get(conversation_key, ())
@@ -4567,10 +4659,17 @@ class QwenExoRuntime:
         conversation_key: str,
         request_id: str,
         rows: Iterable[dict[str, Any]],
+        *,
+        replay: bool = False,
     ) -> None:
         if self.config.reflection_memory_mode == "off":
             return
         conversation_key = str(conversation_key)
+        evidence_store = getattr(self, "reflection_evidence_store", None)
+        if evidence_store is not None:
+            rows = evidence_store.append_rows(
+                conversation_key, request_id, rows, replay=replay
+            )
         retained = self._reflection_memory_trajectories.setdefault(conversation_key, [])
         known = {str(row.get("source_digest") or "") for row in retained}
         max_chars = max(4096, self.config.reflection_memory_max_history_tokens * 4)
@@ -4588,6 +4687,8 @@ class QwenExoRuntime:
                 "call_id": str(raw.get("call_id") or ""),
                 "content": content,
             }
+            if raw.get("event_id"):
+                row["event_id"] = str(raw["event_id"])
             row_digest = stable_digest(
                 "reflection-memory-row-v1",
                 json.dumps(
@@ -4617,6 +4718,17 @@ class QwenExoRuntime:
             > self._max_reflection_memory_conversations
         ):
             self._reflection_memory_trajectories.popitem(last=False)
+
+    def _reflection_memory_history(
+        self, conversation_key: str
+    ) -> tuple[dict[str, Any], ...]:
+        evidence_store = getattr(self, "reflection_evidence_store", None)
+        if evidence_store is not None:
+            return evidence_store.rows(str(conversation_key))
+        return tuple(
+            dict(row)
+            for row in self._reflection_memory_trajectories.get(conversation_key, ())
+        )
 
     @staticmethod
     def _response_item_text(value: Any) -> str:
@@ -5885,10 +5997,7 @@ class QwenExoRuntime:
                     },
                 ),
             )
-        trajectory_history = tuple(
-            dict(row)
-            for row in self._reflection_memory_trajectories.get(conversation_key, ())
-        )
+        trajectory_history = self._reflection_memory_history(conversation_key)
         encoded_history = json.dumps(
             trajectory_history,
             ensure_ascii=False,
@@ -5996,6 +6105,7 @@ class QwenExoRuntime:
         due_at: float | None = None,
         force: bool = False,
     ) -> None:
+        keep_pending = False
         try:
             delay_seconds = (
                 0.0
@@ -6025,14 +6135,7 @@ class QwenExoRuntime:
             if pending is not None and pending.source_digest == source_digest:
                 pending.status = "running"
                 pending.started_at = time.time()
-            self._reflection_memory_sources[conversation_key] = source_digest
-            self._reflection_memory_sources.move_to_end(conversation_key)
-            while (
-                len(self._reflection_memory_sources)
-                > self._max_reflection_memory_conversations
-            ):
-                self._reflection_memory_sources.popitem(last=False)
-            await self.reflection_memory_service.reflect(
+            reflection = await self.reflection_memory_service.reflect(
                 trajectory_id=trajectory_id,
                 conversation_key=conversation_key,
                 original_task=original_task,
@@ -6041,9 +6144,31 @@ class QwenExoRuntime:
                 capsule_history=capsule_history,
                 source_token_count=source_token_count,
             )
+            keep_pending = getattr(reflection, "analysis_status", "complete") in {
+                "partial",
+                "failed_closed",
+            }
+            if keep_pending:
+                if pending is not None:
+                    pending.status = "failed"
+                    pending.error = "部分证据尚未完成因果分析；可重试，已成功段将复用"
+                    pending.coverage = getattr(reflection, "coverage", None)
+            else:
+                self._reflection_memory_sources[conversation_key] = source_digest
+                self._reflection_memory_sources.move_to_end(conversation_key)
+                while (
+                    len(self._reflection_memory_sources)
+                    > self._max_reflection_memory_conversations
+                ):
+                    self._reflection_memory_sources.popitem(last=False)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            keep_pending = True
+            pending = self._pending_reflection_memories.get(conversation_key)
+            if pending is not None and pending.source_digest == source_digest:
+                pending.status = "failed"
+                pending.error = f"{type(exc).__name__}: {exc}"[:500]
             self.telemetry.emit(
                 f"reflection-memory:{conversation_key}",
                 "reflection_memory.failed_closed",
@@ -6060,7 +6185,11 @@ class QwenExoRuntime:
                 pending = getattr(self, "_pending_reflection_memories", None)
                 if pending is not None:
                     work = pending.get(conversation_key)
-                    if work is not None and work.source_digest == source_digest:
+                    if (
+                        work is not None
+                        and work.source_digest == source_digest
+                        and not keep_pending
+                    ):
                         pending.pop(conversation_key, None)
 
     def pending_reflection_memories(self) -> list[dict[str, Any]]:
@@ -6097,6 +6226,7 @@ class QwenExoRuntime:
             work.due_at = time.time()
             work.status = "waiting"
             work.started_at = None
+            work.error = None
             task = asyncio.create_task(
                 self._run_reflection_memory_after_idle(
                     conversation_key=work.conversation_key,
@@ -6386,6 +6516,9 @@ class QwenExoRuntime:
                 title=str(document.title or document.relative_path),
                 content=document.normalized_content,
                 tensor_score=float(candidate.tensor_score or 0.0),
+                causal_entries=self._stored_causal_entries(
+                    document.relative_path, document.sha256
+                ),
             )
             for candidate in ranked
             if (document := by_id.get(candidate.document_id)) is not None
@@ -6421,13 +6554,33 @@ class QwenExoRuntime:
             )
         )
 
+    def _stored_causal_entries(
+        self, document_path: str, document_sha256: str
+    ) -> tuple[dict[str, Any], ...]:
+        for record in self.reflection_memory_store.list():
+            if (
+                record.get("document_path") == document_path
+                and record.get("document_sha256") == document_sha256
+            ):
+                return tuple(record.get("causal_entries") or ())
+        return ()
+
     def _reflection_regeneration_target(
         self, record: dict[str, Any], expected_document_sha256: str
     ) -> ReflectionMemoryCandidate:
         document_path = str(record.get("document_path") or "")
         record_sha256 = str(record.get("document_sha256") or "")
         if not document_path or not record_sha256:
-            raise RuntimeError("Reflection memory has no published document")
+            if not record.get("causal_schema") or expected_document_sha256:
+                raise RuntimeError("Reflection memory has no published document")
+            return ReflectionMemoryCandidate(
+                document_path="candidate:" + record["source_digest"],
+                document_sha256="",
+                title=str(record.get("title") or "因果分析记录"),
+                content="",
+                tensor_score=0.0,
+                causal_entries=tuple(record.get("causal_entries") or ()),
+            )
         if str(expected_document_sha256) != record_sha256:
             raise RuntimeError("Reflection memory changed; refresh before regenerating")
         document = next(
@@ -6446,6 +6599,35 @@ class QwenExoRuntime:
             title=str(document.title or record.get("title") or document.relative_path),
             content=document.normalized_content,
             tensor_score=0.0,
+            causal_entries=self._stored_causal_entries(
+                document.relative_path, document.sha256
+            ),
+        )
+
+    def _load_reflection_source(
+        self, record: dict[str, Any]
+    ) -> ReflectionSourceSnapshot | None:
+        digest = str(record.get("source_snapshot_digest") or record["source_digest"])
+        snapshot = self.reflection_source_store.get(digest)
+        if (
+            snapshot is None
+            or snapshot.source_audit.get("capture") != "journal_references"
+        ):
+            return snapshot
+        event_ids = tuple(snapshot.source_audit.get("raw_event_ids") or ())
+        rows = self.reflection_evidence_store.rows(snapshot.conversation_key, event_ids)
+        by_id = {row["event_id"]: row for row in rows}
+        missing = [eid for eid in event_ids if eid not in by_id]
+        return replace(
+            snapshot,
+            trajectory_history=tuple(by_id[eid] for eid in event_ids if eid in by_id),
+            source_audit={
+                **snapshot.source_audit,
+                "missing_event_ids": missing,
+                "retention": self.reflection_evidence_store.retention_metadata(
+                    snapshot.conversation_key
+                ),
+            },
         )
 
     def start_reflection_memory_regeneration(
@@ -6473,9 +6655,13 @@ class QwenExoRuntime:
         if len(feedback) > 131_072:
             raise ValueError("Verifier feedback exceeds 131072 characters")
         record = self.reflection_memory_store.get(source_digest)
-        snapshot = self.reflection_source_store.get(source_digest)
+        snapshot = self._load_reflection_source(record) if record is not None else None
         if record is None or snapshot is None:
             raise KeyError(source_digest)
+        if snapshot.source_audit.get("missing_event_ids"):
+            raise RuntimeError(
+                "Raw evidence was removed by retention; exact regeneration is unavailable"
+            )
         target = self._reflection_regeneration_target(record, expected_document_sha256)
         queued_at = time.time()
         job_id = (
@@ -6578,20 +6764,24 @@ class QwenExoRuntime:
 
         def report(stage: str) -> None:
             progress_by_stage = {
+                "evidence_extraction": 25,
+                "causal_review": 55,
                 "qk_retrieval": 20,
                 "model_review": 40,
                 "publishing": 82,
             }
             message_by_stage = {
+                "evidence_extraction": "正在分段提取可追溯证据链",
+                "causal_review": "正在检查因果解释、反证与证据强度",
                 "qk_retrieval": "正在检索相关 Reflection Memory",
                 "model_review": "模型正在根据轨迹与 verifier 反馈重新反思",
-                "publishing": "正在原子替换记忆并重建 Tensor Bank",
+                "publishing": "正在按条目合并已准入经验并更新 Tensor Bank",
             }
             self._update_reflection_memory_regeneration(
                 job_id,
                 stage=stage,
-                progress=progress_by_stage[stage],
-                message=message_by_stage[stage],
+                progress=progress_by_stage.get(stage, 40),
+                message=message_by_stage.get(stage, "正在分析轨迹证据"),
             )
 
         tool_ledger = tuple(
@@ -6618,8 +6808,10 @@ class QwenExoRuntime:
                 supersedes_source_digest=snapshot.source_digest,
                 stage_callback=report,
             )
-            if reflection is None or reflection.publication_status != "published":
-                raise RuntimeError("Model did not publish a replacement reflection")
+            if reflection is None or getattr(
+                reflection, "analysis_status", "complete"
+            ) in {"partial", "failed_closed"}:
+                raise RuntimeError("Causal reflection analysis failed closed")
         except asyncio.CancelledError:
             self._update_reflection_memory_regeneration(
                 job_id,
@@ -6636,7 +6828,7 @@ class QwenExoRuntime:
                 job_id,
                 status="failed",
                 stage="failed",
-                message="重新反思失败，原记忆保持不变",
+                message="因果分析未全部完成；已成功段与准入条目保留，可重试剩余部分",
                 error=error,
                 finished_at=time.time(),
             )
@@ -6655,13 +6847,19 @@ class QwenExoRuntime:
             "native_source_digest": reflection.native_source_digest,
             "publication_status": reflection.publication_status,
             "hot_updated": reflection.hot_updated,
+            "analysis_status": getattr(reflection, "analysis_status", None),
+            "coverage": getattr(reflection, "coverage", None),
         }
         self._update_reflection_memory_regeneration(
             job_id,
             status="succeeded",
             stage="completed",
             progress=100,
-            message="重新反思完成，关联记忆已替换",
+            message=(
+                "因果反思完成，已准入条目已更新"
+                if reflection.publication_status == "published"
+                else "因果分析已保存；尚无可发布的有效经验条目"
+            ),
             result=result,
             error=None,
             finished_at=time.time(),
@@ -7121,6 +7319,9 @@ class QwenExoRuntime:
                         title=str(document_by_path[path].title or path),
                         content=document_by_path[path].normalized_content,
                         tensor_score=related_scores[path],
+                        causal_entries=self._stored_causal_entries(
+                            path, document_by_path[path].sha256
+                        ),
                     )
                     for path in candidate_paths
                 )
@@ -7281,21 +7482,64 @@ class QwenExoRuntime:
                 )
                 previous = snapshot_by_path.get(relative_path)
                 previous_documents = {relative_path: previous}
+            if reflection.causal_schema:
+                if len(previous_documents) != 1:
+                    raise ValueError(
+                        "Causal publication cannot replace multiple documents"
+                    )
+                old_entries = (
+                    self._stored_causal_entries(relative_path, previous.sha256)
+                    if previous is not None
+                    else ()
+                )
+                if previous is None and reflection.replaces_source_digest:
+                    candidate_record = self.reflection_memory_store.get(
+                        reflection.replaces_source_digest
+                    )
+                    if (
+                        not candidate_record
+                        or candidate_record.get("publication_status") != "candidate"
+                    ):
+                        raise RuntimeError(
+                            "Private causal candidate changed before publication"
+                        )
+                    old_entries = tuple(candidate_record.get("causal_entries") or ())
+                if previous is not None and not old_entries:
+                    raise ValueError(
+                        "Legacy reflection requires evidence-backed item migration"
+                    )
+                merged_entries = merge_causal_entries(
+                    old_entries,
+                    reflection.entry_changes,
+                    source_digest=reflection.source_digest,
+                )
+                if merged_entries != reflection.causal_entries:
+                    raise RuntimeError("Causal entries changed before publication")
+                reflection = replace(reflection, causal_entries=merged_entries)
+            has_active_entries = not reflection.causal_schema or bool(
+                reflection.active_entries
+            )
+            if not has_active_entries and previous is None:
+                raise ValueError("Candidate-only reflection is not publishable")
             markdown = reflection.markdown()
             effective_category = reflection.retrieval_category
             if previous is not None and previous.retrieval_category:
                 effective_category = previous.retrieval_category
                 markdown = set_markdown_retrieval_category(markdown, effective_category)
             try:
-                document = self.knowledge.upsert(
-                    relative_path,
-                    markdown,
-                    tags=["reflection-memory", f"outcome-{reflection.outcome}"],
-                )
-                if not is_compatible_reflection_memory(document):
-                    raise RuntimeError(
-                        "Published reflection memory schema is incompatible"
+                document = None
+                if has_active_entries:
+                    document = self.knowledge.upsert(
+                        relative_path,
+                        markdown,
+                        tags=["reflection-memory", f"outcome-{reflection.outcome}"],
                     )
+                    if not is_compatible_reflection_memory(document):
+                        raise RuntimeError(
+                            "Published reflection memory schema is incompatible"
+                        )
+                elif previous is not None:
+                    self.knowledge.delete(relative_path)
                 for merged_path in previous_documents:
                     if merged_path != relative_path:
                         self.knowledge.delete(merged_path)
@@ -7325,6 +7569,21 @@ class QwenExoRuntime:
                         origin="observed",
                     )
                 self._sync_document_categories()
+                if reflection.causal_schema:
+                    self.reflection_memory_store.append(
+                        replace(
+                            reflection,
+                            document_path=relative_path,
+                            document_sha256=(
+                                document.sha256 if document is not None else None
+                            ),
+                            native_source_digest=bank.get("source_digest"),
+                            hot_updated=True,
+                            publication_status=(
+                                "published" if document is not None else "retired"
+                            ),
+                        )
+                    )
             except BaseException:
                 try:
                     for affected_path in previous_documents:
@@ -7359,8 +7618,8 @@ class QwenExoRuntime:
                 raise
         payload = {
             "memory_action": reflection.memory_action,
-            "document_path": document.relative_path,
-            "document_sha256": document.sha256,
+            "document_path": relative_path,
+            "document_sha256": document.sha256 if document is not None else None,
             "replaced_document_sha256": (
                 previous.sha256 if previous is not None else None
             ),
@@ -7371,7 +7630,7 @@ class QwenExoRuntime:
             "native_source_digest": bank.get("source_digest"),
             "hot_updated": True,
             "restart_required": False,
-            "publication_status": "published",
+            "publication_status": "published" if document is not None else "retired",
             "reflection_memory_schema": REFLECTION_MEMORY_SCHEMA,
             "compact_card_characters": len(reflection.compact_content),
             "compact_card_digest": stable_digest(reflection.compact_content),
@@ -7380,20 +7639,86 @@ class QwenExoRuntime:
         self.telemetry.emit("admin", "reflection_memory.published", payload)
         return payload
 
-    def reflection_memories(self) -> list[dict[str, Any]]:
-        source_metadata = self.reflection_source_store.metadata()
-        records = self.reflection_memory_store.list()
-        for record in records:
-            metadata = source_metadata.get(str(record.get("source_digest") or ""))
-            record["source_available"] = metadata is not None
-            record["trajectory_source"] = (
-                dict(metadata) if metadata is not None else None
+    def reflection_memories(
+        self, *, limit: int = 25, offset: int = 0, q: str = ""
+    ) -> dict[str, Any]:
+        query = q.strip().lower()
+        records = self.reflection_memory_store.snapshot()
+        matched = [
+            record
+            for record in reversed(records)
+            if not query
+            or any(
+                query in str(record.get(field) or "").lower()
+                for field in (
+                    "title",
+                    "trajectory_id",
+                    "conversation_key",
+                    "source_digest",
+                    "document_path",
+                )
             )
-        return records
+        ]
+        source_metadata = self.reflection_source_store.metadata()
+        summaries = []
+        for record in matched[offset : offset + limit]:
+            summary = {
+                field: record[field]
+                for field in (
+                    "causal_schema",
+                    "trajectory_id",
+                    "conversation_key",
+                    "source_digest",
+                    "source_snapshot_digest",
+                    "title",
+                    "outcome",
+                    "source_event_count",
+                    "source_token_count",
+                    "created_at",
+                    "document_path",
+                    "document_sha256",
+                    "native_source_digest",
+                    "publication_status",
+                    "hot_updated",
+                    "analysis_status",
+                )
+                if field in record
+            }
+            self._attach_reflection_source_metadata(summary, source_metadata)
+            summaries.append(summary)
+        return {
+            "reflections": summaries,
+            "total": len(matched),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @staticmethod
+    def _attach_reflection_source_metadata(
+        record: dict[str, Any], source_metadata: dict[str, dict[str, Any]]
+    ) -> None:
+        metadata = source_metadata.get(
+            str(
+                record.get("source_snapshot_digest")
+                or record.get("source_digest")
+                or ""
+            )
+        )
+        record["source_available"] = metadata is not None
+        record["trajectory_source"] = metadata
+
+    def reflection_memory(self, source_digest: str) -> dict[str, Any]:
+        record = self.reflection_memory_store.get(source_digest)
+        if record is None:
+            raise KeyError(source_digest)
+        self._attach_reflection_source_metadata(
+            record, self.reflection_source_store.metadata()
+        )
+        return record
 
     def reflection_source(self, source_digest: str) -> dict[str, Any]:
         record = self.reflection_memory_store.get(source_digest)
-        snapshot = self.reflection_source_store.get(source_digest)
+        snapshot = self._load_reflection_source(record) if record is not None else None
         if record is None or snapshot is None:
             raise KeyError(source_digest)
         return {

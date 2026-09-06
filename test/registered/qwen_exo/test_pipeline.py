@@ -1046,18 +1046,14 @@ def test_reflection_collection_label_does_not_merge_distinct_memories(tmp_path):
     assert state.selected_document_ids == (first.document_id,)
 
 
-def test_request_start_marks_cross_task_reflection_for_the_judge(tmp_path):
-    """A reflection from another task reaches the judge with its provenance.
-
-    Reflection categories are per-task digests, so a hard cross-task gate
-    made every past experience unreachable from a new conversation (5/5 live
-    questions recalled the right memory at rank 1 and attached nothing). The
-    judge now sees a scope note on such candidates and may select them; the
-    same-task exact candidate is still offered alongside.
-    """
+@pytest.mark.parametrize("supported", [True, False])
+def test_request_start_marks_cross_task_reflection_for_the_judge(tmp_path, supported):
+    """Cross-domain evidence reaches Judge; scope neither vetoes nor forces its verdict."""
     repo = KnowledgeRepository(tmp_path / "reflection-scope")
-    target_task = "Please solve this issue: add implicit HEAD and OPTIONS routing"
-    other_task = "Please solve this issue: add deprecated response headers"
+    target_task = (
+        "Why does the billing worker keep using old settings after deployment?"
+    )
+    other_task = "Investigate stale assets served by the image preview service"
 
     def reflection(path, task, body):
         repo.upsert(
@@ -1067,12 +1063,29 @@ def test_request_start_marks_cross_task_reflection_for_the_judge(tmp_path):
             f"retrieval_category: {reflection_task_category(task)}\n---\n\n{body}",
         )
 
-    reflection("reflection-memory/target.md", target_task, "Implicit method rules.")
-    reflection("reflection-memory/other.md", other_task, "Deprecation header rules.")
-    other = native_candidate(repo, "reflection-memory/other.md", page_id=3, score=0.99)
-    bank = FakeQKTensorBank((other,))
+    reflection("reflection-memory/target.md", target_task, "Billing schema reference.")
+    reflection(
+        "reflection-memory/other.md",
+        other_task,
+        "Unresolved: the source file changed but responses stayed old. The running "
+        "process may load another path or retain cached state; neither cause is proven. "
+        "Compare the process's loaded path and content digest with the deployed file "
+        "before deciding whether reload is necessary. This observation does not prove "
+        "that another service has the same root cause.",
+    )
+    reflection(
+        "reflection-memory/topic.md",
+        "Change invoice currency display",
+        "Billing invoices display a currency symbol next to the amount.",
+    )
+    other = native_candidate(repo, "reflection-memory/other.md", page_id=3, score=0.98)
+    topic = native_candidate(repo, "reflection-memory/topic.md", page_id=4, score=0.99)
+    bank = FakeQKTensorBank((topic, other))
     telemetry = FakeTelemetry()
-    judge = FakeReferenceJudge(supported=True, winner_path="reflection-memory/other.md")
+    judge = FakeReferenceJudge(
+        supported={"reflection-memory/other.md": supported},
+        winner_path="reflection-memory/other.md",
+    )
     pipeline = build_pipeline(
         config(tmp_path, policy_data=False),
         repo,
@@ -1098,6 +1111,7 @@ def test_request_start_marks_cross_task_reflection_for_the_judge(tmp_path):
     assert set(presented) == {
         "reflection-memory/other.md",
         "reflection-memory/target.md",
+        "reflection-memory/topic.md",
     }
     assert presented["reflection-memory/other.md"].scope_note is not None
     assert presented["reflection-memory/target.md"].scope_note is None
@@ -1105,15 +1119,23 @@ def test_request_start_marks_cross_task_reflection_for_the_judge(tmp_path):
     assert not any(
         decision.judge_method.endswith(":task_scope") for decision in state.decisions
     )
-    assert state.selected_document_ids == (other.document_id,)
+    assert state.selected_document_ids == ((other.document_id,) if supported else ())
+    decisions = {decision.candidate_id: decision for decision in state.decisions}
+    assert decisions[topic.candidate_id].status is EligibilityStatus.INELIGIBLE
+    assert decisions[other.candidate_id].status is (
+        EligibilityStatus.ELIGIBLE if supported else EligibilityStatus.INELIGIBLE
+    )
     (proposed,) = telemetry.by_type("tensor.candidates_proposed")
-    assert proposed["task_scope_filtered_count"] == 1
-    assert proposed["task_scope_filtered_candidate_ids"] == [other.candidate_id]
+    assert proposed["task_scope_filtered_count"] == 2
+    assert set(proposed["task_scope_filtered_candidate_ids"]) == {
+        other.candidate_id,
+        topic.candidate_id,
+    }
     assert proposed["task_scope_exact_candidate_count"] == 1
     assert proposed["task_scope_category"] == reflection_task_category(target_task)
     (completed,) = telemetry.by_type("semantic_judge.completed")
-    assert completed["candidate_count"] == 2
-    assert completed["task_scope_blocked_count"] == 1
+    assert completed["candidate_count"] == 3
+    assert completed["task_scope_blocked_count"] == 2
     assert completed["judge_wave_count"] == 1
 
 

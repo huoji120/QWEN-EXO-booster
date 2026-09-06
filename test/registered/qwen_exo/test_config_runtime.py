@@ -1156,3 +1156,69 @@ def test_runtime_post_tool_recall_queues_admitted_think_context(tmp_path):
     assert runtime.telemetry.events[0][1] == "post_tool_recall.completed"
     assert runtime.telemetry.events[0][2]["think_context_ready"] is True
     assert runtime.telemetry.events[0][2]["text_injected"] is False
+
+
+def test_initial_gdn_uses_only_active_verified_causal_entries():
+    active = {
+        "entry_id": "kept",
+        "version": 2,
+        "title": "VERIFIED_RULE",
+        "causal_status": "verified",
+        "admission_status": "active",
+        "rule": "Verified scoped rule",
+        "scope": "exact environment",
+        "versions": [{"rule": "OLD_VERSION_NOT_REPLAYED"}],
+    }
+    record = {
+        "source_digest": "causal",
+        "created_at": 1,
+        "causal_schema": 1,
+        "reflection": "RAW_SUMMARY_NOT_REPLAYED",
+        "causal_entries": [
+            active,
+            {
+                **active,
+                "entry_id": "candidate",
+                "title": "CANDIDATE_NOT_REPLAYED",
+                "causal_status": "supported",
+                "admission_status": "candidate",
+            },
+            {
+                **active,
+                "entry_id": "recallable",
+                "title": "RECALLABLE_NOT_REPLAYED",
+                "causal_status": "supported",
+            },
+            {
+                **active,
+                "entry_id": "retired",
+                "title": "RETIRED_NOT_REPLAYED",
+                "admission_status": "retired",
+            },
+        ],
+    }
+    value = _session_gdn_prompt_runtime([record], context_length=16000)
+    prompt = value._build_session_initial_gdn_prompt()
+    assert "VERIFIED_RULE" in prompt["prompt"]
+    for excluded in (
+        "RAW_SUMMARY_NOT_REPLAYED",
+        "CANDIDATE_NOT_REPLAYED",
+        "RECALLABLE_NOT_REPLAYED",
+        "RETIRED_NOT_REPLAYED",
+        "OLD_VERSION_NOT_REPLAYED",
+    ):
+        assert excluded not in prompt["prompt"]
+    record["causal_entries"] = record["causal_entries"][1:]
+    assert value._build_session_initial_gdn_prompt() is None
+
+
+def test_retiring_last_memory_clears_global_initial_gdn():
+    value = _session_gdn_prompt_runtime([], context_length=16000)
+    value._session_initial_gdn_refresh_lock = asyncio.Lock()
+    value._session_initial_gdn_value_lock = threading.RLock()
+    value._session_initial_gdn_value = {"state_identity": "retired-memory-state"}
+    value._session_initial_gdn_status = {"status": "ready"}
+    assert (
+        asyncio.run(value._refresh_session_initial_gdn(reason="memory_retired")) is None
+    )
+    assert value.initial_gdn_selection() is None

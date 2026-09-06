@@ -520,6 +520,37 @@ async def test_fp8_tensor_bank_ranks_pages_from_raw_attention_heads(tmp_path):
         "ctf.md",
     }
 
+    # Fusion ranking must not apply the raw-score margin to the whole
+    # shortlist: semantic admission is the ambiguity gate for fused results.
+    fused_audit = {}
+    fused = bank.rank(
+        tuple(((1.0, 0.0),) for _ in range(12)),
+        query_states=_query_states(12),
+        query_identity="event-fused-margin-deferred",
+        query_text="WFP outbound authorization",
+        limit=2,
+        min_document_margin=999.0,
+        audit=fused_audit,
+    )
+    assert fused and fused[0].relative_path == "wfp.md"
+    assert fused_audit["margin_gate_active"] is False
+    assert fused_audit["margin_gate_method"] == "semantic_admission"
+
+    raw_audit = {}
+    assert (
+        bank.rank(
+            tuple(((1.0, 0.0),) for _ in range(12)),
+            query_states=_query_states(12),
+            query_identity="event-raw-margin-active",
+            limit=2,
+            min_document_margin=999.0,
+            audit=raw_audit,
+        )
+        == ()
+    )
+    assert raw_audit["margin_gate_active"] is True
+    assert raw_audit["margin_gate_method"] == "raw_document_margin"
+
     score_rejection = {}
     assert (
         bank.rank(

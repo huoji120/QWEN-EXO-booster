@@ -10,7 +10,12 @@ from fastapi.testclient import TestClient
 import qwen_exo_booster.router as router_module
 from qwen_exo_booster.document_ingest import KnowledgeIngestError
 from qwen_exo_booster.router import compat_router, router
-from qwen_exo_booster.runtime import QwenExoRuntimeState
+from qwen_exo_booster.reflection_memory import (
+    ReflectionMemoryStore,
+    ReflectionSourceSnapshot,
+    ReflectionSourceStore,
+)
+from qwen_exo_booster.runtime import QwenExoRuntime, QwenExoRuntimeState
 from qwen_exo_booster.service_config import ServiceConfigStore
 from qwen_exo_booster.tensor_bank import TensorBankCompileError
 from qwen_exo_booster.model_catalog import ModelCatalogStore
@@ -185,8 +190,19 @@ class FakeRuntime:
     def reflection_memory_organization_status(self):
         return dict(self._reflection_organization_status)
 
-    def reflection_memories(self):
-        return list(self.reflections.values())
+    def reflection_memories(self, *, limit=25, offset=0, q=""):
+        records = list(self.reflections.values())
+        return {
+            "reflections": records[offset : offset + limit],
+            "total": len(records),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def reflection_memory(self, source_digest):
+        if source_digest not in self.reflections:
+            raise KeyError(source_digest)
+        return dict(self.reflections[source_digest])
 
     def reflection_source(self, source_digest):
         reflection = self.reflections.get(source_digest)
@@ -432,6 +448,125 @@ def test_reflection_regeneration_exposes_source_and_background_status():
     assert started.status_code == 202
     assert started.json()["job_id"] == "reflection-regeneration-test"
     assert started.json()["details"]["verifier_feedback_chars"] > 0
+
+
+def test_reflection_summary_paging_preserves_full_detail_without_raw_source(tmp_path):
+    bulk = "recorded evidence " * 16000
+    records = [
+        {
+            "source_digest": f"source-{index}",
+            "trajectory_id": f"trajectory-{index}",
+            "conversation_key": f"conversation-{index}",
+            "title": f"Reflection {index}",
+            "document_path": f"reflection-memory/{index}.md",
+            "created_at": float(index),
+            "publication_status": "published",
+            "analysis_status": "complete",
+            "causal_schema": 1,
+            "coverage": {"segments": [bulk]},
+            "causal_entries": [{"evidence": bulk}],
+            "entry_changes": [{"analysis": bulk}],
+            "reflection": bulk,
+            "causal_analysis": bulk,
+        }
+        for index in range(35)
+    ]
+    for index, field in zip(
+        (1, 3, 5, 7, 9),
+        (
+            "title",
+            "trajectory_id",
+            "conversation_key",
+            "source_digest",
+            "document_path",
+        ),
+    ):
+        records[index][field] = f"Needle-{index}"
+    records[5]["source_snapshot_digest"] = "snapshot-5"
+    path = tmp_path / "reflections.json"
+    path.write_text(json.dumps(records), encoding="utf-8")
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.reflection_memory_store = ReflectionMemoryStore(path)
+    runtime.reflection_source_store = ReflectionSourceStore(
+        tmp_path / "sources.sqlite3"
+    )
+    runtime.reflection_source_store.save(
+        ReflectionSourceSnapshot(
+            source_digest="snapshot-5",
+            trajectory_id="trajectory-5",
+            conversation_key="Needle-5",
+            original_task="Preserve source evidence",
+            trajectory_history=({"kind": "tool_observation", "content": bulk},),
+            capsule_history=(),
+            verifier_feedback="",
+            source_event_count=1,
+            source_token_count=16000,
+            source_audit={},
+            captured_at=5.0,
+        )
+    )
+    api = client(runtime)
+
+    listing = api.get("/qwen-exo/reflection-memory")
+    assert listing.status_code == 200
+    assert len(listing.content) < 25000
+    page = listing.json()
+    assert (page["total"], page["limit"], page["offset"]) == (35, 25, 0)
+    assert [row["source_digest"] for row in page["reflections"]] == [
+        f"source-{index}" for index in range(34, 9, -1)
+    ]
+    allowed = {
+        "causal_schema",
+        "trajectory_id",
+        "conversation_key",
+        "source_digest",
+        "source_snapshot_digest",
+        "title",
+        "outcome",
+        "source_event_count",
+        "source_token_count",
+        "created_at",
+        "document_path",
+        "document_sha256",
+        "native_source_digest",
+        "publication_status",
+        "hot_updated",
+        "source_available",
+        "trajectory_source",
+        "analysis_status",
+    }
+    assert all(set(row) <= allowed for row in page["reflections"])
+    filtered = api.get(
+        "/qwen-exo/reflection-memory", params={"q": "needle", "limit": 2, "offset": 2}
+    ).json()
+    assert (filtered["total"], filtered["limit"], filtered["offset"]) == (5, 2, 2)
+    assert [row["source_digest"] for row in filtered["reflections"]] == [
+        "source-5",
+        "source-3",
+    ]
+    assert filtered["reflections"][0]["source_available"] is True
+    assert (
+        filtered["reflections"][0]["trajectory_source"]["source_digest"] == "snapshot-5"
+    )
+    assert len(json.dumps(filtered)) < 5000
+    assert api.get(
+        "/qwen-exo/reflection-memory", params={"q": "needle", "offset": 5}
+    ).json() == {"reflections": [], "total": 5, "limit": 25, "offset": 5}
+
+    detail = api.get("/qwen-exo/reflection-memory/source-3")
+    assert detail.status_code == 200
+    assert detail.json()["reflection"] == {
+        **records[3],
+        "source_available": False,
+        "trajectory_source": None,
+    }
+    assert api.get("/qwen-exo/reflection-memory/source-3/source").status_code == 404
+    assert api.get("/qwen-exo/reflection-memory/missing").status_code == 404
+    source = api.get("/qwen-exo/reflection-memory/source-5/source")
+    assert source.status_code == 200
+    assert source.json()["source"]["trajectory_history"][0]["content"] == bulk
+    assert source.json()["reflection"] == records[5]
+    assert runtime.reflection_memory_store.get("source-3") == records[3]
 
 
 def test_pending_reflection_management_supports_list_start_and_cancel():

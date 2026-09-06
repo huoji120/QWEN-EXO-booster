@@ -168,7 +168,7 @@ export type PendingReflectionMemory = {
   conversation_key: string;
   trajectory_id: string;
   original_task: string;
-  status: "waiting" | "running";
+  status: "waiting" | "running" | "failed";
   event_count: number;
   trajectory_row_count: number;
   capsule_count: number;
@@ -179,6 +179,8 @@ export type PendingReflectionMemory = {
   due_at: number;
   timeout_remaining_seconds: number;
   started_at?: number | null;
+  error?: string | null;
+  coverage?: ReflectionCoverage | null;
 };
 
 export type ReflectionTrajectorySource = {
@@ -194,19 +196,56 @@ export type ReflectionTrajectorySource = {
   verifier_feedback_present: boolean;
 };
 
-export type ReflectionMemoryRecord = {
+export type ReflectionEvidenceRef = {
+  event_id: string;
+  quote: string;
+};
+
+export type ReflectionCausalEntry = {
+  entry_id: string;
+  version: number;
+  title: string;
+  scope: string;
+  problem: string;
+  action: string;
+  observation: string;
+  mechanism: string;
+  alternatives: string[];
+  counterevidence: string[];
+  missing_evidence: string[];
+  causal_status: "verified" | "supported" | "unresolved";
+  admission_status: "active" | "candidate" | "retired";
+  rule: string;
+  next_check: string;
+  evidence_refs: ReflectionEvidenceRef[];
+  verification?: { method?: string; evidence_refs?: ReflectionEvidenceRef[] };
+  reason?: string;
+  versions?: Array<Omit<ReflectionCausalEntry, "versions">>;
+};
+
+export type ReflectionCoverage = {
+  status?: "complete" | "partial" | "failed" | "no_lesson" | string;
+  provided_events?: number;
+  analyzed_events?: number;
+  pending_events?: number;
+  failed_segments?: number;
+  segments?: Array<{
+    segment_id: string;
+    event_ids?: string[];
+    status: string;
+    reason?: string;
+  }>;
+  [key: string]: unknown;
+};
+
+export type ReflectionMemorySummary = {
+  causal_schema?: number;
   trajectory_id: string;
   conversation_key: string;
   source_digest: string;
+  source_snapshot_digest?: string | null;
   title: string;
   outcome: "success" | "failure" | "mixed" | "uncertain";
-  reflection: string;
-  evidence: string;
-  causal_analysis: string;
-  conflict_resolution: string;
-  reusable_experience: string;
-  avoid: string;
-  next_time: string;
   source_event_count: number;
   source_token_count: number;
   created_at: number;
@@ -217,6 +256,42 @@ export type ReflectionMemoryRecord = {
   hot_updated: boolean;
   source_available: boolean;
   trajectory_source?: ReflectionTrajectorySource | null;
+  analysis_status?: string;
+};
+
+export type ReflectionMemoryRecord = ReflectionMemorySummary & {
+  causal_entries?: ReflectionCausalEntry[];
+  coverage?: ReflectionCoverage | null;
+  entry_changes?: Array<Record<string, unknown>>;
+  reflection: string;
+  evidence: string;
+  causal_analysis: string;
+  conflict_resolution: string;
+  reusable_experience: string;
+  avoid: string;
+  next_time: string;
+};
+
+export type ReflectionMemoryListing = {
+  reflections: ReflectionMemorySummary[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export type ReflectionMemoryListQuery = {
+  limit: number;
+  offset: number;
+  q: string;
+};
+export type ReflectionEvidenceEvent = {
+  event_id: string;
+  kind?: string;
+  request_id?: string;
+  tool_name?: string;
+  call_id?: string;
+  content?: string;
+  [key: string]: unknown;
 };
 
 export type ReflectionSourceDetail = {
@@ -227,8 +302,13 @@ export type ReflectionSourceDetail = {
     capsule_history: Array<Record<string, unknown>>;
     verifier_feedback: string;
     source_audit: Record<string, unknown>;
+    coverage?: ReflectionCoverage | null;
+    causal_entries?: ReflectionCausalEntry[];
+    entry_changes?: Array<Record<string, unknown>>;
   };
 };
+
+export type ReflectionEvidenceEventResponse = ReflectionEvidenceEvent;
 
 export type ReflectionRegenerationJobStatus = {
   job_id: string | null;
@@ -237,7 +317,9 @@ export type ReflectionRegenerationJobStatus = {
     | "idle"
     | "queued"
     | "loading_source"
+    | "evidence_extraction"
     | "qk_retrieval"
+    | "causal_review"
     | "model_review"
     | "publishing"
     | "completed"

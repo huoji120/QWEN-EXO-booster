@@ -2,1090 +2,677 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
-from qwen_exo_booster.internal_jobs import InternalJobResult
-from qwen_exo_booster.knowledge import KnowledgeRepository, retrieval_diversity_bucket
+from qwen_exo_booster.internal_jobs import InternalJobResult, InternalJobRunner
+from qwen_exo_booster.reflection_evidence import ReflectionEvidenceStore
 from qwen_exo_booster.reflection_memory import (
-    REFLECTION_MEMORY_TOOL_NAME,
     ReflectionMemory,
     ReflectionMemoryCandidate,
     ReflectionMemoryService,
     ReflectionMemoryStore,
-    ReflectionSourceSnapshot,
     ReflectionSourceStore,
-    _reflection_task_category,
 )
 from qwen_exo_booster.telemetry import TelemetryStore
 
 
 class _CharacterTokenizer:
     def encode(self, value, add_special_tokens=False):
-        del add_special_tokens
         return list(str(value))
 
     def decode(self, values, skip_special_tokens=True):
-        del skip_special_tokens
-        values = tuple(values)
-        if values == (999,):
-            return "</think>"
-        return "".join(str(value) for value in values)
+        return "</think>" if tuple(values) == (999,) else "".join(values)
 
     def apply_chat_template(self, messages, **kwargs):
-        del kwargs
-        return "\n".join(str(message["content"]) for message in messages)
+        return json.dumps(messages, ensure_ascii=False) + "\n"
 
 
-class _ReflectionRunner:
-    def __init__(self, text: str):
-        self.text = text
-        self.prompts: list[str] = []
-        self.jobs = []
-
-    async def run_batch(self, jobs, prompts, _sampling_params, **_kwargs):
-        self.jobs.extend(jobs)
-        self.prompts.extend(str(prompt) for prompt in prompts)
-        return (
-            InternalJobResult(
-                job=jobs[0],
-                text=self.text,
-                prompt_tokens=256,
-                completion_tokens=512,
-                finish_reason="stop",
-                latency_seconds=0.01,
-            ),
+def _call(payload):
+    return (
+        "<tool_call>"
+        + json.dumps(
+            {"name": "record_causal_analysis", "arguments": payload},
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
-
-
-class _SequencedReflectionRunner:
-    def __init__(self, outputs):
-        self.outputs = list(outputs)
-        self.prompts: list[str] = []
-        self.jobs = []
-        self.sampling_params = []
-
-    async def run_batch(self, jobs, prompts, sampling_params, **_kwargs):
-        self.jobs.extend(jobs)
-        self.prompts.extend(str(prompt) for prompt in prompts)
-        self.sampling_params.append(dict(sampling_params))
-        text, completion_tokens, finish_reason = self.outputs.pop(0)
-        return (
-            InternalJobResult(
-                job=jobs[0],
-                text=text,
-                prompt_tokens=256,
-                completion_tokens=completion_tokens,
-                finish_reason=finish_reason,
-                latency_seconds=0.01,
-            ),
-        )
-
-
-def _service(tmp_path, *, max_history_tokens=8192):
-    return ReflectionMemoryService(
-        runner=None,
-        tokenizer=_CharacterTokenizer(),
-        telemetry=TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_history_tokens=max_history_tokens,
+        + "</tool_call>"
     )
 
 
-def _fields(
-    *,
-    memory_action: str = "insert",
-    target_document_path: str = "none",
-    merge_document_paths: str = "[]",
-) -> dict[str, str]:
+def _ref(event):
+    return {"event_id": event["event_id"], "quote": event["content"]}
+
+
+def _issue(events, title="缓存变更需隔离验证"):
     return {
-        "title": "WFP 出站授权层判定与验证",
-        "outcome": "success",
-        "memory_action": memory_action,
-        "target_document_path": target_document_path,
-        "merge_document_paths": merge_document_paths,
-        "reflection": (
-            "工具输出直接证明当前生产配置使用 WFP_LAYER_ALE_AUTH_CONNECT_V4 处理出站授权。"
-            "先前沿用 ALE_AUTH_RECV_ACCEPT 的判断没有核对流量方向，导致排查入口错误；读取 policy.py 后"
-            "立即转向 connect 路径，并用定向探针验证结果，最终确认配置和运行行为一致。"
-        ),
-        "evidence": (
-            "read_repository_file 返回 policy.py 中精确的 WFP_LAYER_ALE_AUTH_CONNECT_V4 标识；"
-            "随后 focused-connect-probe 成功命中同一层，响应状态和日志方向均为 outbound。"
-            "这两项直接证据比旧 capsule 中的入站假设更新，且未观察到 ALE_AUTH_RECV_ACCEPT 命中。"
-        ),
-        "causal_analysis": (
-            "根因是把旧环境的入站规则当成当前环境事实，未在第一次工具读取后检查 direction 字段。"
-            "WFP wrapper 会根据流量方向映射不同 layer constant，因此错误入口让后续参数和过滤路径全部偏移。"
-            "定向探针能够区分两个竞争假设，并在修改前形成最小、可复现的判据。"
-        ),
-        "conflict_resolution": (
-            "旧记录声称 ALE_AUTH_RECV_ACCEPT 生效，但它没有当前版本的文件或运行日志支持；"
-            "本次以 policy.py 和 focused-connect-probe 的直接证据替换该结论。若未来切回 inbound 场景，"
-            "仍需重新检查 layer constant，不能把本结论外推到所有 WFP 事件。"
-        ),
-        "reusable_experience": (
-            "当 wrapper 将 WFP 事件映射到层常量时，先保留工具返回的精确标识，再核对 inbound/outbound"
-            "方向，最后运行只覆盖目标路径的探针。只有文件配置与运行命中同时一致，才修改过滤逻辑；"
-            "该规则适用于存在多层映射且历史文档可能滞后的环境。"
-        ),
-        "avoid": (
-            "不要在最新源码明确写出 WFP_LAYER_ALE_AUTH_CONNECT_V4 时，仍把助手先验中的"
-            " ALE_AUTH_RECV_ACCEPT 当成事实；也不要通过重复宽泛请求来掩盖方向未核对的问题。"
-            "缺少直接命中证据时应保留不确定性，而不是静默选择旧结论。"
-        ),
-        "next_time": (
-            "下一次先读取具体 policy source，记录版本和 direction，再运行 targeted connect probe；"
-            "若配置与运行结果冲突，分别保存两者的时间戳和环境边界，停止修改并定位加载缓存。"
-            "完成后复查 filter path，确保结论只作用于已验证的出站授权场景。"
-        ),
+        "title": title,
+        "scope": "相同输入和环境下的缓存读取路径。",
+        "problem": "旧缓存可能导致读取过期结果。",
+        "action": "固定输入，只切换缓存启用状态。",
+        "observation": "保留切换前后返回值，避免用助手完成声明代替结果。",
+        "mechanism": "缓存是否导致结果差异仍需与真实观察对照。",
+        "rule": "同一输入出现旧值时，先隔离缓存变量再决定是否失效缓存。",
+        "next_check": "恢复缓存设置并重放同一输入；若结果未复现则重新排查。",
+        "alternatives": ["后台数据也可能发生变化。"],
+        "counterevidence": [],
+        "missing_evidence": [],
+        "evidence_refs": [_ref(event) for event in events],
     }
 
 
-def _tool_call(name: str, fields: dict[str, str]) -> str:
-    return '<tool_call name="{}">{}</tool_call>'.format(
-        name,
-        "".join(f"<{key}>{value}</{key}>" for key, value in fields.items()),
-    )
+def _review(payload, *, verified=False, method="controlled_comparison", target=None):
+    return {
+        "causal_status": "verified" if verified else "supported",
+        "method": method if verified else "none",
+        "evidence_refs": payload["issue"]["evidence_refs"],
+        "reason": "比较实际观测与干预，限定结论只适用于已观察范围。",
+        "missing_evidence": [] if verified else ["尚未取得隔离变量的重复结果。"],
+        "confounders_resolved": verified,
+        "scope_supported": verified,
+        "rule_supported": verified,
+        "target": target,
+        "retire": False,
+    }
 
 
-def _short_fields() -> dict[str, str]:
-    fields = _fields()
-    fields.update(
-        {
-            "title": "简短反思",
-            "reflection": "现象已确认。",
-            "evidence": "证据已记录。",
-            "causal_analysis": "原因已定位。",
-            "conflict_resolution": "边界已保留。",
-            "reusable_experience": "条件成立后执行。",
-            "avoid": "避免误判。",
-            "next_time": "下次再验证。",
-        }
-    )
-    return fields
+class _Runner:
+    """Model stand-in uses real prompt event IDs, never invented evidence IDs."""
 
+    def __init__(self, respond, *, two_phase=False):
+        self.respond = respond
+        self.two_phase = two_phase
+        self.payloads = []
+        self.jobs = []
+        self.finished_parents = []
 
-def test_reflection_memory_accepts_structurally_valid_short_output():
-    parsed = ReflectionMemoryService.parse_tool_call(
-        _tool_call(REFLECTION_MEMORY_TOOL_NAME, _short_fields())
-    )
-
-    assert parsed is not None
-    assert parsed["title"] == "简短反思"
-    assert parsed["reflection"] == "现象已确认。"
-
-
-def test_reflection_memory_infers_unnamed_tool_from_complete_fields():
-    unnamed = _tool_call(REFLECTION_MEMORY_TOOL_NAME, _short_fields()).replace(
-        f' name="{REFLECTION_MEMORY_TOOL_NAME}"', ""
-    )
-
-    parsed = ReflectionMemoryService.parse_tool_call(unnamed)
-
-    assert parsed is not None
-    assert parsed["title"] == "简短反思"
-
-
-def test_reflection_memory_rejects_ambiguous_unnamed_tool():
-    with pytest.raises(ValueError, match="unexpected tool: <missing>"):
-        ReflectionMemoryService.parse_tool_call(
-            "<tool_call><title>不完整反思</title></tool_call>"
-        )
-
-
-def test_reflection_memory_accepts_concrete_bare_check_rule():
-    fields = _fields()
-    fields["reusable_experience"] = "检查 WebSocket 握手状态后再决定是否重试。"
-
-    parsed = ReflectionMemoryService.parse_tool_call(
-        _tool_call(REFLECTION_MEMORY_TOOL_NAME, fields)
-    )
-
-    assert parsed is not None
-    assert parsed["reusable_experience"] == "检查 WebSocket 握手状态后再决定是否重试。"
-
-
-def test_reflection_memory_rejects_multiple_tool_calls():
-    call = _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
-
-    with pytest.raises(ValueError, match="exactly one"):
-        ReflectionMemoryService.parse_tool_call(call + call)
-
-
-@pytest.mark.parametrize(
-    ("mutate", "message"),
-    (
-        (lambda fields: fields.pop("evidence"), "fields are incomplete"),
-        (lambda fields: fields.update(evidence=""), "cannot be empty"),
-        (lambda fields: fields.update(outcome="complete"), "outcome is invalid"),
-        (lambda fields: fields.update(memory_action="replace"), "action is invalid"),
-        (lambda fields: fields.update(merge_document_paths="not-json"), "must be JSON"),
-        (
-            lambda fields: fields.update(
-                memory_action="update",
-                target_document_path="reflection-memory/safe.md",
-                merge_document_paths='["reflection-memory/../unsafe.md"]',
+    async def run_batch(self, jobs, prompts, sampling_params, **kwargs):
+        job = jobs[0]
+        self.jobs.append(job)
+        messages, _ = json.JSONDecoder().raw_decode(prompts[0])
+        payload = json.loads(messages[-1]["content"])
+        if self.two_phase and sampling_params.get("stop_token_ids"):
+            text, count, finish = "正在核对证据。", job.token_budget, "length"
+        else:
+            self.payloads.append(payload)
+            response = self.respond(payload)
+            text = response if isinstance(response, str) else _call(response)
+            prefix = '<tool_call>{"name":"record_causal_analysis","arguments":'
+            if prompts[0].endswith(prefix) and text.startswith(prefix):
+                text = text[len(prefix) :]
+            count, finish = 32, "stop"
+        return (
+            InternalJobResult(
+                job=job,
+                text=text,
+                prompt_tokens=len(prompts[0]),
+                completion_tokens=count,
+                finish_reason=finish,
+                latency_seconds=0.01,
             ),
-            "merge path is invalid",
-        ),
-        (lambda fields: fields.update(title="短"), "title length is invalid"),
-    ),
-)
-def test_reflection_memory_keeps_structural_validation(mutate, message):
-    fields = _fields()
-    mutate(fields)
-
-    with pytest.raises(ValueError, match=message):
-        ReflectionMemoryService.parse_tool_call(
-            _tool_call(REFLECTION_MEMORY_TOOL_NAME, fields)
         )
 
+    async def finish_parent(self, parent):
+        self.finished_parents.append(parent)
 
-def test_reflection_memory_rejects_duplicate_required_field():
-    body = _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()).replace(
-        "</evidence>", "</evidence><evidence>重复证据。</evidence>"
+
+def _standard_response(payload, *, verified=False):
+    if "issue" in payload:
+        return _review(payload, verified=verified)
+    return {
+        "issues": [_issue(payload["events"])],
+        "read_event_ids": [],
+        "no_lesson_reason": "",
+    }
+
+
+def _service(tmp_path, runner, **options):
+    return ReflectionMemoryService(
+        runner=runner,
+        tokenizer=_CharacterTokenizer(),
+        telemetry=TelemetryStore(tmp_path / "trace.jsonl"),
+        model_fingerprint="cpu-test-model",
+        mode="active",
+        max_attempts=1,
+        max_history_tokens=12288,
+        store=ReflectionMemoryStore(tmp_path / "memories.json"),
+        source_store=ReflectionSourceStore(tmp_path / "sources.sqlite3"),
+        evidence_store=ReflectionEvidenceStore(tmp_path / "evidence.sqlite3"),
+        **options,
     )
 
-    with pytest.raises(ValueError, match="duplicated field: evidence"):
-        ReflectionMemoryService.parse_tool_call(body)
 
-
-def test_reflection_task_category_is_stable_and_task_specific():
-    first = _reflection_task_category(
-        "Please solve this issue:  Implement AutoToc\nwith stable markers"
-    )
-    equivalent = _reflection_task_category(
-        "please solve this issue: implement autotoc with stable markers"
-    )
-    different = _reflection_task_category("Implement a broken doc-link checker")
-
-    assert first == equivalent
-    assert first.startswith("reflection-task-implement-autotoc-with-stable-markers-")
-    assert different != first
-
-
-def test_reflection_memory_uses_renamed_tool_and_knowledge_metadata():
-    fields = _fields()
-    parsed = ReflectionMemoryService.parse_tool_call(
-        _tool_call(REFLECTION_MEMORY_TOOL_NAME, fields)
-    )
-    record = ReflectionMemory(
-        trajectory_id="resp-1",
-        conversation_key="conversation-1",
-        source_digest="source-digest",
-        source_event_count=3,
-        source_token_count=512,
-        attempts=1,
-        created_at=0.0,
-        target_document_sha256=None,
-        retrieval_category="reflection-task-auto-toc-deadbeef",
-        **parsed,
-    )
-
-    markdown = record.markdown()
-
-    assert "source_kind: trajectory_reflection" in markdown
-    assert "document_group: reflection_memory" in markdown
-    assert 'retrieval_category: "reflection-task-auto-toc-deadbeef"' in markdown
-    assert '"reflection-memory"' in markdown
-    assert "WFP_LAYER_ALE_AUTH_CONNECT_V4" in markdown
-    assert "reflection_memory_schema: 3" in markdown
-    assert "可执行规则（先读）:" in markdown
-    assert "停止信号与禁忌:" in markdown
-    assert len(record.compact_content) < 6000
-    with pytest.raises(ValueError, match="unexpected tool"):
-        ReflectionMemoryService.parse_tool_call(
-            _tool_call("save_trajectory_reflection", fields)
+def _reflect(service, rows, **options):
+    return asyncio.run(
+        service.reflect(
+            trajectory_id="checkpoint",
+            conversation_key="conversation",
+            original_task="判断缓存是否导致旧值，不将相关性当成原因。",
+            tool_ledger=({"tool_name": "probe", "observation": "已记录"},),
+            trajectory_history=tuple(rows),
+            capsule_history=(),
+            **options,
         )
-
-
-def test_reflection_memory_rejects_english_human_fields():
-    fields = _fields()
-    fields["reflection"] = (
-        "The tool output identified the active layer, but this field has no Chinese. "
-        * 12
     )
-    with pytest.raises(ValueError, match="must be Chinese"):
-        ReflectionMemoryService.parse_tool_call(
-            _tool_call(REFLECTION_MEMORY_TOOL_NAME, fields)
-        )
 
 
-def test_reflection_memory_rejects_removed_shadow_mode(tmp_path):
-    with pytest.raises(ValueError, match="off/active"):
-        ReflectionMemoryService(
-            runner=None,
-            tokenizer=None,
-            telemetry=TelemetryStore(tmp_path / "trace.jsonl"),
-            model_fingerprint="model",
-            mode="shadow",
-        )
-
-
-def test_reflection_prompt_contains_full_structured_trajectory_and_title_contract(
-    tmp_path,
-):
-    service = _service(tmp_path)
-    history = (
-        {"kind": "user_context", "content": "inspect the current implementation"},
+def _controlled_rows():
+    return (
         {
-            "kind": "assistant_trajectory",
-            "content": "I should inspect the wrapper before deciding.",
+            "kind": "tool_observation",
+            "call_id": "before",
+            "content": "相同输入 x，缓存开启，返回旧值 1。",
         },
         {
             "kind": "tool_action",
-            "tool_name": "read_repository_file",
-            "call_id": "call-1",
-            "content": '{"path":"policy.py"}',
+            "call_id": "toggle",
+            "content": "只关闭缓存；输入 x、数据、进程版本均保持不变。",
         },
         {
             "kind": "tool_observation",
-            "tool_name": "read_repository_file",
-            "call_id": "call-1",
-            "content": "WFP_LAYER_ALE_AUTH_CONNECT_V4",
-        },
-        {
-            "kind": "assistant_output",
-            "content": "The outbound authorization layer is active.",
+            "call_id": "after",
+            "content": "相同输入 x，缓存关闭，返回当前值 2；恢复缓存后再次返回 1。",
         },
     )
 
-    prompt, audit = service._prompt(
-        original_task="Inspect the WFP wrapper",
-        tool_ledger=({"observation": "WFP_LAYER_ALE_AUTH_CONNECT_V4"},),
-        trajectory_history=history,
-        capsule_history=({"phase": "verified", "event": "targeted probe passed"},),
-        previous_failure="",
-    )
 
-    assert "inspect the current implementation" in prompt
-    assert "I should inspect the wrapper before deciding" in prompt
-    assert "read_repository_file" in prompt
-    assert "WFP_LAYER_ALE_AUTH_CONNECT_V4" in prompt
-    assert "The outbound authorization layer is active" in prompt
-    assert "中文标题" in prompt
-    assert "不得使用文件名、哈希、请求 ID 或照抄任务" in prompt
-    assert "禁止按时间线复述" in prompt
-    assert "暴力猜测" in prompt
-    assert "观察→假设→最小验证→决策→复核" in prompt
-    assert "哪一条精确观察能区分竞争假设" in prompt
-    assert "哪一条观察本应触发停止或转向" in prompt
-    assert "批判决策质量和信息增益" in prompt
-    assert "<memory_action>insert|update</memory_action>" in prompt
-    assert "模型自写的 smoke、局部测试或完成声明不足以证明成功" in prompt
-    assert audit["provided_history_rows"] == 5
-    assert audit["retained_history_rows"] == 5
-    assert audit["source_tokens"] <= 8192
+def test_ambiguous_tool_envelopes_cannot_publish_a_memory(tmp_path):
+    def respond(payload):
+        call = _call(_standard_response(payload))
+        return call + "\n" + call
+
+    service = _service(tmp_path, _Runner(respond))
+    result = _reflect(service, _controlled_rows())
+    assert result.analysis_status == "failed_closed"
+    assert result.coverage["pending_events"] == 3
+    assert result.causal_entries == ()
+    with pytest.raises(ValueError, match="Duplicate causal field"):
+        service.parse_tool_call(
+            '<tool_call>{"name":"record_causal_analysis",'
+            '"arguments":{},"arguments":{"issues":[]}}</tool_call>'
+        )
 
 
-def test_reflection_source_window_bounds_long_history_and_keeps_recent_evidence(
-    tmp_path,
-):
-    service = _service(tmp_path, max_history_tokens=2048)
-    history = tuple(
-        {
-            "kind": "tool_observation",
-            "content": f"event-{index}-" + ("x" * 420),
-            "source_digest": f"digest-{index}",
+def test_full_source_segments_preserve_early_middle_and_tail(tmp_path):
+    runner = _Runner(
+        lambda p: {
+            "issues": [],
+            "read_event_ids": [],
+            "no_lesson_reason": "本段仅有原始采样，尚无可复用决策。",
         }
-        for index in range(12)
     )
-
-    source, audit = service._source_payload(
-        original_task="Long agent trajectory",
-        tool_ledger=({"observation": "latest"},),
-        trajectory_history=history,
-        capsule_history=(),
-    )
-
-    retained = source["trajectory_history"]
-    assert retained
-    assert retained[-1]["source_digest"] == "digest-11"
-    assert audit["omitted_history_rows"] > 0
-    assert audit["omitted_history_digest"]
-    assert audit["source_tokens"] <= 2048
-
-
-def test_reflection_prompt_includes_bounded_qk_memory_candidates(tmp_path):
-    service = _service(tmp_path)
-    candidate = ReflectionMemoryCandidate(
-        document_path="reflection-memory/network-probe.md",
-        document_sha256="sha-old",
-        title="Differentiate transport failures before retrying",
-        content=(
-            "Observe status, response body, and client error class before changing "
-            "the request strategy; repeated identical failures require a pivot."
-        ),
-        tensor_score=0.82,
-    )
-
-    prompt, audit = service._prompt(
-        original_task="Diagnose repeated localhost request failures",
-        tool_ledger=({"observation": "WinError 10106"},),
-        trajectory_history=(
-            {
-                "kind": "tool_observation",
-                "content": "WinError 10106 repeated 256 times",
-            },
-        ),
-        capsule_history=(),
-        previous_failure="",
-        existing_memories=(candidate,),
-    )
-
-    assert candidate.document_path in prompt
-    assert candidate.document_sha256 in prompt
-    assert "repeated identical failures require a pivot" in prompt
-    assert "底层问题、因果机制、决策点和可复用决策规则" in prompt
-    assert audit["provided_memory_candidates"] == 1
-    assert audit["retained_memory_candidates"] == 1
-
-
-def test_reflection_update_must_target_a_qk_candidate():
-    candidate = ReflectionMemoryCandidate(
-        document_path="reflection-memory/proposed.md",
-        document_sha256="sha-proposed",
-        title="Proposed",
-        content="Concrete prior reflection content",
-        tensor_score=0.7,
-    )
-    parsed = ReflectionMemoryService.parse_tool_call(
-        _tool_call(
-            REFLECTION_MEMORY_TOOL_NAME,
-            _fields(
-                memory_action="update",
-                target_document_path=candidate.document_path,
-            ),
+    service = _service(tmp_path, runner)
+    text = "EARLY-OBSERVATION\n" + "原始采样数据\n" * 2400 + "TAIL-OBSERVATION"
+    result = _reflect(service, [{"kind": "tool_observation", "content": text}])
+    fragments = [event for p in runner.payloads for event in p.get("events", [])]
+    assert "".join(event["content"] for event in fragments) == text
+    assert len(fragments) > 1
+    assert [(event["start"], event["end"]) for event in fragments] == [
+        (
+            sum(len(x["content"]) for x in fragments[:i]),
+            sum(len(x["content"]) for x in fragments[: i + 1]),
         )
+        for i in range(len(fragments))
+    ]
+    assert result.analysis_status == "no_lesson"
+    assert result.coverage["provided_events"] == result.coverage["analyzed_events"] == 1
+    assert result.coverage["pending_events"] == 0
+    snapshot = ReflectionSourceStore(tmp_path / "sources.sqlite3").get(
+        result.source_digest
     )
+    assert snapshot.trajectory_history[0]["content"] == text
 
-    target, merged = ReflectionMemoryService._validate_memory_action(
-        parsed, (candidate,)
-    )
-    assert target == candidate
-    assert merged == (candidate,)
-    with pytest.raises(ValueError, match="not proposed by QK"):
-        ReflectionMemoryService._validate_memory_action(parsed, ())
-    with pytest.raises(ValueError, match="insert target must be none"):
-        ReflectionMemoryService.parse_tool_call(
-            _tool_call(
-                REFLECTION_MEMORY_TOOL_NAME,
-                _fields(target_document_path=candidate.document_path),
+
+def test_later_issue_explicitly_rereads_earlier_evidence(tmp_path):
+    reread = []
+
+    def respond(payload):
+        if "issue" in payload:
+            return _review(payload)
+        requested = payload.get("requested_evidence", [])
+        if requested:
+            reread.extend(requested)
+            return {
+                "issues": [
+                    _issue(
+                        [requested[0], payload["events"][-1]], "前后结果需要跨段对照"
+                    )
+                ],
+                "read_event_ids": [],
+                "no_lesson_reason": "",
+            }
+        if any("LATER" in event["content"] for event in payload["events"]):
+            earlier = payload["earlier_issue_index"][0]["evidence_refs"][0]["event_id"]
+            return {"issues": [], "read_event_ids": [earlier], "no_lesson_reason": ""}
+        early = [event for event in payload["events"] if "EARLY" in event["content"]]
+        return {
+            "issues": [_issue(early)] if early else [],
+            "read_event_ids": [],
+            "no_lesson_reason": "本段仅有重复采样。",
+        }
+
+    runner = _Runner(respond)
+    service = _service(tmp_path, runner)
+    rows = [
+        {"kind": "tool_observation", "content": "EARLY 原始失败：返回旧值。"},
+        {"kind": "tool_observation", "content": "采样中。" * 1800},
+        {"kind": "tool_observation", "content": "LATER 切换缓存后返回当前值。"},
+    ]
+    result = _reflect(service, rows)
+    assert result.analysis_status == "complete"
+    assert reread[0]["content"] == rows[0]["content"]
+    assert {ref["event_id"] for ref in result.causal_entries[-1]["evidence_refs"]} == {
+        reread[0]["event_id"],
+        service.evidence_store.rows("conversation")[-1]["event_id"],
+    }
+    # A replay must retain the re-read proof, not validate it only against the later segment.
+    replay = _reflect(service, rows)
+    assert replay.coverage["pending_events"] == 0
+
+
+def test_partial_retry_resumes_successful_issues_without_republishing(tmp_path):
+    fail_late = True
+    extractions = Counter()
+    reviews = Counter()
+    in_progress = []
+
+    def respond(payload):
+        if "issue" in payload:
+            reviews[payload["issue"]["title"]] += 1
+            return _review(payload)
+        events = payload["events"]
+        label = "后段" if any("LATE" in x["content"] for x in events) else "前段"
+        extractions[label] += 1
+        if label == "后段" and fail_late:
+            in_progress.extend(
+                record["analysis_status"]
+                for record in service.store.list()
+                if record.get("causal_entries")
             )
+            return "not a closed tool call"
+        interesting = [
+            x for x in events if "EARLY" in x["content"] or "LATE" in x["content"]
+        ]
+        return {
+            "issues": [_issue(interesting, label + "缓存现象")] if interesting else [],
+            "read_event_ids": [],
+            "no_lesson_reason": "中间采样没有新信息。",
+        }
+
+    runner = _Runner(respond)
+    service = _service(tmp_path, runner)
+    rows = [
+        {"kind": "tool_observation", "content": "EARLY 旧值现象。"},
+        {"kind": "tool_observation", "content": "采样。" * 2200},
+        {"kind": "tool_observation", "content": "LATE 新值现象。"},
+    ]
+    first = _reflect(service, rows)
+    assert first.analysis_status == "partial"
+    assert first.coverage["failed_segments"] == 1
+    assert first.coverage["pending_events"] > 0
+    assert set(in_progress) == {"partial"}
+    completed_extractions = extractions["前段"]
+    completed_reviews = reviews["前段缓存现象"]
+    fail_late = False
+    second = _reflect(service, rows)
+    assert second.analysis_status == "complete"
+    assert second.coverage["pending_events"] == 0
+    assert extractions["前段"] == completed_extractions
+    assert reviews["前段缓存现象"] == completed_reviews
+    assert all(
+        record["analysis_status"] == "complete"
+        for record in service.store.list()
+        if record.get("causal_entries")
+    )
+    entries = [
+        entry
+        for record in service.store.list()
+        for entry in record.get("causal_entries", [])
+    ]
+    assert Counter(entry["title"] for entry in entries) == {
+        "前段缓存现象": 1,
+        "后段缓存现象": 1,
+    }
+
+
+@pytest.mark.parametrize("causal_status", ["supported", "unresolved"])
+def test_evidence_backed_memory_is_publishable_without_verified_cause(
+    tmp_path, causal_status
+):
+    published = []
+
+    async def publish(record):
+        published.append(record)
+        return {"publication_status": "published"}
+
+    def respond(payload):
+        value = _standard_response(payload)
+        if "issue" in payload:
+            value["causal_status"] = causal_status
+        return value
+
+    service = _service(tmp_path, _Runner(respond), publish=publish)
+    result = _reflect(service, _controlled_rows())
+    assert result.publication_status == "published"
+    entry = result.active_entries[0]
+    assert entry["causal_status"] == causal_status
+    assert entry["verification"]["admitted"] is False
+    assert causal_status in result.compact_content
+    assert entry["missing_evidence"][0] in result.compact_content
+    for ref in entry["verification"]["evidence_refs"]:
+        assert ref["quote"] in result.compact_content
+    assert len(published) == 1
+    replay = _reflect(service, _controlled_rows())
+    assert replay.source_digest == result.source_digest
+    assert len(published) == 1
+    assert service.store.get(result.source_digest)["publication_status"] == "published"
+
+
+def test_assistant_success_claim_cannot_become_verified(tmp_path):
+    service = _service(
+        tmp_path, _Runner(lambda p: _standard_response(p, verified=True))
+    )
+    result = _reflect(
+        service,
+        [{"kind": "assistant", "content": "我已验证所有测试通过，关闭缓存就是根因。"}],
+    )
+    entry = result.causal_entries[0]
+    assert entry["causal_status"] != "verified"
+    assert entry["admission_status"] == "candidate"
+    assert entry["missing_evidence"]
+    assert result.active_entries == ()
+
+
+def test_controlled_comparison_is_stored_before_gdn_refresh(tmp_path):
+    callbacks = []
+    service = None
+
+    async def publish(record):
+        callbacks.append("publish")
+        return {
+            "document_path": "reflection-memory/cache.md",
+            "document_sha256": "new-sha",
+            "publication_status": "published",
+            "hot_updated": True,
+        }
+
+    async def refresh(record):
+        stored = ReflectionMemoryStore(tmp_path / "memories.json").get(
+            record.source_digest
         )
+        assert stored["publication_status"] == "published"
+        assert stored["document_sha256"] == "new-sha"
+        callbacks.append("gdn")
 
-
-def test_reflection_field_tag_is_not_misread_as_tool_name():
-    body = _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
-    malformed = body.replace(
-        '<tool_call name="save_reflection_memory">',
-        '<tool_call name="memory_action">',
-        1,
+    service = _service(
+        tmp_path,
+        _Runner(lambda p: _standard_response(p, verified=True)),
+        publish=publish,
+        on_memory_stored=refresh,
     )
+    result = _reflect(service, _controlled_rows())
+    assert result.analysis_status == "complete"
+    assert result.publication_status == "published"
+    assert result.active_entries[0]["verification"]["method"] == "controlled_comparison"
+    assert result.active_entries[0]["rule"] in result.markdown()
+    assert callbacks == ["publish", "gdn"]
 
-    parsed = ReflectionMemoryService.parse_tool_call(malformed)
 
-    assert parsed is not None
-    assert parsed["memory_action"] == "insert"
+def test_fabricated_quote_leaves_failed_coverage_without_memory(tmp_path):
+    def respond(payload):
+        issue = _issue(payload["events"])
+        issue["evidence_refs"][0]["quote"] = "从未出现的成功记录"
+        return {"issues": [issue], "read_event_ids": [], "no_lesson_reason": ""}
+
+    service = _service(tmp_path, _Runner(respond))
+    result = _reflect(service, _controlled_rows())
+    assert result.analysis_status == "failed_closed"
+    assert result.coverage["pending_events"] == 3
+    assert not any(record["causal_entries"] for record in service.store.list())
 
 
-def test_reflection_generation_caps_reasoning_before_tool_phase(tmp_path):
-    runner = _SequencedReflectionRunner(
-        (
-            ("<think>逐项分析轨迹证据。", 32, {"type": "length"}),
-            (
-                _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()),
-                512,
-                {"type": "stop"},
-            ),
-        )
+def test_stale_review_version_does_not_replace_existing_rule(tmp_path):
+    runner = _Runner(lambda p: _standard_response(p, verified=True))
+    service = _service(tmp_path, runner)
+    original = _reflect(service, _controlled_rows())
+    original = replace(
+        original,
+        document_path="reflection-memory/existing.md",
+        document_sha256="original-sha",
+        publication_status="published",
     )
-    service = ReflectionMemoryService(
-        runner,
-        _CharacterTokenizer(),
-        TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_attempts=1,
-        max_output_tokens=1024,
-        max_reasoning_tokens=32,
-        reasoning_end_token_id=999,
-    )
-
-    result = asyncio.run(
-        service._run(
-            parent_id="reflection-parent",
-            source_digest="source-digest",
-            prompt="反思提示：",
-            attempt=1,
-        )
-    )
-
-    assert len(runner.jobs) == 2
-    assert runner.jobs[0].token_budget == 32
-    assert runner.jobs[1].token_budget == 992
-    assert runner.sampling_params[0]["stop_token_ids"] == [999]
-    assert "</think>" in runner.prompts[1]
-    assert result.completion_tokens == 544
-    assert ReflectionMemoryService.parse_tool_call(result.text) is not None
-
-
-def test_reflection_reserves_three_quarters_for_large_tool_payload(tmp_path):
-    runner = _SequencedReflectionRunner(
-        (
-            ("<think>分析。", 2047, {"type": "length"}),
-            (
-                _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()),
-                1024,
-                {"type": "stop"},
-            ),
-        )
-    )
-    service = ReflectionMemoryService(
-        runner,
-        _CharacterTokenizer(),
-        TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_attempts=1,
-        max_output_tokens=8192,
-        max_reasoning_tokens=3072,
-        reasoning_end_token_id=999,
-        retrieve_similar=lambda _parent_id, _query: (),
-    )
-
-    result = asyncio.run(
-        service._run(
-            parent_id="reflection-parent",
-            source_digest="source-digest",
-            prompt="反思提示：",
-            attempt=1,
-        )
-    )
-
-    assert runner.jobs[0].token_budget == 2047
-    assert runner.jobs[1].token_budget == 6144
-    assert ReflectionMemoryService.parse_tool_call(result.text) is not None
-
-
-def test_reflection_accepts_complete_tool_call_at_length_boundary():
-    result = InternalJobResult(
-        job=None,
-        text=_tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()),
-        prompt_tokens=256,
-        completion_tokens=4096,
-        finish_reason={"type": "length"},
-        latency_seconds=0.01,
-    )
-
-    parsed = ReflectionMemoryService._parse_completed_tool_result(result, "reflection")
-
-    assert parsed is not None
-    assert parsed["title"] == _fields()["title"]
-
-
-def test_reflection_rejects_incomplete_tool_call_at_length_boundary():
-    result = InternalJobResult(
-        job=None,
-        text="<think>尚未完成",
-        prompt_tokens=256,
-        completion_tokens=4096,
-        finish_reason={"type": "length"},
-        latency_seconds=0.01,
-    )
-
-    with pytest.raises(ValueError, match="did not stop normally"):
-        ReflectionMemoryService._parse_completed_tool_result(result, "reflection")
-
-
-def test_reflection_generation_updates_retrieved_memory_instead_of_inserting(tmp_path):
+    service.store.append(original)
     candidate = ReflectionMemoryCandidate(
-        document_path="reflection-memory/network-probe.md",
-        document_sha256="sha-old",
-        title="Differentiate transport failures before retrying",
-        content="The prior record requires a discriminating transport probe.",
-        tensor_score=0.91,
+        original.document_path,
+        original.document_sha256,
+        original.title,
+        original.markdown(),
+        0.99,
+        original.causal_entries,
     )
-    runner = _ReflectionRunner(
-        _tool_call(
-            REFLECTION_MEMORY_TOOL_NAME,
-            _fields(
-                memory_action="update",
-                target_document_path=candidate.document_path,
-            ),
-        )
-    )
-    retrieval_queries: list[str] = []
-    published: list[ReflectionMemory] = []
 
-    async def retrieve(_parent_id: str, query: str):
-        retrieval_queries.append(query)
+    async def retrieve(parent, query):
         return (candidate,)
 
-    async def publish(reflection: ReflectionMemory):
-        published.append(reflection)
-        return {
-            "document_path": candidate.document_path,
-            "document_sha256": "sha-updated",
-            "native_source_digest": "bank-updated",
-            "hot_updated": True,
-            "restart_required": False,
-            "publication_status": "published",
-        }
-
-    store = ReflectionMemoryStore(tmp_path / "reflection-memory.json")
-    stored_callbacks = []
-
-    async def on_memory_stored(reflection):
-        stored_callbacks.append((reflection.source_digest, len(store.list())))
-
-    service = ReflectionMemoryService(
-        runner,
-        _CharacterTokenizer(),
-        TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_attempts=1,
-        store=store,
-        publish=publish,
-        retrieve_similar=retrieve,
-        on_memory_stored=on_memory_stored,
-    )
-
-    result = asyncio.run(
-        service.reflect(
-            trajectory_id="resp-update",
-            conversation_key="conversation-update",
-            original_task="Diagnose repeated localhost failures",
-            tool_ledger=({"observation": "WinError 10106 repeated 256 times"},),
-            trajectory_history=(
-                {"kind": "tool_observation", "content": "curl returned a response"},
-            ),
-            capsule_history=(),
-            source_token_count=512,
-        )
-    )
-
-    assert result is not None
-    assert result.memory_action == "update"
-    assert result.target_document_path == candidate.document_path
-    assert result.target_document_sha256 == candidate.document_sha256
-    assert result.retrieval_category == _reflection_task_category(
-        "Diagnose repeated localhost failures"
-    )
-    assert result.document_path == candidate.document_path
-    assert retrieval_queries and "WinError 10106" in retrieval_queries[0]
-    assert candidate.content in runner.prompts[0]
-    assert runner.jobs[0].token_budget == service.max_output_tokens - 1
-    assert runner.jobs[0].deadline_monotonic is None
-    assert not runner.jobs[0].is_cancelled_or_expired(now=1e300)
-    assert len(published) == 1
-    assert published[0].memory_action == "update"
-    assert published[0].retrieval_category == result.retrieval_category
-    assert published[0].target_document_path == candidate.document_path
-    assert published[0].target_document_sha256 == candidate.document_sha256
-    assert published[0].document_path is None
-    assert len(store.list()) == 1
-    assert stored_callbacks == [(result.source_digest, 1)]
-
-
-def test_reflection_markdown_uses_stable_task_category(tmp_path):
-    record = ReflectionMemory(
-        trajectory_id="resp-category",
-        conversation_key="conversation-category",
-        source_digest="source-category",
-        source_event_count=1,
-        source_token_count=64,
-        attempts=1,
-        created_at=0.0,
-        target_document_sha256=None,
-        retrieval_category=_reflection_task_category("Implement AutoToc"),
-        **_fields(),
-    )
-
-    markdown = record.markdown()
-
-    assert f"retrieval_category: {json.dumps(record.retrieval_category)}" in markdown
-    repository = KnowledgeRepository(tmp_path / "knowledge")
-    document = repository.upsert("reflection-memory/auto-toc.md", markdown)
-    assert retrieval_diversity_bucket(document) == record.retrieval_category
-    assert record.retrieval_category.startswith("reflection-task-implement-autotoc-")
-
-
-def test_reflection_organizer_merges_model_selected_qk_candidates(tmp_path):
-    left = ReflectionMemoryCandidate(
-        document_path="reflection-memory/left.md",
-        document_sha256="sha-left",
-        title="左侧记忆",
-        content="相同因果经验的左侧完整反思。",
-        tensor_score=0.91,
-    )
-    right = ReflectionMemoryCandidate(
-        document_path="reflection-memory/right.md",
-        document_sha256="sha-right",
-        title="右侧记忆",
-        content="相同因果经验的右侧完整反思。",
-        tensor_score=0.89,
-    )
-    runner = _ReflectionRunner(
-        _tool_call(
-            REFLECTION_MEMORY_TOOL_NAME,
-            _fields(
-                memory_action="update",
-                target_document_path=left.document_path,
-                merge_document_paths=json.dumps(
-                    [left.document_path, right.document_path]
-                ),
-            ),
-        )
-    )
-    service = ReflectionMemoryService(
-        runner,
-        _CharacterTokenizer(),
-        TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_attempts=1,
-    )
-
-    result = asyncio.run(
-        service.organize_candidates(
-            organization_id="manual-1",
-            candidates=(left, right),
-            qk_pairs=((left.document_path, right.document_path, 0.91),),
-        )
-    )
-
-    assert result is not None
-    assert result.target_document_path == left.document_path
-    assert result.target_document_sha256 == left.document_sha256
-    assert result.merge_document_paths == (left.document_path, right.document_path)
-    assert dict(result.merge_document_sha256s) == {
-        left.document_path: left.document_sha256,
-        right.document_path: right.document_sha256,
-    }
-    assert "模型原生 Q×K 高分检索" in runner.prompts[0]
-    assert "冲突整理" in runner.prompts[0]
-
-
-def test_reflection_organizer_keeps_distinct_memories_on_skip(tmp_path):
-    candidates = (
-        ReflectionMemoryCandidate("reflection-memory/a.md", "sha-a", "甲", "甲", 0.8),
-        ReflectionMemoryCandidate("reflection-memory/b.md", "sha-b", "乙", "乙", 0.8),
-    )
-    runner = _ReflectionRunner(
-        '<tool_call name="skip_reflection_memory">'
-        "<reason>两条记忆只有主题相似，因果机制不同，应保持分开。</reason>"
-        "</tool_call>"
-    )
-    service = ReflectionMemoryService(
-        runner,
-        _CharacterTokenizer(),
-        TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_attempts=1,
-    )
-
-    result = asyncio.run(
-        service.organize_candidates(
-            organization_id="manual-2",
-            candidates=candidates,
-            qk_pairs=((candidates[0].document_path, candidates[1].document_path, 0.8),),
-        )
-    )
-
-    assert result is None
-
-
-def test_reflection_generation_fails_closed_when_qk_retrieval_fails(tmp_path):
-    runner = _ReflectionRunner(_tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()))
-    published: list[ReflectionMemory] = []
-
-    async def retrieve(_parent_id: str, _query: str):
-        raise RuntimeError("query probe unavailable")
-
-    async def publish(reflection: ReflectionMemory):
-        published.append(reflection)
-        return {}
-
-    service = ReflectionMemoryService(
-        runner,
-        _CharacterTokenizer(),
-        TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_attempts=1,
-        publish=publish,
-        retrieve_similar=retrieve,
-    )
-
-    result = asyncio.run(
-        service.reflect(
-            trajectory_id="resp-failed-qk",
-            conversation_key="conversation-failed-qk",
-            original_task="Diagnose transport behavior",
-            tool_ledger=({"observation": "one concrete result"},),
-            trajectory_history=(),
-            capsule_history=(),
-            source_token_count=512,
-        )
-    )
-
-    assert result is None
-    assert runner.prompts == []
-    assert published == []
-
-
-def test_reflection_source_store_persists_trajectory_and_verifier_feedback(tmp_path):
-    snapshot = ReflectionSourceSnapshot(
-        source_digest="source-persisted",
-        trajectory_id="resp-persisted",
-        conversation_key="conversation-persisted",
-        original_task="Fix the failed GraphQL stream",
-        trajectory_history=(
-            {
-                "kind": "tool_observation",
-                "tool_name": "verifier",
-                "content": "17/17 checks passed",
+    def stale_response(payload):
+        if "issue" not in payload:
+            return _standard_response(payload)
+        return _review(
+            payload,
+            verified=True,
+            target={
+                "document_path": candidate.document_path,
+                "entry_id": candidate.causal_entries[0]["entry_id"],
+                "version": candidate.causal_entries[0]["version"] + 1,
+                "relation": "same_mechanism_and_rule",
             },
-        ),
-        capsule_history=({"status": "complete"},),
-        verifier_feedback="Hidden verifier: 4 F2P failures remain",
-        source_event_count=1,
-        source_token_count=512,
-        source_audit={"source_tokens": 128},
-        captured_at=1.0,
+        )
+
+    service.retrieve_similar = retrieve
+    service.runner = _Runner(stale_response)
+    rows = list(_controlled_rows()) + [
+        {"kind": "tool_observation", "content": "第二次受控重复仍然出现同样差异。"}
+    ]
+    result = _reflect(service, rows)
+    assert result.analysis_status == "failed_closed"
+    saved = service.store.get(original.source_digest)
+    assert saved["document_sha256"] == "original-sha"
+    assert saved["causal_entries"] == original.public_dict()["causal_entries"]
+
+
+def test_uncertain_recollection_cannot_replace_a_verified_rule(tmp_path):
+    service = _service(
+        tmp_path, _Runner(lambda p: _standard_response(p, verified=True))
     )
-    path = tmp_path / "reflection-sources.sqlite3"
+    original = _reflect(service, _controlled_rows())
+    original = replace(
+        original,
+        document_path="reflection-memory/proven.md",
+        document_sha256="proven-sha",
+        publication_status="published",
+    )
+    service.store.append(original)
+    candidate = ReflectionMemoryCandidate(
+        original.document_path,
+        original.document_sha256,
+        original.title,
+        original.markdown(),
+        0.99,
+        original.causal_entries,
+    )
 
-    ReflectionSourceStore(path).save(snapshot)
-    reopened = ReflectionSourceStore(path)
-    restored = reopened.get(snapshot.source_digest)
+    async def retrieve(parent, query):
+        return (candidate,)
 
-    assert restored == snapshot
-    assert reopened.metadata()[snapshot.source_digest] == {
-        "source_digest": snapshot.source_digest,
-        "trajectory_id": snapshot.trajectory_id,
-        "conversation_key": snapshot.conversation_key,
-        "captured_at": 1.0,
-        "supersedes_source_digest": None,
-        "source_event_count": 1,
-        "source_token_count": 512,
-        "trajectory_row_count": 1,
-        "capsule_count": 1,
-        "verifier_feedback_present": True,
+    async def publish(record):
+        assert record.memory_action == "insert"
+        assert record.target_document_path is None
+        return {
+            "publication_status": "published",
+            "document_path": "reflection-memory/tentative.md",
+        }
+
+    def respond(payload):
+        if "issue" not in payload:
+            return _standard_response(payload)
+        return _review(
+            payload,
+            target={
+                "document_path": candidate.document_path,
+                "entry_id": candidate.causal_entries[0]["entry_id"],
+                "version": candidate.causal_entries[0]["version"],
+                "relation": "same_mechanism_and_rule",
+            },
+        )
+
+    service.retrieve_similar = retrieve
+    service.publish = publish
+    service.runner = _Runner(respond)
+    rows = list(_controlled_rows()) + [
+        {"kind": "tool_observation", "content": "新一次出现旧值，但尚未隔离缓存变量。"}
+    ]
+    result = _reflect(service, rows)
+    assert result.publication_status == "published"
+    assert result.causal_entries[0]["causal_status"] == "supported"
+    assert (
+        service.store.get(original.source_digest)["causal_entries"]
+        == original.public_dict()["causal_entries"]
+    )
+
+
+def test_reasoning_exhaustion_preserves_tool_phase_and_releases_parents(tmp_path):
+    runner = _Runner(lambda p: _standard_response(p, verified=True), two_phase=True)
+    service = _service(
+        tmp_path,
+        runner,
+        max_output_tokens=2048,
+        max_reasoning_tokens=128,
+        reasoning_end_token_id=999,
+    )
+    result = _reflect(service, _controlled_rows())
+    assert result.analysis_status == "complete"
+    assert result.active_entries
+    reasoning = [job for job in runner.jobs if job.job_id.endswith(":reasoning")]
+    tools = [job for job in runner.jobs if job.job_id.endswith(":tool")]
+    assert len(reasoning) == len(tools) == 2
+    assert all(job.token_budget == 128 for job in reasoning)
+    assert all(job.token_budget == 1920 for job in tools)
+    assert all(job.deadline_monotonic is None for job in runner.jobs)
+    assert set(runner.finished_parents) == {
+        job.parent_request_id for job in runner.jobs
     }
 
 
-def test_regeneration_persists_feedback_and_replaces_required_target(tmp_path):
-    document_path = "reflection-memory/associated.md"
-    target = ReflectionMemoryCandidate(
-        document_path=document_path,
-        document_sha256="a" * 64,
-        title="关联反思",
-        content="旧的反思内容",
-        tensor_score=0.0,
-    )
-    fields = _fields(
-        memory_action="update",
-        target_document_path=document_path,
-        merge_document_paths=json.dumps([document_path]),
-    )
-    runner = _ReflectionRunner(_tool_call(REFLECTION_MEMORY_TOOL_NAME, fields))
-    source_store = ReflectionSourceStore(tmp_path / "reflection-sources.sqlite3")
+def test_complete_tool_example_in_reasoning_is_never_executed(tmp_path):
+    class ReasoningExampleRunner(_Runner):
+        async def run_batch(self, jobs, prompts, sampling_params, **kwargs):
+            result = await super().run_batch(jobs, prompts, sampling_params, **kwargs)
+            if sampling_params.get("stop_token_ids"):
+                return (
+                    replace(
+                        result[0],
+                        text=_call(
+                            {
+                                "issues": [],
+                                "read_event_ids": [],
+                                "no_lesson_reason": "思考中的格式示例，不是实际调用。",
+                            }
+                        ),
+                    ),
+                )
+            return result
 
-    async def retrieve(_parent_id, _query):
-        return ()
-
-    async def publish(reflection):
-        return {
-            "document_path": document_path,
-            "document_sha256": "b" * 64,
-            "native_source_digest": "bank-after",
-            "hot_updated": True,
-            "restart_required": False,
-            "publication_status": "published",
-        }
-
-    service = ReflectionMemoryService(
-        runner,
-        _CharacterTokenizer(),
-        TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_attempts=1,
-        source_store=source_store,
-        publish=publish,
-        retrieve_similar=retrieve,
-    )
-    feedback = "Hidden verifier found four F2P failures after the agent timeout."
-
-    reflection = asyncio.run(
-        service.reflect(
-            trajectory_id="resp-associated",
-            conversation_key="conversation-associated",
-            original_task="Repair the GraphQL stream",
-            tool_ledger=(),
-            trajectory_history=(
-                {"kind": "assistant_trajectory", "content": "implemented parser"},
-            ),
-            capsule_history=(),
-            source_token_count=512,
-            allow_without_tool_events=True,
-            verifier_feedback=feedback,
-            required_update_target=target,
-            supersedes_source_digest="source-before",
-        )
-    )
-
-    assert reflection is not None
-    assert reflection.memory_action == "update"
-    assert reflection.document_path == document_path
-    assert feedback in runner.prompts[0]
-    captured = source_store.get(reflection.source_digest)
-    assert captured is not None
-    assert captured.verifier_feedback == feedback
-    assert captured.supersedes_source_digest == "source-before"
-
-
-def test_regeneration_rejects_inserting_a_second_memory():
-    parsed = ReflectionMemoryService.parse_tool_call(
-        _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
-    )
-    target = ReflectionMemoryCandidate(
-        document_path="reflection-memory/associated.md",
-        document_sha256="a" * 64,
-        title="关联反思",
-        content="旧的反思内容",
-        tensor_score=0.0,
-    )
-
-    with pytest.raises(ValueError, match="must update"):
-        ReflectionMemoryService._validate_memory_action(
-            parsed,
-            (target,),
-            required_update_target=target,
-        )
-
-
-def test_reflection_store_replaces_records_for_the_same_document(tmp_path):
-    parsed = ReflectionMemoryService.parse_tool_call(
-        _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
-    )
-    first = ReflectionMemory(
-        trajectory_id="resp-1",
-        conversation_key="conversation-1",
-        source_digest="source-1",
-        source_event_count=3,
-        source_token_count=512,
-        attempts=1,
-        created_at=1.0,
-        target_document_sha256=None,
-        document_path="reflection-memory/shared.md",
-        document_sha256="sha-1",
-        **parsed,
-    )
-    second = replace(
-        first,
-        trajectory_id="resp-2",
-        conversation_key="conversation-2",
-        source_digest="source-2",
-        document_sha256="sha-2",
-    )
-    store = ReflectionMemoryStore(tmp_path / "reflection-memory.json")
-
-    store.append(first)
-    store.append(second)
-
-    records = store.list()
-    assert len(records) == 1
-    assert records[0]["source_digest"] == "source-2"
-
-
-def test_reflection_store_removes_every_merged_document_record(tmp_path):
-    parsed = ReflectionMemoryService.parse_tool_call(
-        _tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields())
-    )
-    left = ReflectionMemory(
-        trajectory_id="resp-left",
-        conversation_key="conversation",
-        source_digest="source-left",
-        source_event_count=3,
-        source_token_count=512,
-        attempts=1,
-        created_at=1.0,
-        target_document_sha256=None,
-        document_path="reflection-memory/left.md",
-        document_sha256="sha-left",
-        **parsed,
-    )
-    right = replace(
-        left,
-        trajectory_id="resp-right",
-        source_digest="source-right",
-        document_path="reflection-memory/right.md",
-        document_sha256="sha-right",
-    )
-    merged = replace(
-        left,
-        trajectory_id="resp-merged",
-        source_digest="source-merged",
-        memory_action="update",
-        target_document_path=left.document_path,
-        target_document_sha256=left.document_sha256,
-        merge_document_paths=(left.document_path, right.document_path),
-        merge_document_sha256s=(
-            (left.document_path, left.document_sha256),
-            (right.document_path, right.document_sha256),
+    service = _service(
+        tmp_path,
+        ReasoningExampleRunner(
+            lambda p: _standard_response(p, verified=True), two_phase=True
         ),
-        document_sha256="sha-merged",
+        reasoning_end_token_id=999,
     )
-    store = ReflectionMemoryStore(tmp_path / "reflection-memory.json")
-
-    store.append(left)
-    store.append(right)
-    store.append(merged)
-
-    records = store.list()
-    assert len(records) == 1
-    assert records[0]["source_digest"] == "source-merged"
+    result = _reflect(service, _controlled_rows())
+    assert result.analysis_status == "complete"
+    assert result.active_entries[0]["verification"]["method"] == "controlled_comparison"
 
 
-def test_precompaction_checkpoint_can_reflect_without_tool_events(tmp_path):
-    runner = _ReflectionRunner(_tool_call(REFLECTION_MEMORY_TOOL_NAME, _fields()))
-    service = ReflectionMemoryService(
-        runner,
-        _CharacterTokenizer(),
-        TelemetryStore(tmp_path / "trace.jsonl"),
-        model_fingerprint="model",
-        mode="active",
-        max_attempts=1,
+def test_legacy_narrative_remains_visible_but_is_not_merged(tmp_path):
+    record = ReflectionMemory(
+        trajectory_id="legacy",
+        conversation_key="conversation",
+        source_digest="legacy-source",
+        title="历史缓存经验",
+        outcome="uncertain",
+        reflection="旧轨迹尚未形成逐条因果验证。",
+        evidence="旧工具输出摘要。",
+        causal_analysis="未知原因。",
+        reusable_experience="旧版本保留的限定规则。",
+        avoid="不要扩大结论。",
+        next_time="重新取得证据。",
+        memory_action="insert",
+        target_document_path=None,
+        target_document_sha256=None,
+        source_event_count=1,
+        source_token_count=100,
+        attempts=1,
+        created_at=1.0,
     )
-
-    reflection = asyncio.run(
-        service.reflect(
-            trajectory_id="resp_compact_checkpoint",
-            conversation_key="conversation-checkpoint",
-            original_task="Preserve the pre-compaction trajectory",
-            tool_ledger=(),
-            trajectory_history=(
-                {
-                    "kind": "assistant_trajectory",
-                    "content": "PRECOMPACTION-EVIDENCE",
-                    "source_digest": "checkpoint-row",
-                },
+    service = _service(tmp_path, _Runner(_standard_response))
+    service.store.append(record)
+    candidates = tuple(
+        ReflectionMemoryCandidate(
+            f"reflection-memory/{name}.md", name, record.title, record.markdown(), 0.99
+        )
+        for name in ("left", "right")
+    )
+    result = asyncio.run(
+        service.organize_candidates(
+            organization_id="organize",
+            candidates=candidates,
+            qk_pairs=(
+                (candidates[0].document_path, candidates[1].document_path, 0.99),
             ),
-            capsule_history=(),
-            source_token_count=256,
-            allow_without_tool_events=True,
         )
     )
+    assert result is None
+    restored = ReflectionMemoryStore(tmp_path / "memories.json").get(
+        record.source_digest
+    )
+    assert restored["reflection"] == record.reflection
+    assert restored["analysis_status"] == "legacy"
+    assert service.runner.payloads == []
 
-    assert reflection is not None
-    assert "PRECOMPACTION-EVIDENCE" in runner.prompts[0]
+
+def test_reflection_jobs_pass_real_internal_admission(tmp_path):
+    class Manager:
+        async def generate_request(self, request, raw_request):
+            messages = json.loads(request.text[0])
+            payload = json.loads(messages[-1]["content"])
+            yield [
+                {
+                    "text": _call(_standard_response(payload)),
+                    "meta_info": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 32,
+                        "finish_reason": "stop",
+                    },
+                }
+            ]
+
+        def abort_request(self, rid):
+            raise AssertionError("Accepted causal work must not be aborted")
+
+    runner = InternalJobRunner(
+        Manager(),
+        max_fanout=4,
+        max_tokens_per_parent=8192,
+        request_factory=SimpleNamespace,
+    )
+    service = _service(tmp_path, runner)
+    result = _reflect(service, _controlled_rows())
+    assert result.analysis_status == "complete"
+    assert result.causal_entries[0]["admission_status"] == "active"
+    assert service.store.get(result.source_digest)["coverage"]["pending_events"] == 0
 
 
 if __name__ == "__main__":

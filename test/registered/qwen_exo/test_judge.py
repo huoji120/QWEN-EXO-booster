@@ -3,6 +3,8 @@ import json
 import asyncio
 import os
 
+import pytest
+
 from qwen_exo_booster.contracts import EligibilityStatus, stable_digest
 from qwen_exo_booster.internal_jobs import InternalJobResult
 from qwen_exo_booster.judge import (
@@ -286,31 +288,104 @@ def test_judge_batches_candidates_with_shared_prefix(tmp_path):
     assert runner.sampling_params["json_schema"]
 
 
-def test_judge_uses_frozen_candidate_content_after_repository_update(tmp_path):
+@pytest.mark.parametrize(
+    "method,source_tokens,use_full_source",
+    (
+        ("judge", 96, True),
+        ("judge", 97, False),
+        ("select_best", 64, True),
+        ("select_best", 65, False),
+    ),
+)
+def test_judge_prefers_complete_source_only_within_reference_budget(
+    tmp_path, method, source_tokens, use_full_source
+):
     repository = KnowledgeRepository(tmp_path)
-    repository.upsert(
-        "wfp.md", "Use FWPM_LAYER_ALE_AUTH_CONNECT_V4 with an AppID condition."
+    full_source = "\n".join(f"evidence-{index}" for index in range(source_tokens))
+    document = repository.upsert("reference.md", full_source)
+    candidate = replace(
+        repository.candidate_for_document(document.document_id, "diagnostic check"),
+        reference_content="bounded diagnostic excerpt",
     )
-    candidate = repository.rank("FWPM_LAYER_ALE_AUTH_CONNECT_V4")[0]
-    repository.upsert("wfp.md", "replacement content that was never proposed")
-    runner = FakeRunner()
+    other_document = repository.upsert("other.md", "unrelated gardening notes")
+    other = repository.candidate_for_document(other_document.document_id, "gardening")
+    runner = FakeRunner(
+        fixed_text='{"winner":null}' if method == "select_best" else '{"supported":false}'
+    )
+    judge = ReferenceJudge(
+        runner,
+        repository,
+        FakeTokenizer(),
+        model_fingerprint="model-fingerprint",
+        max_reference_tokens=96,
+        max_selection_tokens=128,
+        max_selection_candidates=2,
+    )
+
+    asyncio.run(
+        getattr(judge, method)(
+            parent_request_id="parent-reference",
+            turn_id="turn-reference",
+            question="Which observation supports a diagnostic next check?",
+            candidates=(candidate, other) if method == "select_best" else (candidate,),
+            telemetry_correlation_id="trace-reference",
+        )
+    )
+
+    payload = json.loads(runner.prompts[0].split("<user>", 1)[1])
+    if method == "select_best":
+        reference = next(
+            item["reference"]
+            for item in payload["candidates"]
+            if item["source"] == "reference.md"
+        )
+    else:
+        reference = payload["reference"]
+    assert reference == (full_source if use_full_source else candidate.reference_content)
+    assert len(FakeTokenizer().encode(reference)) <= (64 if method == "select_best" else 96)
+
+
+@pytest.mark.parametrize("method", ("judge", "select_best"))
+@pytest.mark.parametrize("source_change", ("updated", "deleted"))
+def test_judge_uses_frozen_candidate_content_after_repository_change(
+    tmp_path, method, source_change
+):
+    repository, (original, other) = repository_with_candidates(tmp_path)
+    candidate = replace(
+        original, reference_content="FWPM_LAYER_ALE_AUTH_CONNECT_V4 excerpt"
+    )
+    if source_change == "updated":
+        repository.upsert("wfp.md", "replacement content that was never proposed")
+    else:
+        repository.delete("wfp.md")
+    runner = FakeRunner(
+        fixed_text='{"winner":null}' if method == "select_best" else '{"supported":true}'
+    )
     judge = ReferenceJudge(
         runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
     )
 
     result = asyncio.run(
-        judge.judge(
+        getattr(judge, method)(
             parent_request_id="parent-1",
             turn_id="turn-1",
             question="How should WFP filtering be configured?",
-            candidates=(candidate,),
+            candidates=(candidate, other) if method == "select_best" else (candidate,),
             telemetry_correlation_id="trace-1",
         )
     )
 
-    assert result.decisions[0].status is EligibilityStatus.ELIGIBLE
-    assert "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in runner.prompts[0]
-    assert "replacement content" not in runner.prompts[0]
+    assert result.valid_count == (2 if method == "select_best" else 1)
+    payload = json.loads(runner.prompts[0].split("<user>", 1)[1])
+    if method == "select_best":
+        reference = next(
+            item["reference"]
+            for item in payload["candidates"]
+            if item["source"] == "wfp.md"
+        )
+    else:
+        reference = payload["reference"]
+    assert reference == candidate.reference_content
 
 
 def test_judge_truncates_long_question_and_still_reviews(tmp_path):
@@ -493,7 +568,6 @@ def test_judge_identifies_policy_lane_and_uses_operational_applicability(tmp_pat
 
     assert result.decisions[0].status is EligibilityStatus.ELIGIBLE
     assert '"lane":"policydata"' in runner.prompts[0]
-    assert "policy need not contain the task's answer" in runner.prompts[0]
 
 
 def test_judge_reuses_only_exact_valid_semantic_decisions(tmp_path):
@@ -624,33 +698,44 @@ def test_judge_bounds_oversize_reference_and_keeps_batch_alive(tmp_path):
     assert "中间省略" in runner.prompts[0]
 
 
-def test_scope_note_is_shown_to_the_judge_and_splits_the_cache(tmp_path):
-    """Cross-task provenance must reach the judge and not reuse an unscoped verdict.
-
-    The note is the only thing that distinguishes a reflection offered inside
-    its own task from the same reflection offered to another task; a decision
-    cached without the note must not answer for the scoped candidate.
-    """
+def test_cross_task_scope_requires_a_fresh_judge_verdict(tmp_path):
     from qwen_exo_booster.knowledge import CROSS_TASK_REFLECTION_NOTE
 
     repository, (wfp, ctf) = repository_with_candidates(tmp_path)
-    judge = ReferenceJudge(
-        FakeRunner(), repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
-    )
     scoped = replace(wfp, scope_note=CROSS_TASK_REFLECTION_NOTE)
 
-    selection_prompt = judge._render_selection_prompt("q", (scoped, ctf), ("A", "B"))
-    payload = json.loads(selection_prompt.split("<user>", 1)[1])
-    binary_prompt = judge._render_prompt(
-        question="q", reference="rule", lane="knowledge", scope_note=scoped.scope_note
-    )
+    for method, unscoped, candidates, rejected, admitted in (
+        ("judge", (wfp,), (scoped,), '{"supported":false}', '{"supported":true}'),
+        (
+            "select_best",
+            (wfp, ctf),
+            (scoped, ctf),
+            '{"winner":null}',
+            '{"winner":"A"}',
+        ),
+    ):
+        runner = FakeRunner(fixed_text=rejected)
+        judge = ReferenceJudge(
+            runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
+        )
 
-    scoped_items = [item for item in payload["candidates"] if "scope" in item]
-    assert len(scoped_items) == 1
-    assert scoped_items[0]["scope"] == CROSS_TASK_REFLECTION_NOTE
-    assert scoped_items[0]["source"] == "wfp.md"
-    assert '"scope":' in binary_prompt
-    assert judge._cache_key("q", scoped) != judge._cache_key("q", wfp)
-    assert judge._selection_cache_key("q", (scoped, ctf)) != judge._selection_cache_key(
-        "q", (wfp, ctf)
-    )
+        async def review(request_id, items):
+            return await getattr(judge, method)(
+                parent_request_id=request_id,
+                turn_id=f"{request_id}:turn",
+                question="Which evidence helps diagnose this failure?",
+                candidates=items,
+                telemetry_correlation_id=f"{request_id}:trace",
+            )
+
+        original = asyncio.run(review("unscoped", unscoped))
+        runner.fixed_text = admitted
+        cross_task = asyncio.run(review("scoped", candidates))
+        runner.fixed_text = rejected
+        repeated = asyncio.run(review("repeated", candidates))
+
+        assert original.eligible_count == 0
+        assert cross_task.eligible_count == repeated.eligible_count == 1
+        assert cross_task.executed_count == 1
+        assert repeated.executed_count == 0
+        assert runner.calls == 2

@@ -731,8 +731,14 @@ function buildEvidence(
   );
   const candidateProposal = eventPayload(
     proposalEvents
-      .map((event, index) => ({ event, index, count: asObjects(eventPayload(event).candidates).length }))
-      .sort((left, right) => left.count - right.count || left.index - right.index)
+      .map((event, index) => ({
+        event,
+        index,
+        count: asObjects(eventPayload(event).candidates).length,
+      }))
+      .sort(
+        (left, right) => left.count - right.count || left.index - right.index,
+      )
       .at(-1)?.event,
   );
   const requestJudgeEvent = reversed.find(
@@ -895,7 +901,11 @@ function buildEvidence(
         eventId: numberOrNull(event.event_id),
         timestamp: event.timestamp ?? null,
         status: String(payload.status || "not_recorded"),
-        decision: String(payload.maybe_decision || payload.maybe_gate_decision || "not_recorded"),
+        decision: String(
+          payload.maybe_decision ||
+            payload.maybe_gate_decision ||
+            "not_recorded",
+        ),
         scheduledNextTurn:
           booleanOrNull(payload.maybe_scheduled_next_turn) ??
           booleanOrNull(payload.scheduled_next_turn),
@@ -911,7 +921,8 @@ function buildEvidence(
       numberOrNull(trace.prompt_tokens) ??
       numberOrNull(probeStarted.prompt_tokens),
     queryTokens:
-      numberOrNull(memoryProbe.query_tokens) ?? numberOrNull(trace.query_tokens),
+      numberOrNull(memoryProbe.query_tokens) ??
+      numberOrNull(trace.query_tokens),
     cognitionProbeTokens: numberOrNull(probeStarted.cognition_tokens),
     probeLatencySeconds: numberOrNull(probeCompleted.latency_seconds),
     attachedTokens: Number(
@@ -1592,9 +1603,13 @@ function CandidateRow({
 }
 
 function EventRow({ event }: { event: TelemetryEvent }) {
+  const [open, setOpen] = useState(false);
   const type = eventType(event);
   return (
-    <details className="group border-b last:border-b-0">
+    <details
+      className="group border-b last:border-b-0"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
       <summary className="grid cursor-pointer list-none grid-cols-[54px_minmax(150px,240px)_minmax(0,1fr)] items-center gap-3 px-3 py-2.5 hover:bg-muted/50 [&::-webkit-details-marker]:hidden">
         <span className="font-mono text-[10px] text-muted-foreground">
           #{event.event_id ?? "—"}
@@ -1606,15 +1621,17 @@ function EventRow({ event }: { event: TelemetryEvent }) {
           {eventSummary(event)}
         </span>
       </summary>
-      <div className="border-t bg-slate-950 p-3 text-slate-200">
-        <div className="mb-2 flex items-center justify-between font-mono text-[10px] text-slate-400">
-          <span>{type}</span>
-          <span>{dateTime(event.timestamp)}</span>
+      {open ? (
+        <div className="border-t bg-slate-950 p-3 text-slate-200">
+          <div className="mb-2 flex items-center justify-between font-mono text-[10px] text-slate-400">
+            <span>{type}</span>
+            <span>{dateTime(event.timestamp)}</span>
+          </div>
+          <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5">
+            {JSON.stringify(event.payload || {}, null, 2)}
+          </pre>
         </div>
-        <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5">
-          {JSON.stringify(event.payload || {}, null, 2)}
-        </pre>
-      </div>
+      ) : null}
     </details>
   );
 }
@@ -1623,10 +1640,14 @@ function EvidencePanel({
   trace,
   evidence,
   loading,
+  error,
+  onRetry,
 }: {
   trace: RequestTrace;
   evidence: TraceEvidence | null;
   loading: boolean;
+  error: string | null;
+  onRetry: () => void;
 }) {
   const [showAllCandidates, setShowAllCandidates] = useState(false);
   const [documentCandidate, setDocumentCandidate] =
@@ -1656,6 +1677,23 @@ function EvidencePanel({
       setDocumentLoading(false);
     }
   };
+
+  if (error) {
+    return (
+      <div className="grid min-h-[560px] place-items-center rounded-xl border bg-card p-5">
+        <div className="text-center">
+          <p className="text-sm font-medium">{t("请求证据加载失败")}</p>
+          <p className="mt-2 break-words text-xs text-muted-foreground">
+            {error}
+          </p>
+          <Button className="mt-4" variant="outline" onClick={onRetry}>
+            <RefreshCw />
+            {t("刷新")}
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   if (loading || !evidence) {
     return (
@@ -2574,10 +2612,13 @@ export function TracePage() {
     evidence: TraceEvidence;
   } | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [clearAllOpen, setClearAllOpen] = useState(false);
   const [clearingAll, setClearingAll] = useState(false);
   const detailSequence = useRef(0);
+  const listController = useRef<AbortController | null>(null);
+  const detailController = useRef<AbortController | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -2599,12 +2640,18 @@ export function TracePage() {
   }, []);
 
   const loadListing = useCallback(async (silent = false) => {
+    listController.current?.abort();
+    const controller = new AbortController();
+    listController.current = controller;
     if (!silent) setLoading(true);
     try {
-      setListing(await getRequestTraces(100));
+      const next = await getRequestTraces(100, "", controller.signal);
+      if (controller.signal.aborted) return;
+      setListing(next);
       setUnavailable(false);
       setUpdatedAt(Date.now());
     } catch (error) {
+      if (controller.signal.aborted) return;
       if (error instanceof ApiError && error.status === 404) {
         setUnavailable(true);
       } else if (!silent) {
@@ -2613,29 +2660,45 @@ export function TracePage() {
         });
       }
     } finally {
-      if (!silent) setLoading(false);
+      if (!controller.signal.aborted && !silent) setLoading(false);
     }
   }, []);
 
   const loadDetail = useCallback(
     async (trace: RequestTrace, silent = false) => {
+      detailController.current?.abort();
+      const controller = new AbortController();
+      detailController.current = controller;
       const sequence = ++detailSequence.current;
+      setDetailError(null);
       if (!silent) setDetailLoading(true);
       try {
-        const payload = await getTelemetry(1000, trace.request_id);
-        if (sequence !== detailSequence.current) return;
+        const payload = await getTelemetry(
+          1000,
+          trace.request_id,
+          controller.signal,
+        );
+        if (controller.signal.aborted || sequence !== detailSequence.current)
+          return;
         setDetail({
           requestId: trace.request_id,
           evidence: buildEvidence(trace, payload.events || []),
         });
       } catch (error) {
+        if (controller.signal.aborted || sequence !== detailSequence.current)
+          return;
+        setDetailError(error instanceof Error ? error.message : t("未知错误"));
         if (!silent) {
           toast.error(t("请求证据加载失败"), {
             description: error instanceof Error ? error.message : t("未知错误"),
           });
         }
       } finally {
-        if (sequence === detailSequence.current && !silent) {
+        if (
+          !controller.signal.aborted &&
+          sequence === detailSequence.current &&
+          !silent
+        ) {
           setDetailLoading(false);
         }
       }
@@ -2645,6 +2708,11 @@ export function TracePage() {
 
   useEffect(() => {
     void loadListing();
+    return () => {
+      listController.current?.abort();
+      detailController.current?.abort();
+      detailSequence.current += 1;
+    };
   }, [loadListing]);
 
   const requests = listing?.requests ?? [];
@@ -2700,20 +2768,26 @@ export function TracePage() {
   );
 
   useEffect(() => {
-    if (selectedTrace && detail?.requestId !== selectedTrace.request_id) {
-      void loadDetail(selectedTrace);
-    }
-  }, [detail?.requestId, loadDetail, selectedTrace]);
+    setDetail(null);
+    setDetailError(null);
+    if (selectedTrace) void loadDetail(selectedTrace);
+    return () => {
+      detailController.current?.abort();
+      detailSequence.current += 1;
+    };
+  }, [loadDetail, selectedTrace]);
 
   const refresh = async () => {
     await loadListing();
-    if (selectedTrace) await loadDetail(selectedTrace);
   };
 
   const clearAll = async () => {
     setClearingAll(true);
     try {
       await clearTelemetry();
+      listController.current?.abort();
+      detailController.current?.abort();
+      detailSequence.current += 1;
       setClearAllOpen(false);
       setListing({ requests: [], total_requests: 0 });
       setSelectedId(null);
@@ -2860,6 +2934,9 @@ export function TracePage() {
 
             {selectedTrace ? (
               <EvidencePanel
+                key={selectedTrace.request_id}
+                error={detailError}
+                onRetry={() => void loadDetail(selectedTrace)}
                 trace={selectedTrace}
                 evidence={
                   detail?.requestId === selectedTrace.request_id

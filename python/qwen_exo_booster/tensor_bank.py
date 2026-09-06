@@ -1468,6 +1468,10 @@ class TensorBank:
             "relative_runner_up_score": relative_runner_up_score,
             "relative_observed_margin": relative_observed_margin,
             "relative_score_active": bool(fusion_rank),
+            "margin_gate_active": not bool(fusion_rank),
+            "margin_gate_method": (
+                "raw_document_margin" if not fusion_rank else "semantic_admission"
+            ),
             "background_gate_active": background_gate,
             "qk_layer_id": self.qk_layer_id,
             "qk_query_heads": list(self.qk_query_heads),
@@ -1495,7 +1499,8 @@ class TensorBank:
             )
             return ()
         if (
-            observed_margin is not None
+            not fusion_rank
+            and observed_margin is not None
             and observed_margin < float(min_document_margin)
             and not math.isclose(
                 observed_margin,

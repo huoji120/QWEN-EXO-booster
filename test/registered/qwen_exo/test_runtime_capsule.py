@@ -365,7 +365,7 @@ async def test_reflection_regeneration_is_recoverable_and_rejects_duplicates(tmp
     assert completed["result"]["source_digest"] == "source-regenerated"
     assert captures[0]["verifier_feedback"] == feedback
     assert captures[0]["required_update_target"].document_path == document.relative_path
-    listed = value.reflection_memories()[0]
+    listed = value.reflection_memories()["reflections"][0]
     assert listed["source_available"] is True
     assert listed["trajectory_source"]["trajectory_id"] == reflection.trajectory_id
 
@@ -2217,6 +2217,271 @@ async def test_prompt_cache_keeps_reflection_rows_and_pending_work_cumulative(tm
     await asyncio.gather(task, return_exceptions=True)
 
 
+def reflection_lifecycle_runtime(tmp_path, monkeypatch):
+    value = runtime(tmp_path)
+    capture_retrieval_questions(value)
+    value.config = replace(
+        value.config,
+        feature_flags=replace(value.config.feature_flags, external_memory=True),
+        reflection_memory_mode="active",
+        reflection_memory_min_events=10,
+        reflection_memory_min_tokens=0,
+        max_internal_tokens=12288,
+    )
+    value.tokenizer_manager.tokenizer = SimpleNamespace(
+        encode=lambda text, **_kwargs: text.split()
+    )
+
+    async def skip_stage_summary(_request_id):
+        return None
+
+    monkeypatch.setattr(value, "_emit_stage_summary", skip_stage_summary)
+    return value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_role,with_tools", [("system", True), ("user", False)])
+async def test_client_compaction_reflection_survives_next_request(
+    tmp_path, monkeypatch, changed_role, with_tools
+):
+    value = reflection_lifecycle_runtime(tmp_path, monkeypatch)
+    started, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    captured = []
+    published = []
+
+    class PausedReflectionService:
+        async def reflect(self, **kwargs):
+            captured.append(kwargs)
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            if not kwargs["tool_ledger"] and not kwargs.get(
+                "allow_without_tool_events"
+            ):
+                return None
+            published.append(kwargs)
+            return SimpleNamespace(document_path="reflection-memory/checkpoint.md")
+
+    value.reflection_memory_service = PausedReflectionService()
+    original_task = "Repair the synthetic streaming decoder"
+    old_assistant = "The original decoder dropped the final buffered byte."
+    old_tool = "Regression evidence: expected final byte 7, observed no byte."
+    first = FakeRequest(
+        request_id="resp-before-client-compact",
+        prompt_cache_key="omp:compaction-lifecycle",
+        input=[
+            {"role": "system", "content": "Inspect the decoder before editing."},
+            {"role": "user", "content": original_task},
+            {"role": "assistant", "content": old_assistant},
+            *(
+                [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "decoder-check",
+                        "output": old_tool,
+                    }
+                ]
+                if with_tools
+                else []
+            ),
+        ],
+    )
+    compacted_text = "CLIENT COMPACTED SUMMARY: continue from the shortened history."
+    compacted = replace(
+        first,
+        request_id="resp-client-compact",
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    compacted_text
+                    if changed_role == "system"
+                    else first.input[0]["content"]
+                ),
+            },
+            {
+                "role": "user",
+                "content": compacted_text if changed_role == "user" else original_task,
+            },
+        ],
+    )
+    try:
+        await value.prepare_responses_request(first)
+        await value.complete_request(first.request_id)
+        unchanged = replace(first, request_id="resp-before-compact-unchanged")
+        await value.prepare_responses_request(unchanged)
+        await value.complete_request(unchanged.request_id)
+        assert not started.is_set()
+        assert any(
+            event.event_type == "reflection_memory.skipped"
+            and event.payload["reason"] == "minimum_external_tool_events_not_met"
+            for event in value.telemetry.events(first.request_id)
+        )
+
+        await value.prepare_responses_request(compacted)
+        await value.complete_request(compacted.request_id)
+        await asyncio.wait_for(started.wait(), timeout=2)
+        following = replace(
+            compacted,
+            request_id="resp-after-client-compact",
+            input=[
+                *compacted.input,
+                {"role": "assistant", "content": "NEW POST-COMPACTION WORK"},
+            ],
+        )
+        await value.prepare_responses_request(following)
+        await value.complete_request(following.request_id)
+        release.set()
+        await asyncio.wait_for(value._compaction_reflection_queue.join(), timeout=2)
+
+        assert not cancelled.is_set()
+        completed = [
+            event
+            for event in value.telemetry.events()
+            if event.event_type == "reflection_memory.compaction_checkpoint_completed"
+        ]
+        assert len(completed) == 1
+        assert completed[0].payload["status"] == "published"
+        assert (
+            completed[0].payload["document_path"] == "reflection-memory/checkpoint.md"
+        )
+        assert len(captured) == len(published) == 1
+        snapshot = published[0]
+        assert snapshot["original_task"] == original_task
+        evidence = json.dumps(snapshot["trajectory_history"])
+        assert old_assistant in evidence
+        assert original_task in evidence
+        assert compacted_text not in evidence
+        assert "NEW POST-COMPACTION WORK" not in evidence
+        if with_tools:
+            assert old_tool in evidence
+            assert old_tool in json.dumps(snapshot["tool_ledger"])
+        else:
+            assert not snapshot["tool_ledger"]
+        queued = [
+            event
+            for event in value.telemetry.events()
+            if event.event_type == "reflection_memory.compaction_checkpoint_queued"
+        ]
+        assert len(queued) == 1
+        assert (
+            queued[0].payload["checkpoint_id"] == completed[0].payload["checkpoint_id"]
+        )
+    finally:
+        release.set()
+        await value.close()
+
+
+@pytest.mark.asyncio
+async def test_client_compaction_does_not_reflect_when_disabled(tmp_path, monkeypatch):
+    value = reflection_lifecycle_runtime(tmp_path, monkeypatch)
+    value.config = replace(value.config, reflection_memory_mode="off")
+    calls = []
+
+    class ReflectionService:
+        async def reflect(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(document_path="reflection-memory/unexpected.md")
+
+    value.reflection_memory_service = ReflectionService()
+    first = FakeRequest(
+        request_id="resp-disabled-before",
+        prompt_cache_key="omp:disabled-compaction",
+        input=[{"role": "user", "content": "Original synthetic task"}],
+    )
+    try:
+        await value.prepare_responses_request(first)
+        await value.complete_request(first.request_id)
+        compacted = replace(
+            first,
+            request_id="resp-disabled-after",
+            input=[{"role": "user", "content": "Compacted synthetic task"}],
+        )
+        await value.prepare_responses_request(compacted)
+        await value.complete_request(compacted.request_id)
+        await asyncio.wait_for(value._compaction_reflection_queue.join(), timeout=2)
+        assert calls == []
+        assert not any(
+            event.event_type.startswith("reflection_memory.compaction_checkpoint_")
+            for event in value.telemetry.events()
+        )
+    finally:
+        await value.close()
+
+
+@pytest.mark.asyncio
+async def test_same_conversation_request_still_cancels_ordinary_idle_reflection(
+    tmp_path, monkeypatch
+):
+    value = reflection_lifecycle_runtime(tmp_path, monkeypatch)
+    value.config = replace(value.config, reflection_memory_min_events=2)
+    started, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    published = []
+
+    class PausedReflectionService:
+        async def reflect(self, **kwargs):
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            published.append(kwargs)
+
+    value.reflection_memory_service = PausedReflectionService()
+    first = FakeRequest(
+        request_id="resp-ordinary-idle",
+        prompt_cache_key="omp:ordinary-idle",
+        input=[
+            {"role": "user", "content": "Inspect the synthetic decoder"},
+            {"type": "function_call", "call_id": "idle-check", "name": "inspect"},
+            {
+                "type": "function_call_output",
+                "call_id": "idle-check",
+                "output": "Found a dropped byte",
+            },
+            {"type": "function_call", "call_id": "idle-check-2", "name": "inspect"},
+            {
+                "type": "function_call_output",
+                "call_id": "idle-check-2",
+                "output": "Confirmed the same dropped byte",
+            },
+        ],
+    )
+    try:
+        await value.prepare_responses_request(first)
+        conversation_key = value._request_conversation_keys[first.request_id]
+        value._context_integrity_ledgers[conversation_key] = [
+            {"call_id": "idle-check", "observation": "Found a dropped byte"},
+            {
+                "call_id": "idle-check-2",
+                "observation": "Confirmed the same dropped byte",
+            },
+        ]
+        await value.complete_request(first.request_id)
+        pending = value.pending_reflection_memories()
+        assert len(pending) == 1
+        value.start_pending_reflections([pending[0]["conversation_key"]])
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await value.prepare_responses_request(
+            replace(first, request_id="resp-ordinary-next")
+        )
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+        release.set()
+        assert published == []
+        assert value.pending_reflection_memories() == []
+        assert not any(
+            event.event_type == "reflection_memory.compaction_checkpoint_queued"
+            for event in value.telemetry.events()
+        )
+    finally:
+        release.set()
+        await value.close()
+
+
 def test_replayed_full_history_skips_redundant_capsule_update(tmp_path):
     value = runtime(tmp_path)
     capsules = FakeCapsuleService()
@@ -2544,3 +2809,30 @@ def test_capsule_invalid_cooldown_expires_and_retries(tmp_path):
     assert capsules.updates[-1].turn_id == "resp-cooldown-6"
     skipped = invalid_cooldown_skips(value)
     assert [event.payload["cooldown_remaining"] for event in skipped] == [3, 2, 1, 0]
+
+
+def test_reflection_checkpoint_keeps_evidence_evicted_from_hot_window(tmp_path):
+    value = runtime(tmp_path)
+    value.config = replace(
+        value.config,
+        reflection_memory_mode="active",
+        reflection_memory_max_history_tokens=1024,
+        feature_flags=replace(value.config.feature_flags, external_memory=True),
+        max_internal_tokens=16384,
+    )
+    early = "early decisive evidence " + "x" * 5000
+    value._record_reflection_memory_rows(
+        "evidence-conversation",
+        "resp-early",
+        ({"kind": "tool_observation", "call_id": "early", "content": early},),
+    )
+    value._record_reflection_memory_rows(
+        "evidence-conversation",
+        "resp-late",
+        ({"kind": "tool_observation", "call_id": "late", "content": "y" * 3000},),
+    )
+    history = value._reflection_memory_history("evidence-conversation")
+    assert [row["call_id"] for row in history] == ["early", "late"]
+    assert history[0]["content"] == early
+    recovered = value.reflection_evidence_store.get_event(history[0]["event_id"])
+    assert recovered["content"] == early

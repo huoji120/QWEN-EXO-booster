@@ -513,10 +513,10 @@ class MemoryPipeline:
         *,
         question: str = "",
     ) -> tuple[tuple[str, str, str], ...]:
-        """Scope keys of reflections from another task, unless named outright.
+        """Identify cross-task provenance for Judge notes, never hard rejection.
 
-        A reflection the question names by title is what the user is asking
-        about; the cross-task gate is for implicit leakage only.
+        Naming a reflection makes its original evidence the requested subject;
+        other candidates require the Judge to assess diagnostic transferability.
         """
         filtered: list[tuple[str, str, str]] = []
         for candidate in candidates:
@@ -534,21 +534,6 @@ class MemoryPipeline:
                 continue
             filtered.append(self._candidate_scope_key(candidate))
         return tuple(filtered)
-
-    def _filter_task_scoped_reflections(
-        self,
-        candidates: tuple[KnowledgeCandidate, ...],
-        original_task: str,
-    ) -> tuple[tuple[KnowledgeCandidate, ...], int]:
-        filtered_keys = self._task_scope_filtered_keys(candidates, original_task)
-        filtered_key_set = frozenset(filtered_keys)
-        kept = tuple(
-            candidate
-            for candidate in candidates
-            if self._candidate_scope_key(candidate) not in filtered_key_set
-        )
-        return kept, len(filtered_keys)
-
 
     def _exact_task_reflection_candidates(
         self, original_task: str, query: str
@@ -805,8 +790,8 @@ class MemoryPipeline:
         score_filtered_count = len(supplemental) - len(supplemental_judged)
         qk_score_filtered_count = 0
         # Cross-task reflections are not blocked; the judge sees their
-        # provenance and decides whether the reusable rule applies. Reflection
-        # categories are per-task digests, so a hard gate made every past
+        # provenance and decides whether the evidence or diagnostic lesson applies.
+        # Reflection categories are per-task digests, so a hard gate made every past
         # experience unreachable from a new conversation.
         judged = tuple(
             (

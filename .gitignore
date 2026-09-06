@@ -321,6 +321,8 @@ internal-docs/
 /scripts/qwen_exo/corpus/knowledge/reflection-memory/
 /**/knowledge/reflection-memory/
 /**/reflection-memory.json
+/**/reflection-evidence.sqlite3*
+/**/reflection-sources.sqlite3*
 
 # QWEN-EXO model-specific compiled state; publish source Markdown instead
 /model-profiles/

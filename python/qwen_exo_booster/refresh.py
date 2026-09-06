@@ -390,6 +390,7 @@ class SelfAskRefreshService:
         *,
         question: str = "",
     ) -> tuple[tuple[str, str, str], ...]:
+        """Identify cross-task provenance for Judge notes, never hard rejection."""
         filtered: list[tuple[str, str, str]] = []
         for candidate in candidates:
             if candidate.lane != "knowledge":
@@ -406,21 +407,6 @@ class SelfAskRefreshService:
                 continue
             filtered.append(self._candidate_scope_key(candidate))
         return tuple(filtered)
-
-    def _filter_task_scoped_reflections(
-        self,
-        candidates: tuple[KnowledgeCandidate, ...],
-        original_task: str,
-    ) -> tuple[tuple[KnowledgeCandidate, ...], int]:
-        filtered_keys = self._task_scope_filtered_keys(candidates, original_task)
-        filtered_key_set = frozenset(filtered_keys)
-        kept = tuple(
-            candidate
-            for candidate in candidates
-            if self._candidate_scope_key(candidate) not in filtered_key_set
-        )
-        return kept, len(filtered_keys)
-
 
     def _exact_task_reflection_candidates(
         self, original_task: str, query: str

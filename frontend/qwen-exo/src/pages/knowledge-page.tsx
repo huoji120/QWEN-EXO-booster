@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpen,
   CheckCircle2,
@@ -63,7 +63,11 @@ import {
   type ReflectionOrganizationJobStatus,
 } from "@/lib/api";
 import { translate as t, translateFor, useI18n } from "@/lib/i18n";
-import type { DocumentCategory, SourceDocument, SourceListing } from "@/lib/types";
+import type {
+  DocumentCategory,
+  SourceDocument,
+  SourceListing,
+} from "@/lib/types";
 import {
   cn,
   formatBytes,
@@ -364,7 +368,9 @@ export function KnowledgePage() {
   const [categoryOpen, setCategoryOpen] = useState(false);
   const [newCategoryId, setNewCategoryId] = useState("");
   const [newCategoryTitle, setNewCategoryTitle] = useState("");
-  const [newCategoryParent, setNewCategoryParent] = useState<string | null>(null);
+  const [newCategoryParent, setNewCategoryParent] = useState<string | null>(
+    null,
+  );
   const [savingCategory, setSavingCategory] = useState(false);
   const [editorLoading, setEditorLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -380,38 +386,73 @@ export function KnowledgePage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const activeOrganizationJobRef = useRef<string | null>(null);
   const notifiedOrganizationJobsRef = useRef(new Set<string>());
+  const mountedRef = useRef(false);
+  const listRequestRef = useRef<AbortController | null>(null);
+  const organizationRequestRef = useRef<AbortController | null>(null);
+  const viewRef = useRef({ lane, query });
+  viewRef.current = { lane, query };
   const organizing =
     organization.status === "queued" || organization.status === "running";
 
-  const load = async (targetView = lane, targetQuery = query) => {
-    setLoading(true);
-    try {
-      const categoryListing = await listDocumentCategories();
-      setCategories(categoryListing.categories);
-      const next = await listSources(
-        storageLane(targetView),
-        targetView === "policydata" ? "" : targetQuery,
-      );
-      setListing(next);
-      const available = new Set(
-        next.documents.map((document) => document.relative_path),
-      );
-      setSelectedPaths(
-        (current) =>
-          new Set([...current].filter((path) => available.has(path))),
-      );
-    } catch (error) {
-      toast.error(t("知识源加载失败"), {
-        description: error instanceof Error ? error.message : t("未知错误"),
-      });
-    } finally {
-      setLoading(false);
-    }
-  };
+  const load = useCallback(
+    async (
+      targetView = viewRef.current.lane,
+      targetQuery = viewRef.current.query,
+    ) => {
+      if (!mountedRef.current || document.hidden) return;
+      listRequestRef.current?.abort();
+      const controller = new AbortController();
+      listRequestRef.current = controller;
+      setLoading(true);
+      try {
+        const [categoryListing, next] = await Promise.all([
+          listDocumentCategories(controller.signal),
+          listSources(
+            storageLane(targetView),
+            targetView === "policydata" ? "" : targetQuery,
+            controller.signal,
+          ),
+        ]);
+        if (controller.signal.aborted || !mountedRef.current) return;
+        setCategories(categoryListing.categories);
+        setListing(next);
+        const available = new Set(
+          next.documents.map((document) => document.relative_path),
+        );
+        setSelectedPaths(
+          (current) =>
+            new Set([...current].filter((path) => available.has(path))),
+        );
+      } catch (error) {
+        if (controller.signal.aborted || !mountedRef.current) return;
+        controller.abort();
+        toast.error(t("知识源加载失败"), {
+          description: error instanceof Error ? error.message : t("未知错误"),
+        });
+      } finally {
+        if (listRequestRef.current === controller) {
+          listRequestRef.current = null;
+          if (mountedRef.current) setLoading(false);
+        }
+      }
+    },
+    [],
+  );
 
-  const refreshOrganizationStatus = async () => {
+  const refreshOrganizationStatus = useCallback(async () => {
+    if (
+      !mountedRef.current ||
+      document.hidden ||
+      organizationRequestRef.current
+    )
+      return;
+    const controller = new AbortController();
+    organizationRequestRef.current = controller;
     try {
-      const next = await getReflectionMemoryOrganizationStatus();
+      const next = await getReflectionMemoryOrganizationStatus(
+        controller.signal,
+      );
+      if (controller.signal.aborted || !mountedRef.current) return;
       setOrganization(next);
       const activeJob = activeOrganizationJobRef.current;
       if (
@@ -431,7 +472,7 @@ export function KnowledgePage() {
         });
         return;
       }
-      await load("reflection_memory");
+      await load();
       if (next.result?.status === "merged") {
         toast.success(t("相似反思记忆已在后台合并"), {
           description: t("{count} 次合并已提交并热编译。", {
@@ -446,8 +487,12 @@ export function KnowledgePage() {
       }
     } catch {
       // 服务重启或短暂断连时保留最近一次可见状态，下一轮继续查询。
+    } finally {
+      if (organizationRequestRef.current === controller) {
+        organizationRequestRef.current = null;
+      }
     }
-  };
+  }, [load]);
 
   useEffect(() => {
     setSelectedTag("");
@@ -466,17 +511,46 @@ export function KnowledgePage() {
   }, [editorMode, editorOpen, language]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => void load(lane, query), 250);
-    return () => window.clearTimeout(timer);
-  }, [lane, query]);
+    mountedRef.current = true;
+    let timer: number | undefined;
+    let disposed = false;
+    let generation = 0;
+    const poll = async (epoch = generation) => {
+      await refreshOrganizationStatus();
+      if (!disposed && epoch === generation && !document.hidden) {
+        timer = window.setTimeout(() => void poll(epoch), 1500);
+      }
+    };
+    const onVisibilityChange = () => {
+      window.clearTimeout(timer);
+      generation += 1;
+      if (document.hidden) {
+        listRequestRef.current?.abort();
+        organizationRequestRef.current?.abort();
+      } else {
+        void load();
+        void poll();
+      }
+    };
+    void poll();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      disposed = true;
+      mountedRef.current = false;
+      window.clearTimeout(timer);
+      listRequestRef.current?.abort();
+      organizationRequestRef.current?.abort();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [load, refreshOrganizationStatus]);
 
   useEffect(() => {
-    void refreshOrganizationStatus();
-    const timer = window.setInterval(() => {
-      void refreshOrganizationStatus();
-    }, 1500);
-    return () => window.clearInterval(timer);
-  }, []);
+    const timer = window.setTimeout(() => void load(lane, query), 250);
+    return () => {
+      window.clearTimeout(timer);
+      listRequestRef.current?.abort();
+    };
+  }, [lane, query, load]);
 
   const viewDocuments = useMemo(
     () =>
@@ -908,7 +982,11 @@ export function KnowledgePage() {
                 )}
                 {uploading ? t("解析中…") : t("导入")}
               </Button>
-              <Button variant="outline" size="sm" onClick={() => setCategoryOpen(true)}>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCategoryOpen(true)}
+              >
                 <Database />
                 {t("分类")}
               </Button>
@@ -1281,7 +1359,10 @@ export function KnowledgePage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <Badge variant="secondary" className="font-mono text-[10px]">
+                      <Badge
+                        variant="secondary"
+                        className="font-mono text-[10px]"
+                      >
                         {sourceFamilyLabel(sourceFamily(document))}
                       </Badge>
                     </TableCell>
@@ -1376,7 +1457,9 @@ export function KnowledgePage() {
           <DialogHeader>
             <DialogTitle>{t("文档分类")}</DialogTitle>
             <DialogDescription>
-              {t("分类保存在服务端数据库；分类标识稳定用于检索，显示名称可按需要调整。")}
+              {t(
+                "分类保存在服务端数据库；分类标识稳定用于检索，显示名称可按需要调整。",
+              )}
             </DialogDescription>
           </DialogHeader>
           <div className="max-h-64 overflow-y-auto rounded-md border">
@@ -1431,13 +1514,20 @@ export function KnowledgePage() {
               <Label>{t("父级分类")}</Label>
               <Select
                 value={newCategoryParent || "root"}
-                onValueChange={(value) => setNewCategoryParent(value === "root" ? null : value)}
+                onValueChange={(value) =>
+                  setNewCategoryParent(value === "root" ? null : value)
+                }
               >
-                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="root">{t("顶级")}</SelectItem>
                   {categories.map((category) => (
-                    <SelectItem key={category.category_id} value={category.category_id}>
+                    <SelectItem
+                      key={category.category_id}
+                      value={category.category_id}
+                    >
                       {category.title}
                     </SelectItem>
                   ))}
@@ -1449,8 +1539,15 @@ export function KnowledgePage() {
             <Button variant="outline" onClick={() => setCategoryOpen(false)}>
               {t("关闭")}
             </Button>
-            <Button disabled={savingCategory} onClick={() => void createCategory()}>
-              {savingCategory ? <LoaderCircle className="animate-spin" /> : <Plus />}
+            <Button
+              disabled={savingCategory}
+              onClick={() => void createCategory()}
+            >
+              {savingCategory ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Plus />
+              )}
               {t("新建分类")}
             </Button>
           </DialogFooter>
@@ -1542,7 +1639,9 @@ export function KnowledgePage() {
                 ))}
               </datalist>
               <p className="text-[10px] leading-4 text-muted-foreground">
-                {t("上传时自动建议；可输入任意新分类。长文切片会继承同一分类。")}
+                {t(
+                  "上传时自动建议；可输入任意新分类。长文切片会继承同一分类。",
+                )}
               </p>
             </div>
           ) : null}

@@ -1,10 +1,15 @@
-import base64
 import asyncio
+import base64
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from qwen_exo_booster.document_categories import DocumentCategoryStore
+from qwen_exo_booster.document_ingest import (
+    KnowledgeIngestError,
+    prepare_knowledge_bytes,
+    prepare_knowledge_upload,
+)
 from qwen_exo_booster.knowledge import (
     KnowledgeRepository,
     is_compatible_reflection_memory,
@@ -15,15 +20,10 @@ from qwen_exo_booster.knowledge import (
     reflection_task_category,
     set_markdown_retrieval_category,
 )
-from qwen_exo_booster.document_ingest import (
-    KnowledgeIngestError,
-    prepare_knowledge_bytes,
-    prepare_knowledge_upload,
-)
-from qwen_exo_booster.reflection_memory import ReflectionMemory
 from qwen_exo_booster.policy_data import PolicyDataRepository
-from qwen_exo_booster.runtime import QwenExoRuntime
 from qwen_exo_booster.query_probe import QueryStateSpan
+from qwen_exo_booster.reflection_memory import ReflectionMemory, ReflectionMemoryStore
+from qwen_exo_booster.runtime import QwenExoRuntime
 
 
 def test_markdown_normalization_removes_metadata_and_comments():
@@ -690,6 +690,9 @@ class _ReflectionRankBank:
 @pytest.mark.asyncio
 async def test_runtime_reflection_qk_search_is_scoped_to_reflection_documents(tmp_path):
     runtime = object.__new__(QwenExoRuntime)
+    runtime.reflection_memory_store = ReflectionMemoryStore(
+        tmp_path / "reflections.json"
+    )
     runtime.knowledge = KnowledgeRepository(tmp_path / "knowledge")
     reflection_document = runtime.knowledge.upsert(
         "reflection-memory/network.md",
@@ -748,6 +751,9 @@ async def test_runtime_reflection_organizer_builds_model_reviews_from_high_qk_pa
     tmp_path,
 ):
     runtime = object.__new__(QwenExoRuntime)
+    runtime.reflection_memory_store = ReflectionMemoryStore(
+        tmp_path / "reflections.json"
+    )
     runtime.knowledge = KnowledgeRepository(tmp_path / "knowledge")
     documents = tuple(
         runtime.knowledge.upsert(
@@ -1106,8 +1112,14 @@ def test_question_names_document_requires_a_whole_title_segment():
     lint = SimpleNamespace(title="TS 规则提交前门禁误判：tsc 错误计数未闭环")
     latin = SimpleNamespace(title="Mashumaro flatten task contract")
 
-    assert question_names_document("在之前做笔记资料整理的时候 我们遇到什么问题了？", notes)
-    assert not question_names_document("在之前做笔记资料整理的时候 我们遇到什么问题了？", lint)
+    assert question_names_document(
+        "在之前做笔记资料整理的时候 我们遇到什么问题了？", notes
+    )
+    assert not question_names_document(
+        "在之前做笔记资料整理的时候 我们遇到什么问题了？", lint
+    )
     assert not question_names_document("整理一下今天的资料", notes)
-    assert question_names_document("what did the mashumaro flatten task contract say?", latin)
+    assert question_names_document(
+        "what did the mashumaro flatten task contract say?", latin
+    )
     assert not question_names_document("", notes)

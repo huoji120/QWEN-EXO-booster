@@ -258,35 +258,6 @@ def build_service(tmp_path, manager, **kwargs):
     )
 
 
-def test_refresh_filters_task_scoped_reflection_from_another_task(tmp_path):
-    service, repo = build_service(tmp_path, FakeManager())
-    target_task = "Please solve this issue: add implicit HEAD and OPTIONS routing"
-    other_task = "Please solve this issue: add deprecated response headers"
-
-    def add_reflection(path, task):
-        return repo.upsert(
-            path,
-            "---\nsource_kind: trajectory_reflection\n"
-            "document_group: reflection_memory\nreflection_memory_schema: 3\n"
-            f"retrieval_category: {reflection_task_category(task)}\n---\n\nRule.",
-        )
-
-    target = add_reflection("reflection-memory/target.md", target_task)
-    other = add_reflection("reflection-memory/other.md", other_task)
-    candidates = (
-        repo.candidate_for_document(other.document_id, "query"),
-        repo.candidate_for_document(target.document_id, "query"),
-    )
-
-    kept, filtered = service._filter_task_scoped_reflections(candidates, target_task)
-
-    assert [candidate.document_id for candidate in kept] == [target.document_id]
-    assert filtered == 1
-    exact = service._exact_task_reflection_candidates(target_task, "narrow question")
-    assert [candidate.document_id for candidate in exact] == [target.document_id]
-    assert exact[0].candidate_origin == "task_scope_exact"
-
-
 @pytest.mark.asyncio
 async def test_refresh_marks_scope_mismatched_reflection_and_lets_judge_decide(
     tmp_path,
