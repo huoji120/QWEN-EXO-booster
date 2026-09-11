@@ -9,7 +9,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from qwen_exo_booster.contracts import CancellationToken, InternalJob, InternalJobType
+from qwen_exo_booster.contracts import (
+    ATTENTION_DIAGNOSTIC_MAX_LAYERS,
+    CancellationToken,
+    InternalJob,
+    InternalJobType,
+)
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 MAX_MESSAGES = 512
@@ -409,7 +414,7 @@ def _config_value(config: Any, key: str, default: Any = None) -> Any:
     )
 
 
-def _layer_selection(manager: Any, requested: list[int] | None) -> list[int]:
+def _available_layers(manager: Any) -> list[int]:
     config = getattr(manager, "model_config", None)
     text = _config_value(config, "hf_text_config") or _config_value(
         config, "hf_config", config
@@ -427,14 +432,28 @@ def _layer_selection(manager: Any, requested: list[int] | None) -> list[int]:
         raise AttentionDiagnosticError(
             "Active model exposes no supported Full Attention layer structure", 503
         )
-    selected = [available[-1]] if requested is None else requested
+    return available
+
+
+def _default_layers(available: list[int]) -> list[int]:
+    count = min(ATTENTION_DIAGNOSTIC_MAX_LAYERS, len(available))
+    if count == 1:
+        return available[:]
+    return [
+        available[round(i * (len(available) - 1) / (count - 1))] for i in range(count)
+    ]
+
+
+def _layer_selection(manager: Any, requested: list[int] | None) -> list[int]:
+    available = _available_layers(manager)
+    selected = _default_layers(available) if requested is None else requested
     if (
-        not 1 <= len(selected) <= 2
+        not 1 <= len(selected) <= ATTENTION_DIAGNOSTIC_MAX_LAYERS
         or len(set(selected)) != len(selected)
         or any(type(layer) is not int or layer not in available for layer in selected)
     ):
         raise AttentionDiagnosticError(
-            f"Select 1..2 distinct Full Attention layer IDs from {available}"
+            f"Select 1..{ATTENTION_DIAGNOSTIC_MAX_LAYERS} distinct Full Attention layer IDs from {available}"
         )
     return selected
 
@@ -668,8 +687,12 @@ def prepare_attention_preview(
     parsed, count, _, _, ids, _, limit = _prepare_prompt(
         runtime, content, filename, end_message
     )
+    available = _available_layers(runtime.tokenizer_manager)
     return {
         **parsed.preview(),
+        "available_layer_ids": available,
+        "default_layer_ids": _default_layers(available),
+        "max_layers": ATTENTION_DIAGNOSTIC_MAX_LAYERS,
         "token_budget": {
             "end_message": count,
             "prompt_tokens": len(ids),

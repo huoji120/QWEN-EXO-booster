@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from qwen_exo_booster.attention_diagnostic import (
     AttentionDiagnosticError,
+    _layer_selection,
     _render,
     _prepare_run,
     prepare_attention_preview,
@@ -174,7 +175,12 @@ def _diagnostic_runtime(limit=64):
     return SimpleNamespace(
         tokenizer_manager=SimpleNamespace(
             tokenizer=_DiagnosticCharacterTokenizer(),
-            model_config=SimpleNamespace(context_len=limit + 1),
+            model_config=SimpleNamespace(
+                context_len=limit + 1,
+                hf_text_config={
+                    "layer_types": ["linear_attention", "full_attention"] * 8
+                },
+            ),
         )
     )
 
@@ -316,3 +322,50 @@ def test_structured_tool_markers_are_inert_in_rendered_content(item):
     assert any(
         "not an exact multimodal replay" in warning for warning in parsed.warnings
     )
+
+
+@pytest.mark.parametrize("available", [[2], [1, 4, 8], list(range(3, 64, 4))])
+def test_preview_representative_layers_span_actual_full_attention_depth(available):
+    runtime = _diagnostic_runtime()
+    types = ["linear_attention"] * (available[-1] + 1)
+    for layer in available:
+        types[layer] = "full_attention"
+    runtime.tokenizer_manager.model_config.hf_text_config = {"layer_types": types}
+    preview = prepare_attention_preview(runtime, "inspect")
+    chosen = preview["default_layer_ids"]
+    assert preview["available_layer_ids"] == available
+    assert len(chosen) == min(4, len(available))
+    assert chosen == sorted(set(chosen))
+    assert chosen[0] == available[0] and chosen[-1] == available[-1]
+    assert set(chosen).issubset(available)
+    assert _layer_selection(runtime.tokenizer_manager, None) == chosen
+    if len(available) > 4:
+        gaps = [
+            available.index(b) - available.index(a) for a, b in zip(chosen, chosen[1:])
+        ]
+        assert max(gaps) - min(gaps) <= 1
+
+
+def test_custom_layer_selection_rejects_gdn_duplicates_and_oversized_requests():
+    manager = _diagnostic_runtime().tokenizer_manager
+    assert _layer_selection(manager, [15, 1, 7, 9]) == [15, 1, 7, 9]
+    for invalid in ([], [1, 1], [0], [True], [1, 3, 5, 7, 9]):
+        with pytest.raises(AttentionDiagnosticError):
+            _layer_selection(manager, invalid)
+
+
+def test_worker_accepts_four_layers_but_rejects_five():
+    custom = {
+        "qwen_exo_kind": "internal",
+        "qwen_exo_job_type": "attention_diagnostic",
+        "qwen_exo_dflash": "target_only",
+        "qwen_exo_attention_diagnostic": {"layer_ids": [1, 3, 5, 7], "token_count": 2},
+    }
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(custom_params=custom, max_new_tokens=1),
+        origin_input_ids=[1, 2],
+        extra_key="isolated",
+    )
+    assert attention_diagnostic_specs([req])[0]["error"] == 0
+    custom["qwen_exo_attention_diagnostic"]["layer_ids"].append(9)
+    assert attention_diagnostic_specs([req])[0]["error"] == 2

@@ -1,4 +1,11 @@
 {
+  "采样层（Full Attention）": "Sampling layers (Full Attention)",
+  "默认均匀选择覆盖前段到最后层的最多 {count} 个层；可自选 1–{count} 层。层号从 0 开始，不包含 GDN 层。": "By default, up to {count} layers are evenly selected from the earliest to the final Full Attention layer. Select 1–{count} layers. IDs are zero-based and exclude GDN layers.",
+  "第 {layer} 层": "Layer {layer}",
+  "恢复代表层": "Reset representative layers",
+  "已选 {count} / {limit} 层": "Selected {count} / {limit} layers",
+  "请选择至少一个有效的 Full Attention 层。": "Select at least one valid Full Attention layer.",
+  "更多层会增加采样计算与结果传输量。结果逐层查看，不跨层平均；切层后色阶按当前层计算，请用原始百分比对照。": "More layers increase sampling computation and response size. Inspect each layer separately, without cross-layer averaging. Color scales are calculated per layer; compare raw percentages across layers.",
   "消息注意力分布": "Attention by message",
   "每 token 平均占比": "Mean share per token",
   "注意力诊断": "Attention diagnostics",

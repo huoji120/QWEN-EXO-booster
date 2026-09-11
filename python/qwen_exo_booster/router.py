@@ -30,6 +30,7 @@ from qwen_exo_booster.attention_diagnostic import (
 )
 from qwen_exo_booster.attention_diagnostic_conversations import AttentionDiagnosticConversations
 from qwen_exo_booster.config import PROJECT_NAME
+from qwen_exo_booster.contracts import ATTENTION_DIAGNOSTIC_MAX_LAYERS
 from qwen_exo_booster.document_categories import DocumentCategoryError
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
@@ -138,7 +139,7 @@ class AttentionPreviewRequest(BaseModel):
 class AttentionRunRequest(AttentionPreviewRequest):
     end_message: int = Field(ge=1, le=512, strict=True)
     sample_count: int = Field(default=1, ge=1, le=4, strict=True)
-    layer_ids: list[StrictInt] | None = Field(default=None, min_length=1, max_length=2)
+    layer_ids: list[StrictInt] | None = Field(default=None, min_length=1, max_length=ATTENTION_DIAGNOSTIC_MAX_LAYERS)
     end_token: int | None = Field(default=None, ge=1, strict=True)
 
 

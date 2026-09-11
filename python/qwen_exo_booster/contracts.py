@@ -7,6 +7,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Iterable
 
+ATTENTION_DIAGNOSTIC_MAX_LAYERS = 4
+
 
 class ContractViolation(ValueError):
     """Raised when state would violate a QWEN-EXO runtime contract."""

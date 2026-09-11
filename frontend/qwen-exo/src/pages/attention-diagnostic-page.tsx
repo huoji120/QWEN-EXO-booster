@@ -45,6 +45,9 @@ type Preview = {
   format: string;
   warnings: string[];
   token_budget: TokenBudget;
+  available_layer_ids: number[];
+  default_layer_ids: number[];
+  max_layers: number;
 };
 const MAX_BYTES = 2 * 1024 * 1024;
 
@@ -57,6 +60,7 @@ export function AttentionDiagnosticPage() {
   const [tokenBudget, setTokenBudget] = useState<TokenBudget | null>(null);
   const [endToken, setEndToken] = useState<string | null>(null);
   const [sampleCount, setSampleCount] = useState(1);
+  const [selectedLayers, setSelectedLayers] = useState<number[] | null>(null);
   const [report, setReport] = useState<AttentionReport | null>(null);
   const [sampleIndex, setSampleIndex] = useState(0);
   const [layerIndex, setLayerIndex] = useState(0);
@@ -197,6 +201,7 @@ export function AttentionDiagnosticPage() {
       setFilename(detail.filename);
       setSourceWarnings(detail.warnings || []);
       setPreview(data);
+      setSelectedLayers(null);
       setEndMessage(nextEndMessage);
       setTokenBudget(data.token_budget);
       setEndToken(null);
@@ -222,6 +227,7 @@ export function AttentionDiagnosticPage() {
     setContent(next);
     setFilename(name);
     setPreview(null);
+    setSelectedLayers(null);
     setTokenBudget(null);
     setEndToken(null);
     setSourceWarnings([]);
@@ -269,6 +275,7 @@ export function AttentionDiagnosticPage() {
             ? {
                 end_message: endMessage,
                 sample_count: sampleCount,
+                layer_ids: layerIds,
                 ...(endToken !== null ? { end_token: Number(endToken) } : {}),
               }
             : { end_message: selectedEndMessage }),
@@ -412,8 +419,15 @@ export function AttentionDiagnosticPage() {
     Number.isInteger(selectedTokens) &&
     selectedTokens >= 1 &&
     selectedTokens <= budget.prompt_tokens;
+  const layerIds = selectedLayers ?? preview?.default_layer_ids ?? [];
+  const validLayers =
+    !!preview &&
+    layerIds.length > 0 &&
+    layerIds.length <= preview.max_layers &&
+    layerIds.every((id) => preview.available_layer_ids.includes(id));
   const canRun =
     validTokenPrefix &&
+    validLayers &&
     selectedTokens <= tokenLimit &&
     busy === null &&
     !importBusy;
@@ -711,6 +725,76 @@ export function AttentionDiagnosticPage() {
               </p>
             )}
           </div>
+          <fieldset
+            className="space-y-3 rounded-md border p-4"
+            disabled={!!busy || importBusy}
+          >
+            <legend className="px-1 text-sm font-medium">
+              {t("采样层（Full Attention）")}
+            </legend>
+            <p className="text-xs text-muted-foreground">
+              {t(
+                "默认均匀选择覆盖前段到最后层的最多 {count} 个层；可自选 1–{count} 层。层号从 0 开始，不包含 GDN 层。",
+                { count: preview.max_layers },
+              )}
+            </p>
+            <div className="flex flex-wrap gap-3">
+              {preview.available_layer_ids.map((id) => {
+                const checked = layerIds.includes(id);
+                return (
+                  <label
+                    key={id}
+                    className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={
+                        !checked && layerIds.length >= preview.max_layers
+                      }
+                      onChange={() => {
+                        invalidate();
+                        setSelectedLayers(
+                          checked
+                            ? layerIds.filter((layer) => layer !== id)
+                            : [...layerIds, id].sort((a, b) => a - b),
+                        );
+                      }}
+                    />
+                    {t("第 {layer} 层", { layer: id })}
+                  </label>
+                );
+              })}
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  invalidate();
+                  setSelectedLayers(null);
+                }}
+              >
+                {t("恢复代表层")}
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                {t("已选 {count} / {limit} 层", {
+                  count: layerIds.length,
+                  limit: preview.max_layers,
+                })}
+              </span>
+              {!validLayers && (
+                <span role="alert" className="text-xs text-destructive">
+                  {t("请选择至少一个有效的 Full Attention 层。")}
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t(
+                "更多层会增加采样计算与结果传输量。结果逐层查看，不跨层平均；切层后色阶按当前层计算，请用原始百分比对照。",
+              )}
+            </p>
+          </fieldset>
           <div className="flex flex-wrap items-end gap-4">
             <label className="flex flex-col gap-2 text-sm">
               {t("保留至消息（包含）")}
@@ -820,7 +904,6 @@ export function AttentionDiagnosticPage() {
                 value={sampleIndex}
                 onChange={(event) => {
                   setSampleIndex(Number(event.target.value));
-                  setLayerIndex(0);
                   setPage(0);
                 }}
               >
@@ -835,6 +918,7 @@ export function AttentionDiagnosticPage() {
             <label className="flex items-center gap-2 text-sm">
               {t("观测层")}
               <select
+                aria-label={t("观测层")}
                 className={selectClass}
                 value={layerIndex}
                 onChange={(event) => setLayerIndex(Number(event.target.value))}

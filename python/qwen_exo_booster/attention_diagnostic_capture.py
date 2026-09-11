@@ -5,8 +5,9 @@ from typing import Any
 
 import torch
 
+from qwen_exo_booster.contracts import ATTENTION_DIAGNOSTIC_MAX_LAYERS
+
 ATTENTION_DIAGNOSTIC_MAX_TOKENS = 32768
-ATTENTION_DIAGNOSTIC_MAX_LAYERS = 2
 ATTENTION_DIAGNOSTIC_ERROR_KEY = "qwen_exo_attention_error"
 
 
