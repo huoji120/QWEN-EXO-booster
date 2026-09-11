@@ -6,6 +6,7 @@ import { useI18n } from "@/lib/i18n";
 import { useTheme } from "@/lib/theme";
 import type { RuntimeStatus } from "@/lib/types";
 import { ApiKeysPage } from "@/pages/api-keys-page";
+import { AttentionDiagnosticPage } from "@/pages/attention-diagnostic-page";
 import { CatalogPage } from "@/pages/catalog-page";
 import { ChatPage } from "@/pages/chat-page";
 import { EditorPage } from "@/pages/editor-page";
@@ -58,13 +59,10 @@ export default function App() {
     return () => window.removeEventListener("hashchange", onHashChange);
   }, [status]);
 
-  const navigate = useCallback(
-    (next: ViewId) => {
-      setView(next);
-      window.history.replaceState(null, "", `#/${next}`);
-    },
-    [],
-  );
+  const navigate = useCallback((next: ViewId) => {
+    setView(next);
+    window.history.replaceState(null, "", `#/${next}`);
+  }, []);
 
   useEffect(() => {
     if (view === "editor" && !status?.features?.activation_training) {
@@ -84,6 +82,7 @@ export default function App() {
     overview: <OverviewPage status={status} onRefresh={loadStatus} />,
     chat: <ChatPage />,
     trace: <TracePage />,
+    "attention-diagnostic": <AttentionDiagnosticPage />,
     knowledge: <KnowledgePage />,
     reflection: <ReflectionPage />,
     catalog: <CatalogPage status={status} />,

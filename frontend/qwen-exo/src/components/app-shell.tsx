@@ -42,9 +42,15 @@ export const NAV_ITEMS = [
   { id: "overview", label: "总览", icon: Gauge },
   { id: "chat", label: "对话", icon: MessageSquareText },
   { id: "trace", label: "召回轨迹", icon: Activity },
+  { id: "attention-diagnostic", label: "注意力诊断", icon: Activity },
   { id: "knowledge", label: "知识库", icon: BookOpen },
   { id: "reflection", label: "反思记忆", icon: BrainCircuit },
-  { id: "editor", label: "轨迹微调", icon: SlidersHorizontal, experimental: true },
+  {
+    id: "editor",
+    label: "轨迹微调",
+    icon: SlidersHorizontal,
+    experimental: true,
+  },
   { id: "catalog", label: "模型目录", icon: Boxes },
   { id: "api-keys", label: "API 密钥", icon: KeyRound },
   { id: "settings", label: "设置", icon: Settings },
@@ -68,7 +74,9 @@ export function AppShell({
     status?.features?.activation_training,
   );
   const navItems = NAV_ITEMS.filter(
-    (item) => !("experimental" in item && item.experimental) || activationTrainingEnabled,
+    (item) =>
+      !("experimental" in item && item.experimental) ||
+      activationTrainingEnabled,
   );
   const current = navItems.find((item) => item.id === view) || navItems[0];
   const { mode, setMode, dark } = useTheme();

@@ -14,7 +14,7 @@ from fastapi.responses import (
     JSONResponse,
     StreamingResponse,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from qwen_exo_booster.activation_training import (
     COMBINED_EDITOR_NAME,
@@ -22,6 +22,13 @@ from qwen_exo_booster.activation_training import (
     ActivationTrainingStore,
 )
 from qwen_exo_booster.api_keys import ApiKeyStore, ApiKeyStoreError
+from qwen_exo_booster.attention_diagnostic import (
+    MAX_UPLOAD_BYTES,
+    AttentionDiagnosticError,
+    prepare_attention_preview,
+    run_attention_diagnostic,
+)
+from qwen_exo_booster.attention_diagnostic_conversations import AttentionDiagnosticConversations
 from qwen_exo_booster.config import PROJECT_NAME
 from qwen_exo_booster.document_categories import DocumentCategoryError
 from qwen_exo_booster.document_ingest import (
@@ -120,6 +127,19 @@ class QKRankPreviewRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8192)
     limit: int = Field(default=8, ge=1, le=64)
     pooling: Literal["sentence", "windows"] | None = None
+
+
+class AttentionPreviewRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=MAX_UPLOAD_BYTES)
+    filename: str | None = Field(default=None, max_length=255)
+    end_message: int | None = Field(default=None, ge=1, le=512, strict=True)
+
+
+class AttentionRunRequest(AttentionPreviewRequest):
+    end_message: int = Field(ge=1, le=512, strict=True)
+    sample_count: int = Field(default=1, ge=1, le=4, strict=True)
+    layer_ids: list[StrictInt] | None = Field(default=None, min_length=1, max_length=2)
+    end_token: int | None = Field(default=None, ge=1, strict=True)
 
 
 def _api_key_store() -> ApiKeyStore:
@@ -383,6 +403,80 @@ async def recall_trace_compat(
 @compat_router.delete("/v1/recall-trace", include_in_schema=False)
 async def clear_recall_trace(request: Request):
     return await _runtime(request).clear_recall_trace()
+
+@router.get("/attention-diagnostics/conversations")
+async def list_attention_diagnostic_conversations(
+    request: Request,
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    adapter = AttentionDiagnosticConversations(_runtime(request))
+    return await asyncio.to_thread(adapter.list, limit, offset)
+
+
+@router.get("/attention-diagnostics/conversations/{conversation_id}")
+async def get_attention_diagnostic_conversation(request: Request, conversation_id: str):
+    adapter = AttentionDiagnosticConversations(_runtime(request))
+    try:
+        result = await asyncio.to_thread(adapter.detail, conversation_id)
+    except AttentionDiagnosticError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Retained conversation was not found")
+    return result
+
+
+@router.post("/attention-diagnostics/preview")
+async def preview_attention_diagnostic(payload: AttentionPreviewRequest, request: Request):
+    try:
+        return await asyncio.to_thread(
+            prepare_attention_preview, _runtime(request), payload.content,
+            payload.filename, payload.end_message,
+        )
+    except AttentionDiagnosticError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post("/attention-diagnostics/run")
+async def attention_diagnostic(payload: AttentionRunRequest, request: Request):
+    runtime = _runtime(request)
+    if runtime.state is not QwenExoRuntimeState.READY:
+        raise HTTPException(status_code=503, detail="QWEN-EXO runtime is not ready")
+    # Event-loop-local admission; no wait queue retaining uploaded payloads.
+    if getattr(request.app.state, "attention_diagnostic_active", False):
+        raise HTTPException(status_code=409, detail="Another attention diagnostic is running")
+    request.app.state.attention_diagnostic_active = True
+
+    async def wait_for_disconnect():
+        while True:
+            if (await request.receive())["type"] == "http.disconnect":
+                return
+
+    work = asyncio.create_task(
+        run_attention_diagnostic(
+            runtime, payload.content, payload.filename, payload.end_message,
+            payload.sample_count, payload.layer_ids, payload.end_token,
+        )
+    )
+    disconnected = asyncio.create_task(wait_for_disconnect())
+    try:
+        done, _ = await asyncio.wait(
+            (work, disconnected), return_when=asyncio.FIRST_COMPLETED
+        )
+        if disconnected in done:
+            work.cancel()
+            await asyncio.gather(work, return_exceptions=True)
+            raise HTTPException(status_code=499, detail="Client disconnected; diagnostic aborted")
+        return await work
+    except AttentionDiagnosticError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    finally:
+        work.cancel()
+        disconnected.cancel()
+        try:
+            await asyncio.gather(work, disconnected, return_exceptions=True)
+        finally:
+            request.app.state.attention_diagnostic_active = False
 
 
 @router.get("/telemetry/stream")

@@ -17,7 +17,7 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "^/qwen-exo/(status|health|telemetry|recall-trace|knowledge|policydata|tensor-bank|service-config)":
+      "^/qwen-exo/(attention-diagnostics|status|health|telemetry|recall-trace|knowledge|policydata|tensor-bank|service-config)":
         "http://127.0.0.1:30000",
       "/v1": "http://127.0.0.1:30000",
     },

@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
+from qwen_exo_booster.attention_diagnostic_capture import attention_diagnostic_specs
 from qwen_exo_booster.score_bias import (
     SCORE_BIAS_KERNEL_MAX_BLOCKS,
     SCORE_BIAS_SKETCH_DIMENSIONS,
@@ -711,6 +712,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     qwen_exo_score_bias_phases: Optional[List[int]] = None
     qwen_exo_latent_transplants: Optional[List[Optional[dict[str, object]]]] = None
     qwen_exo_activation_editors: Optional[List[Optional[dict[str, object]]]] = None
+    qwen_exo_attention_diagnostics: Optional[List[Optional[dict[str, object]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -1056,6 +1058,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if get_server_args().enable_qwen_exo
                 else None
             ),
+            qwen_exo_attention_diagnostics=attention_diagnostic_specs(batch.reqs),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

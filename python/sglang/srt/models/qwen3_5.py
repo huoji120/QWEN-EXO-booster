@@ -21,6 +21,7 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 import torch.nn as nn
 import triton
+from qwen_exo_booster.attention_diagnostic_capture import capture_attention_diagnostic
 from qwen_exo_booster.attention_signals import (
     AttentionBatchMetadata,
     AttentionSignalTracker,
@@ -1579,6 +1580,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 score_mod=score_mod,
                 aux_tensors=score_bias_aux,
             )
+
+        if forward_batch.qwen_exo_attention_diagnostics is not None:
+            capture_attention_diagnostic(self, q, positions, forward_batch)
 
         if self.attn_output_gate:
             if not _is_npu:
