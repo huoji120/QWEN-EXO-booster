@@ -1,4 +1,13 @@
 {
+  "查看和整理服务器保留的对话记录。": "Browse and manage conversations retained on the server.",
+  "会话记录": "Saved conversations",
+  "会话操作": "Session actions",
+  "已选择 {count} 个会话": "{count} sessions selected",
+  "暂无会话记录": "No saved conversations",
+  "服务器保存的对话会显示在这里，方便查找和清理。": "Retained conversations will appear here, ready to browse and manage.",
+  "换一个会话 ID 试试，或清除搜索查看全部记录。": "Try another conversation ID, or clear the search to see all records.",
+  "清除搜索": "Clear search",
+  "保存与删除说明": "About retention and deletion",
   "采样层（Full Attention）": "Sampling layers (Full Attention)",
   "默认均匀选择覆盖前段到最后层的最多 {count} 个层；可自选 1–{count} 层。层号从 0 开始，不包含 GDN 层。": "By default, up to {count} layers are evenly selected from the earliest to the final Full Attention layer. Select 1–{count} layers. IDs are zero-based and exclude GDN layers.",
   "第 {layer} 层": "Layer {layer}",
