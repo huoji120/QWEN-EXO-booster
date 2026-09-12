@@ -97,7 +97,7 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _load_page_payload(
+def _load_page_file(
     root: Path,
     *,
     source_digest: str,
@@ -117,7 +117,10 @@ def _load_page_payload(
         raise NativeStateBankError(
             f"native Bank rank artifact is unreadable: {path}"
         ) from exc
-    if not isinstance(payload, dict) or payload.get("schema") != _SCHEMA:
+    if not isinstance(payload, dict) or payload.get("schema") not in {
+        _SCHEMA,
+        "qwen-exo-native-state-reference-v1",
+    }:
         raise NativeStateBankError(
             f"native Bank rank artifact has an invalid schema: {path}"
         )
@@ -132,6 +135,121 @@ def _load_page_payload(
             f"native Bank rank artifact identity mismatch: expected={expected}, observed={observed}"
         )
     return payload
+
+
+def _load_page_payload(
+    root: Path, *, source_digest: str, page_id: int, rank: int
+) -> dict[str, Any]:
+    payload = _load_page_file(
+        root, source_digest=source_digest, page_id=page_id, rank=rank
+    )
+    if payload["schema"] == _SCHEMA:
+        return payload
+    reference = payload.get("reused_from")
+    if not isinstance(reference, dict):
+        raise NativeStateBankError("native Bank page reference is missing its source")
+    base = _load_page_file(
+        root,
+        source_digest=str(reference.get("source_digest") or ""),
+        page_id=int(reference.get("page_id", -1)),
+        rank=rank,
+    )
+    if (
+        base["schema"] != _SCHEMA
+        or base.get("prefix_identity") != reference.get("prefix_identity")
+        or any(
+            base.get(key) != payload.get(key)
+            for key in ("model_fingerprint", "world_size", "capture_count")
+        )
+    ):
+        raise NativeStateBankError("native Bank page reference is stale or chained")
+    return {
+        **base,
+        "source_digest": source_digest,
+        "page_id": page_id,
+        "prefix_identity": payload["prefix_identity"],
+        "reused_from": reference,
+    }
+
+
+def reuse_page_artifacts(
+    root: Path,
+    *,
+    source_digest: str,
+    page_id: int,
+    prefix_identity: str,
+    target_digest: str,
+    target_page_id: int,
+    target_prefix_identity: str,
+    world_size: int,
+    model_fingerprint: str,
+    token_ids: tuple[int, ...],
+) -> None:
+    """Publish tiny references to immutable, exactly matching TP document states.
+
+    References always point at original tensor files, never at another reference.
+    Old generations remain live dependencies; age alone cannot authorize deletion.
+    """
+    if target_digest == source_digest:
+        raise NativeStateBankError("native Bank reuse cannot overwrite its source")
+    validate_page_artifacts(
+        root,
+        source_digest=source_digest,
+        page_id=page_id,
+        world_size=world_size,
+        model_fingerprint=model_fingerprint,
+        prefix_identity=prefix_identity,
+        token_count=len(token_ids),
+    )
+    if all(
+        _page_path(root, target_digest, target_page_id, rank).is_file()
+        for rank in range(world_size)
+    ):
+        validate_page_artifacts(
+            root,
+            source_digest=target_digest,
+            page_id=target_page_id,
+            world_size=world_size,
+            model_fingerprint=model_fingerprint,
+            prefix_identity=target_prefix_identity,
+            token_count=len(token_ids),
+        )
+        for rank in range(world_size):
+            existing = _load_page_payload(
+                root, source_digest=target_digest, page_id=target_page_id, rank=rank
+            )
+            if tuple(existing["token_ids"]) != token_ids:
+                raise NativeStateBankError("native Bank reuse target tokens changed")
+        return
+    manifests = []
+    for rank in range(world_size):
+        payload = _load_page_payload(
+            root, source_digest=source_digest, page_id=page_id, rank=rank
+        )
+        if tuple(payload["token_ids"]) != token_ids:
+            raise NativeStateBankError("native Bank reuse document tokens changed")
+        reference = payload.get("reused_from") or {
+            "source_digest": source_digest,
+            "page_id": page_id,
+            "prefix_identity": prefix_identity,
+        }
+        manifests.append(
+            {
+                "schema": "qwen-exo-native-state-reference-v1",
+                "source_digest": target_digest,
+                "page_id": target_page_id,
+                "rank": rank,
+                "world_size": world_size,
+                "model_fingerprint": model_fingerprint,
+                "prefix_identity": target_prefix_identity,
+                "capture_count": len(token_ids),
+                "reused_from": reference,
+            }
+        )
+    for rank, manifest in enumerate(manifests):
+        _atomic_torch_save(
+            manifest, _page_path(root, target_digest, target_page_id, rank)
+        )
 
 
 def _load_session_initial_gdn_payload(

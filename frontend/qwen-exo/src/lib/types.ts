@@ -589,3 +589,26 @@ export type RequestTraceListing = {
   total_requests: number;
   text_mode?: string;
 };
+export type ServerSession = {
+  conversation_key: string;
+  updated_at: number;
+  event_count: number;
+  raw_bytes: number;
+  source_count: number;
+  active: boolean;
+  pending_reflection: boolean;
+};
+
+export type ServerSessionListing = {
+  sessions: ServerSession[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export type ServerSessionDeletion = {
+  deleted: string[];
+  skipped_active: string[];
+  missing: string[];
+  deleted_count: number;
+};

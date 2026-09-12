@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from qwen_exo_booster.contracts import stable_digest
-from qwen_exo_booster.native_state_bank import load_page_key_heads
+from qwen_exo_booster.native_state_bank import _load_page_payload, load_page_key_heads
 
 
 def _post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -130,14 +130,11 @@ def main() -> int:
         raise RuntimeError("Tensor Bank has no native document state")
     source_digest = str(snapshot["source_digest"])
     seed_page = pages[0]
-    seed_artifact_path = (
-        args.state_dir
-        / "native-bank"
-        / source_digest
-        / f"page-{int(seed_page['page_id']):08d}-rank-0000.pt"
-    )
-    seed_artifact = torch.load(
-        str(seed_artifact_path), map_location="cpu", weights_only=True, mmap=True
+    seed_artifact = _load_page_payload(
+        args.state_dir / "native-bank",
+        source_digest=source_digest,
+        page_id=int(seed_page["page_id"]),
+        rank=0,
     )
     seed_ids = tuple(int(token) for token in seed_artifact["token_ids"])[-32:]
     if not seed_ids:
@@ -197,14 +194,11 @@ def main() -> int:
     ):
         raise RuntimeError("selected Tensor Bank document has no aligned salient plan")
     page_id = int(page["page_id"])
-    artifact_path = (
-        args.state_dir
-        / "native-bank"
-        / source_digest
-        / f"page-{page_id:08d}-rank-0000.pt"
-    )
-    artifact = torch.load(
-        str(artifact_path), map_location="cpu", weights_only=True, mmap=True
+    artifact = _load_page_payload(
+        args.state_dir / "native-bank",
+        source_digest=source_digest,
+        page_id=page_id,
+        rank=0,
     )
     artifact_token_ids = tuple(int(item) for item in artifact["token_ids"])
     selected_token_ids = tuple(artifact_token_ids[item] for item in local_positions)

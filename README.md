@@ -118,6 +118,14 @@ Score Bias 可以把相关的系统规约、工具轨迹和历史证据提供给
 
 接口：`POST /qwen-exo/attention-diagnostics/preview` 与 `POST /qwen-exo/attention-diagnostics/run`。该功能需要控制面和模型 worker 同时加载支持版本；仅更新静态页面不会使采样后端生效。
 
+### 服务器会话管理
+
+控制台“服务器会话”（`#/server-sessions`）提供按会话 ID 搜索、分页、单条删除、跨页勾选删除和清空全部。列表显示更新时间、事件数、保存载荷大小估计、快照数及忙碌状态；删除需要明确确认，清空全部不受当前搜索或分页限制。正在处理请求或写入反思来源时保守跳过忙碌会话，不中断推理。
+
+删除范围是该会话保留的事件日志、所有来源快照及内存轨迹／待反思来源；删除后不能再从这些记录导入诊断或重新反思。已发布的反思知识、Knowledge、人格、Tensor Bank、正在服务的 Responses 状态和浏览器聊天记录保留不变。这不是遥测、分析缓存或备份的完整隐私清除；SQLite 空闲页可供后续复用，但文件不一定立即缩小。客户端后续重新发送历史时可以产生新的保存记录。
+
+接口：`GET /qwen-exo/server-sessions?limit=25&offset=0&q=`；`POST /qwen-exo/server-sessions/delete` 接受 `{"conversation_keys":["会话 ID"]}` 或 `{"all":true}`，返回已删除、忙碌跳过和已不存在的列表。仅属于现有控制面，不对公共 `/v1` 网关开放；需要后端加载支持版本。
+
 ## 实测
 
 ### DeepSWE 记忆召回 · GraphQL SWE：18 轮收敛到满分

@@ -129,7 +129,7 @@ class QueryProbeService:
         query_head_count: int | None = None,
         head_dim: int | None = None,
         timeout_seconds: float = 30.0,
-        cache_size: int = 16,
+        cache_size: int = 128,
         query_pooling: str = "windows",
     ) -> None:
         if max_prompt_tokens < 1 or timeout_seconds <= 0 or cache_size < 1:
@@ -163,6 +163,9 @@ class QueryProbeService:
         self._cache: OrderedDict[str, tuple[tuple[tuple[float, ...], ...], ...]] = (
             OrderedDict()
         )
+        # The key includes the exact tokenized plan, spans, geometry and pooling.
+        # A larger bounded cache reuses only identical prefixes across short turns.
+        self._cache_capacity = self.cache_size
         self._cache_lock = asyncio.Lock()
 
     async def warmup(self) -> QueryProbeResult:
@@ -247,7 +250,7 @@ class QueryProbeService:
             turn_id=f"{parent_request_id}:query-probe",
             job_id=f"qwen-exo-query-probe-{stable_digest(parent_request_id)[:32]}",
             job_type=InternalJobType.QUERY_PROBE,
-            priority=-20,
+            priority=-10,
             shared_prefix_key=(
                 "qwen-exo:v1:query-probe:"
                 + stable_digest(parent_request_id, tuple(token_ids), role_plan_digest)[
@@ -345,7 +348,7 @@ class QueryProbeService:
             async with self._cache_lock:
                 self._cache[cache_key] = query_heads
                 self._cache.move_to_end(cache_key)
-                while len(self._cache) > self.cache_size:
+                while len(self._cache) > self._cache_capacity:
                     self._cache.popitem(last=False)
         return self._completed(
             parent_request_id,

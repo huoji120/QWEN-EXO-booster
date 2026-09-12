@@ -43,6 +43,7 @@ export const NAV_ITEMS = [
   { id: "chat", label: "对话", icon: MessageSquareText },
   { id: "trace", label: "召回轨迹", icon: Activity },
   { id: "attention-diagnostic", label: "注意力诊断", icon: Activity },
+  { id: "server-sessions", label: "服务器会话", icon: MessageSquareText },
   { id: "knowledge", label: "知识库", icon: BookOpen },
   { id: "reflection", label: "反思记忆", icon: BrainCircuit },
   {

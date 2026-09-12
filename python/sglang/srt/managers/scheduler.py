@@ -1623,6 +1623,24 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # A cross-mode handoff must commit the previous accepted tokens and
+            # GDN state before preemption releases its KV/Mamba allocations.
+            # Keep last_batch for the normal prefill-to-decode merge below.
+            last_result_processed = False
+            if (
+                self.spec_algorithm.is_dflash()
+                and self.enable_priority_preemption
+                and self.result_queue
+                and any(
+                    self._can_yield_dflash_mode(
+                        req, self.running_batch, self.last_batch
+                    )
+                    for req in self.waiting_queue
+                )
+            ):
+                pop_and_process()
+                last_result_processed = True
+
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -1636,7 +1654,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not last_result_processed:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -1658,7 +1676,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not last_result_processed:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -3699,6 +3717,43 @@ class Scheduler(
 
         return has_target_only, has_non_target_only
 
+    def _can_yield_dflash_mode(
+        self,
+        req: Req,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
+        preselected_requests: Iterable[Req] = (),
+    ) -> bool:
+        """Allow a lane switch only when every owner can yield by priority."""
+        if (
+            not self.spec_algorithm.is_dflash()
+            or not self.enable_priority_preemption
+            or self.chunked_req is not None
+            or preselected_requests
+            or (last_batch is not None and last_batch.chunked_req is not None)
+        ):
+            return False
+        target_only = is_dflash_target_only_request(req)
+        has_target, has_spec = self._dflash_active_request_flags(
+            running_batch, last_batch
+        )
+        if (has_target, has_spec) != (not target_only, target_only):
+            return False
+        priority_sign = -1 if self.server_args.schedule_low_priority_values_first else 1
+        has_victim = False
+        for batch in (running_batch, last_batch):
+            if batch is None:
+                continue
+            for active_req in batch.reqs:
+                if active_req.finished():
+                    continue
+                has_victim = True
+                if (
+                    req.priority - active_req.priority
+                ) * priority_sign <= self.priority_scheduling_preemption_threshold:
+                    return False
+        return has_victim
+
     def get_new_batch_prefill(
         self,
         running_batch: ScheduleBatch,
@@ -3866,11 +3921,48 @@ class Scheduler(
                 self.spec_algorithm.is_dflash() and is_dflash_target_only_request(req)
             )
 
-            if (
-                (target_only_req and active_has_non_target_only)
-                or (not target_only_req and active_has_target_only)
-                or (target_only_waiting and not target_only_req)
+            if (target_only_req and active_has_non_target_only) or (
+                not target_only_req and active_has_target_only
             ):
+                if (
+                    not self._can_yield_dflash_mode(
+                        req, running_batch, last_batch, adder.can_run_list
+                    )
+                    or (self.enable_overlap and self.result_queue)
+                    or (
+                        last_batch is not None
+                        and any(
+                            item not in running_batch.reqs and not item.finished()
+                            for item in last_batch.reqs
+                        )
+                    )
+                ):
+                    continue
+                # Capacity preemption may release only one request even when
+                # memory is plentiful. A mode switch needs the entire lane;
+                # eligibility above checks all owners before the first release.
+                self._release_finished_qwen_exo_states(running_batch.reqs)
+                running_batch.filter_batch()
+                while running_batch.reqs:
+                    if not adder.preempt_to_schedule(req, self.server_args):
+                        break
+                if last_batch is not None and last_batch is not running_batch:
+                    preempted = set(adder.preempt_list)
+                    last_batch.filter_batch(
+                        keep_indices=[
+                            i
+                            for i, item in enumerate(last_batch.reqs)
+                            if item not in preempted and not item.finished()
+                        ]
+                    )
+                active_has_target_only, active_has_non_target_only = (
+                    self._dflash_active_request_flags(running_batch, last_batch)
+                )
+                if active_has_target_only or active_has_non_target_only:
+                    continue
+                running_batch.batch_is_full = False
+                target_only_waiting = target_only_req
+            if target_only_waiting and not target_only_req:
                 continue
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -3917,6 +4009,12 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if self.spec_algorithm.is_dflash() and adder.can_run_list:
+                active_has_target_only, active_has_non_target_only = (
+                    self._dflash_active_request_flags(
+                        running_batch, last_batch, adder.can_run_list
+                    )
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3959,14 +4057,13 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
-        if len(can_run_list) == 0:
-            return None, running_batch
-
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
-        if adder.preempt_list:
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+        for req in adder.preempt_list:
+            self._release_qwen_exo_hybrid_state(req)
+            self._add_request_to_queue(req, is_retracted=True)
+        if len(can_run_list) == 0:
+            return None, running_batch
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill

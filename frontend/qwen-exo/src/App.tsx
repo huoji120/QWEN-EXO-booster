@@ -14,6 +14,7 @@ import { KnowledgePage } from "@/pages/knowledge-page";
 import { OverviewPage } from "@/pages/overview-page";
 import { ReflectionPage } from "@/pages/reflection-page";
 import { SettingsPage } from "@/pages/settings-page";
+import { ServerSessionsPage } from "@/pages/server-sessions-page";
 import { TracePage } from "@/pages/trace-page";
 
 const VALID_VIEWS: Record<string, true> = Object.fromEntries(
@@ -82,6 +83,7 @@ export default function App() {
     overview: <OverviewPage status={status} onRefresh={loadStatus} />,
     chat: <ChatPage />,
     trace: <TracePage />,
+    "server-sessions": <ServerSessionsPage />,
     "attention-diagnostic": <AttentionDiagnosticPage />,
     knowledge: <KnowledgePage />,
     reflection: <ReflectionPage />,

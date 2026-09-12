@@ -27,6 +27,8 @@ import type {
   TrajectoryDraft,
   TrajectoryInfo,
   TrainingSelectionStatus,
+  ServerSessionDeletion,
+  ServerSessionListing,
 } from "@/lib/types";
 import { translate as t } from "@/lib/i18n";
 
@@ -720,4 +722,31 @@ export async function streamResponse(
     }
     reader.releaseLock();
   }
+}
+
+export async function listServerSessions(
+  limit = 25,
+  offset = 0,
+  q = "",
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  if (q) params.set("q", q);
+  return (await (
+    await apiFetch(`/server-sessions?${params}`, { signal })
+  ).json()) as ServerSessionListing;
+}
+
+export async function deleteServerSessions(
+  selection: { conversation_keys: string[] } | { all: true },
+) {
+  return (await (
+    await apiFetch("/server-sessions/delete", {
+      method: "POST",
+      body: JSON.stringify(selection),
+    })
+  ).json()) as ServerSessionDeletion;
 }

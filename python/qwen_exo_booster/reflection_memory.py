@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import tempfile
 import time
 from collections import OrderedDict
@@ -12,6 +13,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
+
 
 from qwen_exo_booster.contracts import (
     CancellationToken,
@@ -26,6 +28,23 @@ from qwen_exo_booster.reflection_evidence import (
     merge_causal_entries,
 )
 from qwen_exo_booster.telemetry import TelemetryStore
+
+
+async def _write_retained_source(function, *args):
+    # Cancellation cannot stop a worker thread. Keep the owning producer alive
+    # until its commit/rollback completes, so erasure cannot overtake the write.
+    work = asyncio.create_task(asyncio.to_thread(function, *args))
+    cancelled = False
+    while not work.done():
+        try:
+            await asyncio.shield(work)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        work.result()
+        raise asyncio.CancelledError
+    return work.result()
+
 
 REFLECTION_MEMORY_TOOL_NAME = "record_causal_analysis"
 
@@ -503,8 +522,10 @@ class ReflectionSourceStore:
             raise ValueError("Reflection source retention must be positive")
         self.path = Path(path).expanduser().resolve()
         self.max_records = int(max_records)
+        self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
             database.execute("""
                 CREATE TABLE IF NOT EXISTS reflection_sources (
                     source_digest TEXT PRIMARY KEY,
@@ -520,6 +541,17 @@ class ReflectionSourceStore:
                     payload_json TEXT NOT NULL
                 )
                 """)
+            columns = {
+                row[1]
+                for row in database.execute("PRAGMA table_info(reflection_sources)")
+            }
+            if "payload_bytes" not in columns:
+                database.execute(
+                    "ALTER TABLE reflection_sources ADD COLUMN payload_bytes INTEGER NOT NULL DEFAULT 0"
+                )
+                database.execute(
+                    "UPDATE reflection_sources SET payload_bytes=length(CAST(payload_json AS BLOB))"
+                )
             database.execute(
                 "CREATE INDEX IF NOT EXISTS reflection_sources_captured_at "
                 "ON reflection_sources(captured_at DESC)"
@@ -527,7 +559,7 @@ class ReflectionSourceStore:
 
     @contextmanager
     def _connect(self):
-        with closing(sqlite3.connect(self.path, timeout=30.0)) as database:
+        with self._lock, closing(sqlite3.connect(self.path, timeout=30.0)) as database:
             with database:
                 yield database
 
@@ -539,7 +571,8 @@ class ReflectionSourceStore:
             sort_keys=True,
             separators=(",", ":"),
         )
-        if len(payload_json.encode("utf-8")) > _MAX_REFLECTION_SOURCE_BYTES:
+        payload_bytes = len(payload_json.encode("utf-8"))
+        if payload_bytes > _MAX_REFLECTION_SOURCE_BYTES:
             raise ValueError("Reflection source snapshot exceeds 16MB")
         metadata = snapshot.public_dict()
         with self._connect() as database:
@@ -549,8 +582,8 @@ class ReflectionSourceStore:
                     source_digest, trajectory_id, conversation_key, captured_at,
                     supersedes_source_digest, source_event_count, source_token_count,
                     trajectory_row_count, capsule_count, verifier_feedback_present,
-                    payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload_json, payload_bytes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot.source_digest,
@@ -564,6 +597,7 @@ class ReflectionSourceStore:
                     len(snapshot.capsule_history),
                     int(bool(snapshot.verifier_feedback.strip())),
                     payload_json,
+                    payload_bytes,
                 ),
             )
             database.execute(
@@ -773,7 +807,7 @@ class ReflectionMemoryService:
             turn_id=job_id,
             job_id=job_id,
             job_type=InternalJobType.REFLECTION_MEMORY,
-            priority=-25,
+            priority=-100,
             shared_prefix_key="qwen-exo:v1:reflection-causal:" + source_digest[:24],
             token_budget=token_budget,
             state_budget_bytes=0,
@@ -1298,7 +1332,7 @@ class ReflectionMemoryService:
             raise RuntimeError(
                 "Causal reflection requires durable evidence, source and memory stores"
             )
-        resolved = await asyncio.to_thread(
+        resolved = await _write_retained_source(
             self.evidence_store.append_rows, conversation_key, trajectory_id, history
         )
         history = tuple({row["event_id"]: row for row in resolved}.values())
@@ -1345,7 +1379,7 @@ class ReflectionMemoryService:
                 ):
                     snapshot_rows = ()
                     audit["capture"] = "journal_references"
-            await asyncio.to_thread(
+            await _write_retained_source(
                 self.source_store.save,
                 ReflectionSourceSnapshot(
                     source_digest=source_digest,

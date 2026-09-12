@@ -36,6 +36,7 @@ from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.native_state_bank import (
     NativeStateBankError,
     load_page_key_heads,
+    reuse_page_artifacts,
     validate_page_artifacts,
 )
 
@@ -203,6 +204,7 @@ class TensorBankPage:
     span_count: int
     surprisal_peak: float
     surprisal_mean: float
+    compile_identity: str = ""
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -219,6 +221,7 @@ class TensorBankPage:
             "model_native": self.model_native,
             "radix_namespace": self.radix_namespace,
             "prefix_identity": self.prefix_identity,
+            "compile_identity": self.compile_identity,
             "salient_positions": list(self.salient_positions),
             "salient_tokens": len(self.salient_positions),
             "anchor_count": self.anchor_count,
@@ -549,10 +552,27 @@ class TensorBank:
             return self._snapshot
         loaded = self._load(source_digest)
         if loaded is not None:
+            self._save(loaded)
             self._snapshot = loaded
             self._resident_page_ids = {page.page_id for page in loaded.pages}
             return loaded
 
+        previous_snapshot = self._snapshot
+        if previous_snapshot.ready:
+            self._save(previous_snapshot, publish=False)
+        generation_root = self.native_root / source_digest
+        retained_artifacts = (
+            frozenset(generation_root.iterdir())
+            if generation_root.is_dir()
+            else frozenset()
+        )
+        previous_pages = {
+            (page.lane, page.document_id): (page, keys)
+            for page, keys in zip(
+                previous_snapshot.pages, previous_snapshot.raw_key_heads
+            )
+        }
+        reused_keys: dict[int, torch.Tensor] = {}
         descriptors: list[dict[str, Any]] = []
         prompts: list[tuple[int, ...]] = []
         label_starts: list[int] = []
@@ -562,9 +582,7 @@ class TensorBank:
                 qualifier_text = (
                     _COGNITION_INDEX_PREFIX
                     if lane == "cognition"
-                    else _POLICY_INDEX_PREFIX
-                    if lane == "policydata"
-                    else _INDEX_PREFIX
+                    else _POLICY_INDEX_PREFIX if lane == "policydata" else _INDEX_PREFIX
                 )
                 qualifier_ids = tuple(
                     int(token)
@@ -611,9 +629,7 @@ class TensorBank:
                     cognition_token_count = (
                         len(raw_document_ids)
                         if lane == "cognition"
-                        else 0
-                        if lane == "policydata"
-                        else len(cognition_ids)
+                        else 0 if lane == "policydata" else len(cognition_ids)
                     )
                     required_prefix_token_count = (
                         len(document_ids)
@@ -675,6 +691,15 @@ class TensorBank:
                             "capture_start": len(qualifier_ids),
                             "capture_count": len(state_ids),
                             "page_identity": page_identity,
+                            "compile_identity": self._compile_identity(
+                                lane,
+                                document.sha256,
+                                qualifier_ids + state_ids,
+                                len(qualifier_ids),
+                                len(document_ids),
+                                cognition_token_count,
+                                required_prefix_token_count,
+                            ),
                         }
                     )
                     prompts.append(qualifier_ids + state_ids)
@@ -684,11 +709,47 @@ class TensorBank:
                 self._snapshot = snapshot
                 return snapshot
 
-            self._discard_native_artifacts(source_digest)
-            for batch_start, batch_end in self._bank_index_batch_ranges(prompts):
-                batch_prompts = prompts[batch_start:batch_end]
-                batch_descriptors = descriptors[batch_start:batch_end]
-                batch_label_starts = label_starts[batch_start:batch_end]
+            pending_indices = []
+            for index, descriptor in enumerate(descriptors):
+                previous = previous_pages.get(
+                    (descriptor["lane"], descriptor["document_id"])
+                )
+                if (
+                    previous is None
+                    or previous[0].compile_identity != descriptor["compile_identity"]
+                ):
+                    pending_indices.append(index)
+                    continue
+                page, keys = previous
+                reuse_page_artifacts(
+                    self.native_root,
+                    source_digest=previous_snapshot.source_digest,
+                    page_id=page.page_id,
+                    prefix_identity=page.prefix_identity,
+                    target_digest=source_digest,
+                    target_page_id=index,
+                    target_prefix_identity=descriptor["page_identity"],
+                    world_size=self._tp_world_size(),
+                    model_fingerprint=self.model_fingerprint,
+                    token_ids=prompts[index][descriptor["capture_start"] :],
+                )
+                for name in (
+                    "salient_positions",
+                    "anchor_count",
+                    "span_count",
+                    "surprisal_peak",
+                    "surprisal_mean",
+                ):
+                    descriptor[name] = getattr(page, name)
+                reused_keys[index] = keys
+            pending_prompts = [prompts[index] for index in pending_indices]
+            for batch_start, batch_end in self._bank_index_batch_ranges(
+                pending_prompts
+            ):
+                indices = pending_indices[batch_start:batch_end]
+                batch_prompts = [prompts[index] for index in indices]
+                batch_descriptors = [descriptors[index] for index in indices]
+                batch_label_starts = [label_starts[index] for index in indices]
                 parent_id = f"qwen-exo-bank:{source_digest[:16]}:{batch_start}"
                 deadline = time.monotonic() + self.timeout_seconds
                 shared_prefix_key = self._radix_namespace(source_digest)
@@ -755,20 +816,26 @@ class TensorBank:
                         self._compile_salient_plan(descriptor, surprisals)
                     )
 
-            for descriptor in descriptors:
-                await self._wait_for_native_page_artifacts(source_digest, descriptor)
+            for index in pending_indices:
+                await self._wait_for_native_page_artifacts(
+                    source_digest, descriptors[index]
+                )
 
             raw_key_heads = tuple(
-                load_page_key_heads(
-                    self.native_root,
-                    source_digest=source_digest,
-                    page_id=int(descriptor["page_id"]),
-                    world_size=self._tp_world_size(),
-                    model_fingerprint=self.model_fingerprint,
-                    prefix_identity=str(descriptor["page_identity"]),
-                    token_count=int(descriptor["capture_count"]),
-                    dtype=torch.float32,
-                    layer_id=self.qk_layer_id,
+                (
+                    reused_keys[int(descriptor["page_id"])]
+                    if int(descriptor["page_id"]) in reused_keys
+                    else load_page_key_heads(
+                        self.native_root,
+                        source_digest=source_digest,
+                        page_id=int(descriptor["page_id"]),
+                        world_size=self._tp_world_size(),
+                        model_fingerprint=self.model_fingerprint,
+                        prefix_identity=str(descriptor["page_identity"]),
+                        token_count=int(descriptor["capture_count"]),
+                        dtype=torch.float32,
+                        layer_id=self.qk_layer_id,
+                    )
                 )
                 for descriptor in descriptors
             )
@@ -794,6 +861,7 @@ class TensorBank:
                     model_native=True,
                     radix_namespace=self._radix_namespace(source_digest),
                     prefix_identity=str(descriptor["page_identity"]),
+                    compile_identity=str(descriptor["compile_identity"]),
                     salient_positions=tuple(descriptor["salient_positions"]),
                     anchor_count=int(descriptor["anchor_count"]),
                     span_count=int(descriptor["span_count"]),
@@ -815,19 +883,46 @@ class TensorBank:
                 span_tokens=self.span_tokens,
             )
             self._save(snapshot)
-            self._snapshot = self._load(source_digest) or snapshot
+            self._snapshot = snapshot
             self._resident_page_ids = {page.page_id for page in pages}
             self._failure_digest = None
             self._compile_failure = None
             return self._snapshot
         except TensorBankCompileError as error:
-            self._discard_native_artifacts(source_digest)
+            self._discard_native_artifacts(source_digest, retained_artifacts)
             self._failure_digest = source_digest
             self._compile_failure = error
             raise
         except Exception:
-            self._discard_native_artifacts(source_digest)
+            self._discard_native_artifacts(source_digest, retained_artifacts)
             raise
+
+    def _compile_identity(
+        self,
+        lane: str,
+        reference_digest: str,
+        prompt: tuple[int, ...],
+        capture_start: int,
+        source_count: int,
+        cognition_count: int,
+        required_prefix_count: int,
+    ) -> str:
+        return stable_digest(
+            _BANK_SCHEMA,
+            self.model_fingerprint,
+            self._tp_world_size(),
+            lane,
+            reference_digest,
+            prompt,
+            capture_start,
+            source_count,
+            cognition_count,
+            required_prefix_count,
+            self.max_document_tokens,
+            self.salient_token_budget,
+            self.surprisal_threshold,
+            self.span_tokens,
+        )
 
     def _compile_salient_plan(
         self, descriptor: Mapping[str, Any], surprisals: tuple[float, ...]
@@ -1007,8 +1102,16 @@ class TensorBank:
                     raise
                 await asyncio.sleep(min(0.05, remaining))
 
-    def _discard_native_artifacts(self, source_digest: str) -> None:
-        shutil.rmtree(self.native_root / source_digest, ignore_errors=True)
+    def _discard_native_artifacts(
+        self, source_digest: str, retained_artifacts: frozenset[Path] = frozenset()
+    ) -> None:
+        directory = self.native_root / source_digest
+        if not retained_artifacts:
+            shutil.rmtree(directory, ignore_errors=True)
+        elif directory.is_dir():
+            for path in directory.iterdir():
+                if path not in retained_artifacts and path.is_file():
+                    path.unlink(missing_ok=True)
 
     @staticmethod
     def _top_mean(values: list[float], limit: int) -> float:
@@ -1335,12 +1438,8 @@ class TensorBank:
             for group_key in grouped_documents
         }
         lexical_scores = self._lexical_scores(query_text, effective_document_scores)
-        fusion_rank = self._fused_rank(
-            effective_relative_scores, lexical_scores
-        )
-        background_gate = (
-            len(effective_relative_scores) >= _RELATIVE_GATE_MIN_DOCUMENTS
-        )
+        fusion_rank = self._fused_rank(effective_relative_scores, lexical_scores)
+        background_gate = len(effective_relative_scores) >= _RELATIVE_GATE_MIN_DOCUMENTS
         if fusion_rank:
             ranked_by_score.sort(key=lambda item: fusion_rank[item[0]])
         ranked_documents = self._diversify_ranked_documents(list(ranked_by_score))
@@ -1664,9 +1763,7 @@ class TensorBank:
         """
         if not lexical_scores:
             return {}
-        qk_order = sorted(
-            relative_scores, key=lambda key: (-relative_scores[key], key)
-        )
+        qk_order = sorted(relative_scores, key=lambda key: (-relative_scores[key], key))
         lexical_order = sorted(
             lexical_scores, key=lambda key: (-lexical_scores[key], key)
         )
@@ -2237,11 +2334,13 @@ class TensorBank:
         return f"qwen-exo:v1:tensor-bank-index:{source_digest[:32]}"
 
     def _load(self, expected_digest: str) -> TensorBankSnapshot | None:
-        if not self.path.is_file():
+        generation_path = self.native_root / expected_digest / "index.pt"
+        path = generation_path if generation_path.is_file() else self.path
+        if not path.is_file():
             return None
         try:
             payload = torch.load(
-                str(self.path), map_location="cpu", mmap=True, weights_only=True
+                str(path), map_location="cpu", mmap=True, weights_only=True
             )
             if (
                 not isinstance(payload, dict)
@@ -2278,6 +2377,7 @@ class TensorBank:
                     model_native=bool(item["model_native"]),
                     radix_namespace=str(item["radix_namespace"]),
                     prefix_identity=str(item["prefix_identity"]),
+                    compile_identity=str(item.get("compile_identity") or ""),
                     salient_positions=tuple(
                         int(value) for value in item["salient_positions"]
                     ),
@@ -2330,6 +2430,57 @@ class TensorBank:
                     )
                 ):
                     return None
+                qualifier = (
+                    _COGNITION_INDEX_PREFIX
+                    if page.lane == "cognition"
+                    else (
+                        _POLICY_INDEX_PREFIX
+                        if page.lane == "policydata"
+                        else _INDEX_PREFIX
+                    )
+                )
+                qualifier_ids = tuple(
+                    int(token)
+                    for token in self.tokenizer.encode(
+                        qualifier, add_special_tokens=False
+                    )
+                )
+                required_prefix_count = (
+                    len(document_ids)
+                    if page.lane == "cognition"
+                    else page.cognition_token_count
+                    + (
+                        min(
+                            _POLICY_NATIVE_PREFIX_TOKENS,
+                            len(document_ids),
+                            max(
+                                0,
+                                self.salient_token_budget - page.cognition_token_count,
+                            ),
+                        )
+                        if page.lane == "policydata"
+                        else 0
+                    )
+                )
+                compile_identity = self._compile_identity(
+                    page.lane,
+                    page.reference_digest,
+                    qualifier_ids + state_ids,
+                    len(qualifier_ids),
+                    len(document_ids),
+                    page.cognition_token_count,
+                    required_prefix_count,
+                )
+                if page.compile_identity and page.compile_identity != compile_identity:
+                    return None
+                if not page.compile_identity:
+                    # Schema-12 snapshots already validate exact document/cognition
+                    # tokens above; materialize their compile identity on load.
+                    pages = (
+                        *pages[:index],
+                        replace(page, compile_identity=compile_identity),
+                        *pages[index + 1 :],
+                    )
                 validate_page_artifacts(
                     self.native_root,
                     source_digest=expected_digest,
@@ -2373,9 +2524,7 @@ class TensorBank:
         except (OSError, RuntimeError, TypeError, ValueError, KeyError, IndexError):
             return None
 
-    def _save(self, snapshot: TensorBankSnapshot) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+    def _save(self, snapshot: TensorBankSnapshot, *, publish: bool = True) -> None:
         payload = {
             "schema": _BANK_SCHEMA,
             "source_digest": snapshot.source_digest,
@@ -2389,11 +2538,16 @@ class TensorBank:
             "retrieval_aggregation": "top4_heads_template_masked_local_window_top4_queries_relative_shadow",
             "pages": [page.public_dict() for page in snapshot.pages],
         }
-        try:
-            torch.save(payload, temporary)
-            os.replace(temporary, self.path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        generation_path = self.native_root / snapshot.source_digest / "index.pt"
+        paths = (generation_path, self.path) if publish else (generation_path,)
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            try:
+                torch.save(payload, temporary)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
 
 __all__ = [

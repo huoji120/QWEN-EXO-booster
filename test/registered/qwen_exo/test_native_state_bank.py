@@ -578,6 +578,190 @@ async def test_tensor_bank_batches_documents_within_fanout_and_token_budget(tmp_
 
 
 @pytest.mark.asyncio
+async def test_bank_reuses_exact_states_across_insert_restart_and_rollback(tmp_path):
+    root = tmp_path / "knowledge"
+    root.mkdir()
+    original = " ".join(f"original-token-{i}" for i in range(150))
+    (root / "b.md").write_text(original, encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    runner = _BankBuildRunner(tmp_path / "native-bank", "model-fingerprint")
+
+    def create_bank():
+        return TensorBank(
+            tmp_path / "tensor-bank.pt",
+            runner,
+            _WordTokenizer(),
+            {"knowledge": repository},
+            model_fingerprint="model-fingerprint",
+            tp_size=1,
+            salient_token_budget=128,
+        )
+
+    bank = create_bank()
+    first = await bank.ensure_ready()
+    initial = _load_page_payload(
+        runner.root, source_digest=first.source_digest, page_id=0, rank=0
+    )
+    # Insertion moves the logical page ID, but must not change its native state.
+    (root / "a.md").write_text("new document " * 90, encoding="utf-8")
+    repository.refresh()
+    second = await bank.ensure_ready()
+    assert len(runner.batch_prompt_tokens[-1]) == 1
+    page = next(page for page in second.pages if page.relative_path == "b.md")
+    reused = _load_page_payload(
+        runner.root, source_digest=second.source_digest, page_id=page.page_id, rank=0
+    )
+    assert reused["token_ids"] == initial["token_ids"]
+    for name in ("key", "value"):
+        torch.testing.assert_close(
+            _dequantize_fp8(
+                reused["full_attention"]["0"][name],
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            ),
+            _dequantize_fp8(
+                initial["full_attention"]["0"][name],
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            ),
+        )
+    torch.testing.assert_close(
+        _dequantize_fp8(
+            reused["section_delta"]["temporal"],
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ),
+        _dequantize_fp8(
+            initial["section_delta"]["temporal"],
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ),
+    )
+    assert (
+        _page_path(runner.root, second.source_digest, page.page_id, 0).stat().st_size
+        < _page_path(runner.root, first.source_digest, 0, 0).stat().st_size / 2
+    )
+    bank = create_bank()
+    calls = runner.calls
+    assert (await bank.ensure_ready()).source_digest == second.source_digest
+    assert runner.calls == calls
+    (root / "c.md").write_text("third document " * 90, encoding="utf-8")
+    repository.refresh()
+    third = await bank.ensure_ready()
+    page = next(page for page in third.pages if page.relative_path == "b.md")
+    manifest = torch.load(
+        _page_path(runner.root, third.source_digest, page.page_id, 0), weights_only=True
+    )
+    assert manifest["reused_from"]["source_digest"] == first.source_digest
+    # Rollback must load the retained generation, not delete referenced tensors.
+    (root / "a.md").unlink()
+    (root / "c.md").unlink()
+    repository.refresh()
+    calls = runner.calls
+    assert (await bank.ensure_ready()).source_digest == first.source_digest
+    assert runner.calls == calls
+    canonical = torch.load(tmp_path / "tensor-bank.pt", weights_only=True)
+    assert canonical["source_digest"] == first.source_digest
+    assert [item["relative_path"] for item in canonical["pages"]] == ["b.md"]
+    still_readable = _load_page_payload(
+        runner.root, source_digest=third.source_digest, page_id=page.page_id, rank=0
+    )
+    assert still_readable["token_ids"] == initial["token_ids"]
+
+
+@pytest.mark.asyncio
+async def test_bank_recompiles_knowledge_when_personality_conditioning_changes(
+    tmp_path,
+):
+    knowledge_root = tmp_path / "knowledge"
+    policy_root = tmp_path / "policy"
+    knowledge_root.mkdir()
+    policy_root.mkdir()
+    (knowledge_root / "reference.md").write_text("knowledge " * 150, encoding="utf-8")
+    (policy_root / "identity.md").write_text(
+        "careful personality " * 80, encoding="utf-8"
+    )
+    knowledge = KnowledgeRepository(knowledge_root)
+    policy = KnowledgeRepository(policy_root)
+    knowledge.refresh()
+    policy.refresh()
+    runner = _BankBuildRunner(tmp_path / "native-bank", "model-fingerprint")
+    bank = TensorBank(
+        tmp_path / "tensor-bank.pt",
+        runner,
+        _WordTokenizer(),
+        {"knowledge": knowledge, "policydata": policy},
+        model_fingerprint="model-fingerprint",
+        tp_size=1,
+    )
+    first = await bank.ensure_ready()
+    (policy_root / "identity.md").write_text(
+        "different personality " * 80, encoding="utf-8"
+    )
+    policy.refresh()
+    second = await bank.ensure_ready()
+    assert len(runner.batch_prompt_tokens[-1]) == 2
+    old_page = next(page for page in first.pages if page.lane == "knowledge")
+    new_page = next(page for page in second.pages if page.lane == "knowledge")
+    old = _load_page_payload(
+        runner.root, source_digest=first.source_digest, page_id=old_page.page_id, rank=0
+    )
+    new = _load_page_payload(
+        runner.root,
+        source_digest=second.source_digest,
+        page_id=new_page.page_id,
+        rank=0,
+    )
+    assert old["token_ids"] != new["token_ids"]
+
+
+@pytest.mark.asyncio
+async def test_bank_reference_rejects_missing_or_chained_source(tmp_path):
+    root = tmp_path / "knowledge"
+    root.mkdir()
+    (root / "b.md").write_text("original " * 150, encoding="utf-8")
+    repository = KnowledgeRepository(root)
+    repository.refresh()
+    runner = _BankBuildRunner(tmp_path / "native-bank", "model-fingerprint")
+    bank = TensorBank(
+        tmp_path / "tensor-bank.pt",
+        runner,
+        _WordTokenizer(),
+        {"knowledge": repository},
+        model_fingerprint="model-fingerprint",
+        tp_size=1,
+    )
+    first = await bank.ensure_ready()
+    (root / "a.md").write_text("added " * 150, encoding="utf-8")
+    repository.refresh()
+    second = await bank.ensure_ready()
+    page = next(page for page in second.pages if page.relative_path == "b.md")
+    path = _page_path(runner.root, second.source_digest, page.page_id, 0)
+    manifest = torch.load(path, weights_only=True)
+    base_path = _page_path(runner.root, first.source_digest, 0, 0)
+    base = torch.load(base_path, weights_only=True)
+    base["schema"] = manifest["schema"]
+    base["reused_from"] = manifest["reused_from"]
+    torch.save(base, base_path)
+    with pytest.raises(RuntimeError, match="stale or chained"):
+        _load_page_payload(
+            runner.root,
+            source_digest=second.source_digest,
+            page_id=page.page_id,
+            rank=0,
+        )
+    base_path.unlink()
+    with pytest.raises(RuntimeError, match="missing"):
+        _load_page_payload(
+            runner.root,
+            source_digest=second.source_digest,
+            page_id=page.page_id,
+            rank=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_tensor_bank_builds_one_document_state_with_aligned_surprisal_spans(
     tmp_path,
 ):

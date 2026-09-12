@@ -118,6 +118,14 @@ The block heatmap shows **sampled query positions × contiguous token blocks**, 
 
 Endpoints: `POST /qwen-exo/attention-diagnostics/preview` and `POST /qwen-exo/attention-diagnostics/run`. Both the control plane and model workers must load a supporting version; updating static assets alone does not activate sampling.
 
+### Server session management
+
+The **Server sessions** console page (`#/server-sessions`) supports conversation-ID search, pagination, single deletion, cross-page selection, and clear-all. It shows update time, event count, estimated retained payload bytes, snapshot count, and busy status. Deletion requires explicit confirmation; clear-all ignores the current search and page. Sessions with active requests or source-writing reflection work are conservatively skipped without interrupting inference.
+
+Deletion removes the conversation's retained event journal, all source snapshots, and in-memory trajectories/pending reflection sources. These records are then unavailable for diagnostic import or re-reflection. Published Reflection/Knowledge documents, personality, Tensor Bank, serving Responses state, and browser chat history remain unchanged. This is not a complete privacy purge of telemetry, analysis caches, or backups. SQLite free pages remain reusable, but files may not immediately shrink. Future client requests that resend history can create new retained records.
+
+Endpoints: `GET /qwen-exo/server-sessions?limit=25&offset=0&q=` and `POST /qwen-exo/server-sessions/delete`, accepting either `{"conversation_keys":["conversation ID"]}` or `{"all":true}` and returning deleted, skipped-busy, and missing lists. These belong to the existing control plane, not the public `/v1` gateway, and require a supporting backend version.
+
 ## Measured
 
 ### DeepSWE memory recall · GraphQL SWE: perfect score after 18 rounds

@@ -15,6 +15,11 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Iterable
+from qwen_exo_booster.server_sessions import (
+    retained_source_producer,
+    require_source_admission,
+    wait_source_admission,
+)
 
 from qwen_exo_booster.activation_editor import (
     parse_activation_editor_spec,
@@ -1139,7 +1144,7 @@ class QwenExoRuntime:
                 turn_id=f"{parent_id}:{reason}",
                 job_id=job_id,
                 job_type=InternalJobType.REFLECTION_MEMORY,
-                priority=-30,
+                priority=-100,
                 shared_prefix_key=(
                     _SESSION_INITIAL_GDN_CACHE_PREFIX
                     + str(prompt["source_digest"])[:24]
@@ -1852,6 +1857,7 @@ class QwenExoRuntime:
             parts.append(cognition)
         return "\n\n".join(parts) or None
 
+    @retained_source_producer
     async def prepare_responses_request(
         self, request: Any
     ) -> tuple[Any, MemoryPreparationState | None]:
@@ -2433,6 +2439,7 @@ class QwenExoRuntime:
             str(record.get("summary") or ""),
         )
 
+    @retained_source_producer
     async def compact_responses(self, request: Any) -> dict[str, Any]:
         if self.config.response_compaction_mode == "off":
             raise ResponseCompactionError(
@@ -6117,6 +6124,7 @@ class QwenExoRuntime:
                 )
             )
             await asyncio.sleep(delay_seconds)
+            await wait_source_admission(self)
             if not force and (
                 self._reflection_memory_last_activity.get(conversation_key)
                 != activity_at
@@ -6135,6 +6143,10 @@ class QwenExoRuntime:
             if pending is not None and pending.source_digest == source_digest:
                 pending.status = "running"
                 pending.started_at = time.time()
+            producers = getattr(self, "_server_session_reflections", None)
+            if producers is None:
+                producers = self._server_session_reflections = set()
+            producers.add(asyncio.current_task())
             reflection = await self.reflection_memory_service.reflect(
                 trajectory_id=trajectory_id,
                 conversation_key=conversation_key,
@@ -6179,6 +6191,9 @@ class QwenExoRuntime:
                 },
             )
         finally:
+            getattr(self, "_server_session_reflections", set()).discard(
+                asyncio.current_task()
+            )
             current = self._reflection_memory_tasks.get(conversation_key)
             if current is asyncio.current_task():
                 self._reflection_memory_tasks.pop(conversation_key, None)
@@ -6203,6 +6218,7 @@ class QwenExoRuntime:
     def start_pending_reflections(
         self, conversation_keys: Iterable[str]
     ) -> dict[str, Any]:
+        require_source_admission(self)
         keys = tuple(
             dict.fromkeys(
                 str(key).strip() for key in conversation_keys if str(key).strip()
@@ -6637,6 +6653,7 @@ class QwenExoRuntime:
         verifier_feedback: str,
         expected_document_sha256: str,
     ) -> dict[str, Any]:
+        require_source_admission(self)
         if (
             self.reflection_memory_service is None
             or self.tensor_bank is None
