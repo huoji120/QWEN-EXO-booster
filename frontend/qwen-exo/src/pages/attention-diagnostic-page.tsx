@@ -8,12 +8,14 @@ import { loadSessions } from "@/lib/session-store";
 import type { ChatSession } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
 import { AttentionBlockHeatmap } from "@/components/attention-block-heatmap";
+import { DependencyTextHeatmap } from "@/components/dependency-text-heatmap";
 import {
   classifyAttentionTokens,
   visibleTokenText,
   type AttentionMessage,
   type AttentionReport,
   type AttributionCategory,
+  type DependencyReport,
 } from "@/lib/attention-diagnostic-view";
 
 type Conversation = {
@@ -62,10 +64,14 @@ export function AttentionDiagnosticPage() {
   const [sampleCount, setSampleCount] = useState(1);
   const [selectedLayers, setSelectedLayers] = useState<number[] | null>(null);
   const [report, setReport] = useState<AttentionReport | null>(null);
+  const [dependencyReport, setDependencyReport] = useState<DependencyReport | null>(null);
+  const [probeToken, setProbeToken] = useState("");
+  const [dependencyBlockSize, setDependencyBlockSize] = useState(64);
+  const [resultTab, setResultTab] = useState<"attention" | "dependency">("attention");
   const [sampleIndex, setSampleIndex] = useState(0);
   const [layerIndex, setLayerIndex] = useState(0);
   const [page, setPage] = useState(0);
-  const [busy, setBusy] = useState<"preview" | "run" | null>(null);
+  const [busy, setBusy] = useState<"preview" | "run" | "dependency" | null>(null);
   const [error, setError] = useState("");
   const controller = useRef<AbortController | null>(null);
   const fileVersion = useRef(0);
@@ -216,11 +222,11 @@ export function AttentionDiagnosticPage() {
       }
     }
   }
-
   function invalidate() {
     stopRequests();
     setError("");
     setReport(null);
+    setDependencyReport(null);
   }
   function replaceContent(next: string, name = "") {
     invalidate();
@@ -238,10 +244,7 @@ export function AttentionDiagnosticPage() {
     if (!file) return;
     stopRequests();
     const version = fileVersion.current;
-    if (file.size > MAX_BYTES) {
-      setError(t("文件不能超过 2 MiB"));
-      return;
-    }
+    if (file.size > MAX_BYTES) { setError(t("文件不能超过 2 MiB")); return; }
     try {
       const text = await file.text();
       if (fileVersion.current === version) replaceContent(text, file.name);
@@ -249,66 +252,25 @@ export function AttentionDiagnosticPage() {
       if (fileVersion.current === version) setError(String(cause));
     }
   }
-  async function request(mode: "preview" | "run", selectedEndMessage?: number) {
-    if (mode === "run" && !canRun) return;
-    if (new TextEncoder().encode(content).length > MAX_BYTES) {
-      setError(t("文件不能超过 2 MiB"));
-      return;
-    }
-    invalidate();
-    if (mode === "preview") {
-      setTokenBudget(null);
-      setEndToken(null);
-      if (selectedEndMessage !== undefined) setEndMessage(selectedEndMessage);
-    }
-    const current = new AbortController();
-    controller.current = current;
-    setBusy(mode);
+  async function request(mode: "preview" | "run" | "dependency", selectedEndMessage?: number) {
+    if ((mode === "run" || mode === "dependency") && !canRun) return;
+    if (new TextEncoder().encode(content).length > MAX_BYTES) { setError(t("文件不能超过 2 MiB")); return; }
+    if (mode === "preview") { setTokenBudget(null); setEndToken(null); if (selectedEndMessage !== undefined) setEndMessage(selectedEndMessage); }
+    setError("");
+    const current = new AbortController(); controller.current = current; setBusy(mode);
     try {
-      const response = await apiFetch(`/attention-diagnostics/${mode}`, {
-        method: "POST",
-        signal: current.signal,
-        body: JSON.stringify({
-          content,
-          filename: filename || undefined,
-          ...(mode === "run"
-            ? {
-                end_message: endMessage,
-                sample_count: sampleCount,
-                layer_ids: layerIds,
-                ...(endToken !== null ? { end_token: Number(endToken) } : {}),
-              }
-            : { end_message: selectedEndMessage }),
-        }),
-      });
-      const data = await response.json();
-      if (current.signal.aborted) return;
-      if (mode === "preview") {
-        const nextEndMessage = data.token_budget.end_message;
-        setPreview(data as Preview);
-        setEndMessage(nextEndMessage);
-        setTokenBudget(data.token_budget);
-      } else {
-        setReport(data as AttentionReport);
-        setSampleIndex(0);
-        setLayerIndex(0);
-        setPage(0);
-      }
-    } catch (cause) {
-      if (!current.signal.aborted)
-        setError(
-          cause instanceof ApiError && cause.status === 404
-            ? t("当前后端未提供注意力诊断接口；需部署支持版本。")
-            : cause instanceof Error
-              ? cause.message
-              : String(cause),
-        );
-    } finally {
-      if (controller.current === current) {
-        controller.current = null;
-        setBusy(null);
-      }
-    }
+      const endpoint = mode === "dependency" ? "dependency" : mode;
+      const body = mode === "preview" ? { content, filename: filename || undefined, end_message: selectedEndMessage } : {
+        content, filename: filename || undefined, end_message: endMessage,
+        ...(mode === "run" ? { sample_count: sampleCount, layer_ids: layerIds, ...(endToken !== null ? { end_token: Number(endToken) } : {}) } : { ...(endToken !== null ? { end_token: Number(endToken) } : {}), ...(probeToken.trim() ? { probe_token: probeToken } : {}), block_size: dependencyBlockSize }),
+      };
+      const response = await apiFetch(`/attention-diagnostics/${endpoint}`, { method: "POST", signal: current.signal, body: JSON.stringify(body) });
+      const data = await response.json(); if (current.signal.aborted) return;
+      if (mode === "preview") { setPreview(data as Preview); setEndMessage(data.token_budget.end_message); setTokenBudget(data.token_budget); }
+      else if (mode === "dependency") { setDependencyReport(data as DependencyReport); setResultTab("dependency"); }
+      else { setReport(data as AttentionReport); setResultTab("attention"); setSampleIndex(0); setLayerIndex(0); setPage(0); }
+    } catch (cause) { if (!current.signal.aborted) setError(cause instanceof ApiError && cause.status === 404 ? t("当前后端未提供注意力诊断接口；需部署支持版本。") : cause instanceof Error ? cause.message : String(cause)); }
+    finally { if (controller.current === current) { controller.current = null; setBusy(null); } }
   }
   const sample = report?.samples[sampleIndex];
   const layer = sample?.layers[layerIndex];
@@ -876,23 +838,42 @@ export function AttentionDiagnosticPage() {
           ))}
         </section>
       )}
-      {busy === "run" && (
+      {busy === "run" || busy === "dependency" ? (
         <div role="status" className="flex items-center gap-2 text-sm">
           <LoaderCircle className="h-4 w-4 animate-spin" />
-          {t("模型正在计算采样；可取消，不会保存对话。")}
+          {busy === "dependency" ? t("正在计算依赖探针；可取消，不会保存对话。") : t("模型正在计算采样；可取消，不会保存对话。")}
         </div>
-      )}
+      ) : null}
+      <fieldset className="space-y-3 rounded-md border p-4" disabled={!!busy || importBusy}>
+        <legend className="px-1 text-sm font-medium">{t("依赖探针")}</legend>
+        <p className="text-xs text-muted-foreground">{t("移除连续 token 块后，重新计算固定 probe token 的 log-probability；delta 越大表示局部预测依赖更强，不是整体注意力或因果证明。")}</p>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="flex min-w-0 flex-1 basis-40 flex-col gap-2 text-sm">{t("固定 probe token（可选）")}
+            <Input value={probeToken} maxLength={128} onChange={(event) => { invalidate(); setProbeToken(event.target.value); }} placeholder={t("默认使用后续 token")} />
+          </label>
+          <label className="flex flex-col gap-2 text-sm">{t("块大小")}
+            <select className={selectClass} value={dependencyBlockSize} onChange={(event) => { invalidate(); setDependencyBlockSize(Number(event.target.value)); }}>
+              {[16, 64, 256].map((size) => <option key={size} value={size}>{size}</option>)}
+            </select>
+          </label>
+          <Button disabled={!canRun} onClick={() => void request("dependency")}><Play className="h-4 w-4" />{t("运行依赖探针")}</Button>
+        </div>
+      </fieldset>
       {error && (
-        <div
-          role="alert"
-          className="rounded-lg border border-destructive/40 p-4 text-sm text-destructive"
-        >
-          {error}
-        </div>
+        <div role="alert" className="rounded-lg border border-destructive/40 p-4 text-sm text-destructive">{error}</div>
       )}
-      {report && sample && layer && (
+      {dependencyReport && resultTab === "dependency" && (
+        <section className="min-w-0 space-y-4 rounded-lg border p-4 sm:p-6">
+          <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-semibold">{t("依赖探针结果")}</h2><Button variant="outline" onClick={() => setResultTab("attention")} disabled={!report}>{t("查看注意力结果")}</Button></div>
+          <p className="text-xs text-muted-foreground">{t("固定 probe token：{token} · 基线 log-probability：{value}", { token: dependencyReport.probe_token, value: dependencyReport.base_logprob.toFixed(5) })}</p>
+          <p className="text-xs text-muted-foreground">{t("delta 越大表示移除该局部 token 块后，固定 probe token 的 log-probability 下降越多；这是局部预测依赖，不是整体模型关注度，也不是完整输出的因果证明。")}</p>
+          <DependencyTextHeatmap report={dependencyReport} />
+          {dependencyReport.warnings.map((warning, index) => <p key={index} className="text-xs text-muted-foreground">{warning}</p>)}
+        </section>
+      )}
+      {report && sample && layer && resultTab === "attention" && (
         <section className="space-y-4 rounded-lg border p-4 sm:p-6">
-          <h2 className="font-semibold">{t("文本注意力热图")}</h2>
+          <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-semibold">{t("文本注意力热图")}</h2>{dependencyReport && <Button variant="outline" onClick={() => setResultTab("dependency")}>{t("查看依赖结果")}</Button>}</div>
           <p className="break-all text-xs text-muted-foreground">
             {report.model} · {report.prompt_tokens} tokens · {report.method}
           </p>

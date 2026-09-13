@@ -31,6 +31,27 @@ export type AttentionReport = {
   messages: AttentionMessage[];
   warnings: string[];
 };
+export type DependencyBlock = {
+  start: number;
+  end: number;
+  token_start: number;
+  token_end: number;
+  text: string;
+  ablated_logprob: number;
+  delta: number;
+};
+
+export type DependencyReport = {
+  schema: string;
+  method: string;
+  probe_token: string;
+  base_logprob: number;
+  blocks: DependencyBlock[];
+  warnings: string[];
+  tokens: AttentionToken[];
+  messages: AttentionMessage[];
+  rendered_prompt: string;
+};
 
 export type AttributionCategory =
   | "source"

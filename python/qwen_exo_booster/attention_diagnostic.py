@@ -26,6 +26,10 @@ _CHATML_END = re.compile(r"<\|im_end\|>|<\|endoftext\|>")
 _METHOD = "reconstructed_attention_estimate_mean_all_query_heads"
 
 
+DEPENDENCY_BLOCK_DEFAULT = 64
+DEPENDENCY_BLOCK_MAX = 256
+DEPENDENCY_MAX_BLOCKS = 32
+
 class AttentionDiagnosticError(ValueError):
     def __init__(self, message: str, status_code: int = 422):
         super().__init__(message)
@@ -971,3 +975,101 @@ async def run_attention_diagnostic(
         "messages": messages,
         "warnings": list(dict.fromkeys(warnings)),
     }
+
+async def run_attention_dependency_probe(
+    runtime: Any,
+    content: str,
+    filename: str | None,
+    end_message: int,
+    end_token: int | None = None,
+    probe_token: str | None = None,
+    block_size: int = DEPENDENCY_BLOCK_DEFAULT,
+) -> dict[str, Any]:
+    if type(block_size) is not int or not 1 <= block_size <= DEPENDENCY_BLOCK_MAX:
+        raise AttentionDiagnosticError("block_size must be 1..256")
+    manager = runtime.tokenizer_manager
+    tokenizer = getattr(manager, "tokenizer", None)
+    if tokenizer is None:
+        raise AttentionDiagnosticError("Active tokenizer is unavailable", 503)
+    rendered, messages, ids, tokens, warnings = await asyncio.to_thread(
+        _prepare_run, runtime, content, filename, end_message, end_token
+    )
+    if len(ids) < 1:
+        raise AttentionDiagnosticError("Rendered prompt contains no scoreable prefix")
+    if probe_token is not None and (not isinstance(probe_token, str) or not probe_token):
+        raise AttentionDiagnosticError("probe_token must be a nonempty string")
+    probe_ids = None
+    if probe_token is not None:
+        try:
+            probe_ids = list(tokenizer(probe_token, add_special_tokens=False)["input_ids"])
+        except Exception as exc:
+            raise AttentionDiagnosticError("probe_token could not be tokenized") from exc
+        if len(probe_ids) != 1 or type(probe_ids[0]) is not int:
+            raise AttentionDiagnosticError("probe_token must tokenize to exactly one token")
+    _preflight_worker(manager)
+    parent = "attention-dependency-" + uuid.uuid4().hex
+    namespace = "qwen-exo:v1:attention-dependency:" + parent
+    deadline = time.monotonic() + DIAGNOSTIC_TIMEOUT_SECONDS
+
+    def make_job(suffix: str) -> InternalJob:
+        return InternalJob(
+            parent_request_id=parent, turn_id=parent, job_id=f"{parent}-{suffix}",
+            job_type=InternalJobType.CAUSAL_REPLAY, priority=-12,
+            shared_prefix_key=namespace, token_budget=1, state_budget_bytes=0,
+            deadline_monotonic=deadline,
+            cancellation_token=CancellationToken("cancel:" + parent),
+            telemetry_correlation_id=parent,
+            max_fanout=min(32, runtime.internal_jobs.max_fanout),
+        )
+    async def score(prefix: list[int], token_id: int, suffix: str) -> float:
+        result = await runtime.internal_jobs.run_score_batch(
+            (make_job(suffix),), ((tuple(prefix) + (token_id,)),), (max(0, len(prefix) - 1),),
+            {"temperature": 0, "top_p": 1, "top_k": 1, "skip_special_tokens": True},
+            extra_keys=(namespace + ":" + suffix,),
+        )
+        if len(result) != 1 or result[0].prompt_tokens != len(prefix) + 1:
+            raise AttentionDiagnosticError("Worker returned mismatched dependency score", 503)
+        values = result[0].token_logprobs
+        if len(values) != 1 or not math.isfinite(values[0]):
+            raise AttentionDiagnosticError("Worker returned no fixed-token logprob", 503)
+        return float(values[0])
+
+    try:
+        if probe_ids is None:
+            generated = await runtime.internal_jobs.run_batch(
+                (make_job("baseline-generate"),), (ids,),
+                {"temperature": 0, "top_p": 1, "top_k": 1, "skip_special_tokens": True},
+                extra_keys=(namespace + ":baseline-generate",),
+            )
+            output_ids = generated[0].metadata.get("output_ids") if len(generated) == 1 else None
+            if not isinstance(output_ids, (tuple, list)) or len(output_ids) != 1:
+                raise AttentionDiagnosticError("Worker did not return a scoreable baseline token", 503)
+            probe_ids = [int(output_ids[0])]
+            warnings.append("probe_token omitted; the target model's greedy baseline next token was selected explicitly.")
+        base = await score(ids, probe_ids[0], "base")
+        blocks = []
+        for start in range(0, len(ids), block_size):
+            if len(blocks) >= DEPENDENCY_MAX_BLOCKS:
+                warnings.append("Dependency blocks were capped at 32; remaining tokens were not probed.")
+                break
+            end = min(len(ids), start + block_size)
+            prefix = ids[:start] + ids[end:]
+            value = await score(prefix, probe_ids[0], f"block-{start}")
+            blocks.append({"start": start, "end": end, "token_start": start,
+                           "token_end": end, "text": rendered[tokens[start]["start"]:tokens[end - 1]["end"]],
+                           "ablated_logprob": value, "delta": base - value})
+    except asyncio.CancelledError:
+        await runtime.internal_jobs.cancel_parent(parent)
+        raise
+    except asyncio.TimeoutError as exc:
+        raise AttentionDiagnosticError(
+            "Dependency probe timed out; internal model work was aborted", 504
+        ) from exc
+    except Exception as exc:
+        raise AttentionDiagnosticError("Dependency probe worker failed; no result is available", 503) from exc
+    finally:
+        await runtime.internal_jobs.finish_parent(parent)
+    return {"schema": "qwen-exo-attention-dependency-v1", "method": "span_ablation_fixed_next_token_logprob",
+            "probe_token": probe_token if probe_token is not None else tokenizer.decode(probe_ids),
+            "base_logprob": base, "blocks": blocks, "warnings": list(dict.fromkeys(warnings)),
+            "tokens": tokens, "messages": messages, "rendered_prompt": rendered}

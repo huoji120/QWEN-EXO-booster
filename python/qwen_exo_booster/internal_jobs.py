@@ -310,6 +310,7 @@ class InternalJobRunner:
                 ],
                 return_logprob=True,
                 logprob_start_len=list(start_list),
+                token_ids_logprob=[[int(tokens[-1])] for tokens in input_list],
                 top_logprobs_num=0,
                 stream=False,
                 priority=min(job.priority for job in job_list),
@@ -486,6 +487,11 @@ class InternalJobRunner:
         completion_tokens = meta.get("completion_tokens")
         if completion_tokens is None:
             completion_tokens = len(output.get("output_ids") or ())
+        metadata = dict(meta)
+        # Generation IDs are needed by diagnostic callers that must score the
+        # exact sampled token rather than re-tokenizing its display text.
+        if output.get("output_ids") is not None:
+            metadata["output_ids"] = tuple(output.get("output_ids") or ())
         return InternalJobResult(
             job=job,
             text=str(output.get("text") or ""),
@@ -493,7 +499,7 @@ class InternalJobRunner:
             completion_tokens=int(completion_tokens),
             finish_reason=meta.get("finish_reason"),
             latency_seconds=latency_seconds,
-            metadata=dict(meta),
+            metadata=metadata,
         )
 
     @classmethod
@@ -524,6 +530,8 @@ class InternalJobRunner:
             value = item.get("logprob")
         elif isinstance(item, (list, tuple)) and item:
             value = item[0]
+            if isinstance(value, (list, tuple)) and value:
+                value = value[0]
         else:
             value = item
         try:

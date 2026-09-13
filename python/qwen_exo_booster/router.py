@@ -27,6 +27,7 @@ from qwen_exo_booster.attention_diagnostic import (
     AttentionDiagnosticError,
     prepare_attention_preview,
     run_attention_diagnostic,
+    run_attention_dependency_probe,
 )
 from qwen_exo_booster.attention_diagnostic_conversations import (
     AttentionDiagnosticConversations,
@@ -166,6 +167,14 @@ class AttentionRunRequest(AttentionPreviewRequest):
         default=None, min_length=1, max_length=ATTENTION_DIAGNOSTIC_MAX_LAYERS
     )
     end_token: int | None = Field(default=None, ge=1, strict=True)
+
+
+class AttentionDependencyRequest(AttentionPreviewRequest):
+    model_config = {"extra": "forbid"}
+    end_message: int = Field(ge=1, le=512, strict=True)
+    end_token: int | None = Field(default=None, ge=1, strict=True)
+    probe_token: str | None = Field(default=None, max_length=256)
+    block_size: int = Field(default=64, ge=1, le=256, strict=True)
 
 
 def _api_key_store() -> ApiKeyStore:
@@ -532,6 +541,8 @@ async def attention_diagnostic(payload: AttentionRunRequest, request: Request):
                 status_code=499, detail="Client disconnected; diagnostic aborted"
             )
         return await work
+
+
     except AttentionDiagnosticError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     finally:
@@ -541,6 +552,29 @@ async def attention_diagnostic(payload: AttentionRunRequest, request: Request):
             await asyncio.gather(work, disconnected, return_exceptions=True)
         finally:
             request.app.state.attention_diagnostic_active = False
+
+@router.post("/attention-diagnostics/dependency")
+async def attention_dependency_probe(
+    payload: AttentionDependencyRequest, request: Request
+):
+    runtime = _runtime(request)
+    if runtime.state is not QwenExoRuntimeState.READY:
+        raise HTTPException(status_code=503, detail="QWEN-EXO runtime is not ready")
+    if getattr(request.app.state, "attention_diagnostic_active", False):
+        raise HTTPException(status_code=409, detail="Another attention diagnostic is running")
+    request.app.state.attention_diagnostic_active = True
+    work = asyncio.create_task(run_attention_dependency_probe(
+        runtime, payload.content, payload.filename, payload.end_message,
+        payload.end_token, payload.probe_token, payload.block_size,
+    ))
+    try:
+        return await work
+    except AttentionDiagnosticError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    finally:
+        work.cancel()
+        await asyncio.gather(work, return_exceptions=True)
+        request.app.state.attention_diagnostic_active = False
 
 
 @router.get("/telemetry/stream")
