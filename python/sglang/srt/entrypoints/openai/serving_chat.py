@@ -26,6 +26,7 @@ from jsonschema import Draft202012Validator, SchemaError
 from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageContentTextPart,
     ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -821,8 +822,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         The Responses entrypoint receives this text through the memory
         pipeline's instructions. Chat Completions has no instructions field,
-        so the same text becomes the first system message, ahead of any client
-        system prompt so the client can still refine the task.
+        so prepend it to the client's leading system message (or create one).
+        Qwen templates reject a second system message, even at position 1.
         """
         if raw_request is None or request.input_ids is not None:
             # Pre-tokenized prompts bypass the chat template entirely.
@@ -841,10 +842,28 @@ class OpenAIServingChat(OpenAIServingBase):
             # GPT-style clients send only user turns; without a system turn the
             # Qwen template injects its vendor identity prompt.
             personality = _DEFAULT_SYSTEM_PROMPT
-        messages = [
-            ChatCompletionMessageGenericParam(role="system", content=personality),
-            *request.messages,
-        ]
+        if request.messages and request.messages[0].role == "system":
+            system = request.messages[0]
+            if isinstance(system.content, list):
+                content = [
+                    ChatCompletionMessageContentTextPart(
+                        type="text", text=personality + "\n\n"
+                    ),
+                    *system.content,
+                ]
+            else:
+                content = personality
+                if system.content:
+                    content += "\n\n" + system.content
+            messages = [
+                system.model_copy(update={"content": content}),
+                *request.messages[1:],
+            ]
+        else:
+            messages = [
+                ChatCompletionMessageGenericParam(role="system", content=personality),
+                *request.messages,
+            ]
         return request.model_copy(update={"messages": messages})
 
     def _apply_qwen_exo_chat_runtime_params(

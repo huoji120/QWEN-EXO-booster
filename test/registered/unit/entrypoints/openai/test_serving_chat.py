@@ -6,7 +6,7 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -94,7 +94,7 @@ class _MockTemplateManager:
         self.force_reasoning = False
 
 
-class ServingChatTestCase(unittest.TestCase):
+class ServingChatTestCase(CustomTestCase):
     # ------------- common fixtures -------------
     def setUp(self):
         self.tm = _MockTokenizerManager()
@@ -203,36 +203,70 @@ class ServingChatTestCase(unittest.TestCase):
         assert custom_params["qwen_exo_kind"] == "user"
         assert custom_params["qwen_exo_session_initial_gdn"] == selection
 
-    def test_chat_prepends_personality_before_client_system_prompt(self):
-        """Chat Completions must carry the PolicyData personality like Responses.
+    def test_chat_personality_renders_with_client_system_prompt(self):
+        """Personality must not make a valid client prompt fail templating."""
+        from transformers.utils.chat_template_utils import render_jinja_template
 
-        Responses attaches it through the memory pipeline's instructions;
-        Chat Completions has no instructions field and previously sent the
-        bare client messages, so the model answered "who are you" without
-        its configured identity. The card leads so a client system prompt
-        can still refine the task afterwards.
-        """
-        self._qwen_exo_runtime(None, personality="<policy_data>identity</policy_data>")
-        request = ChatCompletionRequest(
-            model="x",
-            messages=[
-                {"role": "system", "content": "client system"},
-                {"role": "user", "content": "who are you?"},
-            ],
+        # Exercise the single-leading-system contract enforced by Qwen templates.
+        template = (
+            "{% for message in messages %}"
+            "{% if message.role == 'system' and not loop.first %}"
+            "{{ raise_exception('System message must be at the beginning.') }}"
+            "{% endif %}"
+            "{{ '<|' + message.role + '|>' + message.content }}"
+            "{% endfor %}"
         )
+        self._qwen_exo_runtime(None, personality="server identity")
+        for content in (
+            "client system",
+            [{"type": "text", "text": "client system"}],
+            None,
+        ):
+            with self.subTest(content=content):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "system", "content": content},
+                        {"role": "user", "content": "who are you?"},
+                    ],
+                )
+                original = request.model_dump()
+                prepared = self.chat._prepend_qwen_exo_personality(
+                    request, self.fastapi_request
+                )
+                from sglang.srt.parser.jinja_template_utils import (
+                    process_content_for_template_format,
+                )
 
-        prepared = self.chat._prepend_qwen_exo_personality(
-            request, self.fastapi_request
+                messages = [
+                    process_content_for_template_format(
+                        message.model_dump(), "string", [], [], [], []
+                    )
+                    for message in prepared.messages
+                ]
+                rendered, _ = render_jinja_template(
+                    conversations=[messages], chat_template=template
+                )
+                system_text, user_text = rendered[0].split("<|user|>")
+                self.assertTrue(system_text.startswith("<|system|>server identity"))
+                client_text = system_text.removeprefix("<|system|>server identity")
+                self.assertEqual(
+                    client_text.strip(), "client system" if content else ""
+                )
+                self.assertEqual(user_text, "who are you?")
+                self.assertEqual(request.model_dump(), original)
+
+    def test_chat_personality_bypasses_pretokenized_and_unbound_requests(self):
+        self._qwen_exo_runtime(None, personality="server identity")
+        request = self.basic_req.model_copy(update={"input_ids": [1, 2, 3]})
+        self.assertIs(
+            self.chat._prepend_qwen_exo_personality(request, self.fastapi_request),
+            request,
         )
-
-        assert [(m.role, m.content) for m in prepared.messages] == [
-            ("system", "<policy_data>identity</policy_data>"),
-            ("system", "client system"),
-            ("user", "who are you?"),
-        ]
-        assert [m.role for m in request.messages] == ["system", "user"]
-        untouched = self.chat._prepend_qwen_exo_personality(request, None)
-        assert untouched is request
+        self.assertIs(
+            self.chat._prepend_qwen_exo_personality(self.basic_req, None),
+            self.basic_req,
+        )
 
     def test_chat_without_initial_gdn_uses_isolated_cache_namespace(self):
         """Requests served before the state is ready never share cached prefixes
