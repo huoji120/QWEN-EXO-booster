@@ -163,6 +163,19 @@ def test_speculative_q_commits_only_accept_tokens_in_order():
     assert torch.equal(state.previous_q[1], torch.tensor([0.0, 1.0]))
 
 
+def test_decode_observer_treats_empty_graph_mask_as_disabled_rows():
+    tracker = AttentionSignalTracker(num_heads=1, num_kv_heads=1, head_dim=2)
+
+    result = tracker.observe_decode_slots(
+        torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        torch.tensor([1, 2], dtype=torch.long),
+        torch.empty(0, dtype=torch.bool),
+    )
+
+    assert result["qwen_exo_q_norm"].shape == (2,)
+    assert torch.isnan(result["qwen_exo_q_norm"]).all()
+    assert torch.isnan(result["qwen_exo_q_sketch"]).all()
+
 def test_native_bank_keys_register_memory_energy_without_prefix_reprefill():
     tracker = AttentionSignalTracker(num_heads=1, num_kv_heads=1, head_dim=2)
     native_key = f"qwen-exo-native:{'a' * 64}"

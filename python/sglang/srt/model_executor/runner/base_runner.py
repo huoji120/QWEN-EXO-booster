@@ -547,6 +547,16 @@ class BaseRunner(ABC):
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
+            qwen_exo_observe=(
+                [False] * batch_size
+                if mr.server_args.enable_qwen_exo
+                else None
+            ),
+            qwen_exo_observe_mask=(
+                torch.zeros(batch_size, dtype=torch.bool, device=mr.device)
+                if mr.server_args.enable_qwen_exo
+                else None
+            ),
         )
 
         if buffers.ngram_embedding_info is not None:

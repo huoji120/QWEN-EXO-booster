@@ -438,9 +438,26 @@ class AttentionSignalTracker:
         row_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         state = self._ensure_decode_slots(current.device)
-        row_count = current.shape[0]
+        row_count = int(current.shape[0])
         raw_slots = request_slots[:row_count].long()
-        rows_enabled = row_mask[:row_count].bool()
+        if raw_slots.numel() != row_count:
+            padded_slots = torch.full(
+                (row_count,), self.max_requests, dtype=torch.long, device=current.device
+            )
+            padded_slots[: raw_slots.numel()].copy_(raw_slots)
+            raw_slots = padded_slots
+        if row_mask.numel() == 0:
+            rows_enabled = torch.zeros(
+                row_count, dtype=torch.bool, device=current.device
+            )
+        else:
+            rows_enabled = row_mask[:row_count].bool()
+            if rows_enabled.numel() != row_count:
+                padded_mask = torch.zeros(
+                    row_count, dtype=torch.bool, device=current.device
+                )
+                padded_mask[: rows_enabled.numel()].copy_(rows_enabled)
+                rows_enabled = padded_mask
         valid_slots = (raw_slots >= 0) & (raw_slots < self.max_requests)
         safe_slots = raw_slots.clamp(min=0, max=self.max_requests)
         configured = state.observe.index_select(0, safe_slots)
@@ -837,11 +854,15 @@ class AttentionSignalTracker:
         )
         if self.score_bias_anchor_max_blocks:
             aux[:, 0, : 3 * self.score_bias_anchor_max_blocks].copy_(
-                anchor_triplets.reshape(row_count, -1)
+                anchor_triplets.reshape(
+                    row_count, 3 * self.score_bias_anchor_max_blocks
+                )
             )
         start_slot = 3 * self.score_bias_anchor_max_blocks
         end_slot = start_slot + 3 * self.score_bias_selected_blocks
-        aux[:, 0, start_slot:end_slot].copy_(triplets.reshape(row_count, -1))
+        aux[:, 0, start_slot:end_slot].copy_(
+            triplets.reshape(row_count, 3 * self.score_bias_selected_blocks)
+        )
 
         info = {
             "qwen_exo_score_bias_phase": torch.where(

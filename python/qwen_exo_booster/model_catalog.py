@@ -110,6 +110,8 @@ def _runtime_quantization(config: dict[str, Any], variant: str) -> str | None:
     if not isinstance(quantization, dict):
         return None
     method = str(quantization.get("quant_method") or "").lower()
+    if method == "modelopt" and str(quantization.get("quant_algo") or "").upper() == "NVFP4":
+        return "modelopt_fp4"
     if method == "fp8":
         return "fp8"
     if (

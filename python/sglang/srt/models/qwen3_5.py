@@ -637,13 +637,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        linear_attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, layer_id, linear_attn_quant_config, alt_stream, prefix
+            config, layer_id, quant_config, alt_stream, prefix
         )
 
         # NOTE: Determine the MLP type based on the model type
@@ -918,11 +913,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
+        attn_quant_config = quant_config
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,

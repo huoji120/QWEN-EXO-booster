@@ -5,6 +5,23 @@ set -euo pipefail
 : "${QWEN_EXO_ENABLED:=1}"
 : "${QWEN_EXO_CONTAINER:=qwen-exo-booster}"
 : "${QWEN_EXO_SOURCE_PATH:=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
+native_mode="${QWEN_EXO_NATIVE:-0}"
+case "${native_mode}" in
+  0|1) ;;
+  *)
+    echo "Invalid QWEN_EXO_NATIVE=${native_mode@Q}; expected 0 or 1." >&2
+    exit 1
+    ;;
+esac
+if [[ "${native_mode}" == "1" ]]; then
+  : "${QWEN_EXO_PYTHON:?QWEN_EXO_PYTHON is required for native execution}"
+  if [[ ! -x "${QWEN_EXO_PYTHON}" ]]; then
+    echo "Native Python executable not found or not executable: ${QWEN_EXO_PYTHON}" >&2
+    exit 1
+  fi
+  export PATH="$(dirname -- "${QWEN_EXO_PYTHON}"):${PATH:-}"
+  export PYTHONPATH="${QWEN_EXO_SOURCE_PATH}/python${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 : "${QWEN_EXO_CONTEXT_LENGTH:=131072}"
 : "${QWEN_EXO_TP_SIZE:=2}"
 : "${QWEN_EXO_DOCKER_GPUS:=all}"
@@ -146,6 +163,48 @@ QWEN_EXO_MODEL_CATALOG_ROOTS="$(IFS=:; echo "${catalog_container_roots[*]}")"
 : "${QWEN_EXO_MODEL_CATALOG_CONFIG:=/data/qwen-exo/model-catalog.json}"
 : "${QWEN_EXO_MODEL_DATA_ROOT:=/data/qwen-exo}"
 : "${QWEN_EXO_PRE_COMPLETE_PATH:=${QWEN_EXO_DATA_PATH}/pre-complete}"
+
+native_translate_path() {
+  local value="$1"
+  local index container_root suffix
+  for index in "${!catalog_container_roots[@]}"; do
+    container_root="${catalog_container_roots[index]}"
+    case "${value}" in
+      "${container_root}")
+        printf '%s' "${catalog_host_roots[index]}"
+        return
+        ;;
+      "${container_root}"/*)
+        suffix="${value#"${container_root}"}"
+        printf '%s%s' "${catalog_host_roots[index]}" "${suffix}"
+        return
+        ;;
+    esac
+  done
+  case "${value}" in
+    /data/qwen-exo-pre-complete)
+      printf '%s' "${QWEN_EXO_PRE_COMPLETE_PATH}"
+      ;;
+    /data/qwen-exo-pre-complete/*)
+      printf '%s%s' "${QWEN_EXO_PRE_COMPLETE_PATH}" "${value#/data/qwen-exo-pre-complete}"
+      ;;
+    /data/qwen-exo)
+      printf '%s' "${QWEN_EXO_DATA_PATH}"
+      ;;
+    /data/qwen-exo/*)
+      printf '%s%s' "${QWEN_EXO_DATA_PATH}" "${value#/data/qwen-exo}"
+      ;;
+    *)
+      printf '%s' "${value}"
+      ;;
+  esac
+}
+
+if [[ "${native_mode}" == "1" ]]; then
+  QWEN_EXO_MODEL_CATALOG_ROOTS="$(IFS=:; echo "${catalog_host_roots[*]}")"
+  QWEN_EXO_MODEL_CATALOG_CONFIG="$(native_translate_path "${QWEN_EXO_MODEL_CATALOG_CONFIG}")"
+  QWEN_EXO_MODEL_DATA_ROOT="${QWEN_EXO_DATA_PATH}"
+fi
 export QWEN_EXO_MODEL_PATH QWEN_EXO_MODEL_CATALOG_PATH QWEN_EXO_DATA_PATH
 export QWEN_EXO_MODEL_CATALOG_ROOTS QWEN_EXO_MODEL_CATALOG_CONFIG QWEN_EXO_MODEL_DATA_ROOT
 export QWEN_EXO_PRE_COMPLETE_PATH
@@ -155,7 +214,7 @@ if [[ ! -f "${QWEN_EXO_SOURCE_PATH}/python/sglang/srt/server_args.py" ]]; then
   exit 1
 fi
 
-if [[ "${QWEN_EXO_ENABLED}" == "1" ]] && ! python3 \
+if [[ "${QWEN_EXO_ENABLED}" == "1" ]] && ! "${QWEN_EXO_PYTHON:-python3}" \
   "${QWEN_EXO_SOURCE_PATH}/python/qwen_exo_booster/fingerprint.py" \
   "${QWEN_EXO_MODEL_PATH}"; then
   echo "QWEN-EXO startup aborted before Docker launch." >&2
@@ -218,45 +277,36 @@ seed_corpus \
   "${QWEN_EXO_DATA_PATH}/cognition"
 
 
-docker rm -f "${QWEN_EXO_CONTAINER}" >/dev/null 2>&1 || true
-
-docker_args=(
-  --restart unless-stopped
-  --name "${QWEN_EXO_CONTAINER}"
-  --gpus "${QWEN_EXO_DOCKER_GPUS}"
-  --ipc=host
-  --network=host
-  --ulimit memlock=-1
-  -e NCCL_P2P_DISABLE=1
-  -e NCCL_SHM_DISABLE=0
-  -e "SGLANG_MAMBA_SSM_DTYPE=${QWEN_EXO_MAMBA_SSM_DTYPE}"
-  -e "SGLANG_MAMBA_CONV_DTYPE=${QWEN_EXO_MAMBA_SSM_DTYPE}"
-
-
-  -e "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT=${QWEN_EXO_USE_JIT_FP8_QUANT}"
-  -e "SGLANG_LOGPROB_CHUNK_SIZE=${QWEN_EXO_LOGPROB_CHUNK_SIZE}"
-  -e "SGLANG_QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB=${QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB}"
-  -e "SGLANG_DFLASH_DISABLE_TORCH_COMPILE=${SGLANG_DFLASH_DISABLE_TORCH_COMPILE:-0}"
-  -e "QWEN_EXO_SERVICE_CONFIG=${QWEN_EXO_SERVICE_CONFIG_PATH}"
-  -e QWEN_EXO_API_KEY_STORE=/data/qwen-exo/api-keys.json
-  -e QWEN_EXO_MANAGED_RESTART=1
-  -e "QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING=${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:-0}"
-  -e "QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY=${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY}"
-  -e "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR:-}"
-  -e "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH:-}"
-  -e "QWEN_EXO_MODEL_CATALOG_ROOTS=${QWEN_EXO_MODEL_CATALOG_ROOTS}"
-  -e "QWEN_EXO_MODEL_CATALOG_CONFIG=${QWEN_EXO_MODEL_CATALOG_CONFIG}"
-  -e "QWEN_EXO_MODEL_DATA_ROOT=${QWEN_EXO_MODEL_DATA_ROOT}"
-  -e QWEN_EXO_PRE_COMPLETE_KNOWLEDGE_DIR=/data/qwen-exo-pre-complete
-  -v "${QWEN_EXO_DATA_PATH}:/data/qwen-exo"
-  -v "${QWEN_EXO_PRE_COMPLETE_PATH}:/data/qwen-exo-pre-complete"
-  -v "${QWEN_EXO_SOURCE_PATH}/python:/sgl-workspace/sglang/python:ro"
+if [[ "${native_mode}" == "1" ]]; then
+  runtime_service_config="$(native_translate_path "${QWEN_EXO_SERVICE_CONFIG_PATH}")"
+  runtime_api_key_store="${QWEN_EXO_DATA_PATH}/api-keys.json"
+  runtime_pre_complete="${QWEN_EXO_PRE_COMPLETE_PATH}"
+else
+  runtime_service_config="${QWEN_EXO_SERVICE_CONFIG_PATH}"
+  runtime_api_key_store=/data/qwen-exo/api-keys.json
+  runtime_pre_complete=/data/qwen-exo-pre-complete
+fi
+runtime_env=(
+  NCCL_P2P_DISABLE=1
+  NCCL_SHM_DISABLE=0
+  "SGLANG_MAMBA_SSM_DTYPE=${QWEN_EXO_MAMBA_SSM_DTYPE}"
+  "SGLANG_MAMBA_CONV_DTYPE=${QWEN_EXO_MAMBA_SSM_DTYPE}"
+  "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT=${QWEN_EXO_USE_JIT_FP8_QUANT}"
+  "SGLANG_LOGPROB_CHUNK_SIZE=${QWEN_EXO_LOGPROB_CHUNK_SIZE}"
+  "SGLANG_QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB=${QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB}"
+  "SGLANG_DFLASH_DISABLE_TORCH_COMPILE=${SGLANG_DFLASH_DISABLE_TORCH_COMPILE:-0}"
+  "QWEN_EXO_SERVICE_CONFIG=${runtime_service_config}"
+  "QWEN_EXO_API_KEY_STORE=${runtime_api_key_store}"
+  QWEN_EXO_MANAGED_RESTART=1
+  "QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING=${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:-0}"
+  "QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY=${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY}"
+  "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR:-}"
+  "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH:-}"
+  "QWEN_EXO_MODEL_CATALOG_ROOTS=${QWEN_EXO_MODEL_CATALOG_ROOTS}"
+  "QWEN_EXO_MODEL_CATALOG_CONFIG=${QWEN_EXO_MODEL_CATALOG_CONFIG}"
+  "QWEN_EXO_MODEL_DATA_ROOT=${QWEN_EXO_MODEL_DATA_ROOT}"
+  "QWEN_EXO_PRE_COMPLETE_KNOWLEDGE_DIR=${runtime_pre_complete}"
 )
-for index in "${!catalog_host_roots[@]}"; do
-  docker_args+=( -v "${catalog_host_roots[index]}:${catalog_container_roots[index]}:ro" )
-done
-
-
 for debug_env in \
   CUDA_LAUNCH_BLOCKING \
   NCCL_DEBUG \
@@ -267,10 +317,35 @@ for debug_env in \
   SGLANG_KERNEL_API_DUMP_INCLUDE \
   SGLANG_KERNEL_API_DUMP_EXCLUDE; do
   if [[ -n "${!debug_env:-}" ]]; then
-    docker_args+=( -e "${debug_env}=${!debug_env}" )
+    runtime_env+=( "${debug_env}=${!debug_env}" )
   fi
 done
 unset debug_env
+
+if [[ "${native_mode}" == "0" ]]; then
+  docker rm -f "${QWEN_EXO_CONTAINER}" >/dev/null 2>&1 || true
+fi
+
+docker_args=(
+  --restart unless-stopped
+  --name "${QWEN_EXO_CONTAINER}"
+  --gpus "${QWEN_EXO_DOCKER_GPUS}"
+  --ipc=host
+  --network=host
+  --ulimit memlock=-1
+  -v "${QWEN_EXO_DATA_PATH}:/data/qwen-exo"
+  -v "${QWEN_EXO_PRE_COMPLETE_PATH}:/data/qwen-exo-pre-complete"
+  -v "${QWEN_EXO_SOURCE_PATH}/python:/sgl-workspace/sglang/python:ro"
+)
+for environment in "${runtime_env[@]}"; do
+  docker_args+=( -e "${environment}" )
+done
+unset environment
+for index in "${!catalog_host_roots[@]}"; do
+  docker_args+=( -v "${catalog_host_roots[index]}:${catalog_container_roots[index]}:ro" )
+done
+
+
 
 server_args=(
   --model-path "${catalog_container_roots[0]}/$(basename -- "${QWEN_EXO_MODEL_PATH}")"
@@ -421,6 +496,19 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
       --qwen-exo-score-bias-selected-blocks "${QWEN_EXO_SCORE_BIAS_SELECTED_BLOCKS}"
     )
   fi
+fi
+
+if [[ "${native_mode}" == "1" ]]; then
+  server_args+=( --disable-flashinfer-autotune )
+  native_server_args=()
+  for argument in "${server_args[@]}"; do
+    native_server_args+=( "$(native_translate_path "${argument}")" )
+  done
+  for environment in "${runtime_env[@]}"; do
+    export "${environment}"
+  done
+  unset environment
+  exec "${QWEN_EXO_PYTHON}" -m qwen_exo_booster.service_launcher -- "${native_server_args[@]}"
 fi
 
 exec docker run "${docker_args[@]}" \
