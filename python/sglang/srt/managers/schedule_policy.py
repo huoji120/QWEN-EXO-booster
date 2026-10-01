@@ -33,6 +33,10 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
+from qwen_exo_booster.scheduler_fairness import (
+    is_background_request,
+    work_class_preemption,
+)
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
@@ -1191,6 +1195,7 @@ class PrefillAdder:
         """
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+        exo_work_classes = getattr(server_args, "enable_qwen_exo", False)
 
         # NOTE: A request finishes in two phases:
         #   1) update_finish_state + release_kv_cache  (in process_batch_result)
@@ -1207,6 +1212,11 @@ class PrefillAdder:
         sorted_valid_running_reqs = sorted(
             valid_running_reqs,
             key=lambda x: (
+                (
+                    not is_background_request(x)
+                    if exo_work_classes
+                    else False
+                ),
                 x.priority * (-priority_sign),
                 -x.time_stats.wait_queue_entry_time,
             ),
@@ -1223,7 +1233,13 @@ class PrefillAdder:
             # Priority difference needs to meet the threshold to be preemptible.
             priority_diff = (req.priority - running_req.priority) * (-priority_sign)
 
-            if priority_diff > self.priority_scheduling_preemption_threshold:
+            class_preemption = (
+                work_class_preemption(req, running_req) if exo_work_classes else None
+            )
+            if class_preemption is True or (
+                class_preemption is None
+                and priority_diff > self.priority_scheduling_preemption_threshold
+            ):
                 preemptible_reqs.append(running_req)
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(
                     running_req

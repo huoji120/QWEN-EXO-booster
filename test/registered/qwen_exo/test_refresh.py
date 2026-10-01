@@ -44,12 +44,28 @@ class FakeManager:
         self.question_payload = question_payload
         self.integrity_payload = integrity_payload
         self.requests = []
+        self.completed_judge_jobs = set()
+        self._token_ids = {"A": 1, "B": 2}
+        self._token_text = {1: "A", 2: "B"}
 
     def encode(self, text, add_special_tokens=False):
-        return str(text).split()
+        result = []
+        for token in str(text).split():
+            if token not in self._token_ids:
+                token_id = len(self._token_ids) + 1
+                self._token_ids[token] = token_id
+                self._token_text[token_id] = token
+            result.append(self._token_ids[token])
+        return result
 
     def decode(self, token_ids, **_kwargs):
-        return " ".join(token_ids)
+        return " ".join(self._token_text[token] for token in token_ids)
+
+    def prompts(self, request):
+        text = getattr(request, "text", None)
+        if text is not None:
+            return text
+        return [self.decode(tokens[:-1]) for tokens in request.input_ids]
 
     def apply_chat_template(self, messages, **_kwargs):
         return "\n".join(message["content"] for message in messages)
@@ -57,6 +73,32 @@ class FakeManager:
     async def generate_request(self, request, _raw_request):
         self.requests.append(request)
         outputs = []
+        if getattr(request, "input_ids", None) is not None:
+            for index, (tokens, options, prompt) in enumerate(zip(
+                request.input_ids, request.token_ids_logprob, self.prompts(request),
+            )):
+                assert request.sampling_params[index]["max_new_tokens"] == 0
+                supported = self.all_supported or "WFP_LAYER" in prompt
+                scores = (-0.1, -2.0) if supported else (-2.0, -0.1)
+                outputs.append({
+                    "text": "",
+                    "meta_info": {
+                        "id": request.rid[index],
+                        "prompt_tokens": len(tokens),
+                        "completion_tokens": 0,
+                        "finish_reason": {"type": "length", "length": 0},
+                        "input_token_logprobs": [
+                            [None, tokens[-2], None], [-1.0, tokens[-1], None],
+                        ],
+                        "input_token_ids_logprobs": [
+                            None,
+                            [[score, token, None] for score, token in zip(scores, options)],
+                        ],
+                    },
+                })
+                self.completed_judge_jobs.add(request.rid[index])
+            yield outputs
+            return
         for prompt in request.text:
             if "internal document-retrieval question classifier" in prompt:
                 text = self.question_payload or json.dumps(
@@ -68,12 +110,6 @@ class FakeManager:
                         },
                     },
                     ensure_ascii=False,
-                )
-            elif "Judge whether the supplied candidate" in prompt:
-                text = (
-                    '{"supported":true}'
-                    if self.all_supported or "WFP_LAYER" in prompt
-                    else '{"supported":false}'
                 )
             elif "Answer the classified self-question" in prompt:
                 text = (
@@ -182,11 +218,7 @@ class JudgeGatedBindingTensorBank:
         self.resident_page_ids = None
 
     def bind_native_prefix(self, candidate, *, query, preferred_page_ids=()):
-        assert any(
-            "Judge whether the supplied candidate" in prompt
-            for request in self.manager.requests
-            for prompt in request.text
-        )
+        assert self.manager.completed_judge_jobs, "Native binding preceded semantic admission"
         page_id = preferred_page_ids[0] if preferred_page_ids else candidate.page_ids[0]
         native = NativePrefixSelection(
             source_digest="c" * 64,
@@ -716,9 +748,10 @@ async def test_refresh_uses_policy_data_without_reference_judge(tmp_path):
     assert record.selected_lanes[0] == "policydata"
     assert record.answer == "Run focused regression tests before delivery."
     judge_prompts = [
-        request.text[0]
+        prompt
         for request in manager.requests
-        if "Judge whether the supplied candidate" in request.text[0]
+        if getattr(request, "input_ids", None) is not None
+        for prompt in manager.prompts(request)
     ]
     assert all("focused regression tests" not in prompt for prompt in judge_prompts)
 
@@ -751,9 +784,10 @@ async def test_qk_policydata_requires_semantic_applicability_judge(tmp_path):
     assert record.answer is None
     assert service.eligible_candidates("request-qk-policy") == ()
     judge_prompts = [
-        request.text[0]
+        prompt
         for request in manager.requests
-        if "Judge whether the supplied candidate" in request.text[0]
+        if getattr(request, "input_ids", None) is not None
+        for prompt in manager.prompts(request)
     ]
     assert len(judge_prompts) == 1
     assert '"lane":"policydata"' in judge_prompts[0]
@@ -796,9 +830,9 @@ async def test_refresh_judges_all_qk_candidates_in_bounded_waves(tmp_path):
     judge_requests = [
         request
         for request in manager.requests
-        if request.text and "Judge whether the supplied candidate" in request.text[0]
+        if getattr(request, "input_ids", None) is not None
     ]
-    assert [len(request.text) for request in judge_requests] == [8, 2]
+    assert [len(request.input_ids) for request in judge_requests] == [8, 2]
     completed = [
         event.payload
         for event in service.telemetry.events("request-qk-waves")
@@ -842,7 +876,7 @@ Act as an evidence-first coding agent.
     assert record.selected_document_ids == ()
     assert service.eligible_candidates("request-base-policy") == ()
     assert all(
-        "coding-agent-execution-policy.md" not in str(request.text)
+        "coding-agent-execution-policy.md" not in str(manager.prompts(request))
         for request in manager.requests
     )
 
@@ -1268,7 +1302,8 @@ async def test_post_tool_recall_runs_per_tool_turn_and_latest_record_wins(tmp_pa
     self_ask_prompts = [
         request.text[0]
         for request in manager.requests
-        if "internal document-retrieval question classifier" in request.text[0]
+        if getattr(request, "text", None)
+        and "internal document-retrieval question classifier" in request.text[0]
     ]
     assert len(self_ask_prompts) == 1
     assert "corrected result" not in self_ask_prompts[0]
@@ -1320,7 +1355,8 @@ async def test_policy_candidate_never_becomes_a_gap_reflection(tmp_path):
     answer_prompt = next(
         request.text[0]
         for request in manager.requests
-        if "Answer the classified self-question" in request.text[0]
+        if getattr(request, "text", None)
+        and "Answer the classified self-question" in request.text[0]
     )
     answer_payload = json.loads(answer_prompt.rsplit("\n", 1)[-1])
     assert answer_payload["question"]["kind"] == "factual"

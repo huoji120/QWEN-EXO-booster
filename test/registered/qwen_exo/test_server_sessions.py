@@ -19,7 +19,7 @@ from qwen_exo_booster.reflection_memory import (
     ReflectionSourceStore,
 )
 from qwen_exo_booster.router import router
-from qwen_exo_booster.runtime import QwenExoRuntime
+from qwen_exo_booster.runtime import QwenExoRuntime, QwenExoRuntimeState
 
 
 def session_runtime(path):
@@ -229,3 +229,54 @@ def test_pending_source_deletion_preserves_serving_lineage(tmp_path):
         assert api.get("/qwen-exo/server-sessions").json()["total"] == 0
     assert runtime._conversation_keys_by_response_id == {"previous-response": "waiting"}
     assert runtime._memory_parents_by_conversation == {"waiting": "previous-response"}
+
+
+@pytest.mark.asyncio
+async def test_organization_queue_protects_sources_until_worker_and_queue_finish(tmp_path):
+    from qwen_exo_booster.server_sessions import ServerSessionStore
+
+    runtime = session_runtime(tmp_path)
+    retain(runtime, "organization-source")
+    runtime.state = QwenExoRuntimeState.READY
+    runtime.reflection_memory_service = object()
+    runtime.tensor_bank = object()
+    runtime.query_probe = object()
+    runtime.knowledge = SimpleNamespace(snapshot=SimpleNamespace(source_digest="source"))
+    runtime.telemetry = SimpleNamespace(emit=lambda *_args: None)
+    runtime._reflection_memory_organization_queue = asyncio.Queue()
+    runtime._reflection_memory_organization_worker = None
+    runtime._reflection_memory_organization_states = OrderedDict()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def organize(*, progress):
+        entered.set()
+        await release.wait()
+        return {"status": "kept_distinct"}
+
+    runtime.organize_reflection_memories = organize
+    runtime.start_reflection_memory_organization()
+    store = ServerSessionStore(runtime)
+    assert store._globally_busy()
+    await asyncio.wait_for(entered.wait(), 1)
+    assert runtime._reflection_memory_organization_queue.empty()
+    result = await store.delete(all=True)
+    assert result["skipped_active"] == ["organization-source"]
+    assert runtime.reflection_source_store.get("organization-source-new") is not None
+    assert (await store.list())["sessions"][0]["active"]
+    release.set()
+    await asyncio.wait_for(runtime._reflection_memory_organization_queue.join(), 1)
+    await runtime._reflection_memory_organization_worker
+    assert not (await store.list())["sessions"][0]["active"]
+    result = await store.delete(all=True)
+    assert result["deleted"] == ["organization-source"]
+    assert runtime.reflection_source_store.get("organization-source-new") is None
+
+
+@pytest.mark.asyncio
+async def test_organization_admission_waits_for_source_erasure_boundary(tmp_path):
+    runtime = session_runtime(tmp_path)
+    runtime._server_session_erasure = asyncio.get_running_loop().create_future()
+    with pytest.raises(RuntimeError):
+        runtime.start_reflection_memory_organization()
+    runtime._server_session_erasure.set_result(None)

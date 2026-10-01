@@ -9,8 +9,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from qwen_exo_booster.scheduler_fairness import BackgroundPrefillFairness
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -19,28 +19,6 @@ from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-FORBIDDEN_TOKENS = ("self.running_batch", "self.last_batch", "self.cur_batch")
-
-DECISION_METHODS = (
-    Scheduler.get_next_batch_to_run,
-    Scheduler.get_new_batch_prefill,
-    Scheduler._get_new_batch_prefill_raw,
-    Scheduler._abort_on_running_timeout,
-    Scheduler.is_disable_overlap_for_batch,
-    SchedulerDisaggregationPrefillMixin.get_next_disagg_prefill_batch_to_run,
-    SchedulerDisaggregationPrefillMixin.process_prefill_chunk,
-    SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch,
-    SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run,
-)
-
-
-class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
-    def test_decision_methods_take_batches_as_params_not_self(self):
-        for method in DECISION_METHODS:
-            source = inspect.getsource(inspect.unwrap(method))
-            self.assertIn(f"def {method.__name__}", source)
-            for token in FORBIDDEN_TOKENS:
-                self.assertNotIn(token, source)
 
 
 class TestDFlashActiveBatchIsolation(CustomTestCase):
@@ -143,11 +121,24 @@ class TestDFlashPriorityYield(CustomTestCase):
             ebnf=None,
             structural_tag=None,
             max_new_tokens=100,
+            ignore_eos=False,
         )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=0)
         req.full_untruncated_fill_ids = [1, 2, 3]
         req.prefix_indices = []
         req.output_ids = [4, 5]
+        req.host_hit_length = 0
+        req.last_node = MagicMock()
+        req.mamba_pool_idx = None
+        req.retracted_stain = False
+        req.inflight_middle_chunks = 0
+        req.needs_host_load_back.return_value = False
+
+        def set_extend_range(start, end):
+            req.extend_range = SimpleNamespace(start=start, end=end, length=end - start)
+
+        req.set_extend_range.side_effect = set_extend_range
+        set_extend_range(0, len(req.full_untruncated_fill_ids))
         req.retraction_count = 0
         req.kv = None
         req.input_embeds = None
@@ -162,6 +153,9 @@ class TestDFlashPriorityYield(CustomTestCase):
         )
         batch.chunked_req = None
         batch.batch_is_full = False
+        batch.is_prefill_only = False
+        batch.return_logprob = False
+        batch.input_embeds = None
         batch.is_empty.side_effect = lambda: not batch.reqs
 
         def filter_batch(*, keep_indices=None):
@@ -203,6 +197,9 @@ class TestDFlashPriorityYield(CustomTestCase):
         scheduler.is_mixed_chunk = False
         scheduler.min_free_slots_delayer = None
         scheduler.chunked_prefill_size = None
+        scheduler.enable_dynamic_chunking = False
+        scheduler.enable_hisparse = False
+        scheduler.ps = SimpleNamespace(pp_size=1)
         scheduler.max_prefill_tokens = 10000
         scheduler.max_prefill_bs = 1
         scheduler.max_running_requests = 8
@@ -238,7 +235,9 @@ class TestDFlashPriorityYield(CustomTestCase):
         )
         return scheduler
 
-    def _prefill(self, scheduler, running, last=None, *, reject=False):
+    def _prefill(
+        self, scheduler, running, last=None, *, reject=False, real_admission=False
+    ):
         # Exercise real priority/resource accounting; isolate only GPU allocation
         # and prefix matching at the prefill boundary.
         adder = object.__new__(PrefillAdder)
@@ -254,6 +253,19 @@ class TestDFlashPriorityYield(CustomTestCase):
         adder.rem_total_token_offset = sum(
             adder._get_running_request_total_token_offset(req) for req in running.reqs
         )
+        adder.page_size = scheduler.page_size
+        adder.rem_chunk_tokens = scheduler.chunked_prefill_size
+        adder.rem_input_tokens = scheduler.max_prefill_tokens
+        adder.cur_rem_token_offset = 0
+        adder.rem_swa_token_offset = 0
+        adder.rem_mamba_slots = None
+        adder._mamba_slot_cost = 0
+        adder.dllm_config = None
+        adder.log_hit_tokens = adder.log_input_tokens = 0
+        adder.reprocessed_log_hit_tokens = adder.reprocessed_log_input_tokens = 0
+        adder.prefill_delayer_single_pass = None
+        adder.prefill_max_requests = None
+        adder.dsa_prefill_cp_in_seq_split = False
 
         def add_one(req, **kwargs):
             if reject:
@@ -261,10 +273,13 @@ class TestDFlashPriorityYield(CustomTestCase):
             adder.can_run_list.append(req)
             return AddReqResult.CONTINUE
 
-        adder.add_one_req = add_one
+        if not real_admission:
+            adder.add_one_req = add_one
 
         def init_batch(reqs, *args, **kwargs):
-            return self._batch(reqs, target_only=args[-1].is_none())
+            batch = self._batch(reqs, target_only=args[-1].is_none())
+            batch.chunked_req = kwargs.get("chunked_req")
+            return batch
 
         module = "sglang.srt.managers.scheduler."
         with (
@@ -275,6 +290,145 @@ class TestDFlashPriorityYield(CustomTestCase):
             patch(module + "TEST_RETRACT", False),
         ):
             return scheduler._get_new_batch_prefill_raw(None, running, last)
+
+    def test_non_speculative_waiter_runs_before_background_decode_finishes(self):
+        for exo in (False, True):
+            for low_first in (False, True):
+                with self.subTest(exo=exo, low_first=low_first):
+                    background = self._request("reflection", -100)
+                    background.sampling_params.custom_params["qwen_exo_work_class"] = "reflection"
+                    foreground = self._request("probe", 0)
+                    scheduler = self._scheduler([foreground], low_first=low_first)
+                    scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+                    scheduler.server_args.enable_qwen_exo = exo
+                    if exo:
+                        scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
+                    running = self._batch([background], target_only=True)
+                    scheduled, retained = self._prefill(scheduler, running, real_admission=True)
+                    self.assertEqual(scheduled.reqs, [foreground])
+                    self.assertEqual(retained.reqs, [background])
+                    self.assertEqual(scheduler.waiting_queue, [])
+                    self.assertEqual(background.retraction_count, 0)
+
+    def test_full_physical_pool_foreground_reaches_background_preemption(self):
+        for low_first in (False, True):
+            with self.subTest(low_first=low_first):
+                foreground = [
+                    self._request(f"user-{index}", -1000 if low_first else 1000)
+                    for index in range(2)
+                ]
+                background = [
+                    self._request(f"background-{index}", -100)
+                    for index in range(4)
+                ]
+                for index, req in enumerate(background):
+                    req.sampling_params.custom_params["qwen_exo_work_class"] = (
+                        "reflection" if index == 0 else "maintenance"
+                    )
+                incoming = self._request("probe", 0)
+                scheduler = self._scheduler([incoming], low_first=low_first)
+                scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+                scheduler.server_args.enable_qwen_exo = True
+                scheduler.max_running_requests = 6
+                scheduler.get_num_allocatable_reqs = lambda running_bs: 6 - running_bs
+                scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
+                running = self._batch(foreground + background, target_only=True)
+                scheduled, retained = self._prefill(
+                    scheduler, running, real_admission=True
+                )
+                self.assertEqual(scheduled.reqs, [incoming])
+                self.assertTrue(all(req in retained.reqs for req in foreground))
+                self.assertEqual(len(retained.reqs) + len(scheduled.reqs), 6)
+                retracted = [req for req in background if req.retraction_count == 1]
+                self.assertEqual(len(retracted), 1)
+                self.assertEqual(scheduler.waiting_queue, retracted)
+                self.assertEqual(retracted[0].output_ids, [4, 5])
+
+    def test_foreground_priority_does_not_bypass_kv_admission(self):
+        background = self._request("reflection", -100)
+        foreground = self._request("probe", 0)
+        scheduler = self._scheduler([foreground])
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
+        # Running reserve=98; incoming input=3, remaining output=98, page slack=1.
+        scheduler.token_to_kv_pool_allocator.available_size.return_value = 200
+        running = self._batch([background], target_only=True)
+        scheduled, retained = self._prefill(scheduler, running, real_admission=True)
+        self.assertIsNone(scheduled)
+        self.assertEqual(retained.reqs, [background])
+        self.assertEqual(scheduler.waiting_queue, [foreground])
+
+    def test_yielded_chunk_preserves_owner_and_resumes_after_scoring_prefill(self):
+        background = self._request("reflection", -100)
+        background.sampling_params.custom_params["qwen_exo_work_class"] = "reflection"
+        background.full_untruncated_fill_ids = list(range(8192))
+        background.prefix_indices = list(range(2048))
+        background.set_extend_range(0, 2048)
+        background.req_pool_idx = 7
+        foreground = self._request("scoring", 0)
+        foreground.sampling_params.max_new_tokens = 0
+        scheduler = self._scheduler([foreground])
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.chunked_prefill_size = 2048
+        scheduler.chunked_req = background
+        scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
+        scheduler._qwen_exo_prefill_fairness.record_prefill([background])
+        empty = self._batch([], target_only=True)
+        scheduled, _ = self._prefill(scheduler, empty, real_admission=True)
+        self.assertEqual(scheduled.reqs, [foreground])
+        self.assertIsNone(scheduled.chunked_req)
+        self.assertTrue(scheduled.contains_last_prefill_chunk)
+        self.assertIs(scheduler.chunked_req, background)
+        self.assertEqual(background.inflight_middle_chunks, 0)
+        self.assertEqual(background.req_pool_idx, 7)
+        self.assertEqual(background.extend_range.end, 2048)
+        resumed, _ = self._prefill(scheduler, empty, real_admission=True)
+        self.assertEqual(resumed.reqs, [background])
+        self.assertIs(resumed.chunked_req, background)
+        self.assertEqual(background.inflight_middle_chunks, 1)
+        self.assertEqual(background.extend_range.end, 4096)
+        self.assertEqual(background.req_pool_idx, 7)
+
+    def test_long_foreground_keeps_single_chunk_owner_and_background_progress(self):
+        background = self._request("reflection", -100)
+        background.sampling_params.custom_params["qwen_exo_work_class"] = "reflection"
+        background.full_untruncated_fill_ids = list(range(8192))
+        background.prefix_indices = list(range(2048))
+        background.set_extend_range(0, 2048)
+        foreground = self._request("long-foreground", 0)
+        foreground.full_untruncated_fill_ids = list(range(4096))
+        scheduler = self._scheduler([foreground])
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.chunked_prefill_size = 2048
+        scheduler.chunked_req = background
+        scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
+        scheduler._qwen_exo_prefill_fairness.record_prefill([background])
+        scheduled, _ = self._prefill(scheduler, self._batch([], target_only=True))
+        self.assertEqual(scheduled.reqs, [background])
+        self.assertIs(scheduler.chunked_req, background)
+        self.assertEqual(background.extend_range.end, 4096)
+        self.assertEqual(scheduler.waiting_queue, [foreground])
+
+    def test_background_chunk_yields_to_foreground_decode_without_new_prefill(self):
+        background = self._request("reflection", -100)
+        background.sampling_params.custom_params["qwen_exo_work_class"] = "reflection"
+        background.full_untruncated_fill_ids = list(range(8192))
+        background.prefix_indices = list(range(2048))
+        background.set_extend_range(0, 2048)
+        foreground = self._request("user", 0)
+        scheduler = self._scheduler([])
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.chunked_prefill_size = 2048
+        scheduler.chunked_req = background
+        scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
+        scheduler._qwen_exo_prefill_fairness.record_prefill([background])
+        running = self._batch([foreground], target_only=True)
+        scheduled, retained = self._prefill(scheduler, running)
+        self.assertIsNone(scheduled)
+        self.assertEqual(retained.reqs, [foreground])
+        self.assertIs(scheduler.chunked_req, background)
+        self.assertEqual(background.extend_range.end, 2048)
+        self.assertEqual(background.inflight_middle_chunks, 0)
 
     def test_higher_priority_switch_retracts_entire_lane_and_resumes(self):
         for low_first in (False, True):

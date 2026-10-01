@@ -46,6 +46,8 @@ flowchart LR
 
 QK only nominates; the semantic Judge decides. Candidates with low scores, weak margins, wrong task scope, or a negative verdict are rejected—with the reason and telemetry evidence preserved.
 
+Semantic review uses two fixed options: `A=pass`, `B=reject`. Each candidate requires one prefill, reading both token logprobs at the same answer position. Admission requires `log P(A) > log P(B)` (equivalent to a pass score above 0.5 after a two-option softmax); ties reject. There is no third semantic option, generated review text/JSON, or autoregressive Judge fallback. Scoring failures or misaligned results admit nothing, are not cached, and retain an execution-failure marker. Candidates are reviewed independently; existing Q×K ranking, scope checks, and injection budgets remain in force. This removes review-answer decoding, not prefill, and the scores are not calibrated correctness probabilities. Reflection text and compaction summaries keep their existing generation paths.
+
 ## Core capabilities
 
 ### Model-native knowledge: Markdown is long-term knowledge
@@ -58,7 +60,11 @@ Write technical docs, project rules, API references, or team experience as Markd
 
 At task end or client context compaction, the server analyzes retained real trajectories in segments, checking each issue's actions, observations, mechanism, competing explanations, and counterevidence. Every lesson links to inspectable original events and is classified as **causally verified, supported by evidence, or unresolved**. Entries with checkable sources, useful experience, and explicit applicability boundaries may become eligible for Knowledge publication (`active`) without a verified root cause. Supported or unresolved lessons retain observations, hypotheses, conditional suggestions, and missing evidence; admission does not turn them into confirmed root causes or mandatory rules.
 
-Successfully analyzed segments can be reused, while failed or uncovered portions can be retried. Lessons retain entry-level versions, and insufficient new evidence cannot overwrite a verified rule. **Analysis completion, task success, and long-term-memory admission are three different states.**
+Final admission reuses the internal binary semantic-scoring path: read logprobs for `A=pass` and `B=reject` at the same answer position, and mark an entry `active` only when `log P(A) > log P(B)`; ties reject. This scoring generates no tokens and does not substitute a generated JSON verdict. The preceding structured analysis only records evidence grades, explanations, and exact merge/retirement proposals. `verified`, fixed observation counts, an empty missing-evidence list, and proof booleans are no longer hard admission requirements. Quotes must still match real sources, and target identities and versions must match. Execution failures remain distinct from semantic rejection and are not cached as reviewed results.
+
+Successfully analyzed segments can be reused, while failed or uncovered portions can be retried. Lessons retain entry-level versions. Replacing or retiring an old entry requires binary model approval of the complete old entry together with the proposed change. Review policy and model identity participate in result-reuse keys, so old-policy cached verdicts cannot masquerade as new binary reviews. **Analysis completion, task success, and long-term-memory admission are three different states.**
+
+Global initial GDN includes admitted `active` reflections, not only `verified` ones; candidates and retired entries are excluded. Its input and consolidated reflection preserve evidence grades, applicability, missing evidence, and conditional wording. Whole entries are packed within the budget without promoting supported experience to established causation. Existing active memories retain their original admission provenance; no new binary-review records are fabricated for them.
 
 Only published Knowledge documents join ordinary Knowledge recall. Records without a `document_path` remain unindexed; eligibility does not mean publication or actual recall. Different questions may pass semantic review through the same underlying problem or applicable mechanism without repeating the original task wording. Topic overlap alone is insufficient, and selection is not guaranteed. Applying a lesson still requires checking current conditions, its scope, and unresolved evidence gaps.
 
@@ -168,6 +174,10 @@ bash scripts/qwen_exo/build_image.sh
 ```
 
 See `docker/compose.yaml` (service `sglang`) for orchestration. `scripts/qwen_exo/launch_js4090.sh` is a complete two-GPU launch example; adjust the flags for your machine.
+
+Internal work inherits its parent's scheduling class. Query Probe, Judge, and Refresh required by the current request remain foreground; reflection and its children use an independent one-slot lane, while maintenance uses an independent three-slot lane. Memory organization has its own FIFO queue rather than sharing its organization lock with per-conversation reflection. Background descendants cannot promote themselves to foreground; cancellation, expiry, and completion release admission. Logical lanes do not add physical GPU capacity: KV, Mamba, and request-slot limits still apply. Foreground can preempt background, never the reverse.
+
+On single-stage, non-speculative CUDA scheduling, background prefill yields at chunk boundaries to interleave foreground prefill/decode while retaining the same chunk owner and full reflection input/output budgets. Short foreground prefills can fit between chunks; longer inputs exceeding the remaining chunk budget may still wait for the current background prefill to finish. This is not immediate switching for arbitrary prompt lengths. Set `QWEN_EXO_CHUNKED_PREFILL_SIZE=2048` to tune chunks and, for a six-request deployment, `QWEN_EXO_CUDA_GRAPH_MAX_BS=6`, keeping decode graphs `full` and prefill graphs `disabled`. Requests above captured sizes still use eager execution. Verify mixed workloads and actual decode-graph logs rather than inferring latency gains from configuration.
 
 ### Apple Silicon
 

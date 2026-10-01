@@ -216,7 +216,6 @@ class FakeReferenceJudge:
         self.question_original_tokens = int(question_original_tokens)
         self.question_review_tokens = int(question_review_tokens)
         self.calls = []
-        self.selection_calls = []
 
     async def judge(
         self,
@@ -237,6 +236,8 @@ class FakeReferenceJudge:
                 if isinstance(self.supported, dict)
                 else bool(self.supported)
             )
+            if self.winner_path is not None:
+                supported = supported and candidate.relative_path == self.winner_path
             decisions.append(
                 EligibilityDecision.create(
                     candidate_id=candidate.candidate_id,
@@ -262,17 +263,8 @@ class FakeReferenceJudge:
             latency_seconds=0.001,
             cache_hit_count=0,
             executed_count=len(candidates),
-            selection_method="independent_binary",
-            selected_candidate_id=(
-                next(
-                    (
-                        decision.candidate_id
-                        for decision in decisions
-                        if decision.eligible
-                    ),
-                    None,
-                )
-            ),
+            selection_method="direct_binary_logits",
+            selected_candidate_id=None,
             presented_candidate_count=len(candidates),
             question_truncated=(
                 self.question_original_tokens > self.question_review_tokens
@@ -281,73 +273,6 @@ class FakeReferenceJudge:
             question_review_tokens=self.question_review_tokens,
         )
 
-    async def select_best(
-        self,
-        *,
-        parent_request_id,
-        turn_id,
-        question,
-        candidates,
-        telemetry_correlation_id,
-    ):
-        del turn_id, telemetry_correlation_id
-        candidates = tuple(candidates)
-        self.calls.append((parent_request_id, question, candidates))
-        self.selection_calls.append((parent_request_id, question, candidates))
-        supported_candidates = tuple(
-            candidate
-            for candidate in candidates
-            if (
-                self.supported.get(candidate.relative_path, False)
-                if isinstance(self.supported, dict)
-                else bool(self.supported)
-            )
-        )
-        if self.winner_path is None:
-            winner = next(iter(supported_candidates), None)
-        else:
-            winner = next(
-                (
-                    candidate
-                    for candidate in supported_candidates
-                    if candidate.relative_path == self.winner_path
-                ),
-                None,
-            )
-        decisions = tuple(
-            EligibilityDecision.create(
-                candidate_id=candidate.candidate_id,
-                parent_request_id=parent_request_id,
-                question=question,
-                reference=candidate.reference_content,
-                status=(
-                    EligibilityStatus.ELIGIBLE
-                    if candidate is winner
-                    else EligibilityStatus.INELIGIBLE
-                ),
-                judge_method="fake_listwise_judge",
-                judge_model_fingerprint="fake-model",
-                decision_margin=0.0,
-            )
-            for candidate in candidates
-        )
-        return SimpleNamespace(
-            decisions=decisions,
-            candidate_count=len(candidates),
-            valid_count=len(candidates),
-            eligible_count=1 if winner is not None else 0,
-            latency_seconds=0.001,
-            cache_hit_count=0,
-            executed_count=1,
-            selection_method="comparative_listwise",
-            selected_candidate_id=(winner.candidate_id if winner is not None else None),
-            presented_candidate_count=len(candidates),
-            question_truncated=(
-                self.question_original_tokens > self.question_review_tokens
-            ),
-            question_original_tokens=self.question_original_tokens,
-            question_review_tokens=self.question_review_tokens,
-        )
 
 
 class FakeTelemetry:
@@ -934,7 +859,7 @@ def test_same_document_group_candidates_merge_before_judge(tmp_path):
     assert judged[0].native_prefix.page_id == 3
     assert judged[1].document_id == other.document_id
     assert len(state.decisions) == 2
-    assert state.selected_document_ids == (best.document_id,)
+    assert state.selected_document_ids == (best.document_id, other.document_id)
     (prefilter,) = telemetry.by_type("qk.prefilter")
     assert prefilter["status"] == "passed"
     assert prefilter["merged_count"] == 1
@@ -1206,7 +1131,7 @@ def test_reflection_named_by_the_question_bypasses_the_task_scope_gate(tmp_path)
     assert state.selected_document_ids == (notes.document_id,)
 
 
-def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):
+def test_binary_judge_can_reject_higher_qk_candidate(tmp_path):
     repo = repository(tmp_path)
     higher_qk = native_candidate(repo, "wfp.md", page_id=3, score=0.95)
     semantic_winner = native_candidate(repo, "ctf.md", page_id=4, score=0.90)
@@ -1230,20 +1155,19 @@ def test_comparative_selector_can_choose_lower_qk_candidate(tmp_path):
         FakeRequest(request_id="resp-listwise-winner", input="Explain CTF ROP chains"),
     )
 
-    assert len(judge.selection_calls) == 1
     assert state.selected_document_ids == (semantic_winner.document_id,)
     assert state.radix_prefix_page_id is None
-    assert state.knowledge_admission_mode == "comparative_semantic_selection"
+    assert state.knowledge_admission_mode == "semantic_eligibility"
     (judge_event,) = telemetry.by_type("semantic_judge.completed")
-    assert judge_event["selection_method"] == "comparative_listwise"
-    assert judge_event["selected_candidate_id"] == semantic_winner.candidate_id
+    assert judge_event["selection_method"] == "direct_binary_logits"
+    assert judge_event["selected_candidate_id"] is None
     assert judge_event["presented_candidate_count"] == 2
     assert judge_event["question_truncated"] is True
     assert judge_event["question_original_tokens"] == 3382
     assert judge_event["question_review_tokens"] == 2048
 
 
-def test_comparative_selector_preserves_all_qk_candidates(tmp_path):
+def test_binary_judge_preserves_all_qk_candidates(tmp_path):
     repo = repository(tmp_path)
     for index in range(3):
         repo.upsert(f"extra-{index}.md", f"Distinct reference number {index}")
@@ -1273,7 +1197,7 @@ def test_comparative_selector_preserves_all_qk_candidates(tmp_path):
         FakeRequest(request_id="resp-all-qk", input="Choose the best reference"),
     )
 
-    judged = judge.selection_calls[0][2]
+    judged = judge.calls[0][2]
     assert [candidate.relative_path for candidate in judged] == list(paths)
     assert len(state.decisions) == 5
     (prefilter,) = telemetry.by_type("qk.prefilter")
@@ -1327,7 +1251,7 @@ def test_large_qk_shortlist_is_judged_in_bounded_waves(tmp_path):
     assert completed["candidate_count"] == len(candidates)
     assert completed["presented_candidate_count"] == len(candidates)
     assert completed["judge_wave_count"] == 4
-    assert completed["selection_method"] == "independent_binary_waves"
+    assert completed["selection_method"] == "direct_binary_logits"
 
 
 def test_judge_rejection_expands_to_next_qk_wave(tmp_path):
@@ -1424,7 +1348,7 @@ def test_second_distinct_page_candidate_kept_when_configured(tmp_path):
     assert prefilter["sent_to_judge"] == 3
 
 
-def test_prefilter_routes_low_margin_candidates_to_comparative_judge(tmp_path):
+def test_prefilter_routes_low_margin_candidates_to_binary_judge(tmp_path):
     repo = repository(tmp_path)
     first = native_candidate(repo, "wfp.md", page_id=3, score=0.901)
     second = native_candidate(repo, "ctf.md", page_id=4, score=0.900)
@@ -1445,9 +1369,11 @@ def test_prefilter_routes_low_margin_candidates_to_comparative_judge(tmp_path):
         FakeRequest(request_id="resp-prefilter-compare", input="WFP CTF"),
     )
 
-    assert len(judge.selection_calls) == 1
-    assert len(judge.selection_calls[0][2]) == 2
-    assert state.selected_document_ids == (first.document_id,)
+    assert len(judge.calls) == 1
+    assert len(judge.calls[0][2]) == 2
+    decisions = {decision.candidate_id: decision for decision in state.decisions}
+    assert decisions[first.candidate_id].eligible
+    assert decisions[second.candidate_id].eligible
     assert state.radix_prefix_page_id is None
     (prefilter,) = telemetry.by_type("qk.prefilter")
     assert prefilter["status"] == "passed"
@@ -1461,9 +1387,9 @@ def test_prefilter_routes_low_margin_candidates_to_comparative_judge(tmp_path):
     assert prefilter["preset"] == "balanced"
     assert prefilter["cache_hit"] is False
     (judge_event,) = telemetry.by_type("semantic_judge.completed")
-    assert judge_event["executed_count"] == 1
-    assert judge_event["eligible_count"] == 1
-    assert judge_event["selection_method"] == "comparative_listwise"
+    assert judge_event["executed_count"] == 2
+    assert judge_event["eligible_count"] == 2
+    assert judge_event["selection_method"] == "direct_binary_logits"
     assert judge_event["presented_candidate_count"] == 2
 
 

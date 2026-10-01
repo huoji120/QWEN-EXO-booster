@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from collections import OrderedDict
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -23,7 +24,8 @@ from qwen_exo_booster.knowledge import (
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.reflection_memory import ReflectionMemory, ReflectionMemoryStore
-from qwen_exo_booster.runtime import QwenExoRuntime
+from qwen_exo_booster.runtime import QwenExoRuntime, QwenExoRuntimeState
+from qwen_exo_booster.task_scheduling import current_internal_work_class
 
 
 def test_markdown_normalization_removes_metadata_and_comments():
@@ -839,83 +841,136 @@ tags: [reflection-memory]
     assert all(0 <= progress <= 100 for _stage, progress, *_rest in progress_events)
 
 
-@pytest.mark.asyncio
-async def test_runtime_reflection_organization_runs_in_background_with_status():
+def _organization_runtime():
     runtime = object.__new__(QwenExoRuntime)
+    runtime.state = QwenExoRuntimeState.READY
     runtime.reflection_memory_service = object()
     runtime.tensor_bank = object()
     runtime.query_probe = object()
     runtime.knowledge = SimpleNamespace(
         snapshot=SimpleNamespace(source_digest="knowledge-digest")
     )
-    events = []
-    runtime.telemetry = SimpleNamespace(
-        emit=lambda request_id, event_type, payload: events.append(
-            (request_id, event_type, payload)
-        )
-    )
-    runtime._reflection_memory_organization_task = None
-    runtime._reflection_memory_organization_state = {
-        "job_id": None,
-        "status": "idle",
-        "stage": "idle",
-        "progress": 0,
-        "message": "尚未开始整理",
-        "queued_at": None,
-        "started_at": None,
-        "updated_at": None,
-        "finished_at": None,
-        "details": {},
-        "result": None,
-        "error": None,
-    }
-    started = asyncio.Event()
-    release = asyncio.Event()
+    runtime.telemetry = SimpleNamespace(emit=lambda *_args: None)
+    runtime._reflection_memory_organization_worker = None
+    runtime._reflection_memory_organization_queue = asyncio.Queue()
+    runtime._reflection_memory_organization_states = OrderedDict()
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_runtime_reflection_organization_queues_requests_sequentially():
+    runtime = _organization_runtime()
+    entered = asyncio.Queue()
+    releases = [asyncio.Event() for _ in range(4)]
+    calls = []
 
     async def organize_reflection_memories(*, progress):
-        progress(
-            "model_review",
-            48,
-            "模型正在审查候选",
-            {"pass_index": 1, "review_count": 1},
-        )
-        started.set()
-        await release.wait()
-        return {
-            "status": "kept_distinct",
-            "document_count": 3,
-            "high_qk_pair_count": 2,
-            "review_count": 1,
-            "merged_document_count": 0,
-        }
+        index = len(calls)
+        calls.append(index)
+        assert current_internal_work_class("query_probe") == "maintenance"
+        progress("model_review", 48, "review", {"review_count": 1})
+        entered.put_nowait(index)
+        await releases[index].wait()
+        return {"status": "kept_distinct", "review_count": index + 1}
 
     runtime.organize_reflection_memories = organize_reflection_memories
+    accepted = [runtime.start_reflection_memory_organization() for _ in range(4)]
+    assert len({item["job_id"] for item in accepted}) == 4
+    assert all(item["status"] == "queued" for item in accepted)
+    for index in range(4):
+        assert await asyncio.wait_for(entered.get(), 1) == index
+        running = runtime.reflection_memory_organization_status()
+        assert calls == list(range(index + 1))
+        assert running["job_id"] == accepted[index]["job_id"]
+        assert running["status"] == "running"
+        assert running["stage"] == "model_review"
+        assert running["progress"] == 48
+        assert running["active_count"] == 1
+        assert running["max_concurrency"] == 1
+        assert running["queued_count"] == 3 - index
+        releases[index].set()
+    await asyncio.wait_for(runtime._reflection_memory_organization_queue.join(), 1)
+    await runtime._reflection_memory_organization_worker
+    completed = runtime.reflection_memory_organization_status()
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["review_count"] == 4
+    assert completed["active_count"] == completed["queued_count"] == 0
+    assert current_internal_work_class("query_probe") == "foreground"
 
-    accepted = runtime.start_reflection_memory_organization()
-    await started.wait()
-    running = runtime.reflection_memory_organization_status()
 
-    assert accepted["status"] == "queued"
-    assert accepted["job_id"].startswith("reflection-organization-")
-    assert running["status"] == "running"
-    assert running["stage"] == "model_review"
-    assert running["progress"] == 48
-    assert running["details"]["review_count"] == 1
-    with pytest.raises(RuntimeError, match="already running"):
+@pytest.mark.asyncio
+async def test_runtime_reflection_organization_shutdown_drains_queued_requests():
+    runtime = _organization_runtime()
+    entered = asyncio.Event()
+    calls = []
+
+    async def organize_reflection_memories(*, progress):
+        calls.append("started")
+        entered.set()
+        await asyncio.Event().wait()
+
+    runtime.organize_reflection_memories = organize_reflection_memories
+    accepted = [runtime.start_reflection_memory_organization() for _ in range(3)]
+    await asyncio.wait_for(entered.wait(), 1)
+    runtime.state = QwenExoRuntimeState.STOPPING
+    await runtime._stop_reflection_memory_organization()
+    await asyncio.wait_for(runtime._reflection_memory_organization_queue.join(), 1)
+    assert calls == ["started"]
+    assert runtime._reflection_memory_organization_worker is None
+    for item in accepted:
+        state = runtime._reflection_memory_organization_states[item["job_id"]]
+        assert state["status"] == "failed" and state["error"] == "cancelled"
+        assert state["finished_at"] is not None
+    status = runtime.reflection_memory_organization_status()
+    assert status["active_count"] == status["queued_count"] == 0
+    with pytest.raises(RuntimeError):
         runtime.start_reflection_memory_organization()
 
-    release.set()
-    await runtime._reflection_memory_organization_task
-    completed = runtime.reflection_memory_organization_status()
 
-    assert completed["status"] == "succeeded"
-    assert completed["stage"] == "completed"
-    assert completed["progress"] == 100
-    assert completed["result"]["status"] == "kept_distinct"
-    assert any(
-        event_type == "reflection_memory.organization.job_completed"
-        for _request_id, event_type, _payload in events
-    )
+@pytest.mark.asyncio
+async def test_runtime_reflection_organization_bounds_completed_state_and_restarts_worker():
+    runtime = _organization_runtime()
+    calls = 0
+
+    async def organize_reflection_memories(*, progress):
+        nonlocal calls
+        calls += 1
+        return {"status": "kept_distinct", "review_count": calls}
+
+    runtime.organize_reflection_memories = organize_reflection_memories
+    accepted = [runtime.start_reflection_memory_organization() for _ in range(40)]
+    await asyncio.wait_for(runtime._reflection_memory_organization_queue.join(), 1)
+    await runtime._reflection_memory_organization_worker
+    assert calls == 40
+    assert len(runtime._reflection_memory_organization_states) == 32
+    assert accepted[0]["job_id"] not in runtime._reflection_memory_organization_states
+    assert runtime.reflection_memory_organization_status()["result"]["review_count"] == 40
+    runtime.start_reflection_memory_organization()
+    await asyncio.wait_for(runtime._reflection_memory_organization_queue.join(), 1)
+    assert calls == 41
+    assert len(runtime._reflection_memory_organization_states) == 32
+
+
+@pytest.mark.asyncio
+async def test_runtime_reflection_organization_failure_does_not_strand_queue():
+    runtime = _organization_runtime()
+    calls = 0
+
+    async def organize_reflection_memories(*, progress):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("invalid candidate")
+        return {"status": "kept_distinct"}
+
+    runtime.organize_reflection_memories = organize_reflection_memories
+    first = runtime.start_reflection_memory_organization()
+    second = runtime.start_reflection_memory_organization()
+    await asyncio.wait_for(runtime._reflection_memory_organization_queue.join(), 1)
+    states = runtime._reflection_memory_organization_states
+    assert states[first["job_id"]]["status"] == "failed"
+    assert states[second["job_id"]]["status"] == "succeeded"
+    assert calls == 2
 
 
 @pytest.mark.asyncio

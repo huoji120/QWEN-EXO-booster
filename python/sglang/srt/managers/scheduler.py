@@ -26,6 +26,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from itertools import chain
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -48,6 +49,13 @@ from qwen_exo_booster.hybrid_state import (
 )
 from qwen_exo_booster.native_state_bank import NativeStateBankManager
 from qwen_exo_booster.scheduler_admission import SchedulerAdmission
+from qwen_exo_booster.scheduler_fairness import (
+    BackgroundPrefillFairness,
+    WorkClassAdmission,
+    fits_complete_prefill,
+    is_background_request,
+    work_class_preemption,
+)
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -1012,6 +1020,9 @@ class Scheduler(
             )
             if self.server_args.enable_qwen_exo
             else None
+        )
+        self._qwen_exo_prefill_fairness = (
+            BackgroundPrefillFairness() if self.server_args.enable_qwen_exo else None
         )
         self._install_qwen_exo_cache_lifecycle()
         if self.server_args.enable_qwen_exo:
@@ -3645,6 +3656,9 @@ class Scheduler(
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
+                fairness = getattr(self, "_qwen_exo_prefill_fairness", None)
+                if ret is not None and fairness is not None:
+                    fairness.record_decode()
             else:
                 ret = None
 
@@ -3748,9 +3762,16 @@ class Scheduler(
                 if active_req.finished():
                     continue
                 has_victim = True
-                if (
-                    req.priority - active_req.priority
-                ) * priority_sign <= self.priority_scheduling_preemption_threshold:
+                class_preemption = (
+                    work_class_preemption(req, active_req)
+                    if getattr(self.server_args, "enable_qwen_exo", False)
+                    else None
+                )
+                if class_preemption is False or (
+                    class_preemption is None
+                    and (req.priority - active_req.priority) * priority_sign
+                    <= self.priority_scheduling_preemption_threshold
+                ):
                     return False
         return has_victim
 
@@ -3781,6 +3802,17 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _clear_unadmitted_mamba_match(self, req: Req) -> None:
+        # A prefix match can stage COW/clear before PrefillAdder rejects it.
+        # Session-held slots have their own lifecycle and must not be freed.
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
+        if req.mamba_pool_idx is not None and not getattr(req, "session", None):
+            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3795,6 +3827,51 @@ class Scheduler(
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
+        fairness = getattr(self, "_qwen_exo_prefill_fairness", None)
+        foreground_waiting = fairness is not None and any(
+            not is_background_request(req) for req in self.waiting_queue
+        )
+        foreground_decoding = (
+            fairness is not None
+            and not running_batch.is_prefill_only
+            and any(
+                not req.finished() and not is_background_request(req)
+                for req in running_batch.reqs
+            )
+        )
+        # Retry admission rather than retaining a stale NO_TOKEN/full latch.
+        # PrefillAdder still checks every KV/Mamba/prefill resource boundary.
+        if foreground_waiting:
+            running_batch.batch_is_full = False
+        interleave_background = (
+            fairness is not None
+            and self.ps.pp_size == 1
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self.spec_algorithm.is_none()
+            and not self.enable_hisparse
+            and not self.is_hybrid_swa
+            and fairness.should_yield(
+                foreground_waiting=foreground_waiting,
+                foreground_decoding=foreground_decoding,
+            )
+        )
+        yield_background_chunk = (
+            interleave_background
+            and self.chunked_req is not None
+            and is_background_request(self.chunked_req)
+        )
+        work_admission = (
+            WorkClassAdmission(
+                self.max_running_requests,
+                chain(
+                    running_batch.reqs,
+                    last_batch.reqs if last_batch is not None else (),
+                    (self.chunked_req,) if self.chunked_req is not None else (),
+                ),
+            )
+            if fairness is not None
+            else None
+        )
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -3845,6 +3922,9 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
+        if fairness is not None:
+            # Stable: retain configured FCFS/cache/numeric order within a lane.
+            self.waiting_queue.sort(key=is_background_request)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -3879,7 +3959,7 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
-        if self.chunked_req is not None:
+        if self.chunked_req is not None and not yield_background_chunk:
             self._resume_qwen_exo_chunked_prefill(self.chunked_req)
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -3915,14 +3995,19 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if work_admission is not None and not work_admission.can_admit(req):
+                continue
+            if interleave_background and is_background_request(req):
+                continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
             target_only_req = (
                 self.spec_algorithm.is_dflash() and is_dflash_target_only_request(req)
             )
 
-            if (target_only_req and active_has_non_target_only) or (
-                not target_only_req and active_has_target_only
+            if self.spec_algorithm.is_dflash() and (
+                (target_only_req and active_has_non_target_only)
+                or (not target_only_req and active_has_target_only)
             ):
                 if (
                     not self._can_yield_dflash_mode(
@@ -4004,11 +4089,28 @@ class Scheduler(
                 self._reject_qwen_exo_cached_reuse(req, exc)
                 rejected_qwen_reqs.append(req)
                 continue
+            if (
+                fairness is not None
+                and self.chunked_req is not None
+                and (
+                    self.is_hybrid_swa
+                    or not fits_complete_prefill(
+                        req,
+                        remaining_chunk_tokens=adder.rem_chunk_tokens,
+                        page_size=self.page_size,
+                    )
+                )
+            ):
+                # Keep the sole chunk owner; do not start a second long prompt.
+                self._clear_unadmitted_mamba_match(req)
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if work_admission is not None and req in adder.can_run_list:
+                work_admission.add(req)
             if self.spec_algorithm.is_dflash() and adder.can_run_list:
                 active_has_target_only, active_has_non_target_only = (
                     self._dflash_active_request_flags(
@@ -4028,23 +4130,9 @@ class Scheduler(
                         )
                     else:
                         running_batch.batch_is_full = True
-                # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.mamba_cow_src_index = None
-                    req.mamba_needs_clear = False
-                    if req.mamba_pool_idx is not None and not getattr(
-                        req, "session", None
-                    ):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.mamba_pool_idx = None
+                    self._clear_unadmitted_mamba_match(req)
                 break
 
         if mamba_allocator is not None:
@@ -4054,6 +4142,15 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in rejected_set
             ]
+        if (
+            yield_background_chunk
+            and not adder.can_run_list
+            and not foreground_decoding
+        ):
+            # No useful foreground work fit. Resume the same owned chunk now,
+            # rather than spinning idle or starving it behind a long prompt.
+            self._resume_qwen_exo_chunked_prefill(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4070,8 +4167,13 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        batch_chunked_req = (
+            None
+            if yield_background_chunk and self.chunked_req not in can_run_set
+            else self.chunked_req
+        )
+        if batch_chunked_req is not None:
+            batch_chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4092,7 +4194,7 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             batch_spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_req=batch_chunked_req,
         )
 
         if self.qwen_exo_hybrid_policy is not None:
@@ -4104,7 +4206,7 @@ class Scheduler(
             )
         else:
             new_batch.contains_last_prefill_chunk = (
-                self.chunked_req is None or len(can_run_list) != 1
+                batch_chunked_req is None or len(can_run_list) != 1
             )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
@@ -4137,12 +4239,14 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
+                    batch_chunked_req.extend_range.length
+                    if batch_chunked_req is not None
                     else 0
                 ),
             ),
         )
+        if fairness is not None:
+            fairness.record_prefill(can_run_list)
 
         # Mixed-style chunked prefill
         if (

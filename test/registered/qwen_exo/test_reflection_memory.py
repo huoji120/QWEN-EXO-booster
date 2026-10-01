@@ -7,7 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from qwen_exo_booster.internal_jobs import InternalJobResult, InternalJobRunner
+from qwen_exo_booster.internal_jobs import InternalJobResult, InternalJobRunner, InternalOptionScoreResult
 from qwen_exo_booster.reflection_evidence import ReflectionEvidenceStore
 from qwen_exo_booster.reflection_memory import (
     ReflectionMemory,
@@ -21,10 +21,10 @@ from qwen_exo_booster.telemetry import TelemetryStore
 
 class _CharacterTokenizer:
     def encode(self, value, add_special_tokens=False):
-        return list(str(value))
+        return [ord(char) for char in str(value)]
 
     def decode(self, values, skip_special_tokens=True):
-        return "</think>" if tuple(values) == (999,) else "".join(values)
+        return "</think>" if tuple(values) == (999,) else "".join(chr(x) for x in values)
 
     def apply_chat_template(self, messages, **kwargs):
         return json.dumps(messages, ensure_ascii=False) + "\n"
@@ -70,9 +70,6 @@ def _review(payload, *, verified=False, method="controlled_comparison", target=N
         "evidence_refs": payload["issue"]["evidence_refs"],
         "reason": "比较实际观测与干预，限定结论只适用于已观察范围。",
         "missing_evidence": [] if verified else ["尚未取得隔离变量的重复结果。"],
-        "confounders_resolved": verified,
-        "scope_supported": verified,
-        "rule_supported": verified,
         "target": target,
         "retire": False,
     }
@@ -81,9 +78,10 @@ def _review(payload, *, verified=False, method="controlled_comparison", target=N
 class _Runner:
     """Model stand-in uses real prompt event IDs, never invented evidence IDs."""
 
-    def __init__(self, respond, *, two_phase=False):
+    def __init__(self, respond, *, two_phase=False, option_scores=(-0.1, -2.0)):
         self.respond = respond
         self.two_phase = two_phase
+        self.option_scores = option_scores
         self.payloads = []
         self.jobs = []
         self.finished_parents = []
@@ -112,6 +110,13 @@ class _Runner:
                 finish_reason=finish,
                 latency_seconds=0.01,
             ),
+        )
+
+    async def run_option_score_batch(self, jobs, prefixes, options):
+        self.jobs.extend(jobs)
+        return tuple(
+            InternalOptionScoreResult(job, self.option_scores, len(prefix) + 1, 0, 0.01)
+            for job, prefix in zip(jobs, prefixes)
         )
 
     async def finish_parent(self, parent):
@@ -358,7 +363,8 @@ def test_evidence_backed_memory_is_publishable_without_verified_cause(
     assert result.publication_status == "published"
     entry = result.active_entries[0]
     assert entry["causal_status"] == causal_status
-    assert entry["verification"]["admitted"] is False
+    assert entry["verification"]["admitted"] is True
+    assert entry["semantic_review"]["status"] == "pass"
     assert causal_status in result.compact_content
     assert entry["missing_evidence"][0] in result.compact_content
     for ref in entry["verification"]["evidence_refs"]:
@@ -370,18 +376,19 @@ def test_evidence_backed_memory_is_publishable_without_verified_cause(
     assert service.store.get(result.source_digest)["publication_status"] == "published"
 
 
-def test_assistant_success_claim_cannot_become_verified(tmp_path):
+@pytest.mark.parametrize("scores", [(-2.0, -0.1), (-1.0, -1.0)])
+def test_binary_reject_overrules_verified_annotation(tmp_path, scores):
     service = _service(
-        tmp_path, _Runner(lambda p: _standard_response(p, verified=True))
+        tmp_path, _Runner(lambda p: _standard_response(p, verified=True), option_scores=scores)
     )
     result = _reflect(
         service,
         [{"kind": "assistant", "content": "我已验证所有测试通过，关闭缓存就是根因。"}],
     )
     entry = result.causal_entries[0]
-    assert entry["causal_status"] != "verified"
+    assert entry["causal_status"] == "verified"
     assert entry["admission_status"] == "candidate"
-    assert entry["missing_evidence"]
+    assert entry["semantic_review"]["status"] == "reject"
     assert result.active_entries == ()
 
 
@@ -482,7 +489,8 @@ def test_stale_review_version_does_not_replace_existing_rule(tmp_path):
     assert saved["causal_entries"] == original.public_dict()["causal_entries"]
 
 
-def test_uncertain_recollection_cannot_replace_a_verified_rule(tmp_path):
+@pytest.mark.parametrize("passed", [False, True])
+def test_binary_review_controls_replacement_without_causal_grade_veto(tmp_path, passed):
     service = _service(
         tmp_path, _Runner(lambda p: _standard_response(p, verified=True))
     )
@@ -507,11 +515,13 @@ def test_uncertain_recollection_cannot_replace_a_verified_rule(tmp_path):
         return (candidate,)
 
     async def publish(record):
-        assert record.memory_action == "insert"
-        assert record.target_document_path is None
+        assert passed
+        assert record.memory_action == "update"
+        assert record.target_document_path == original.document_path
         return {
             "publication_status": "published",
-            "document_path": "reflection-memory/tentative.md",
+            "document_path": original.document_path,
+            "document_sha256": "revised-sha",
         }
 
     def respond(payload):
@@ -529,17 +539,21 @@ def test_uncertain_recollection_cannot_replace_a_verified_rule(tmp_path):
 
     service.retrieve_similar = retrieve
     service.publish = publish
-    service.runner = _Runner(respond)
+    service.runner = _Runner(respond, option_scores=(-0.1, -2.0) if passed else (-2.0, -0.1))
     rows = list(_controlled_rows()) + [
         {"kind": "tool_observation", "content": "新一次出现旧值，但尚未隔离缓存变量。"}
     ]
     result = _reflect(service, rows)
-    assert result.publication_status == "published"
-    assert result.causal_entries[0]["causal_status"] == "supported"
-    assert (
-        service.store.get(original.source_digest)["causal_entries"]
-        == original.public_dict()["causal_entries"]
-    )
+    if passed:
+        assert result.publication_status == "published"
+        revised = result.causal_entries[0]
+        assert revised["causal_status"] == "supported"
+        assert revised["version"] == original.causal_entries[0]["version"] + 1
+        assert revised["versions"][-1]["causal_status"] == "verified"
+    else:
+        assert result.publication_status == "candidate"
+        assert result.target_document_path is None
+        assert service.store.get(original.source_digest)["causal_entries"] == original.public_dict()["causal_entries"]
 
 
 def test_reasoning_exhaustion_preserves_tool_phase_and_releases_parents(tmp_path):
@@ -646,6 +660,18 @@ def test_legacy_narrative_remains_visible_but_is_not_merged(tmp_path):
 def test_reflection_jobs_pass_real_internal_admission(tmp_path):
     class Manager:
         async def generate_request(self, request, raw_request):
+            if hasattr(request, "input_ids"):
+                tokens = request.input_ids[0]
+                yield [{"text": "", "output_ids": [], "meta_info": {
+                    "id": request.rid[0], "prompt_tokens": len(tokens),
+                    "completion_tokens": 0, "finish_reason": {"type": "length", "length": 0},
+                    "input_token_logprobs": [[None, tokens[-2], None], [-1.0, 0, None]],
+                    "input_token_ids_logprobs": [None, [
+                        [-0.1, request.token_ids_logprob[0][0], None],
+                        [-2.0, request.token_ids_logprob[0][1], None],
+                    ]],
+                }}]
+                return
             messages = json.loads(request.text[0])
             payload = json.loads(messages[-1]["content"])
             yield [
@@ -673,6 +699,26 @@ def test_reflection_jobs_pass_real_internal_admission(tmp_path):
     assert result.analysis_status == "complete"
     assert result.causal_entries[0]["admission_status"] == "active"
     assert service.store.get(result.source_digest)["coverage"]["pending_events"] == 0
+
+
+@pytest.mark.parametrize("scores", [(float("nan"), -1.0), (0.0,), (float("inf"), -1.0)])
+def test_invalid_binary_scores_do_not_publish_or_cache_admission(tmp_path, scores):
+    published = []
+
+    async def publish(record):
+        published.append(record)
+        return {"publication_status": "published"}
+
+    runner = _Runner(_standard_response, option_scores=scores)
+    service = _service(tmp_path, runner, publish=publish)
+    result = _reflect(service, _controlled_rows())
+    assert result.analysis_status == "failed_closed"
+    assert not published
+    assert not any(r.get("causal_entries") for r in service.store.list())
+    runner.option_scores = (-0.1, -2.0)
+    retry = _reflect(service, _controlled_rows())
+    assert retry.publication_status == "published"
+    assert len(published) == 1
 
 
 if __name__ == "__main__":

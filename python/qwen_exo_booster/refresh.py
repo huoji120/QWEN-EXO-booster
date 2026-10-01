@@ -1867,7 +1867,7 @@ class SelfAskRefreshService:
                 batches,
                 decisions,
                 selected_candidate_id=None,
-                selection_method="independent_binary_waves",
+                selection_method="direct_binary_logits",
             ),
             len(batches),
         )

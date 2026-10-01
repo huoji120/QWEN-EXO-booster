@@ -68,6 +68,7 @@ class TestPrefillAdder(CustomTestCase):
         self, *, schedule_low_priority_values_first: bool
     ) -> MagicMock:
         server_args = MagicMock()
+        server_args.enable_qwen_exo = False
         server_args.schedule_low_priority_values_first = (
             schedule_low_priority_values_first
         )
@@ -101,6 +102,49 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_exo_foreground_preempts_background_independent_of_priority_direction(self):
+        for low_first in (False, True):
+            with self.subTest(low_first=low_first):
+                foreground = self.create_mock_req("user", -1000 if low_first else 1000, 50)
+                background = self.create_mock_req("reflection", -100, 50)
+                background.sampling_params.custom_params = {"qwen_exo_work_class": "reflection"}
+                incoming = self.create_mock_req("probe", 0, 49)
+                args = self.create_server_args(schedule_low_priority_values_first=low_first)
+                args.enable_qwen_exo = True
+                self.mock_token_allocator.available_size.return_value = 100
+                self.mock_token_allocator.full_available_size.return_value = 100
+                adder = self.create_adder(self.create_running_batch([foreground, background]))
+                self.assertTrue(adder.preempt_to_schedule(incoming, args))
+                self.assertEqual(adder.preempt_list, [background])
+                self.assertEqual(adder.rem_total_token_offset, 50)
+
+    def test_exo_background_cannot_preempt_foreground_even_with_better_numeric_priority(self):
+        for low_first in (False, True):
+            with self.subTest(low_first=low_first):
+                foreground = self.create_mock_req("user", 0, 50)
+                incoming = self.create_mock_req("maintenance", -100 if low_first else 100, 49)
+                incoming.sampling_params.custom_params = {"qwen_exo_work_class": "maintenance"}
+                args = self.create_server_args(schedule_low_priority_values_first=low_first)
+                args.enable_qwen_exo = True
+                self.mock_token_allocator.available_size.return_value = 50
+                self.mock_token_allocator.full_available_size.return_value = 50
+                adder = self.create_adder(self.create_running_batch([foreground]))
+                self.assertFalse(adder.preempt_to_schedule(incoming, args))
+                self.assertEqual(adder.preempt_list, [])
+                self.assertEqual(adder.rem_total_token_offset, 50)
+
+    def test_exo_foreground_preemption_still_requires_sufficient_token_capacity(self):
+        background = self.create_mock_req("reflection", -100, 50)
+        background.sampling_params.custom_params = {"qwen_exo_work_class": "reflection"}
+        incoming = self.create_mock_req("probe", 0, 60)
+        args = self.create_server_args(schedule_low_priority_values_first=True)
+        args.enable_qwen_exo = True
+        self.mock_token_allocator.available_size.return_value = 50
+        self.mock_token_allocator.full_available_size.return_value = 50
+        adder = self.create_adder(self.create_running_batch([background]))
+        self.assertFalse(adder.preempt_to_schedule(incoming, args))
+        self.assertEqual(adder.preempt_list, [])
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

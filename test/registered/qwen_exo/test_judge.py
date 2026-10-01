@@ -1,741 +1,370 @@
-from dataclasses import replace
-import json
 import asyncio
-import os
+import json
+from dataclasses import replace
 
 import pytest
 
 from qwen_exo_booster.contracts import EligibilityStatus, stable_digest
-from qwen_exo_booster.internal_jobs import InternalJobResult
-from qwen_exo_booster.judge import (
-    ReferenceJudge,
-    parse_reference_selection,
-    parse_reference_support,
-)
+from qwen_exo_booster.internal_jobs import InternalOptionScoreResult
+from qwen_exo_booster.judge import JudgeBatchResult, ReferenceJudge
 from qwen_exo_booster.knowledge import KnowledgeRepository
 
 
 class FakeTokenizer:
     def encode(self, text, add_special_tokens=False):
-        return str(text).split()
+        return [ord(char) for char in str(text)]
 
     def decode(self, token_ids, **kwargs):
-        return " ".join(token_ids)
+        return "".join(chr(token) for token in token_ids)
 
     def apply_chat_template(self, messages, **kwargs):
-        assert kwargs["enable_thinking"] is False
-        return "<system>" + messages[0]["content"] + "<user>" + messages[1]["content"]
+        # Make the flag observable in the actual scored prefix, not just call kwargs.
+        suffix = "<think>" if kwargs.get("enable_thinking", True) else "<answer>"
+        return "<system>" + messages[0]["content"] + "<user>" + messages[1]["content"] + suffix
+
+
+def payload(prefix):
+    prompt = FakeTokenizer().decode(prefix)
+    assert prompt.endswith("<answer>")
+    return json.loads(prompt.split("<user>", 1)[1].removesuffix("<answer>"))
 
 
 class FakeRunner:
-    def __init__(self, malformed=False, finish_type="stop", fixed_text=None):
-        self.malformed = malformed
-        self.finish_type = finish_type
-        self.fixed_text = fixed_text
-        self.jobs = ()
-        self.prompts = ()
-        self.sampling_params = None
-        self.calls = 0
+    def __init__(self, scores=None, *, max_fanout=32, failure=None, corrupt=None):
+        self.scores = scores
+        self.max_fanout = max_fanout
+        self.failure = failure
+        self.corrupt = corrupt
+        self.calls = []
 
-    async def run_batch(self, jobs, prompts, sampling_params):
-        self.calls += 1
-        self.jobs = tuple(jobs)
-        self.prompts = tuple(prompts)
-        self.sampling_params = sampling_params
+    async def run_option_score_batch(self, jobs, input_ids, option_token_ids):
+        jobs, prefixes = tuple(jobs), tuple(input_ids)
+        self.calls.append((jobs, prefixes, option_token_ids))
+        if self.failure is not None:
+            raise self.failure
         results = []
-        for job, prompt in zip(self.jobs, self.prompts):
-            if self.fixed_text is not None:
-                text = self.fixed_text
-            elif self.malformed:
-                text = '{"supported":true,"extra":1}'
-            else:
-                text = (
-                    '{"supported":true}'
-                    if "FWPM_LAYER_ALE_AUTH_CONNECT_V4" in prompt
-                    else '{"supported":false}'
-                )
-            results.append(
-                InternalJobResult(
-                    job=job,
-                    text=text,
-                    prompt_tokens=100,
-                    completion_tokens=4,
-                    finish_reason={"type": self.finish_type},
-                    latency_seconds=0.01,
-                )
-            )
-        return tuple(results)
+        for job, prefix in zip(jobs, prefixes):
+            reference = payload(prefix)["reference"]
+            scores = self.scores
+            if scores is None:
+                scores = (-0.1, -2.5) if "AppID" in reference else (-3.0, -0.2)
+            results.append(InternalOptionScoreResult(
+                job=job, option_logprobs=scores,
+                prompt_tokens=len(prefix) + 1, completion_tokens=0,
+                latency_seconds=0.01,
+            ))
+        return tuple(self.corrupt(results) if self.corrupt else results)
 
 
 def repository_with_candidates(tmp_path):
     repository = KnowledgeRepository(tmp_path)
-    repository.upsert(
-        "wfp.md", "Use FWPM_LAYER_ALE_AUTH_CONNECT_V4 with an AppID condition."
-    )
-    repository.upsert("ctf.md", "Heap exploitation and return oriented programming.")
-    wfp = repository.rank("FWPM_LAYER_ALE_AUTH_CONNECT_V4")[0]
-    ctf = repository.rank("heap exploitation")[0]
-    return repository, (wfp, ctf)
-
-
-def test_parse_reference_support_is_strict_and_fail_closed():
-    assert parse_reference_support('{"supported":true}') is True
-    assert parse_reference_support('{"supported":false}') is False
-    assert parse_reference_support('{"supported":true,"extra":1}') is None
-    assert parse_reference_support('{"supported":true,"supported":false}') is None
-    assert parse_reference_support("true") is None
-
-
-def test_parse_reference_selection_is_strict_and_allows_abstention():
-    aliases = ("A", "B")
-    assert parse_reference_selection('{"winner":"A"}', aliases) == (True, "A")
-    assert parse_reference_selection('{"winner":null}', aliases) == (True, None)
-    assert parse_reference_selection('{"winner":"Z"}', aliases) == (False, None)
-    assert parse_reference_selection('{"winner":"A","extra":1}', aliases) == (
-        False,
-        None,
-    )
-    assert parse_reference_selection('{"winner":"A","winner":"B"}', aliases) == (
-        False,
-        None,
+    good = repository.upsert("wfp.md", "Use an AppID condition for outbound authorization.")
+    other = repository.upsert("other.md", "Use compost and water the garden.")
+    return repository, tuple(
+        repository.candidate_for_document(document.document_id, "question")
+        for document in (good, other)
     )
 
 
-def test_select_best_compares_candidates_in_one_bounded_job(tmp_path):
+def evaluate(judge, candidates, *, question="Configure outbound authorization", parent="parent"):
+    return asyncio.run(judge.judge(
+        parent_request_id=parent, turn_id=f"{parent}:turn", question=question,
+        candidates=candidates, telemetry_correlation_id=f"{parent}:trace",
+    ))
+
+
+def make_judge(tmp_path, *, runner=None, **kwargs):
     repository, candidates = repository_with_candidates(tmp_path)
-    runner = FakeRunner(fixed_text='{"winner":"A"}')
+    runner = runner or FakeRunner()
     judge = ReferenceJudge(
-        runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
+        runner, repository, FakeTokenizer(), model_fingerprint="model", **kwargs,
     )
+    return judge, runner, candidates
 
-    result = asyncio.run(
-        judge.select_best(
-            parent_request_id="parent-listwise",
-            turn_id="turn-listwise",
-            question="Which reference best answers the WFP question?",
-            candidates=candidates,
-            telemetry_correlation_id="trace-listwise",
-        )
-    )
 
-    assert len(runner.jobs) == len(runner.prompts) == 1
-    prompt_payload = json.loads(runner.prompts[0].split("<user>", 1)[1])
-    assert {item["source"] for item in prompt_payload["candidates"]} == {
-        "wfp.md",
-        "ctf.md",
-    }
-    winner_source = next(
-        item["source"] for item in prompt_payload["candidates"] if item["id"] == "A"
-    )
-    winner_candidate = next(
-        candidate
-        for candidate in candidates
-        if candidate.relative_path == winner_source
-    )
-    assert result.selection_method == "comparative_listwise"
-    assert result.presented_candidate_count == 2
-    assert result.executed_count == 1
-    assert result.valid_count == 2
+def test_binary_scores_admit_independently_and_account_prefill_once(tmp_path):
+    judge, runner, candidates = make_judge(tmp_path)
+    result = evaluate(judge, candidates)
+    assert [decision.eligible for decision in result.decisions] == [True, False]
+    assert [decision.decision_margin for decision in result.decisions] == pytest.approx([2.4, -2.8])
+    assert result.valid_count == result.executed_count == 2
     assert result.eligible_count == 1
-    assert result.selected_candidate_id == winner_candidate.candidate_id
-    assert sum(decision.eligible for decision in result.decisions) == 1
-    schema = json.loads(runner.sampling_params["json_schema"])
-    assert schema["properties"]["winner"]["enum"] == [None, "A", "B"]
-    assert '"score"' not in runner.prompts[0]
-
-
-def test_select_best_presents_eight_candidates(tmp_path):
-    repository = KnowledgeRepository(tmp_path)
-    documents = [
-        repository.upsert(f"reference-{index}.md", f"reference content {index}")
-        for index in range(8)
-    ]
-    candidates = tuple(repository.rank(document.content)[0] for document in documents)
-    runner = FakeRunner(fixed_text='{"winner":"H"}')
-    judge = ReferenceJudge(
-        runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
-    )
-
-    result = asyncio.run(
-        judge.select_best(
-            parent_request_id="parent-eight",
-            turn_id="turn-eight",
-            question="Which reference is relevant?",
-            candidates=candidates,
-            telemetry_correlation_id="trace-eight",
-        )
-    )
-
-    assert result.presented_candidate_count == 8
-    assert result.valid_count == 8
-    assert result.eligible_count == 1
-    assert result.selected_candidate_id == candidates[7].candidate_id
-    assert json.loads(runner.sampling_params["json_schema"])["properties"]["winner"][
-        "enum"
-    ] == [None, "A", "B", "C", "D", "E", "F", "G", "H"]
-
-
-def test_select_best_can_reject_every_candidate(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    judge = ReferenceJudge(
-        FakeRunner(fixed_text='{"winner":null}'),
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-    )
-
-    result = asyncio.run(
-        judge.select_best(
-            parent_request_id="parent-none",
-            turn_id="turn-none",
-            question="Unrelated clinical dosing question",
-            candidates=candidates,
-            telemetry_correlation_id="trace-none",
-        )
-    )
-
-    assert result.valid_count == 2
-    assert result.eligible_count == 0
+    assert result.selection_method == "direct_binary_logits"
     assert result.selected_candidate_id is None
-    assert all(
-        decision.status is EligibilityStatus.INELIGIBLE for decision in result.decisions
-    )
+    jobs, prefixes, options = runner.calls[0]
+    assert len(jobs) == len(prefixes) == 2
+    assert options == (ord("A"), ord("B"))
+    assert all(job.token_budget == 1 for job in jobs)
+    assert len({job.job_id for job in jobs}) == 2
+    assert result.prompt_tokens == sum(len(prefix) + 1 for prefix in prefixes)
+    assert result.completion_tokens == 0
 
 
-def test_select_best_invalid_winner_fails_closed(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    judge = ReferenceJudge(
-        FakeRunner(fixed_text='{"winner":"Z"}'),
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-    )
-
-    result = asyncio.run(
-        judge.select_best(
-            parent_request_id="parent-invalid",
-            turn_id="turn-invalid",
-            question="WFP question",
-            candidates=candidates,
-            telemetry_correlation_id="trace-invalid",
-        )
-    )
-
-    assert result.valid_count == result.eligible_count == 0
-    assert all(
-        decision.status is EligibilityStatus.INVALID for decision in result.decisions
-    )
-
-
-def test_select_best_cache_is_candidate_order_independent(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    runner = FakeRunner(fixed_text='{"winner":"A"}')
-    judge = ReferenceJudge(
-        runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
-    )
-
-    async def select(parent_request_id, items):
-        return await judge.select_best(
-            parent_request_id=parent_request_id,
-            turn_id=f"{parent_request_id}:turn",
-            question="WFP question",
-            candidates=items,
-            telemetry_correlation_id=f"{parent_request_id}:trace",
-        )
-
-    first = asyncio.run(select("first", candidates))
-    repeated = asyncio.run(select("second", tuple(reversed(candidates))))
-
-    assert first.selected_candidate_id == repeated.selected_candidate_id
-    assert first.executed_count == 1
-    assert repeated.executed_count == 0
-    assert repeated.cache_hit_count == 1
-    assert all(
-        decision.judge_method == "sglang_constrained_listwise_cache"
-        for decision in repeated.decisions
-    )
-    assert runner.calls == 1
-
-
-def test_judge_batches_candidates_with_shared_prefix(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    runner = FakeRunner()
-    judge = ReferenceJudge(
-        runner,
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-    )
-
-    result = asyncio.run(
-        judge.judge(
-            parent_request_id="parent-1",
-            turn_id="turn-1",
-            question="How should WFP AppID filtering be configured?",
-            candidates=candidates,
-            telemetry_correlation_id="trace-1",
-        )
-    )
-
-    assert [decision.status for decision in result.decisions] == [
-        EligibilityStatus.ELIGIBLE,
-        EligibilityStatus.INELIGIBLE,
-    ]
+@pytest.mark.parametrize("scores,eligible,margin", [
+    ((-0.2, -0.8), True, 0.6),
+    ((-0.8, -0.2), False, -0.6),
+    ((-0.5, -0.5), False, 0.0),
+])
+def test_binary_boundary_has_no_abstention_and_ties_reject(tmp_path, scores, eligible, margin):
+    judge, _, candidates = make_judge(tmp_path, runner=FakeRunner(scores))
+    result = evaluate(judge, candidates)
     assert result.valid_count == 2
-    assert result.eligible_count == 1
-    assert len({job.shared_prefix_key for job in runner.jobs}) == 1
-    assert len(os.path.commonprefix(runner.prompts)) > 100
-    assert runner.sampling_params["json_schema"]
+    assert all(decision.eligible is eligible for decision in result.decisions)
+    assert all(decision.decision_margin == pytest.approx(margin) for decision in result.decisions)
+    assert result.eligible_count == (2 if eligible else 0)
 
 
-@pytest.mark.parametrize(
-    "method,source_tokens,use_full_source",
-    (
-        ("judge", 96, True),
-        ("judge", 97, False),
-        ("select_best", 64, True),
-        ("select_best", 65, False),
-    ),
-)
-def test_judge_prefers_complete_source_only_within_reference_budget(
-    tmp_path, method, source_tokens, use_full_source
-):
-    repository = KnowledgeRepository(tmp_path)
-    full_source = "\n".join(f"evidence-{index}" for index in range(source_tokens))
-    document = repository.upsert("reference.md", full_source)
-    candidate = replace(
-        repository.candidate_for_document(document.document_id, "diagnostic check"),
-        reference_content="bounded diagnostic excerpt",
-    )
-    other_document = repository.upsert("other.md", "unrelated gardening notes")
-    other = repository.candidate_for_document(other_document.document_id, "gardening")
-    runner = FakeRunner(
-        fixed_text='{"winner":null}' if method == "select_best" else '{"supported":false}'
-    )
-    judge = ReferenceJudge(
-        runner,
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-        max_reference_tokens=96,
-        max_selection_tokens=128,
-        max_selection_candidates=2,
-    )
+@pytest.mark.parametrize("corrupt", [
+    lambda results: results[:-1],
+    lambda results: list(reversed(results)),
+    lambda results: [replace(results[0], option_logprobs=(-0.1,))] + results[1:],
+    lambda results: [replace(results[0], option_logprobs=(float("nan"), -1))] + results[1:],
+    lambda results: [replace(results[0], option_logprobs=(-1, float("inf")))] + results[1:],
+    lambda results: [replace(results[0], completion_tokens=1)] + results[1:],
+])
+def test_invalid_batch_rejects_every_candidate_and_is_not_cached(tmp_path, corrupt):
+    runner = FakeRunner(corrupt=corrupt)
+    judge, _, candidates = make_judge(tmp_path, runner=runner)
+    first = evaluate(judge, candidates)
+    assert first.valid_count == first.eligible_count == first.cache_hit_count == 0
+    assert all(decision.status is EligibilityStatus.INELIGIBLE for decision in first.decisions)
+    assert all(decision.judge_method == "direct_binary_logits_failed" for decision in first.decisions)
+    assert all(decision.decision_margin is None for decision in first.decisions)
+    runner.corrupt = None
+    retried = evaluate(judge, candidates, parent="retry")
+    assert retried.executed_count == retried.valid_count == 2
+    assert retried.cache_hit_count == 0
+    assert retried.eligible_count == 1
 
-    asyncio.run(
-        getattr(judge, method)(
-            parent_request_id="parent-reference",
-            turn_id="turn-reference",
-            question="Which observation supports a diagnostic next check?",
-            candidates=(candidate, other) if method == "select_best" else (candidate,),
-            telemetry_correlation_id="trace-reference",
-        )
-    )
 
-    payload = json.loads(runner.prompts[0].split("<user>", 1)[1])
-    if method == "select_best":
-        reference = next(
-            item["reference"]
-            for item in payload["candidates"]
-            if item["source"] == "reference.md"
-        )
+@pytest.mark.parametrize("failure", [RuntimeError("unavailable"), TimeoutError("deadline")])
+def test_operational_failure_retries_without_cached_rejection(tmp_path, failure):
+    runner = FakeRunner(failure=failure)
+    judge, _, candidates = make_judge(tmp_path, runner=runner)
+    failed = evaluate(judge, candidates)
+    runner.failure = None
+    recovered = evaluate(judge, candidates)
+    assert failed.valid_count == failed.eligible_count == 0
+    assert recovered.cache_hit_count == 0
+    assert recovered.eligible_count == 1
+
+
+def test_cancellation_propagates_without_populating_cache(tmp_path):
+    runner = FakeRunner(failure=asyncio.CancelledError())
+    judge, _, candidates = make_judge(tmp_path, runner=runner)
+    with pytest.raises(asyncio.CancelledError):
+        evaluate(judge, candidates)
+    runner.failure = None
+    result = evaluate(judge, candidates)
+    assert result.cache_hit_count == 0
+    assert result.valid_count == 2
+
+
+def test_fanout_waves_preserve_order_and_add_usage(tmp_path):
+    judge, runner, candidates = make_judge(tmp_path, runner=FakeRunner(max_fanout=1))
+    result = evaluate(judge, candidates)
+    assert [len(call[0]) for call in runner.calls] == [1, 1]
+    assert [decision.candidate_id for decision in result.decisions] == [candidate.candidate_id for candidate in candidates]
+    assert result.prompt_tokens == sum(len(prefix) + 1 for _, prefixes, _ in runner.calls for prefix in prefixes)
+    assert result.valid_count == 2
+
+
+def test_cache_preserves_margin_and_rebinds_request_identity_in_any_order(tmp_path):
+    judge, runner, candidates = make_judge(tmp_path)
+    first = evaluate(judge, candidates)
+    changed_ids = tuple(replace(candidate, candidate_id=f"new-{index}") for index, candidate in enumerate(reversed(candidates)))
+    cached = evaluate(judge, changed_ids, parent="second")
+    assert len(runner.calls) == 1
+    assert cached.cache_hit_count == 2
+    assert cached.executed_count == cached.prompt_tokens == cached.completion_tokens == 0
+    for original, current, candidate in zip(reversed(first.decisions), cached.decisions, changed_ids):
+        assert current.status is original.status
+        assert current.decision_margin == original.decision_margin
+        assert current.parent_request_id == "second"
+        assert current.candidate_id == candidate.candidate_id
+        assert current.judge_method == "direct_binary_logits_cache"
+
+
+@pytest.mark.parametrize("change", ["question", "reference", "digest", "lane", "scope", "model", "template"])
+def test_cache_invalidates_semantic_and_model_identities(tmp_path, change):
+    judge, runner, candidates = make_judge(tmp_path)
+    candidate = candidates[0]
+    evaluate(judge, (candidate,))
+    question = "Configure outbound authorization"
+    if change == "question":
+        question += " with a different condition"
+    elif change == "reference":
+        candidate = replace(candidate, reference_content="new AppID evidence")
+    elif change == "digest":
+        candidate = replace(candidate, reference_digest="f" * 64)
+    elif change == "lane":
+        candidate = replace(candidate, lane="policydata")
+    elif change == "scope":
+        candidate = replace(candidate, scope_note="Conditional evidence only")
+    elif change == "model":
+        judge.model_fingerprint = "other-model"
     else:
-        reference = payload["reference"]
-    assert reference == (full_source if use_full_source else candidate.reference_content)
-    assert len(FakeTokenizer().encode(reference)) <= (64 if method == "select_best" else 96)
+        previous = judge.tokenizer.apply_chat_template
+        judge.tokenizer.apply_chat_template = lambda *args, **kwargs: "new template\n" + previous(*args, **kwargs)
+    fresh = evaluate(judge, (candidate,), question=question)
+    assert fresh.executed_count == 1
+    assert fresh.cache_hit_count == 0
+    assert len(runner.calls) == 2
 
 
-@pytest.mark.parametrize("method", ("judge", "select_best"))
-@pytest.mark.parametrize("source_change", ("updated", "deleted"))
-def test_judge_uses_frozen_candidate_content_after_repository_change(
-    tmp_path, method, source_change
-):
-    repository, (original, other) = repository_with_candidates(tmp_path)
-    candidate = replace(
-        original, reference_content="FWPM_LAYER_ALE_AUTH_CONNECT_V4 excerpt"
-    )
+def test_cache_eviction_retains_recently_used_decisions(tmp_path):
+    judge, runner, candidates = make_judge(tmp_path, cache_size=2)
+    evaluate(judge, (candidates[0],))
+    evaluate(judge, (candidates[1],))
+    evaluate(judge, (candidates[0],))
+    evaluate(judge, (candidates[0],), question="different")
+    kept = evaluate(judge, (candidates[0],))
+    evicted = evaluate(judge, (candidates[1],))
+    assert kept.cache_hit_count == 1
+    assert evicted.executed_count == 1
+    assert len(runner.calls) == 4
+
+
+def test_duplicate_semantics_keep_candidate_identity_and_count_cache_hits(tmp_path):
+    judge, _, candidates = make_judge(tmp_path)
+    twins = (candidates[0], replace(candidates[0], candidate_id="twin"))
+    first = evaluate(judge, twins)
+    cached = evaluate(judge, twins)
+    assert first.executed_count == cached.cache_hit_count == 2
+    assert [decision.candidate_id for decision in cached.decisions] == [candidate.candidate_id for candidate in twins]
+
+
+@pytest.mark.parametrize("source_size,use_full", [(96, True), (97, False)])
+def test_complete_reference_used_only_within_budget(tmp_path, source_size, use_full):
+    judge, runner, candidates = make_judge(tmp_path, max_reference_tokens=96)
+    full = "AppID " + "x" * (source_size - 6)
+    document = judge.repository.upsert("bounded.md", full)
+    candidate = replace(judge.repository.candidate_for_document(document.document_id, "q"), reference_content="AppID excerpt")
+    result = evaluate(judge, (candidate,))
+    observed = payload(runner.calls[0][1][0])["reference"]
+    assert observed == (full if use_full else candidate.reference_content)
+    assert result.decisions[0].reference_digest == stable_digest(candidate.reference_content)
+
+
+@pytest.mark.parametrize("source_change", ["updated", "deleted"])
+def test_repository_changes_do_not_replace_frozen_evidence(tmp_path, source_change):
+    judge, runner, candidates = make_judge(tmp_path)
+    candidate = replace(candidates[0], reference_content="AppID frozen excerpt")
     if source_change == "updated":
-        repository.upsert("wfp.md", "replacement content that was never proposed")
+        judge.repository.upsert("wfp.md", "unrelated replacement")
     else:
-        repository.delete("wfp.md")
-    runner = FakeRunner(
-        fixed_text='{"winner":null}' if method == "select_best" else '{"supported":true}'
-    )
-    judge = ReferenceJudge(
-        runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
-    )
-
-    result = asyncio.run(
-        getattr(judge, method)(
-            parent_request_id="parent-1",
-            turn_id="turn-1",
-            question="How should WFP filtering be configured?",
-            candidates=(candidate, other) if method == "select_best" else (candidate,),
-            telemetry_correlation_id="trace-1",
-        )
-    )
-
-    assert result.valid_count == (2 if method == "select_best" else 1)
-    payload = json.loads(runner.prompts[0].split("<user>", 1)[1])
-    if method == "select_best":
-        reference = next(
-            item["reference"]
-            for item in payload["candidates"]
-            if item["source"] == "wfp.md"
-        )
-    else:
-        reference = payload["reference"]
-    assert reference == candidate.reference_content
+        judge.repository.delete("wfp.md")
+    result = evaluate(judge, (candidate,))
+    assert payload(runner.calls[0][1][0])["reference"] == candidate.reference_content
+    assert result.decisions[0].eligible
 
 
-def test_judge_truncates_long_question_and_still_reviews(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    runner = FakeRunner()
-    judge = ReferenceJudge(
-        runner,
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-        max_question_tokens=64,
-    )
-    question = (
-        "head-marker "
-        + " ".join(f"word-{index}" for index in range(3000))
-        + " tail-marker"
-    )
+def test_cache_tracks_actual_reviewed_source_after_repository_change(tmp_path):
+    judge, runner, candidates = make_judge(tmp_path)
+    candidate = replace(candidates[0], reference_content="unrelated excerpt")
+    first = evaluate(judge, (candidate,))
+    judge.repository.delete("wfp.md")
+    second = evaluate(judge, (candidate,))
+    assert first.eligible_count == 1
+    assert second.executed_count == 1
+    assert second.eligible_count == 0
+    assert len(runner.calls) == 2
 
-    result = asyncio.run(
-        judge.judge(
-            parent_request_id="parent-long",
-            turn_id="turn-long",
-            question=question,
-            candidates=(candidates[0],),
-            telemetry_correlation_id="trace-long",
-        )
-    )
 
-    assert result.decisions[0].status is EligibilityStatus.ELIGIBLE
-    assert result.valid_count == result.eligible_count == 1
-    assert result.executed_count == 1
-    assert result.question_truncated is True
-    assert result.question_original_tokens == 3002
-    assert result.question_review_tokens <= 64
-    assert len(runner.prompts) == 1
-    assert "head-marker" in runner.prompts[0]
-    assert "tail-marker" in runner.prompts[0]
-    assert "middle question tokens omitted" in runner.prompts[0]
+def test_long_question_and_reference_are_bounded_with_original_provenance(tmp_path):
+    judge, runner, candidates = make_judge(tmp_path, max_question_tokens=192, max_reference_tokens=96)
+    question = "HEAD " + "x" * 1000 + " TAIL"
+    reference = "AppID " + "y" * 1000 + " END"
+    candidate = replace(candidates[0], reference_digest="f" * 64, reference_content=reference)
+    result = evaluate(judge, (candidate,), question=question)
+    observed = payload(runner.calls[0][1][0])
+    assert observed["question"].startswith("HEAD ") and observed["question"].endswith(" TAIL")
+    assert observed["reference"].startswith("AppID ") and observed["reference"].endswith(" END")
+    assert len(observed["question"]) <= 192
+    assert observed["reference"].startswith(reference[:72])
+    assert observed["reference"].endswith(reference[-24:])
+    assert len(observed["reference"]) < len(reference)
+    assert result.question_truncated
+    assert result.question_original_tokens == len(question)
+    assert result.question_review_tokens == len(observed["question"])
     assert result.decisions[0].question_digest == stable_digest(question)
-
-
-def test_select_best_truncates_long_question_and_still_reviews(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    runner = FakeRunner(fixed_text='{"winner":"A"}')
-    judge = ReferenceJudge(
-        runner,
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-        max_question_tokens=64,
-    )
-    question = (
-        "original-task "
-        + " ".join(f"trajectory-{index}" for index in range(3000))
-        + " latest-evidence"
-    )
-
-    result = asyncio.run(
-        judge.select_best(
-            parent_request_id="parent-long-listwise",
-            turn_id="turn-long-listwise",
-            question=question,
-            candidates=candidates,
-            telemetry_correlation_id="trace-long-listwise",
-        )
-    )
-
-    prompt_payload = json.loads(runner.prompts[0].split("<user>", 1)[1])
-    review_question = prompt_payload["question"]
-    assert result.selection_method == "comparative_listwise"
-    assert result.valid_count == 2
-    assert result.eligible_count == 1
-    assert result.executed_count == 1
-    assert result.presented_candidate_count == 2
-    assert result.question_truncated is True
-    assert result.question_original_tokens == 3002
-    assert result.question_review_tokens <= 64
-    assert "original-task" in review_question
-    assert "latest-evidence" in review_question
-    assert "middle question tokens omitted" in review_question
-    assert all(
-        decision.question_digest == stable_digest(question)
-        for decision in result.decisions
-    )
-
-
-def test_malformed_output_marks_every_candidate_invalid(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    judge = ReferenceJudge(
-        FakeRunner(malformed=True),
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-    )
-
-    result = asyncio.run(
-        judge.judge(
-            parent_request_id="parent-1",
-            turn_id="turn-1",
-            question="question",
-            candidates=candidates,
-            telemetry_correlation_id="trace-1",
-        )
-    )
-
-    assert all(
-        decision.status is EligibilityStatus.INVALID for decision in result.decisions
-    )
-    assert result.valid_count == 0
-    assert result.eligible_count == 0
-
-
-def test_valid_json_without_normal_stop_is_invalid(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    judge = ReferenceJudge(
-        FakeRunner(finish_type="length"),
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-    )
-
-    result = asyncio.run(
-        judge.judge(
-            parent_request_id="parent-truncated",
-            turn_id="turn-truncated",
-            question="WFP question",
-            candidates=(candidates[0],),
-            telemetry_correlation_id="trace-truncated",
-        )
-    )
-
-    assert result.decisions[0].status is EligibilityStatus.INVALID
-    assert result.eligible_count == 0
-
-
-def test_candidate_permutation_does_not_change_decisions(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    judge = ReferenceJudge(
-        FakeRunner(), repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
-    )
-
-    async def evaluate(items):
-        return await judge.judge(
-            parent_request_id="parent-1",
-            turn_id="turn-1",
-            question="WFP question",
-            candidates=items,
-            telemetry_correlation_id="trace-1",
-        )
-
-    forward = asyncio.run(evaluate(candidates))
-    reverse = asyncio.run(evaluate(tuple(reversed(candidates))))
-    forward_by_candidate = {
-        decision.candidate_id: decision.status for decision in forward.decisions
-    }
-    reverse_by_candidate = {
-        decision.candidate_id: decision.status for decision in reverse.decisions
-    }
-
-    assert forward_by_candidate == reverse_by_candidate
-
-
-def test_judge_identifies_policy_lane_and_uses_operational_applicability(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    policy_candidate = replace(candidates[0], lane="policydata")
-    runner = FakeRunner()
-    judge = ReferenceJudge(
-        runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
-    )
-
-    result = asyncio.run(
-        judge.judge(
-            parent_request_id="parent-policy",
-            turn_id="turn-policy",
-            question="Implement and verify the requested repository change",
-            candidates=(policy_candidate,),
-            telemetry_correlation_id="trace-policy",
-        )
-    )
-
-    assert result.decisions[0].status is EligibilityStatus.ELIGIBLE
-    assert '"lane":"policydata"' in runner.prompts[0]
-
-
-def test_judge_reuses_only_exact_valid_semantic_decisions(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    runner = FakeRunner()
-    judge = ReferenceJudge(
-        runner,
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-    )
-
-    async def evaluate(parent_request_id, question):
-        return await judge.judge(
-            parent_request_id=parent_request_id,
-            turn_id=f"turn-{parent_request_id}",
-            question=question,
-            candidates=candidates,
-            telemetry_correlation_id=f"trace-{parent_request_id}",
-        )
-
-    first = asyncio.run(evaluate("first", "WFP question"))
-    repeated = asyncio.run(evaluate("second", "WFP question"))
-    changed = asyncio.run(evaluate("third", "Different WFP question"))
-
-    assert first.cache_hit_count == 0
-    assert first.executed_count == 2
-    assert repeated.cache_hit_count == 2
-    assert repeated.executed_count == 0
-    assert runner.calls == 2
-    assert all(
-        decision.parent_request_id == "second" for decision in repeated.decisions
-    )
-    assert all(
-        decision.judge_method == "sglang_constrained_binary_cache"
-        for decision in repeated.decisions
-    )
+    assert result.decisions[0].reference_digest == stable_digest(reference)
+    # Changing omitted text must not reuse the previous full-question identity.
+    changed_question = question[:500] + "z" + question[501:]
+    changed = evaluate(judge, (candidate,), question=changed_question)
+    assert payload(runner.calls[1][1][0])["question"] == observed["question"]
     assert changed.cache_hit_count == 0
-    assert changed.executed_count == 2
+    assert changed.shared_prefix_key != result.shared_prefix_key
 
 
-def test_judge_cache_uses_semantic_reference_not_request_candidate_id(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    runner = FakeRunner()
-    judge = ReferenceJudge(
-        runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
+@pytest.mark.parametrize("limit", [128, 192, 256])
+def test_question_budget_preserves_both_ends(tmp_path, limit):
+    judge, runner, candidates = make_judge(tmp_path, max_question_tokens=limit)
+    result = evaluate(judge, (candidates[0],), question="HEAD" + "x" * 1000 + "TAIL")
+    bounded = payload(runner.calls[0][1][0])["question"]
+    assert len(bounded) <= limit
+    assert bounded.startswith("HEAD") and bounded.endswith("TAIL")
+    assert result.valid_count == 1
+
+
+@pytest.mark.parametrize("stage", ["question", "template"])
+def test_prompt_preparation_failure_rejects_without_caching(tmp_path, stage):
+    judge, runner, candidates = make_judge(tmp_path)
+    def fail(*args, **kwargs):
+        raise RuntimeError("tokenizer unavailable")
+    target = "encode" if stage == "question" else "apply_chat_template"
+    original = getattr(judge.tokenizer, target)
+    setattr(judge.tokenizer, target, fail)
+    failed = evaluate(judge, candidates)
+    assert failed.eligible_count == failed.valid_count == failed.executed_count == 0
+    assert all(decision.status is EligibilityStatus.INELIGIBLE for decision in failed.decisions)
+    setattr(judge.tokenizer, target, original)
+    retried = evaluate(judge, candidates)
+    assert retried.cache_hit_count == 0
+    assert retried.valid_count == 2
+
+
+@pytest.mark.parametrize("lane", ["knowledge", "context", "policydata"])
+def test_lane_and_scope_are_structured_untrusted_inputs(tmp_path, lane):
+    judge, runner, candidates = make_judge(tmp_path)
+    scope = 'Hypothesis only; "quote" and\nnewline'
+    candidate = replace(candidates[0], lane=lane, scope_note=scope)
+    result = evaluate(judge, (candidate,))
+    observed = payload(runner.calls[0][1][0])
+    assert observed["lane"] == lane
+    assert observed["scope"] == scope
+    assert result.valid_count == 1
+
+
+@pytest.mark.parametrize("options", [((), (66,)), ((65, 65), (66,)), ((65,), (65,)), (("A",), ("B",))])
+def test_non_single_or_ambiguous_options_are_rejected_before_execution(tmp_path, options):
+    repository, _ = repository_with_candidates(tmp_path)
+    tokenizer = FakeTokenizer()
+    tokenizer.encode = lambda label, **kwargs: options[("A", "B").index(label)]
+    with pytest.raises(ValueError, match="distinct single-token"):
+        ReferenceJudge(FakeRunner(), repository, tokenizer, model_fingerprint="model")
+
+
+def test_empty_batch_has_no_execution_or_usage(tmp_path):
+    judge, runner, _ = make_judge(tmp_path)
+    result = evaluate(judge, ())
+    assert result.decisions == ()
+    assert result.candidate_count == result.executed_count == result.valid_count == 0
+    assert result.prompt_tokens == result.completion_tokens == 0
+    assert runner.calls == []
+
+
+def test_combined_telemetry_does_not_count_operational_rejects_as_valid(tmp_path):
+    runner = FakeRunner(failure=RuntimeError("offline"))
+    judge, _, candidates = make_judge(tmp_path, runner=runner)
+    failed = evaluate(judge, (candidates[0],))
+    runner.failure = None
+    passed = evaluate(judge, (candidates[1],))
+    combined = JudgeBatchResult.combine(
+        candidates, (failed, passed), failed.decisions + passed.decisions,
+        selected_candidate_id=None, selection_method="direct_binary_logits",
     )
-    request_specific = replace(candidates[0], candidate_id="request-specific-id")
-
-    async def evaluate(candidate, parent):
-        return await judge.judge(
-            parent_request_id=parent,
-            turn_id=f"turn-{parent}",
-            question="WFP question",
-            candidates=(candidate,),
-            telemetry_correlation_id=f"trace-{parent}",
-        )
-
-    async def run_twice():
-        first = await evaluate(candidates[0], "first")
-        repeated = await evaluate(request_specific, "second")
-        return first, repeated
-
-    first, repeated = asyncio.run(run_twice())
-
-    assert first.executed_count == 1
-    assert repeated.cache_hit_count == 1
-    assert repeated.decisions[0].candidate_id == "request-specific-id"
-    assert runner.calls == 1
-
-
-def test_judge_never_caches_invalid_results(tmp_path):
-    repository, candidates = repository_with_candidates(tmp_path)
-    runner = FakeRunner(malformed=True)
-    judge = ReferenceJudge(
-        runner,
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-    )
-
-    async def evaluate(parent_request_id):
-        return await judge.judge(
-            parent_request_id=parent_request_id,
-            turn_id=f"turn-{parent_request_id}",
-            question="WFP question",
-            candidates=candidates,
-            telemetry_correlation_id=f"trace-{parent_request_id}",
-        )
-
-    first = asyncio.run(evaluate("first-invalid"))
-    repeated = asyncio.run(evaluate("second-invalid"))
-
-    assert first.cache_hit_count == repeated.cache_hit_count == 0
-    assert first.executed_count == repeated.executed_count == 2
-    assert runner.calls == 2
-
-
-def test_judge_bounds_oversize_reference_and_keeps_batch_alive(tmp_path):
-    repository = KnowledgeRepository(tmp_path)
-    repository.upsert(
-        "long.md", "head FWPM_LAYER_ALE_AUTH_CONNECT_V4 " + "filler " * 8000 + "tail"
-    )
-    repository.upsert("short.md", "unrelated gardening notes")
-    long_candidate = repository.rank("FWPM_LAYER_ALE_AUTH_CONNECT_V4")[0]
-    short_candidate = repository.rank("gardening")[0]
-    runner = FakeRunner()
-    judge = ReferenceJudge(
-        runner,
-        repository,
-        FakeTokenizer(),
-        model_fingerprint="model-fingerprint",
-    )
-
-    result = asyncio.run(
-        judge.judge(
-            parent_request_id="parent-long",
-            turn_id="turn-1",
-            question="How should WFP AppID filtering be configured?",
-            candidates=(long_candidate, short_candidate),
-            telemetry_correlation_id="trace-long",
-        )
-    )
-
-    assert result.valid_count == 2
-    assert result.decisions[0].status is EligibilityStatus.ELIGIBLE
-    assert "filler" * 4000 not in runner.prompts[0]
-    assert "中间省略" in runner.prompts[0]
-
-
-def test_cross_task_scope_requires_a_fresh_judge_verdict(tmp_path):
-    from qwen_exo_booster.knowledge import CROSS_TASK_REFLECTION_NOTE
-
-    repository, (wfp, ctf) = repository_with_candidates(tmp_path)
-    scoped = replace(wfp, scope_note=CROSS_TASK_REFLECTION_NOTE)
-
-    for method, unscoped, candidates, rejected, admitted in (
-        ("judge", (wfp,), (scoped,), '{"supported":false}', '{"supported":true}'),
-        (
-            "select_best",
-            (wfp, ctf),
-            (scoped, ctf),
-            '{"winner":null}',
-            '{"winner":"A"}',
-        ),
-    ):
-        runner = FakeRunner(fixed_text=rejected)
-        judge = ReferenceJudge(
-            runner, repository, FakeTokenizer(), model_fingerprint="model-fingerprint"
-        )
-
-        async def review(request_id, items):
-            return await getattr(judge, method)(
-                parent_request_id=request_id,
-                turn_id=f"{request_id}:turn",
-                question="Which evidence helps diagnose this failure?",
-                candidates=items,
-                telemetry_correlation_id=f"{request_id}:trace",
-            )
-
-        original = asyncio.run(review("unscoped", unscoped))
-        runner.fixed_text = admitted
-        cross_task = asyncio.run(review("scoped", candidates))
-        runner.fixed_text = rejected
-        repeated = asyncio.run(review("repeated", candidates))
-
-        assert original.eligible_count == 0
-        assert cross_task.eligible_count == repeated.eligible_count == 1
-        assert cross_task.executed_count == 1
-        assert repeated.executed_count == 0
-        assert runner.calls == 2
+    assert combined.valid_count == 1
+    assert combined.candidate_count == combined.executed_count == 2
+    assert combined.prompt_tokens == passed.prompt_tokens
+    assert combined.completion_tokens == 0

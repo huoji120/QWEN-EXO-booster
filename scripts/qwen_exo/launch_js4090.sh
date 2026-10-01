@@ -58,6 +58,7 @@ fi
 : "${QWEN_EXO_MAX_INTERNAL_FANOUT:=32}"
 : "${QWEN_EXO_MAX_INTERNAL_TOKENS:=12288}"
 : "${QWEN_EXO_MAX_PREFILL_TOKENS:=65536}"
+: "${QWEN_EXO_CHUNKED_PREFILL_SIZE:=}"
 : "${QWEN_EXO_MAX_OUTPUT_TOKENS:=8192}"
 : "${QWEN_EXO_MAX_REASONING_TOKENS:=3072}"
 : "${QWEN_EXO_TENSOR_BANK_MAX_DOCUMENT_TOKENS:=$((QWEN_EXO_CONTEXT_LENGTH - 2048))}"
@@ -377,6 +378,9 @@ server_args=(
   --host 127.0.0.1
   --port "${QWEN_EXO_PORT}"
 )
+if [[ -n "${QWEN_EXO_CHUNKED_PREFILL_SIZE}" ]]; then
+  server_args+=( --chunked-prefill-size "${QWEN_EXO_CHUNKED_PREFILL_SIZE}" )
+fi
 if [[ -n "${QWEN_EXO_SPECULATIVE_ALGORITHM}" ]]; then
   server_args+=( --speculative-algorithm "${QWEN_EXO_SPECULATIVE_ALGORITHM}" )
   if [[ -n "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_PATH}" ]]; then

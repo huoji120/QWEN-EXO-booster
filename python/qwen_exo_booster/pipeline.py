@@ -41,9 +41,6 @@ _MEMORY_HEADER = (
     "private context unless the user explicitly asks about system internals."
 )
 
-# Preserve the complete native shortlist for listwise judging; a four-item cap
-# let unrelated high-volume trajectory families crowd out task-specific memory.
-_COMPARATIVE_CANDIDATE_LIMIT = 8
 
 
 def response_memory_metadata(
@@ -634,7 +631,7 @@ class MemoryPipeline:
 
         An absolute score failure can abstain before the Semantic Judge. A small
         winner margin is not weak evidence: it routes the bounded Top-K set to
-        comparative selection. Non-Q/K provenance always blocks an early skip.
+        per-candidate semantic review. Non-Q/K provenance blocks an early skip.
         """
         preset_min_score, preset_margin = qk_recall_gates(self.config.qk_recall_preset)
         min_score = (
@@ -846,7 +843,6 @@ class MemoryPipeline:
 
         batches: list[Any] = []
         selection_method = "not_run"
-        selected_candidate_id: str | None = None
         if judged and judge_available and not skip_judge:
             token_budget = max(1, int(getattr(self.reference_judge, "token_budget", 1)))
             token_capacity = max(
@@ -856,44 +852,24 @@ class MemoryPipeline:
                 1,
                 min(int(self.config.max_internal_fanout), token_capacity),
             )
-            if len(judged) > _COMPARATIVE_CANDIDATE_LIMIT:
-                for wave_index in range(0, len(judged), wave_limit):
-                    wave = judged[wave_index : wave_index + wave_limit]
-                    batches.append(
-                        await self.reference_judge.judge(
-                            parent_request_id=request_id,
-                            turn_id=(
-                                f"{request_id}:request-admission-judge:wave-"
-                                f"{wave_index // wave_limit}"
-                            ),
-                            question=question,
-                            candidates=wave,
-                            telemetry_correlation_id=(
-                                f"{request_id}:request-admission:wave-"
-                                f"{wave_index // wave_limit}"
-                            ),
-                        )
+            for wave_index in range(0, len(judged), wave_limit):
+                wave = judged[wave_index : wave_index + wave_limit]
+                batches.append(
+                    await self.reference_judge.judge(
+                        parent_request_id=request_id,
+                        turn_id=(
+                            f"{request_id}:request-admission-judge:wave-"
+                            f"{wave_index // wave_limit}"
+                        ),
+                        question=question,
+                        candidates=wave,
+                        telemetry_correlation_id=(
+                            f"{request_id}:request-admission:wave-"
+                            f"{wave_index // wave_limit}"
+                        ),
                     )
-                selection_method = "independent_binary_waves"
-            else:
-                judge_kwargs = {
-                    "parent_request_id": request_id,
-                    "turn_id": f"{request_id}:request-admission-judge",
-                    "question": question,
-                    "candidates": judged,
-                    "telemetry_correlation_id": f"{request_id}:request-admission",
-                }
-                if len(judged) > 1:
-                    first_batch = await self.reference_judge.select_best(**judge_kwargs)
-                else:
-                    first_batch = await self.reference_judge.judge(**judge_kwargs)
-                batches.append(first_batch)
-                selection_method = str(
-                    getattr(first_batch, "selection_method", "independent_binary")
                 )
-                selected_candidate_id = getattr(
-                    first_batch, "selected_candidate_id", None
-                )
+            selection_method = "direct_binary_logits"
 
         decision_by_id: dict[str, EligibilityDecision] = {}
         for batch in batches:
@@ -923,13 +899,11 @@ class MemoryPipeline:
                 == stable_digest(candidate.reference_content)
             )
         }
-        if selected_candidate_id not in eligible_ids:
-            selected_candidate_id = None
         batch = JudgeBatchResult.combine(
             judged,
             tuple(batches),
             decision_tuple,
-            selected_candidate_id=selected_candidate_id,
+            selected_candidate_id=None,
             selection_method=selection_method,
         )
         eligible = tuple(
@@ -937,12 +911,7 @@ class MemoryPipeline:
             for candidate in merged_candidates
             if candidate.candidate_id in eligible_ids
         )
-        admission_mode = (
-            "comparative_semantic_selection"
-            if batch is not None
-            and batch.selection_method.startswith("comparative_listwise")
-            else "semantic_eligibility"
-        )
+        admission_mode = "semantic_eligibility"
         self._emit_request_judge_telemetry(
             request_id,
             candidates=judged,

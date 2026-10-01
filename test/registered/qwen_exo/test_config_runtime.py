@@ -585,7 +585,11 @@ def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):
     )
     runtime = QwenExoRuntime.from_server_args(
         server_args(tmp_path, model_path=str(model_path)),
-        SimpleNamespace(tokenizer=object()),
+        SimpleNamespace(
+            tokenizer=SimpleNamespace(
+                encode=lambda text, **kwargs: [ord(char) for char in text]
+            )
+        ),
     )
 
     asyncio.run(runtime.start())
@@ -676,6 +680,42 @@ def test_session_initial_gdn_keeps_target_only_under_replayssm_spec():
     assert runtime._session_initial_gdn_dflash_mode() == "target_only"
     runtime.tokenizer_manager = SimpleNamespace(server_args=SimpleNamespace())
     assert runtime._session_initial_gdn_dflash_mode() == "eligible"
+
+
+@pytest.mark.parametrize("grade", ["verified", "supported", "unresolved"])
+def test_global_gdn_accepts_active_memory_independent_of_causal_grade(grade):
+    class Tokenizer:
+        def encode(self, text, **kwargs):
+            return [ord(x) for x in text]
+
+        def apply_chat_template(self, messages, **kwargs):
+            return json.dumps(messages, ensure_ascii=False)
+
+    entry = {
+        "entry_id": "admitted", "version": 1, "admission_status": "active",
+        "causal_status": grade, "title": "条件性缓存经验", "mechanism": "机制待查",
+        "rule": "先核对缓存键", "missing_evidence": ["缺少隔离变量比较"],
+    }
+    record = {"created_at": 1, "causal_schema": 1, "causal_entries": [entry]}
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.tokenizer_manager = SimpleNamespace(tokenizer=Tokenizer())
+    runtime.model_identity = SimpleNamespace(fingerprint="model")
+    runtime.config = SimpleNamespace(context_length=10000)
+    runtime.reflection_memory_store = SimpleNamespace(list=lambda: [record])
+    prompt = runtime._build_session_initial_gdn_prompt()
+    assert prompt["memory_count"] == 1
+    assert "缺少隔离变量比较" in prompt["prompt"]
+    assert grade in prompt["prompt"]
+    original_identity = prompt["state_identity"]
+    entry["missing_evidence"] = ["缺少回退复现"]
+    assert runtime._build_session_initial_gdn_prompt()["state_identity"] != original_identity
+    for status in ("candidate", "retired"):
+        entry["admission_status"] = status
+        assert runtime._build_session_initial_gdn_prompt() is None
+    entry["admission_status"] = "active"
+    entry["rule"] = "oversized" * 10000
+    # No partial entry is substituted when the admitted entry exceeds the budget.
+    assert runtime._build_session_initial_gdn_prompt() is None
 
 
 def test_startup_without_memories_serves_without_initial_gdn():
@@ -1158,7 +1198,7 @@ def test_runtime_post_tool_recall_queues_admitted_think_context(tmp_path):
     assert runtime.telemetry.events[0][2]["text_injected"] is False
 
 
-def test_initial_gdn_uses_only_active_verified_causal_entries():
+def test_initial_gdn_uses_active_entries_not_raw_summaries_or_old_versions():
     active = {
         "entry_id": "kept",
         "version": 2,
@@ -1186,7 +1226,7 @@ def test_initial_gdn_uses_only_active_verified_causal_entries():
             {
                 **active,
                 "entry_id": "recallable",
-                "title": "RECALLABLE_NOT_REPLAYED",
+                "title": "RECALLABLE_SUPPORTED",
                 "causal_status": "supported",
             },
             {
@@ -1200,15 +1240,19 @@ def test_initial_gdn_uses_only_active_verified_causal_entries():
     value = _session_gdn_prompt_runtime([record], context_length=16000)
     prompt = value._build_session_initial_gdn_prompt()
     assert "VERIFIED_RULE" in prompt["prompt"]
+    assert "RECALLABLE_SUPPORTED" in prompt["prompt"]
+    assert prompt["memory_count"] == 2
     for excluded in (
         "RAW_SUMMARY_NOT_REPLAYED",
         "CANDIDATE_NOT_REPLAYED",
-        "RECALLABLE_NOT_REPLAYED",
         "RETIRED_NOT_REPLAYED",
         "OLD_VERSION_NOT_REPLAYED",
     ):
         assert excluded not in prompt["prompt"]
-    record["causal_entries"] = record["causal_entries"][1:]
+    record["causal_entries"] = [
+        entry for entry in record["causal_entries"]
+        if entry["admission_status"] != "active"
+    ]
     assert value._build_session_initial_gdn_prompt() is None
 
 

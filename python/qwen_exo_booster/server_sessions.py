@@ -141,21 +141,23 @@ class ServerSessionStore:
             for task in getattr(runtime, "_server_session_producers", ())
         ):
             return True
-        for name in (
-            "_reflection_memory_regeneration_task",
-            "_reflection_memory_organization_task",
-        ):
-            task = getattr(runtime, name, None)
-            if task is not None and not task.done():
-                return True
+        task = getattr(runtime, "_reflection_memory_regeneration_task", None)
+        if task is not None and not task.done():
+            return True
         if any(
             not task.done()
             for task in getattr(runtime, "_server_session_reflections", ())
         ):
             return True
-        queue = getattr(runtime, "_compaction_reflection_queue", None)
-        # Includes the checkpoint held by the worker and pending queue puts.
-        return bool(queue is not None and getattr(queue, "_unfinished_tasks", 0))
+        for name in (
+            "_compaction_reflection_queue",
+            "_reflection_memory_organization_queue",
+        ):
+            queue = getattr(runtime, name, None)
+            # Includes the item held by the worker, not just queued items.
+            if queue is not None and getattr(queue, "_unfinished_tasks", 0):
+                return True
+        return False
 
     def _active(self, key: str) -> bool:
         runtime = self.runtime

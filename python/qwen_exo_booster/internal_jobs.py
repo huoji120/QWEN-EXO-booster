@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from qwen_exo_booster.contracts import ContractViolation, InternalJob, InternalJobType
+from qwen_exo_booster.task_scheduling import current_internal_work_class
 
 _DFLASH_ELIGIBLE_JOB_TYPES = frozenset(
     {
@@ -33,6 +34,7 @@ def _internal_custom_params(
         "qwen_exo_job_type": job.job_type.value,
         "qwen_exo_parent_request_id": job.parent_request_id,
         "qwen_exo_state_budget_bytes": job.state_budget_bytes,
+        "qwen_exo_work_class": current_internal_work_class(job.job_type),
     }
     force_target_only = custom.get("qwen_exo_dflash") == "target_only"
     requested = custom.get("qwen_exo_dflash") == "eligible"
@@ -74,6 +76,15 @@ class InternalScoreResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class InternalOptionScoreResult:
+    job: InternalJob
+    option_logprobs: tuple[float, ...]
+    prompt_tokens: int
+    completion_tokens: int
+    latency_seconds: float
+
+
 class InternalJobRunner:
     """Submits hidden child work directly to SGLang's tokenizer manager.
 
@@ -100,6 +111,13 @@ class InternalJobRunner:
         self._reserved_tokens: dict[str, int] = {}
         self._lock = asyncio.Lock()
         self._capacity_changed = asyncio.Condition(self._lock)
+        self._lane_limits = {
+            "foreground": self.max_fanout,
+            "reflection": 1,
+            "maintenance": 3,
+        }
+        self._lane_active = dict.fromkeys(self._lane_limits, 0)
+        self._active_lanes: dict[tuple[str, str], str] = {}
 
     async def run_batch(
         self,
@@ -163,10 +181,23 @@ class InternalJobRunner:
         self._validate_cache_namespace(job_list[0].shared_prefix_key)
         for extra_key in per_job_extra_keys:
             self._validate_cache_namespace(extra_key)
-        if any(job.is_cancelled_or_expired() for job in job_list):
-            raise asyncio.CancelledError(
-                "Internal job was cancelled or expired before admission"
-            )
+        self._check_liveness(parent_request_id, job_list)
+        lane_limit = self._lane_limits[current_internal_work_class(job_list[0].job_type)]
+        if len(job_list) > lane_limit:
+            results = []
+            normalized_prompts = next(iter(prompt_kwargs.values()))
+            for start in range(0, len(job_list), lane_limit):
+                end = start + lane_limit
+                results.extend(
+                    await self.run_batch(
+                        job_list[start:end],
+                        normalized_prompts[start:end],
+                        sampling_params,
+                        custom_params_per_job=per_job_custom[start:end],
+                        extra_keys=per_job_extra_keys[start:end],
+                    )
+                )
+            return tuple(results)
 
         await self._reserve(parent_request_id, job_list)
         started = time.perf_counter()
@@ -190,7 +221,7 @@ class InternalJobRunner:
                 ],
                 return_logprob=False,
                 stream=False,
-                priority=min(job.priority for job in job_list),
+                priority=self._priority(job_list[0]),
                 extra_key=list(per_job_extra_keys),
                 no_logs=True,
                 custom_labels={
@@ -205,6 +236,7 @@ class InternalJobRunner:
                     "Internal job deadline elapsed before dispatch"
                 )
             outputs = await asyncio.wait_for(self._collect(request), timeout=timeout)
+            self._check_liveness(parent_request_id, job_list)
             if len(outputs) != len(job_list):
                 raise RuntimeError(
                     f"Internal batch returned {len(outputs)} results for {len(job_list)} jobs"
@@ -221,7 +253,7 @@ class InternalJobRunner:
             self._abort_jobs(job_list)
             raise
         finally:
-            await self._release(parent_request_id, job_list)
+            await asyncio.shield(self._release(parent_request_id, job_list))
 
     async def run_score_batch(
         self,
@@ -280,10 +312,23 @@ class InternalJobRunner:
         self._validate_cache_namespace(job_list[0].shared_prefix_key)
         for extra_key in per_job_extra_keys:
             self._validate_cache_namespace(extra_key)
-        if any(job.is_cancelled_or_expired() for job in job_list):
-            raise asyncio.CancelledError(
-                "Replay score job was cancelled or expired before admission"
-            )
+        self._check_liveness(parent_request_id, job_list)
+        lane_limit = self._lane_limits[current_internal_work_class(job_list[0].job_type)]
+        if len(job_list) > lane_limit:
+            results = []
+            for start in range(0, len(job_list), lane_limit):
+                end = start + lane_limit
+                results.extend(
+                    await self.run_score_batch(
+                        job_list[start:end],
+                        input_list[start:end],
+                        start_list[start:end],
+                        sampling_params,
+                        custom_params_per_job=per_job_custom[start:end],
+                        extra_keys=per_job_extra_keys[start:end],
+                    )
+                )
+            return tuple(results)
 
         await self._reserve(parent_request_id, job_list)
         started = time.perf_counter()
@@ -313,7 +358,7 @@ class InternalJobRunner:
                 token_ids_logprob=[[int(tokens[-1])] for tokens in input_list],
                 top_logprobs_num=0,
                 stream=False,
-                priority=min(job.priority for job in job_list),
+                priority=self._priority(job_list[0]),
                 extra_key=list(per_job_extra_keys),
                 no_logs=True,
                 custom_labels={
@@ -328,6 +373,7 @@ class InternalJobRunner:
                     "Replay score deadline elapsed before dispatch"
                 )
             outputs = await asyncio.wait_for(self._collect(request), timeout=timeout)
+            self._check_liveness(parent_request_id, job_list)
             if len(outputs) != len(job_list):
                 raise RuntimeError(
                     f"Replay score batch returned {len(outputs)} results for {len(job_list)} jobs"
@@ -344,7 +390,181 @@ class InternalJobRunner:
             self._abort_jobs(job_list)
             raise
         finally:
-            await self._release(parent_request_id, job_list)
+            await asyncio.shield(self._release(parent_request_id, job_list))
+
+    async def run_option_score_batch(
+        self,
+        jobs: Iterable[InternalJob],
+        input_ids: Iterable[Iterable[int]],
+        option_token_ids: Iterable[int],
+    ) -> tuple[InternalOptionScoreResult, ...]:
+        """Read two next-token scores from one target-only prefill per job."""
+        job_list = tuple(jobs)
+        prefixes = tuple(tuple(tokens) for tokens in input_ids)
+        options = tuple(option_token_ids)
+        if not job_list or len(job_list) != len(prefixes):
+            raise ContractViolation("Option score batch requires one prefix per job")
+        if (
+            len(options) != 2
+            or any(type(token) is not int or token < 0 for token in options)
+            or len(set(options)) != 2
+        ):
+            raise ContractViolation("Option scores require two distinct token IDs")
+        if any(
+            not tokens or any(type(token) is not int or token < 0 for token in tokens)
+            for tokens in prefixes
+        ):
+            raise ContractViolation("Option score prefixes require non-empty token IDs")
+        if len({job.job_id for job in job_list}) != len(job_list):
+            raise ContractViolation("Option score job IDs must be unique")
+        parents = {job.parent_request_id for job in job_list}
+        if len(parents) != 1:
+            raise ContractViolation("Option score batch must have one parent")
+        parent_request_id = next(iter(parents))
+        if len(job_list) > self.max_fanout or len(job_list) > min(
+            job.max_fanout for job in job_list
+        ):
+            raise ContractViolation("Option score batch exceeds configured fanout")
+        if sum(job.token_budget for job in job_list) > self.max_tokens_per_parent:
+            raise ContractViolation("Option score batch exceeds the token reserve")
+        if len({job.job_type for job in job_list}) != 1:
+            raise ContractViolation("Option score batch must have one job type")
+        if len({job.shared_prefix_key for job in job_list}) != 1:
+            raise ContractViolation("Option score batch must share one prefix key")
+        self._validate_cache_namespace(job_list[0].shared_prefix_key)
+        self._check_liveness(parent_request_id, job_list)
+        lane_limit = self._lane_limits[current_internal_work_class(job_list[0].job_type)]
+        if len(job_list) > lane_limit:
+            results = []
+            for start in range(0, len(job_list), lane_limit):
+                end = start + lane_limit
+                results.extend(
+                    await self.run_option_score_batch(
+                        job_list[start:end], prefixes[start:end], options
+                    )
+                )
+            return tuple(results)
+
+        await self._reserve(parent_request_id, job_list)
+        started = time.perf_counter()
+        try:
+            # SGLang prepends a None input-logprob row and drops the final
+            # distribution. Include the last prefix token and one fixed sentinel
+            # in the suffix so row 1 is exactly P(option | full prefix).
+            request = self._make_request(
+                rid=[job.job_id for job in job_list],
+                input_ids=[[*tokens, 0] for tokens in prefixes],
+                sampling_params=[
+                    {
+                        "max_new_tokens": 0,
+                        "temperature": 1,
+                        "custom_params": _internal_custom_params(
+                            job, {}, {"qwen_exo_dflash": "target_only"}, {},
+                            allow_dflash=False,
+                        ),
+                    }
+                    for job in job_list
+                ],
+                return_logprob=True,
+                logprob_start_len=[len(tokens) - 1 for tokens in prefixes],
+                token_ids_logprob=[list(options) for _ in job_list],
+                top_logprobs_num=0,
+                stream=False,
+                priority=self._priority(job_list[0]),
+                extra_key=[job.shared_prefix_key for job in job_list],
+                no_logs=True,
+                custom_labels={
+                    "qwen_exo_visibility": "internal",
+                    "qwen_exo_job_type": job_list[0].job_type.value,
+                },
+            )
+            deadline = self._earliest_deadline(job_list)
+            timeout = None if deadline is None else deadline - time.monotonic()
+            if timeout is not None and timeout <= 0:
+                raise asyncio.TimeoutError("Option score deadline elapsed before dispatch")
+            outputs = await asyncio.wait_for(self._collect(request), timeout=timeout)
+            self._check_liveness(parent_request_id, job_list)
+            if len(outputs) != len(job_list):
+                raise RuntimeError("Option score batch returned an incorrect result count")
+            elapsed = time.perf_counter() - started
+            return tuple(
+                self._option_score_result(job, tokens, options, output, elapsed)
+                for job, tokens, output in zip(job_list, prefixes, outputs)
+            )
+        except (asyncio.CancelledError, Exception):
+            self._abort_jobs(job_list)
+            raise
+        finally:
+            await asyncio.shield(self._release(parent_request_id, job_list))
+
+    @staticmethod
+    def _option_score_result(
+        job: InternalJob,
+        prefix: tuple[int, ...],
+        options: tuple[int, ...],
+        output: dict[str, Any],
+        latency_seconds: float,
+    ) -> InternalOptionScoreResult:
+        def sequence(value: Any, size: int) -> bool:
+            return isinstance(value, (list, tuple)) and len(value) == size
+
+        if not isinstance(output, dict) or not isinstance(output.get("meta_info"), dict):
+            raise RuntimeError("Option score result has no metadata")
+        meta = output["meta_info"]
+        if meta.get("id") != job.job_id:
+            raise RuntimeError("Option score result job identity is misaligned")
+        finish_reason = meta.get("finish_reason")
+        if (
+            not isinstance(finish_reason, dict)
+            or finish_reason.get("type") != "length"
+            or type(finish_reason.get("length")) is not int
+            or finish_reason["length"] != 0
+        ):
+            raise RuntimeError("Option score result did not finish a zero-token prefill")
+        if (
+            type(meta.get("completion_tokens")) is not int
+            or meta["completion_tokens"] != 0
+            or output.get("output_ids")
+            or output.get("text")
+        ):
+            raise RuntimeError("Option score result contains generated tokens")
+        if (
+            type(meta.get("prompt_tokens")) is not int
+            or meta["prompt_tokens"] != len(prefix) + 1
+        ):
+            raise RuntimeError("Option score result prompt length is misaligned")
+        token_rows = meta.get("input_token_logprobs")
+        if (
+            not sequence(token_rows, 2)
+            or not all(sequence(row, 3) for row in token_rows)
+            or token_rows[0][0] is not None
+            or type(token_rows[0][1]) is not int
+            or token_rows[0][1] != prefix[-1]
+            or type(token_rows[1][1]) is not int
+            or token_rows[1][1] != 0
+        ):
+            raise RuntimeError("Option score result input rows are misaligned")
+        rows = meta.get("input_token_ids_logprobs")
+        if not sequence(rows, 2) or rows[0] is not None or not sequence(rows[1], 2):
+            raise RuntimeError("Option score result option rows are misaligned")
+        scores = []
+        for token, entry in zip(options, rows[1]):
+            if (
+                not sequence(entry, 3)
+                or type(entry[1]) is not int
+                or entry[1] != token
+                or type(entry[0]) not in (int, float)
+                or not math.isfinite(entry[0])
+            ):
+                raise RuntimeError("Option score result contains invalid option logprobs")
+            scores.append(float(entry[0]))
+        return InternalOptionScoreResult(
+            job=job,
+            option_logprobs=tuple(scores),
+            prompt_tokens=meta["prompt_tokens"],
+            completion_tokens=0,
+            latency_seconds=latency_seconds,
+        )
 
     async def cancel_parent(self, parent_request_id: str) -> None:
         async with self._capacity_changed:
@@ -361,72 +581,69 @@ class InternalJobRunner:
             self._cancelled_parents.discard(parent_request_id)
             self._capacity_changed.notify_all()
 
+    @staticmethod
+    def _priority(job: InternalJob) -> int:
+        return 0 if current_internal_work_class(job.job_type) == "foreground" else -100
+
+    def _check_liveness(
+        self, parent_request_id: str, jobs: tuple[InternalJob, ...]
+    ) -> None:
+        if parent_request_id in self._cancelled_parents or any(
+            job.cancellation_token.cancelled for job in jobs
+        ):
+            raise asyncio.CancelledError("Internal job was cancelled")
+        deadline = self._earliest_deadline(jobs)
+        if deadline is not None and deadline <= time.monotonic():
+            raise asyncio.TimeoutError("Internal job deadline elapsed")
+
     async def _reserve(
         self, parent_request_id: str, jobs: tuple[InternalJob, ...]
     ) -> None:
+        lane = current_internal_work_class(jobs[0].job_type)
+        requested_tokens = sum(job.token_budget for job in jobs)
+        job_ids = {job.job_id for job in jobs}
+        if len(job_ids) != len(jobs):
+            raise ContractViolation("Internal job IDs must be unique")
         async with self._capacity_changed:
-            if parent_request_id in self._cancelled_parents:
-                raise asyncio.CancelledError("Parent request is cancelled")
-            requested_tokens = sum(job.token_budget for job in jobs)
-            reserved_tokens = self._reserved_tokens.get(parent_request_id, 0)
-            if reserved_tokens + requested_tokens > self.max_tokens_per_parent:
-                raise ContractViolation(
-                    "Internal jobs exceed the parent cumulative token reserve"
-                )
             deadline = self._earliest_deadline(jobs)
-            while (
-                sum(len(active_jobs) for active_jobs in self._active.values())
-                + len(jobs)
-                > self.max_fanout
-            ):
-                if deadline is None:
-                    await self._capacity_changed.wait()
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError(
-                            "Internal job deadline elapsed during global admission"
-                        )
-                    try:
-                        await asyncio.wait_for(
-                            self._capacity_changed.wait(), timeout=remaining
-                        )
-                    except asyncio.TimeoutError as exc:
-                        raise asyncio.TimeoutError(
-                            "Internal job deadline elapsed during global admission"
-                        ) from exc
-                if parent_request_id in self._cancelled_parents or any(
-                    job.is_cancelled_or_expired() for job in jobs
-                ):
-                    raise asyncio.CancelledError(
-                        "Internal job was cancelled while awaiting global admission"
+            while True:
+                self._check_liveness(parent_request_id, jobs)
+                reserved_tokens = self._reserved_tokens.get(parent_request_id, 0)
+                if reserved_tokens + requested_tokens > self.max_tokens_per_parent:
+                    raise ContractViolation(
+                        "Internal jobs exceed the parent cumulative token reserve"
                     )
+                if self._lane_active[lane] + len(jobs) <= self._lane_limits[lane]:
+                    break
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise asyncio.TimeoutError(
+                        "Internal job deadline elapsed during lane admission"
+                    )
+                await asyncio.wait_for(self._capacity_changed.wait(), timeout=remaining)
             active = self._active.setdefault(parent_request_id, set())
-            # A job's ``max_fanout`` bounds its own batch (checked before
-            # reservation); the parent's concurrent children are bounded by the
-            # runner-wide fanout. Bounding the parent by the smallest child's
-            # batch fanout rejected every single-job probe while a sibling
-            # self-ask job was in flight.
-            if len(active) + len(jobs) > self.max_fanout:
-                raise ContractViolation("Parent already owns the maximum child fanout")
-            duplicate = active.intersection(job.job_id for job in jobs)
+            duplicate = active.intersection(job_ids)
             if duplicate:
                 raise ContractViolation(
                     f"Internal job IDs are already active: {duplicate}"
                 )
-            active.update(job.job_id for job in jobs)
-            self._reserved_tokens[parent_request_id] = (
-                reserved_tokens + requested_tokens
-            )
+            active.update(job_ids)
+            for job_id in job_ids:
+                self._active_lanes[parent_request_id, job_id] = lane
+            self._lane_active[lane] += len(jobs)
+            self._reserved_tokens[parent_request_id] = reserved_tokens + requested_tokens
 
     async def _release(
         self, parent_request_id: str, jobs: tuple[InternalJob, ...]
     ) -> None:
         async with self._capacity_changed:
             active = self._active.get(parent_request_id)
-            if active is None:
-                return
-            active.difference_update(job.job_id for job in jobs)
+            for job in jobs:
+                lane = self._active_lanes.pop((parent_request_id, job.job_id), None)
+                if lane is not None:
+                    self._lane_active[lane] -= 1
+                if active is not None:
+                    active.discard(job.job_id)
             if not active:
                 self._active.pop(parent_request_id, None)
             self._capacity_changed.notify_all()

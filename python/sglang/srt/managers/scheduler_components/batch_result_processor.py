@@ -84,6 +84,15 @@ def _copy_customized_value(key: str, value):
     return value
 
 
+def _tolist_if_tensor(value):
+    return value.tolist() if isinstance(value, torch.Tensor) else value
+
+
+def _tuple_from_tensor_or_sequence(value):
+    converted = _tolist_if_tensor(value)
+    return tuple(converted) if isinstance(converted, list) else converted
+
+
 def _customized_values_for_accept(
     key: str,
     value,
@@ -468,23 +477,26 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         if batch.return_logprob:
             if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.tolist()
+                logits_output.next_token_logprobs = _tolist_if_tensor(
+                    logits_output.next_token_logprobs
                 )
             if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
+                logits_output.input_token_logprobs = _tuple_from_tensor_or_sequence(
+                    logits_output.input_token_logprobs
                 )
             if logits_output.next_token_top_logprobs_val:
                 logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    _tolist_if_tensor(v)
+                    for v in logits_output.next_token_top_logprobs_val
                 ]
                 logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    _tolist_if_tensor(x)
+                    for x in logits_output.next_token_top_logprobs_idx
                 ]
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                    _tolist_if_tensor(v)
+                    for v in logits_output.next_token_token_ids_logprobs_val
                 ]
 
     def _apply_prefill_logprobs(
@@ -885,18 +897,19 @@ class SchedulerBatchResultProcessor:
             next_token_ids = [[t] for t in ids]
 
         if batch.return_logprob:
-            next_token_logprobs = logits_output.next_token_logprobs.tolist()
+            next_token_logprobs = _tolist_if_tensor(logits_output.next_token_logprobs)
             if logits_output.next_token_top_logprobs_val:
                 logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    _tolist_if_tensor(v) for v in logits_output.next_token_top_logprobs_val
                 ]
                 logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    _tolist_if_tensor(x) for x in logits_output.next_token_top_logprobs_idx
                 ]
 
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                    _tolist_if_tensor(v)
+                    for v in logits_output.next_token_token_ids_logprobs_val
                 ]
         return next_token_ids, next_token_logprobs
 
