@@ -38,6 +38,11 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
+    # Draft KV geometry (total KV heads, head_dim + v_head_dim). Resolved
+    # before the parallel groups exist, so the pool configurator applies the
+    # TP split and the draft KV dtype.
+    dflash_draft_total_kv_heads: Optional[int] = None
+    dflash_draft_kv_head_dims: Optional[int] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -185,3 +190,7 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        config.dflash_draft_total_kv_heads = draft_model_config.get_total_num_kv_heads()
+        config.dflash_draft_kv_head_dims = (
+            draft_model_config.head_dim + draft_model_config.v_head_dim
+        )

@@ -6,6 +6,7 @@ from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 logger = logging.getLogger(__name__)
 
@@ -75,20 +76,39 @@ def configure_kv_cache_dtype(
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")
 
-    # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
-    # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
-    if (
-        is_draft_worker
-        and is_dflash
-        and speculative_draft_attention_backend == "fa4"
-        and kv_cache_dtype != model_dtype
-    ):
-        logger.info(
-            "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
-            "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
-            kv_cache_dtype,
-            model_dtype,
+    if is_draft_worker and is_dflash:
+        draft_kv_cache_dtype = dflash_draft_kv_cache_dtype(
+            target_kv_cache_dtype=kv_cache_dtype,
+            model_dtype=model_dtype,
+            speculative_draft_attention_backend=speculative_draft_attention_backend,
         )
-        kv_cache_dtype = model_dtype
+        if draft_kv_cache_dtype != kv_cache_dtype:
+            logger.info(
+                "DFLASH draft: overriding KV cache dtype %s -> %s.",
+                kv_cache_dtype,
+                draft_kv_cache_dtype,
+            )
+            kv_cache_dtype = draft_kv_cache_dtype
 
     return resolved_kv_cache_dtype, kv_cache_dtype
+
+
+def dflash_draft_kv_cache_dtype(
+    *,
+    target_kv_cache_dtype: torch.dtype,
+    model_dtype: torch.dtype,
+    speculative_draft_attention_backend: Optional[str],
+) -> torch.dtype:
+    """KV dtype of the DFLASH draft worker's own pool, given the target's.
+
+    Shared by the draft worker and the target's pool budget, which must size
+    the draft pool in the same dtype.
+    """
+    # fa4 draft attention can't read the target's quantized KV (needs
+    # K.dtype == Q.dtype), so it gets compute-dtype KV.
+    if speculative_draft_attention_backend == "fa4":
+        return model_dtype
+    # The draft pool has no FP4 dequant-workspace or native-FP4 attention path.
+    if is_float4_e2m1fn_x2(target_kv_cache_dtype):
+        return torch.float8_e4m3fn
+    return target_kv_cache_dtype

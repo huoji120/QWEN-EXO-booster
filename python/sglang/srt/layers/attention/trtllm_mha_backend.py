@@ -57,6 +57,29 @@ if TYPE_CHECKING:
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
 
+
+def causal_draft_block_mask(rows: int, q_len: int, device) -> torch.Tensor:
+    """XQA speculative-decoding mask for uniform draft blocks.
+
+    uint16 bit-packed ``[rows, q_len, words * 2]`` (32-bit aligned): draft
+    token ``i`` may attend to draft tokens ``0..i``; all earlier context is
+    always visible. Contiguous so a ``[:bs]`` slice stays valid under CUDA
+    graph capture.
+    """
+    words = (q_len + 31) // 32
+    packed = torch.zeros(q_len, words * 2, dtype=torch.int32)
+    for i in range(q_len):
+        for j in range(i + 1):
+            packed[i, j // 16] |= 1 << (j % 16)
+    return (
+        packed.to(torch.uint16)
+        .unsqueeze(0)
+        .expand(rows, q_len, words * 2)
+        .contiguous()
+        .to(device)
+    )
+
+
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 
 
@@ -157,6 +180,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
+        )
+        # Native FP4 verify runs XQA speculative decoding, which needs an
+        # explicit draft-block mask; build it once for graph capture.
+        self.native_fp4_verify_mask = (
+            causal_draft_block_mask(
+                model_runner.req_to_token_pool.size,
+                self.speculative_num_draft_tokens,
+                model_runner.device,
+            )
+            if self.is_nvfp4_kvcache and self.speculative_num_draft_tokens
+            else None
         )
 
         # SWA hybrid models split the KV cache into full and SWA pools with
@@ -927,6 +961,73 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         return kv_cache, kv_cache_block_scales
 
+    def _forward_target_verify_nvfp4(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Verify a uniform draft block against the packed NVFP4 cache.
+
+        XQA speculative decoding reads each request's KV once for the whole
+        block, with a causal mask among the draft tokens. The FlashInfer
+        prefill path would instead dequantize every request's full context on
+        every verify step.
+        """
+        if self.forward_metadata.is_ragged_verify:
+            raise RuntimeError(
+                "Native FP4 KV verify supports uniform draft blocks only; "
+                "ragged verify layouts are not implemented."
+            )
+        if save_kv_cache and k is not None:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(
+                    forward_batch.out_cache_loc,
+                    self.forward_metadata.swa_out_cache_loc,
+                ),
+                k,
+                v,
+                *self._kv_write_scales(layer),
+            )
+        q_len = self.forward_metadata.max_seq_len_q
+        if (
+            self.native_fp4_verify_mask is None
+            or self.native_fp4_verify_mask.shape[1] != q_len
+        ):
+            raise RuntimeError(
+                f"Native FP4 KV verify mask was built for "
+                f"{self.speculative_num_draft_tokens} draft tokens, got {q_len}."
+            )
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        bs = q.shape[0] // q_len
+        kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
+        k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
+        o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=q,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            block_tables=self._get_layer_page_table(layer, forward_batch),
+            seq_lens=self.forward_metadata.cache_seqlens_int32,
+            max_seq_len=self.max_context_len,
+            bmm1_scale=k_scale * layer.scaling,
+            bmm2_scale=v_scale,
+            window_left=layer.sliding_window_size,
+            sinks=kwargs.get("sinks", None),
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            out_dtype=self.q_data_type,
+            q_len_per_req=q_len,
+            mask=self.native_fp4_verify_mask[:bs],
+            kv_cache_sf=kv_cache_block_scales,
+        )
+        if o.dtype != self.q_data_type:
+            o = o.to(self.q_data_type)
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1028,9 +1129,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         if self.decode_uses_native_fp4:
+            if self.is_nvfp4_kvcache and forward_batch.forward_mode.is_target_verify():
+                return self._forward_target_verify_nvfp4(
+                    q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+                )
             raise RuntimeError(
-                "TRTLLM MHA with native FP4 KV cache supports decode only; "
-                "use a separate prefill backend such as flashinfer or triton."
+                "TRTLLM MHA with native FP4 KV cache supports decode and target "
+                "verify only; use a separate prefill backend such as flashinfer "
+                "or triton."
             )
 
         cache_loc = forward_batch.out_cache_loc

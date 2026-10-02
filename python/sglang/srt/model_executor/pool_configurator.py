@@ -85,6 +85,33 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     )
 
 
+def _dflash_draft_cell_size(
+    kvc: KVCacheConfigurator, *, draft_num_layers: int
+) -> Optional[int]:
+    """Bytes/token of the DFLASH draft worker's own KV pool, or None when the
+    draft geometry is unknown (the caller then scales by layer count)."""
+    aux = kvc.spec_aux_config
+    if aux.dflash_draft_total_kv_heads is None or aux.dflash_draft_kv_head_dims is None:
+        return None
+    from sglang.srt.mem_cache.kv_cache_dtype import dflash_draft_kv_cache_dtype
+
+    draft_dtype = dflash_draft_kv_cache_dtype(
+        target_kv_cache_dtype=kvc.kv_cache_dtype,
+        model_dtype=kvc.model_dtype,
+        speculative_draft_attention_backend=(
+            kvc.server_args.speculative_draft_attention_backend
+        ),
+    )
+    # Same TP split as ModelConfig.get_num_kv_heads.
+    kv_heads = max(1, aux.dflash_draft_total_kv_heads // get_parallel().attn_tp_size)
+    return (
+        draft_num_layers
+        * kv_heads
+        * aux.dflash_draft_kv_head_dims
+        * torch._utils._element_size(draft_dtype)
+    )
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -166,6 +193,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
+                    draft_cell_size_per_token=_dflash_draft_cell_size(
+                        kvc, draft_num_layers=int(draft_num_layers)
+                    ),
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:

@@ -36,6 +36,10 @@ fi
 : "${QWEN_EXO_SPECULATIVE_NUM_STEPS:=}"
 : "${QWEN_EXO_SPECULATIVE_EAGLE_TOPK:=}"
 : "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS:=}"
+# "decode" routes target verify to the decode backend (needed for NVFP4 KV,
+# whose FlashInfer prefill path would dequantize every context per step).
+: "${QWEN_EXO_SPECULATIVE_ATTENTION_MODE:=}"
+: "${QWEN_EXO_SPECULATIVE_DRAFT_WINDOW_SIZE:=}"
 # Experimental only: keep relaxed acceptance disabled unless explicitly benchmarked.
 : "${QWEN_EXO_DFLASH_THINK_ACCEPT_MODE:=off}"
 : "${QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY:=0.60}"
@@ -66,6 +70,11 @@ fi
 : "${QWEN_EXO_TENSOR_BANK_SURPRISAL_THRESHOLD:=6.0}"
 : "${QWEN_EXO_TENSOR_BANK_SPAN_TOKENS:=16}"
 : "${QWEN_EXO_MAMBA_STRATEGY:=extra_buffer}"
+# GDN state pool size relative to the full-attention KV pool (sglang default 0.9),
+# or an explicit slot count; with speculative decoding an explicit count also
+# reserves the per-draft-token intermediate states before sizing the KV pool.
+: "${QWEN_EXO_MAMBA_FULL_MEMORY_RATIO:=}"
+: "${QWEN_EXO_MAX_MAMBA_CACHE_SIZE:=}"
 : "${QWEN_EXO_MAMBA_SSM_DTYPE:=bfloat16}"
 
 : "${QWEN_EXO_OBSERVER_MODE:=active}"
@@ -118,6 +127,18 @@ fi
 : "${QWEN_EXO_SCORE_BIAS_TAIL_TOKENS:=4096}"
 : "${QWEN_EXO_SCORE_BIAS_TAIL_RATIO:=0.15}"
 : "${QWEN_EXO_SCORE_BIAS_SELECTED_BLOCKS:=2}"
+# Full attention runs on FlashInfer: FA3/FA4 ship no SM120 kernels. CUDA Score
+# Bias edits scores inside the Triton attention kernel, so it keeps Triton.
+# NVFP4 KV splits the phases: FlashInfer prefill reads a dequant workspace and
+# trtllm_mha (XQA) decode reads the packed FP4 cache.
+if [[ "${QWEN_EXO_SCORE_BIAS_MODE}" == "off" ]]; then
+  : "${QWEN_EXO_ATTENTION_BACKEND:=flashinfer}"
+else
+  : "${QWEN_EXO_ATTENTION_BACKEND:=triton}"
+fi
+: "${QWEN_EXO_PREFILL_ATTENTION_BACKEND:=}"
+: "${QWEN_EXO_DECODE_ATTENTION_BACKEND:=}"
+: "${QWEN_EXO_SAMPLING_BACKEND:=flashinfer}"
 
 case "${QWEN_EXO_ENABLED}" in
   0|1) ;;
@@ -358,8 +379,8 @@ server_args=(
   --mem-fraction-static "${QWEN_EXO_MEM_FRACTION_STATIC}"
   --max-running-requests "${QWEN_EXO_MAX_RUNNING_REQUESTS}"
   --max-prefill-tokens "${QWEN_EXO_MAX_PREFILL_TOKENS}"
-  --attention-backend triton
-  --sampling-backend pytorch
+  --attention-backend "${QWEN_EXO_ATTENTION_BACKEND}"
+  --sampling-backend "${QWEN_EXO_SAMPLING_BACKEND}"
   --disable-custom-all-reduce
   --cuda-graph-backend-decode "${QWEN_EXO_CUDA_GRAPH_BACKEND_DECODE}"
   --cuda-graph-backend-prefill "${QWEN_EXO_CUDA_GRAPH_BACKEND_PREFILL}"
@@ -381,6 +402,18 @@ server_args=(
 if [[ -n "${QWEN_EXO_CHUNKED_PREFILL_SIZE}" ]]; then
   server_args+=( --chunked-prefill-size "${QWEN_EXO_CHUNKED_PREFILL_SIZE}" )
 fi
+if [[ -n "${QWEN_EXO_PREFILL_ATTENTION_BACKEND}" ]]; then
+  server_args+=( --prefill-attention-backend "${QWEN_EXO_PREFILL_ATTENTION_BACKEND}" )
+fi
+if [[ -n "${QWEN_EXO_DECODE_ATTENTION_BACKEND}" ]]; then
+  server_args+=( --decode-attention-backend "${QWEN_EXO_DECODE_ATTENTION_BACKEND}" )
+fi
+if [[ -n "${QWEN_EXO_MAMBA_FULL_MEMORY_RATIO}" ]]; then
+  server_args+=( --mamba-full-memory-ratio "${QWEN_EXO_MAMBA_FULL_MEMORY_RATIO}" )
+fi
+if [[ -n "${QWEN_EXO_MAX_MAMBA_CACHE_SIZE}" ]]; then
+  server_args+=( --max-mamba-cache-size "${QWEN_EXO_MAX_MAMBA_CACHE_SIZE}" )
+fi
 if [[ -n "${QWEN_EXO_SPECULATIVE_ALGORITHM}" ]]; then
   server_args+=( --speculative-algorithm "${QWEN_EXO_SPECULATIVE_ALGORITHM}" )
   if [[ -n "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_PATH}" ]]; then
@@ -397,6 +430,12 @@ if [[ -n "${QWEN_EXO_SPECULATIVE_ALGORITHM}" ]]; then
   fi
   if [[ -n "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS}" ]]; then
     server_args+=( --speculative-num-draft-tokens "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_ATTENTION_MODE}" ]]; then
+    server_args+=( --speculative-attention-mode "${QWEN_EXO_SPECULATIVE_ATTENTION_MODE}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_DRAFT_WINDOW_SIZE}" ]]; then
+    server_args+=( --speculative-draft-window-size "${QWEN_EXO_SPECULATIVE_DRAFT_WINDOW_SIZE}" )
   fi
 fi
 if [[ "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING}" == "1" ]]; then
@@ -486,9 +525,9 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
   if [[ "${QWEN_EXO_QK_ONLY_KNOWLEDGE}" == "1" ]]; then
     server_args+=( --qwen-exo-qk-only-knowledge )
   fi
+  server_args+=( --qwen-exo-score-bias-mode "${QWEN_EXO_SCORE_BIAS_MODE}" )
   if [[ "${QWEN_EXO_SCORE_BIAS_MODE}" != "off" ]]; then
     server_args+=(
-      --qwen-exo-score-bias-mode "${QWEN_EXO_SCORE_BIAS_MODE}"
       --qwen-exo-score-bias-min-surprisal "${QWEN_EXO_SCORE_BIAS_MIN_SURPRISAL}"
       --qwen-exo-score-bias-max "${QWEN_EXO_SCORE_BIAS_MAX}"
       --qwen-exo-score-bias-half-life-steps "${QWEN_EXO_SCORE_BIAS_HALF_LIFE_STEPS}"
