@@ -119,6 +119,23 @@ def main() -> None:
     except ServiceConfigError as exc:
         raise SystemExit(f"QWEN-EXO service config error [{exc.code}]: {exc}") from exc
 
+    if "--enable-qwen-exo" in effective_args:
+        from qwen_exo_booster.runtime_lora import RuntimeLoRA
+
+        adapter = RuntimeLoRA.from_model_path(_argument_value(effective_args, "--model-path"))
+        if adapter is not None:
+            managed_lora_options = {
+                "--enable-lora", "--lora-paths", "--max-loaded-loras",
+                "--max-loras-per-batch", "--lora-strict-loading",
+            }
+            if any(arg.split("=", 1)[0] in managed_lora_options for arg in effective_args):
+                raise SystemExit("Runtime LoRA is configured by the model profile, not duplicate CLI options")
+            effective_args.extend([
+                "--enable-lora", "--lora-paths", f"{adapter.name}={adapter.path}",
+                "--max-loaded-loras", "1", "--max-loras-per-batch", "1",
+                "--lora-strict-loading",
+            ])
+
     os.execvp(
         sys.executable,
         [sys.executable, "-m", "sglang.launch_server", *effective_args],

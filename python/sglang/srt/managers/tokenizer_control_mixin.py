@@ -569,6 +569,8 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
+            if self.qwen_exo_runtime_lora is not None:
+                raise ValueError("Fixed runtime LoRA changes require a model-profile restart")
             if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
@@ -647,6 +649,8 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
+            if self.qwen_exo_runtime_lora is not None:
+                raise ValueError("Fixed runtime LoRA changes require a model-profile restart")
             if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
@@ -717,6 +721,8 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
+            if self.qwen_exo_runtime_lora is not None:
+                raise ValueError("Fixed runtime LoRA changes require a model-profile restart")
             if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."

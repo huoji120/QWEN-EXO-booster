@@ -315,6 +315,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init LoRA status
         self.init_lora()
+        self.maybe_init_qwen_exo_runtime_lora()
 
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation()
@@ -521,6 +522,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for lora_ref in self.server_args.lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
+    def maybe_init_qwen_exo_runtime_lora(self):
+        # A QWEN-EXO model profile may pin one runtime LoRA: every request is
+        # bound to it and dynamic adapter changes are rejected.
+        self.qwen_exo_runtime_lora = None
+        if not self.server_args.enable_qwen_exo:
+            return
+        from qwen_exo_booster.runtime_lora import RuntimeLoRA
+
+        adapter = RuntimeLoRA.from_model_path(self.server_args.model_path)
+        if adapter is not None:
+            adapter.validate_loaded(self.enable_lora, self.server_args.lora_paths)
+            self.qwen_exo_runtime_lora = adapter
+
     def init_disaggregation(self):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -626,6 +640,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+        if self.qwen_exo_runtime_lora is not None:
+            obj.lora_path = self.qwen_exo_runtime_lora.bind_request(obj.lora_path)
 
         # Normalize the request
         obj.normalize_batch_and_arguments()

@@ -179,6 +179,8 @@ bash scripts/qwen_exo/build_image.sh
 
 CUDA 单阶段、非 speculative 调度在后台 prefill 分块边界交替让出前台 prefill/decode，保留同一后台 chunk owner，不缩短反思输入或输出预算。短前台 prefill 可插入；超过剩余 chunk 容量的长前台输入可能仍需等待当前后台 prefill 完成，并非任意长度请求都能立即切换。可用 `QWEN_EXO_CHUNKED_PREFILL_SIZE=2048` 调整分块；六请求部署可设置 `QWEN_EXO_CUDA_GRAPH_MAX_BS=6`，保持 decode graph 为 `full`、prefill graph 为 `disabled`。超过捕获范围仍走 eager；应以混合前后台实测和实际 decode graph 日志验证，不能从配置值推断延迟收益。
 
+未合并 LoRA 可作为固定模型 profile 运行：在独立模型目录的 `config.json` 中设置 `qwen_exo_runtime_lora`，字段为 `schema: 1`、adapter 的 `name`、相对模型目录的 `path`、以及 `file_hashes`（`adapter_config.json` 与 `adapter_model.bin` 或 `adapter_model.safetensors` 的 SHA-256）。不修改原始权重；使用硬链接组织 checkpoint 时，不得原地修改链接文件。配置内容参与模型指纹，adapter 哈希在启动时校验。`service_launcher` 自动加载单个 adapter，TokenizerManager 在批处理规范化前给所有外部与内部请求绑定该 adapter；禁止请求另一个 adapter，以及动态加载/卸载绕过 profile 身份。更换 adapter 要切换 profile 并重启，原生状态重新构建，不能沿用另一 adapter 的 GDN/KV。已验证单卡 Dense Qwen 的原始底模在线 FP8 + 独立 rank-4 LoRA、FlashInfer、六请求 Decode Graph 捕获；这不是量化精度或模型能力提升证明。
+
 ### Apple Silicon
 
 macOS 不需要 Docker，也不需要 CUDA，走原生 MLX：

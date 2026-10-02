@@ -112,6 +112,7 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.enable_metrics = False
     tm.enable_trace = False
     tm.enable_lora = False
+    tm.qwen_exo_runtime_lora = None
     tm.incremental_streaming_output = False
     tm.allow_auto_truncate = False
     tm.skip_tokenizer_init = False
