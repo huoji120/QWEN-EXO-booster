@@ -731,6 +731,7 @@ class ReflectionMemoryService:
             Callable[[str, str], Awaitable[Iterable[ReflectionMemoryCandidate]]] | None
         ) = None,
         on_memory_stored: Callable[[ReflectionMemory], Awaitable[None]] | None = None,
+        yield_to_foreground: Callable[[], Awaitable[None]] | None = None,
     ):
         if mode not in {"off", "active"}:
             raise ValueError("Reflection memory mode must be off/active")
@@ -758,6 +759,9 @@ class ReflectionMemoryService:
         )
         self.publish, self.retrieve_similar = publish, retrieve_similar
         self.on_memory_stored = on_memory_stored
+        # Each phase decodes thousands of tokens; user turns that arrive while
+        # a reflection is in progress get the GPU before the next phase starts.
+        self.yield_to_foreground = yield_to_foreground
         self._analysis_lock = asyncio.Lock()
 
     def _token_count(self, text):
@@ -837,6 +841,8 @@ class ReflectionMemoryService:
         }
         if stop_token_ids:
             sampling["stop_token_ids"] = list(stop_token_ids)
+        if self.yield_to_foreground is not None:
+            await self.yield_to_foreground()
         result = (await self.runner.run_batch((job,), (prompt,), sampling))[0]
         if phase != "reasoning":
             attempt_record = {

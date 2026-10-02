@@ -3,8 +3,10 @@ import asyncio
 import json
 import sys
 import threading
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from qwen_exo_booster.config import PROJECT_NAME, QwenExoConfig
@@ -960,8 +962,8 @@ def test_new_memory_refresh_runs_in_background_and_coalesces():
 
     Consolidation prefills every memory and decodes a full reflection. The
     organization job stores several memories back to back; awaiting a refresh
-    per memory serialized minutes of generation into that job. A burst now
-    yields the running pass plus exactly one follow-up pass.
+    per memory serialized minutes of generation into that job. A burst before
+    the pass starts folds into it; a burst during it yields one follow-up pass.
     """
     reasons = []
     release = asyncio.Event()
@@ -970,9 +972,7 @@ def test_new_memory_refresh_runs_in_background_and_coalesces():
         reasons.append(reason)
         await release.wait()
 
-    runtime = object.__new__(QwenExoRuntime)
-    runtime._session_initial_gdn_refresh_task = None
-    runtime._session_initial_gdn_refresh_requested = None
+    runtime = _quiet_runtime()
     runtime._refresh_session_initial_gdn = refresh
 
     async def scenario():
@@ -980,12 +980,54 @@ def test_new_memory_refresh_runs_in_background_and_coalesces():
             await runtime._on_reflection_memory_stored(SimpleNamespace())
         await asyncio.sleep(0)
         assert reasons == ["new_memory"]
+        for _ in range(3):
+            await runtime._on_reflection_memory_stored(SimpleNamespace())
         release.set()
         await runtime._session_initial_gdn_refresh_task
         assert reasons == ["new_memory", "new_memory"]
         assert runtime._session_initial_gdn_refresh_requested is None
 
     asyncio.run(scenario())
+
+
+def _quiet_runtime():
+    runtime = object.__new__(QwenExoRuntime)
+    runtime._session_initial_gdn_refresh_task = None
+    runtime._session_initial_gdn_refresh_requested = None
+    runtime._request_questions = {}
+    runtime._finalize_tasks = {}
+    runtime._foreground_last_activity = time.monotonic() - 3600
+    return runtime
+
+
+def test_new_memory_refresh_waits_for_user_turns_and_reflections():
+    """Consolidation decodes thousands of tokens; it must not start while a
+    user request is in flight or a reflection is still publishing memories."""
+    reasons = []
+
+    async def refresh(*, reason):
+        reasons.append(reason)
+
+    runtime = _quiet_runtime()
+    runtime._refresh_session_initial_gdn = refresh
+    runtime._request_questions = {"resp-user": "question"}
+
+    async def scenario():
+        reflection = asyncio.create_task(asyncio.sleep(3600))
+        runtime._server_session_reflections = {reflection}
+        await runtime._on_reflection_memory_stored(SimpleNamespace())
+        await asyncio.sleep(0.05)
+        assert reasons == []
+        runtime._request_questions.clear()
+        await asyncio.sleep(0.05)
+        assert reasons == []
+        reflection.cancel()
+        await asyncio.gather(reflection, return_exceptions=True)
+        await asyncio.wait_for(runtime._session_initial_gdn_refresh_task, 10)
+        assert reasons == ["new_memory"]
+
+    with patch("qwen_exo_booster.runtime._FOREGROUND_POLL_SECONDS", 0.01):
+        asyncio.run(scenario())
 
 
 def _selection_runtime(identity):

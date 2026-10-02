@@ -185,6 +185,54 @@ def test_reflection_memory_runs_after_own_request_becomes_idle(tmp_path, monkeyp
     assert value._reflection_memory_sources["conversation-1"] == "reflection-source"
 
 
+def test_reflection_waits_again_after_plain_user_turn(tmp_path, monkeypatch):
+    """A user turn without new tool output still counts as activity: the idle
+    waiter re-arms for the newer timestamp instead of reflecting mid-chat or
+    dropping the pending reflection."""
+    value = runtime(tmp_path)
+    value.config = replace(
+        value.config,
+        feature_flags=replace(value.config.feature_flags, external_memory=True),
+        reflection_memory_mode="active",
+        max_internal_tokens=12288,
+    )
+    calls = []
+    sleeps = []
+
+    class ReflectionMemoryService:
+        async def reflect(self, **kwargs):
+            calls.append(kwargs)
+
+    async def recording_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            value._reflection_memory_last_activity["conversation-1"] = 2.0
+
+    value.reflection_memory_service = ReflectionMemoryService()
+    value._reflection_memory_last_activity["conversation-1"] = 1.0
+    value._foreground_last_activity = -3600.0
+    monkeypatch.setattr("qwen_exo_booster.runtime.asyncio.sleep", recording_sleep)
+
+    asyncio.run(
+        value._run_reflection_memory_after_idle(
+            conversation_key="conversation-1",
+            activity_at=1.0,
+            trajectory_id="resp-1",
+            original_task="Inspect the WFP wrapper",
+            tool_ledger=(),
+            trajectory_history=({"kind": "tool_observation", "content": "ok"},),
+            capsule_history=(),
+            source_token_count=512,
+            source_digest="reflection-source",
+            due_at=0.0,
+        )
+    )
+
+    assert len(sleeps) == 2
+    assert len(calls) == 1
+    assert value._reflection_memory_sources["conversation-1"] == "reflection-source"
+
+
 @pytest.mark.asyncio
 async def test_pending_reflection_can_be_listed_and_started_immediately(tmp_path):
     value = runtime(tmp_path)
@@ -2836,3 +2884,72 @@ def test_reflection_checkpoint_keeps_evidence_evicted_from_hot_window(tmp_path):
     assert history[0]["content"] == early
     recovered = value.reflection_evidence_store.get_event(history[0]["event_id"])
     assert recovered["content"] == early
+
+
+@pytest.mark.asyncio
+async def test_memory_finalizes_and_slot_frees_before_slow_capsule(tmp_path):
+    """Agent loops send the next turn right after a tool call. The previous
+    turn's capsule is a low-priority generation that can wait tens of seconds
+    behind other agents; neither the client slot nor the next turn's memory
+    parent may wait for it."""
+    value = runtime(tmp_path)
+    release = asyncio.Event()
+
+    async def slow_capsule():
+        await release.wait()
+
+    value._request_questions["resp-1"] = "task"
+    value._request_conversation_keys["resp-1"] = "conversation-1"
+    value._capsule_tasks["resp-1"] = asyncio.create_task(slow_capsule())
+    value._memory_finalized["resp-1"] = asyncio.Event()
+    finishing = asyncio.create_task(value._finish_request("resp-1"))
+    value._finalize_tasks["resp-1"] = finishing
+
+    await asyncio.wait_for(value._memory_finalized["resp-1"].wait(), 5)
+    assert not finishing.done()
+    assert value._active_foreground_requests() == 0
+
+    release.set()
+    await finishing
+
+
+def test_capacity_counts_only_generating_requests(tmp_path):
+    value = runtime(tmp_path)
+    value._request_questions = {"generating": "a", "finalizing": "b"}
+    value._finalize_tasks = {"finalizing": object()}
+    assert value._active_foreground_requests() == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_checkpoint_never_blocks_a_user_request(tmp_path):
+    """Regression: the compaction reflection worker waits for user requests to
+    go quiet, while user requests that detected client compaction awaited a
+    blocking put() into its bounded queue. Once the queue filled, every such
+    request held its client slot forever and the server answered 429."""
+    value = runtime(tmp_path)
+    release = asyncio.Event()
+
+    class ReflectionMemoryService:
+        async def reflect(self, **kwargs):
+            await release.wait()
+
+    value.reflection_memory_service = ReflectionMemoryService()
+    checkpoint = SimpleNamespace(
+        response_id="resp", checkpoint_id="cp", conversation_key="conversation",
+        trajectory_history=(), source_token_count=1, original_task="task",
+        tool_ledger=(), capsule_history=(),
+    )
+    capacity = value._compaction_reflection_queue.maxsize
+    results = []
+    for _ in range(capacity + 3):
+        results.append(
+            await asyncio.wait_for(
+                value._enqueue_compaction_reflection_checkpoint(checkpoint), 1
+            )
+        )
+        await asyncio.sleep(0)
+    assert results[0] is True
+    assert results[-1] is False
+    release.set()
+    value._compaction_reflection_worker.cancel()
+    await asyncio.gather(value._compaction_reflection_worker, return_exceptions=True)

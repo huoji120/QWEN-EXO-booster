@@ -121,6 +121,12 @@ from qwen_exo_booster.task_scheduling import internal_task_scope
 logger = logging.getLogger(__name__)
 
 _REFLECTION_ORGANIZATION_COMPLETED_LIMIT = 32
+# Background maintenance (reflection, session-initial GDN consolidation) decodes
+# thousands of tokens on the same GPU as user turns. It starts only once no user
+# request is in flight and none finished within this window, so agent loops
+# with short tool gaps are not interleaved with maintenance work.
+_FOREGROUND_QUIET_SECONDS = 30.0
+_FOREGROUND_POLL_SECONDS = 2.0
 
 
 def _query_probe_timeout_seconds(tokenizer_manager: Any) -> float:
@@ -508,6 +514,10 @@ class QwenExoRuntime:
         self._request_generation_output_ids: dict[tuple[str, int], tuple[int, ...]] = {}
         self._reflection_memory_tasks: dict[str, asyncio.Task[Any]] = {}
         self._reflection_memory_last_activity: OrderedDict[str, float] = OrderedDict()
+        self._foreground_last_activity = time.monotonic()
+        # Set once a finishing request's memory state is final; later turns of
+        # the conversation wait for this instead of the whole finalization.
+        self._memory_finalized: dict[str, asyncio.Event] = {}
         self._reflection_memory_sources: OrderedDict[str, str] = OrderedDict()
         self._reflection_memory_trajectories: OrderedDict[str, list[dict[str, Any]]] = (
             OrderedDict()
@@ -1323,9 +1333,63 @@ class QwenExoRuntime:
         self._session_initial_gdn_refresh_task = task
         return task
 
+    def _judge_reuse_scope(self, request_id: str, original_task: str) -> str | None:
+        """Admission decisions are reusable within one conversation and task."""
+        conversation_key = self._request_conversation_keys.get(str(request_id))
+        if not conversation_key or not str(original_task or "").strip():
+            return None
+        return stable_digest(
+            "judge-reuse-scope-v1", conversation_key, str(original_task).strip()
+        )
+
+    def _active_foreground_requests(self) -> int:
+        """Requests still generating for a client.
+
+        A request whose response is complete only runs post-processing
+        (capsule, memory finalization); it must not hold a client slot.
+        """
+        return sum(
+            1
+            for request_id in self._request_questions
+            if request_id not in self._finalize_tasks
+        )
+
+    async def _wait_for_foreground_quiet(
+        self, quiet_seconds: float = _FOREGROUND_QUIET_SECONDS
+    ) -> None:
+        """Yield the GPU to user turns before background maintenance work."""
+        while True:
+            if self._active_foreground_requests():
+                await asyncio.sleep(_FOREGROUND_POLL_SECONDS)
+                continue
+            stamp = self._foreground_last_activity
+            remaining = stamp + quiet_seconds - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(remaining)
+            if (
+                not self._active_foreground_requests()
+                and self._foreground_last_activity == stamp
+            ):
+                return
+
     async def _run_session_initial_gdn_refresh(self, *, reason: str) -> None:
         pending: str | None = reason
         while pending is not None:
+            # Reflections publish one memory per segment; consolidating after
+            # each one regenerates the full reflection several times in a row.
+            # Wait for running reflections and user turns so one pass covers
+            # the whole burst (later requests fold into ``pending``).
+            while True:
+                await self._wait_for_foreground_quiet()
+                if not any(
+                    not task.done()
+                    for task in getattr(self, "_server_session_reflections", ())
+                ):
+                    break
+                await asyncio.sleep(_FOREGROUND_POLL_SECONDS)
+            pending = self._session_initial_gdn_refresh_requested or pending
+            self._session_initial_gdn_refresh_requested = None
             await self._refresh_session_initial_gdn(reason=pending)
             pending = self._session_initial_gdn_refresh_requested
             self._session_initial_gdn_refresh_requested = None
@@ -1571,6 +1635,7 @@ class QwenExoRuntime:
                         publish=self._publish_reflection_memory,
                         retrieve_similar=self._retrieve_reflection_memory_candidates,
                         on_memory_stored=self._on_reflection_memory_stored,
+                        yield_to_foreground=self._wait_for_foreground_quiet,
                     )
                 if (
                     self.config.response_compaction_mode != "off"
@@ -1911,13 +1976,14 @@ class QwenExoRuntime:
                 raise QwenExoRequestConflict(
                     f"QWEN-EXO request_id {request.request_id!r} is already active"
                 )
-            if len(self._request_questions) >= self.config.max_running_requests:
+            if self._active_foreground_requests() >= self.config.max_running_requests:
                 raise QwenExoCapacityConflict(
                     "QWEN-EXO concurrent request capacity is exhausted"
                 )
             if self.adaptive_retrieval is not None:
                 self.adaptive_retrieval.begin(request.request_id)
             self._request_questions[request.request_id] = provisional_task
+            self._foreground_last_activity = time.monotonic()
             if bool(getattr(request, "background", False)):
                 self._pending_background_requests.add(request.request_id)
         tool_events = self._response_tool_events(request.input)
@@ -1960,15 +2026,25 @@ class QwenExoRuntime:
                     },
                 )
         self._request_conversation_keys[request.request_id] = conversation_key
+        if conversation_key in self._reflection_memory_last_activity:
+            # A plain user turn (no new tool output) is activity too; the idle
+            # waiter re-arms instead of reflecting mid-conversation.
+            self._reflection_memory_last_activity[conversation_key] = time.monotonic()
+            self._reflection_memory_last_activity.move_to_end(conversation_key)
         effective_memory_previous_response_id = previous_response_id or (
             self._memory_parents_by_conversation.get(conversation_key)
         )
         if effective_memory_previous_response_id:
-            parent_finalization = self._finalize_tasks.get(
-                str(effective_memory_previous_response_id)
-            )
-            if parent_finalization is not None:
-                await asyncio.shield(parent_finalization)
+            parent_id = str(effective_memory_previous_response_id)
+            if previous_response_id:
+                # The parent capsule seeds this turn's capsule lineage.
+                parent_finalization = self._finalize_tasks.get(parent_id)
+                if parent_finalization is not None:
+                    await asyncio.shield(parent_finalization)
+            else:
+                parent_memory = self._memory_finalized.get(parent_id)
+                if parent_memory is not None:
+                    await asyncio.shield(parent_memory.wait())
         if head_changed:
             checkpoint = self._build_compaction_reflection_checkpoint(
                 response_id=str(request.request_id),
@@ -2182,6 +2258,7 @@ class QwenExoRuntime:
             query_probe_prompt_tokens=query_probe_prompt_tokens,
             memory_previous_response_id=effective_memory_previous_response_id,
             published_previous_response_id=previous_response_id,
+            judge_reuse_scope=self._judge_reuse_scope(request.request_id, original_task),
         )
         # The global initial GDN namespace is prefixed onto the radix key by the
         # Responses entrypoint together with the selection itself, so internal
@@ -2314,7 +2391,22 @@ class QwenExoRuntime:
         ):
             return False
         self._ensure_compaction_reflection_worker()
-        await self._compaction_reflection_queue.put(checkpoint)
+        try:
+            # Called while a user request holds its client slot: never wait for
+            # the background worker, which itself yields to user requests.
+            self._compaction_reflection_queue.put_nowait(checkpoint)
+        except asyncio.QueueFull:
+            self.telemetry.emit(
+                checkpoint.response_id,
+                "reflection_memory.compaction_checkpoint_dropped",
+                {
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "conversation_key": checkpoint.conversation_key,
+                    "reason": "queue_full",
+                    "queue_depth": self._compaction_reflection_queue.qsize(),
+                },
+            )
+            return False
         self.telemetry.emit(
             checkpoint.response_id,
             "reflection_memory.compaction_checkpoint_queued",
@@ -5738,6 +5830,7 @@ class QwenExoRuntime:
                     self._capsule_tasks[request_id] = asyncio.create_task(
                         self._update_execution_capsule(request_id)
                     )
+        self._memory_finalized[request_id] = asyncio.Event()
         task = asyncio.create_task(self._finish_request(request_id))
         self._finalize_tasks[request_id] = task
         task.add_done_callback(
@@ -5748,6 +5841,9 @@ class QwenExoRuntime:
     def _finalization_done(self, request_id: str, task: asyncio.Task[None]) -> None:
         if self._finalize_tasks.get(request_id) is task:
             self._finalize_tasks.pop(request_id, None)
+            memory_finalized = self._memory_finalized.pop(request_id, None)
+            if memory_finalized is not None:
+                memory_finalized.set()
         if task.cancelled():
             return
         error = task.exception()
@@ -6097,6 +6193,43 @@ class QwenExoRuntime:
             },
         )
 
+    async def _await_reflection_idle(
+        self,
+        *,
+        conversation_key: str,
+        activity_at: float,
+        trajectory_id: str,
+        source_digest: str,
+    ) -> bool:
+        """Re-arm until the conversation has been idle for the full window.
+
+        Plain user turns refresh the activity clock without rescheduling, so a
+        newer timestamp extends the wait instead of dropping the reflection.
+        Returns False when the conversation was forgotten (LRU eviction).
+        """
+        idle_seconds = self.config.reflection_memory_idle_seconds
+        while True:
+            latest = self._reflection_memory_last_activity.get(conversation_key)
+            if latest is None:
+                return False
+            if latest != activity_at:
+                activity_at = latest
+                remaining = latest + idle_seconds - time.monotonic()
+                pending = self._pending_reflection_memories.get(conversation_key)
+                if pending is not None and pending.source_digest == source_digest:
+                    pending.due_at = time.time() + max(0.0, remaining)
+                await asyncio.sleep(max(0.0, remaining))
+                continue
+            if any(
+                request_id != trajectory_id and value == conversation_key
+                for request_id, value in self._request_conversation_keys.items()
+            ):
+                await asyncio.sleep(_FOREGROUND_POLL_SECONDS)
+                continue
+            await self._wait_for_foreground_quiet()
+            if self._reflection_memory_last_activity.get(conversation_key) == latest:
+                return True
+
     @internal_task_scope("reflection")
     async def _run_reflection_memory_after_idle(
         self,
@@ -6125,17 +6258,14 @@ class QwenExoRuntime:
                 )
             )
             await asyncio.sleep(delay_seconds)
+            if not force and not await self._await_reflection_idle(
+                conversation_key=conversation_key,
+                activity_at=activity_at,
+                trajectory_id=trajectory_id,
+                source_digest=source_digest,
+            ):
+                return
             await wait_source_admission(self)
-            if not force and (
-                self._reflection_memory_last_activity.get(conversation_key)
-                != activity_at
-            ):
-                return
-            if not force and any(
-                request_id != trajectory_id and value == conversation_key
-                for request_id, value in self._request_conversation_keys.items()
-            ):
-                return
             if self._reflection_memory_sources.get(conversation_key) == source_digest:
                 return
             pending = getattr(self, "_pending_reflection_memories", {}).get(
@@ -6292,7 +6422,6 @@ class QwenExoRuntime:
                 for task in (
                     self._refresh_tasks.get(request_id),
                     self._replay_tasks.get(request_id),
-                    self._capsule_tasks.get(request_id),
                 )
                 if task is not None
             )
@@ -6319,6 +6448,18 @@ class QwenExoRuntime:
                         "memory.request_state_finalize_failed_closed",
                         {"error_type": type(exc).__name__},
                     )
+            if memory_state is not None:
+                conversation_key = self._request_conversation_keys.get(request_id)
+                if conversation_key:
+                    self._remember_memory_parent(conversation_key, request_id)
+            memory_finalized = self._memory_finalized.get(request_id)
+            if memory_finalized is not None:
+                memory_finalized.set()
+            # The capsule is a low-priority generation; the next turn of a
+            # stateless conversation must not queue behind it.
+            capsule_task = self._capsule_tasks.get(request_id)
+            if capsule_task is not None:
+                await asyncio.gather(capsule_task, return_exceptions=True)
             await self._emit_stage_summary(request_id)
             self._schedule_reflection_memory(request_id)
             await self.internal_jobs.finish_parent(request_id)
@@ -6330,10 +6471,6 @@ class QwenExoRuntime:
                     "score_bias.failed_closed",
                     {"error_type": type(exc).__name__},
                 )
-            if memory_state is not None:
-                conversation_key = self._request_conversation_keys.get(request_id)
-                if conversation_key:
-                    self._remember_memory_parent(conversation_key, request_id)
         finally:
             self._adaptive_transition(
                 request_id,
@@ -6344,6 +6481,7 @@ class QwenExoRuntime:
             self._replay_tasks.pop(request_id, None)
             self._capsule_tasks.pop(request_id, None)
             self._request_questions.pop(request_id, None)
+            self._foreground_last_activity = time.monotonic()
             self._request_outputs.pop(request_id, None)
             self._request_output_state.pop(request_id, None)
             self._bank_cache_status_emitted.discard(request_id)
@@ -6412,6 +6550,7 @@ class QwenExoRuntime:
             decision="request_cancelled",
         )
         self._request_questions.pop(request_id, None)
+        self._foreground_last_activity = time.monotonic()
         self._request_outputs.pop(request_id, None)
         self._request_output_state.pop(request_id, None)
         self._bank_cache_status_emitted.discard(request_id)

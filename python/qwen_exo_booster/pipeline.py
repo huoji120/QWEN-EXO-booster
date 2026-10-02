@@ -739,6 +739,7 @@ class MemoryPipeline:
         candidates: tuple[KnowledgeCandidate, ...],
         qk_cache_hit: bool = False,
         task_scope_blocked_keys: frozenset[tuple[str, str, str]] = frozenset(),
+        judge_reuse_scope: str | None = None,
     ) -> tuple[
         tuple[KnowledgeCandidate, ...],
         tuple[EligibilityDecision, ...],
@@ -854,6 +855,9 @@ class MemoryPipeline:
             )
             for wave_index in range(0, len(judged), wave_limit):
                 wave = judged[wave_index : wave_index + wave_limit]
+                reuse_kwargs = (
+                    {"reuse_scope": judge_reuse_scope} if judge_reuse_scope else {}
+                )
                 batches.append(
                     await self.reference_judge.judge(
                         parent_request_id=request_id,
@@ -867,6 +871,7 @@ class MemoryPipeline:
                             f"{request_id}:request-admission:wave-"
                             f"{wave_index // wave_limit}"
                         ),
+                        **reuse_kwargs,
                     )
                 )
             selection_method = "direct_binary_logits"
@@ -1029,6 +1034,7 @@ class MemoryPipeline:
         query_probe_prompt_tokens: int = 0,
         memory_previous_response_id: str | None = None,
         published_previous_response_id: str | None = None,
+        judge_reuse_scope: str | None = None,
     ) -> tuple[Any, MemoryPreparationState]:
         api_previous_response_id = (
             published_previous_response_id
@@ -1243,6 +1249,7 @@ class MemoryPipeline:
             candidates=candidate_tuple,
             qk_cache_hit=qk_rank_cache_hit,
             task_scope_blocked_keys=task_scope_filtered_key_set,
+            judge_reuse_scope=judge_reuse_scope,
         )
         # A confident raw Q/K winner can still be semantically wrong. If the
         # first bounded Judge wave rejects everything, inspect the next ranked
@@ -1344,6 +1351,7 @@ class MemoryPipeline:
                         candidates=new_qk_candidates,
                         qk_cache_hit=bool(expanded_meta["cache_hit"]),
                         task_scope_blocked_keys=expanded_scope_keys,
+                        judge_reuse_scope=judge_reuse_scope,
                     )
                     decision_by_id = {
                         decision.candidate_id: decision

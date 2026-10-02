@@ -53,6 +53,14 @@ _REFERENCE_JUDGE_SYSTEM = (
 )
 
 
+# Agent loops re-ask nearly the same retrieval question every tool turn; the
+# admission of a given document for a conversation's original task is reused
+# by at most this many later turns, and never past the age limit, before it is
+# judged again against the then-current question.
+_SESSION_DECISION_MAX_REUSES = 3
+_SESSION_DECISION_TTL_SECONDS = 600.0
+
+
 @dataclass(frozen=True, slots=True)
 class _BoundedQuestion:
     text: str
@@ -174,6 +182,10 @@ class ReferenceJudge:
         self._decision_cache: OrderedDict[
             str, tuple[EligibilityStatus, float]
         ] = OrderedDict()
+        # session key -> (status, margin, judged_at monotonic, reuses so far)
+        self._session_decisions: OrderedDict[
+            str, tuple[EligibilityStatus, float, float, int]
+        ] = OrderedDict()
         self._cache_lock = asyncio.Lock()
 
     def _single_token_options(self) -> tuple[int, int]:
@@ -197,7 +209,10 @@ class ReferenceJudge:
         question: str,
         candidates: Iterable[KnowledgeCandidate],
         telemetry_correlation_id: str,
+        reuse_scope: str | None = None,
     ) -> JudgeBatchResult:
+        """Judge candidates; ``reuse_scope`` (conversation + original task)
+        lets a fresh decision for the same document be reused across turns."""
         started = time.perf_counter()
         original_question = str(question or "")
         candidate_list = tuple(candidates)
@@ -232,6 +247,7 @@ class ReferenceJudge:
             )
         deadline = time.monotonic() + self.timeout_seconds
         pending: list[tuple[int, str, tuple[int, ...]]] = []
+        session_keys: dict[int, str] = {}
         cache_hits = 0
         for index, candidate in enumerate(candidate_list):
             try:
@@ -254,6 +270,17 @@ class ReferenceJudge:
                     )
                     cache_hits += 1
                     continue
+                if reuse_scope:
+                    session_key = self._session_key(reuse_scope, candidate)
+                    reused = await self._session_decision(session_key)
+                    if reused is not None:
+                        decisions[index] = self._decision(
+                            parent_request_id, original_question, candidate,
+                            reused[0], reused[1], "direct_binary_logits_session_cache",
+                        )
+                        cache_hits += 1
+                        continue
+                    session_keys[index] = session_key
                 prefix = tuple(self.tokenizer.encode(prompt, add_special_tokens=False))
                 pending.append((index, cache_key, prefix))
             except asyncio.CancelledError:
@@ -265,6 +292,7 @@ class ReferenceJudge:
         prompt_tokens = 0
         executed_count = 0
         cache_updates: list[tuple[str, tuple[EligibilityStatus, float]]] = []
+        session_updates: list[tuple[str, tuple[EligibilityStatus, float]]] = []
         wave_size = max(1, int(getattr(self.runner, "max_fanout", 32)))
         for offset in range(0, len(pending), wave_size):
             wave = pending[offset : offset + wave_size]
@@ -329,6 +357,8 @@ class ReferenceJudge:
                     status, margin, "direct_binary_logits",
                 )
                 cache_updates.append((cache_key, (status, margin)))
+                if index in session_keys:
+                    session_updates.append((session_keys[index], (status, margin)))
 
         async with self._cache_lock:
             for cache_key, cached in cache_updates:
@@ -336,6 +366,12 @@ class ReferenceJudge:
                 self._decision_cache.move_to_end(cache_key)
             while len(self._decision_cache) > self.cache_size:
                 self._decision_cache.popitem(last=False)
+            now = time.monotonic()
+            for session_key, (status, margin) in session_updates:
+                self._session_decisions[session_key] = (status, margin, now, 0)
+                self._session_decisions.move_to_end(session_key)
+            while len(self._session_decisions) > self.cache_size:
+                self._session_decisions.popitem(last=False)
         return JudgeBatchResult(
             decisions=tuple(decisions),
             candidate_count=len(candidate_list),
@@ -457,6 +493,37 @@ class ReferenceJudge:
             add_generation_prompt=True,
             enable_thinking=False,
         )
+
+    def _session_key(self, reuse_scope: str, candidate: KnowledgeCandidate) -> str:
+        return stable_digest(
+            "reference-judge-session-v1",
+            self.model_fingerprint,
+            _REFERENCE_JUDGE_SYSTEM,
+            reuse_scope,
+            candidate.lane,
+            candidate.reference_digest,
+            stable_digest(candidate.reference_content),
+            str(candidate.scope_note or ""),
+            str(self._option_token_ids),
+        )
+
+    async def _session_decision(
+        self, session_key: str
+    ) -> tuple[EligibilityStatus, float] | None:
+        async with self._cache_lock:
+            reused = self._session_decisions.get(session_key)
+            if reused is None:
+                return None
+            status, margin, judged_at, reuses = reused
+            if (
+                reuses >= _SESSION_DECISION_MAX_REUSES
+                or time.monotonic() - judged_at > _SESSION_DECISION_TTL_SECONDS
+            ):
+                self._session_decisions.pop(session_key, None)
+                return None
+            self._session_decisions[session_key] = (status, margin, judged_at, reuses + 1)
+            self._session_decisions.move_to_end(session_key)
+            return status, margin
 
     def _cache_key(
         self, question: str, candidate: KnowledgeCandidate, prompt: str,
