@@ -4,30 +4,38 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-
 from qwen_exo_booster.attention_diagnostic import (
     AttentionDiagnosticError,
     _layer_selection,
-    _render,
     _prepare_run,
-    prepare_attention_preview,
+    _render,
     _weights,
     parse_attention_upload,
+    prepare_attention_preview,
 )
 from qwen_exo_booster.attention_diagnostic_capture import (
+    _cached_key_descale,
+    _diagnostic_backend,
+    _unsupported_attention,
     attention_diagnostic_specs,
     diagnostic_position_matches,
     mean_cached_attention,
+    runtime_profile_lora_ids,
 )
 
 
-def test_cached_attention_matches_gqa_sdpa_with_permuted_slots():
+def _named(name, **fields):
+    instance = type(name, (), {})()
+    instance.__dict__.update(fields)
+    return instance
+
+
+def test_cached_attention_matches_gqa_sdpa():
     generator = torch.Generator().manual_seed(73)
     query = torch.randn(8, 16, generator=generator)
-    keys = torch.randn(48, 2, 16, generator=generator)
-    mapping = torch.randperm(47, generator=generator)[:23] + 1
-    actual = mean_cached_attention(query, keys, mapping, scaling=0.25, key_descale=0.7)
-    selected = keys[mapping].repeat_interleave(4, dim=1).transpose(0, 1) * 0.7
+    keys = torch.randn(23, 2, 16, generator=generator)
+    actual = mean_cached_attention(query, keys, scaling=0.25, key_descale=0.7)
+    selected = keys.repeat_interleave(4, dim=1).transpose(0, 1) * 0.7
     reference = (
         F.scaled_dot_product_attention(
             query[:, None, :], selected, torch.eye(23).expand(8, -1, -1), scale=0.25
@@ -36,6 +44,62 @@ def test_cached_attention_matches_gqa_sdpa_with_permuted_slots():
         .mean(0)
     )
     torch.testing.assert_close(actual, reference, atol=1e-6, rtol=1e-5)
+
+
+def test_nvfp4_split_backend_cache_is_read_back_for_diagnostics(monkeypatch):
+    """NVFP4 KV runs prefill on FlashInfer over a dequant workspace and decode
+    on trtllm_mha. Diagnostics rejected that setup (error 1) because cached K
+    was read as packed FP4 bytes; keys are now read back dequantized through
+    the pool with the FP4 scales applied, so no scalar descale remains."""
+    from sglang.srt.model_executor import forward_context
+
+    full_pool = _named(
+        "MHATokenToKVPool", is_quantized_kv_cache=True, dtype=torch.uint8
+    )
+    prefill = _named(
+        "FlashInferAttnBackend",
+        prefill_uses_dequant_workspace=True,
+        token_to_kv_pool=_named(
+            "HybridLinearKVPool", use_mla=False, full_kv_pool=full_pool
+        ),
+    )
+    split = _named(
+        "HybridAttnBackend",
+        prefill_backend=prefill,
+        decode_backend=_named("TRTLLMHAAttnBackend"),
+    )
+    monkeypatch.setattr(
+        forward_context,
+        "get_attn_backend",
+        lambda: _named("HybridLinearAttnBackend", full_attn_backend=split),
+    )
+
+    assert _diagnostic_backend() == (prefill, full_pool)
+    layer = SimpleNamespace(k_scale=None, v_scale=None, k_scale_float=None)
+    assert _cached_key_descale(layer, full_pool) == 1.0
+
+
+def test_flashinfer_extend_metadata_is_not_mistaken_for_multi_item_scoring():
+    """FlashInfer extend metadata always holds a MultiItemScoringParams object,
+    disabled unless multi-item scoring is on; treating its presence as MIS made
+    every FlashInfer diagnostic fail as unsupported (error 1)."""
+    from sglang.srt.layers.attention.flashinfer_backend import MultiItemScoringParams
+
+    layer = SimpleNamespace(
+        is_cross_attention=False,
+        logit_cap=0.0,
+        sliding_window_size=-1,
+        xai_temperature_len=-1,
+        attn_type=SimpleNamespace(value="decoder"),
+        pos_encoding_mode="NONE",
+    )
+    batch = SimpleNamespace(cross_attention_custom_mask=None)
+    disabled = SimpleNamespace(multi_item_params=MultiItemScoringParams())
+    assert not _unsupported_attention(layer, disabled, batch)
+    enabled = SimpleNamespace(
+        multi_item_params=MultiItemScoringParams(prefix_len_ptr=torch.tensor([3]))
+    )
+    assert _unsupported_attention(layer, enabled, batch)
 
 
 def test_text_mrope_prefix_positions_accept_axes_without_out_of_bounds():
@@ -153,6 +217,47 @@ def test_capture_requires_isolated_internal_job_and_rejects_memory():
     assert attention_diagnostic_specs([req])[0]["error"] == 2
     custom["qwen_exo_kind"] = "internal"
     custom["qwen_exo_session_initial_gdn"] = {"identity": "old"}
+    assert attention_diagnostic_specs([req])[0]["error"] == 2
+
+
+def test_runtime_profile_lora_is_the_served_model_for_diagnostics(
+    tmp_path, monkeypatch
+):
+    """A runtime LoRA profile binds its adapter to every request, so every
+    diagnostic arrived with that lora_id and was rejected as invalid (error 2).
+    The profile adapter is the served model; any other adapter stays rejected."""
+    from qwen_exo_booster import attention_diagnostic_capture
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"qwen_exo_runtime_lora": {"schema": 1, "name": "row2500"}})
+    )
+    refs = [
+        SimpleNamespace(lora_id="profile-id", lora_name="row2500"),
+        SimpleNamespace(lora_id="other-id", lora_name="other"),
+    ]
+    assert runtime_profile_lora_ids(tmp_path, refs) == {"profile-id"}
+    (tmp_path / "config.json").write_text("{}")
+    assert runtime_profile_lora_ids(tmp_path, refs) == frozenset()
+
+    monkeypatch.setattr(
+        attention_diagnostic_capture,
+        "_served_lora_ids",
+        lambda: frozenset({"profile-id"}),
+    )
+    custom = {
+        "qwen_exo_kind": "internal",
+        "qwen_exo_job_type": "attention_diagnostic",
+        "qwen_exo_dflash": "target_only",
+        "qwen_exo_attention_diagnostic": {"layer_ids": [3], "token_count": 2},
+    }
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(custom_params=custom, max_new_tokens=1),
+        origin_input_ids=[1, 2],
+        extra_key="isolated",
+        lora_id="profile-id",
+    )
+    assert attention_diagnostic_specs([req])[0]["error"] == 0
+    req.lora_id = "other-id"
     assert attention_diagnostic_specs([req])[0]["error"] == 2
 
 

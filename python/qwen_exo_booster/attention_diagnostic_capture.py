@@ -1,14 +1,40 @@
 from __future__ import annotations
 
+import functools
+import json
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
-
 from qwen_exo_booster.contracts import ATTENTION_DIAGNOSTIC_MAX_LAYERS
 
 ATTENTION_DIAGNOSTIC_MAX_TOKENS = 32768
 ATTENTION_DIAGNOSTIC_ERROR_KEY = "qwen_exo_attention_error"
+
+
+def runtime_profile_lora_ids(model_path, lora_refs) -> frozenset[str]:
+    """LoRA ids that a QWEN-EXO runtime LoRA profile binds to every request.
+
+    The tokenizer binds the profile's single adapter to all requests and rejects
+    any other, so a diagnostic carrying it reconstructs the served model. Only
+    the manifest name is read here; the tokenizer verified the adapter hashes.
+    """
+    config = json.loads((Path(model_path) / "config.json").read_text(encoding="utf-8"))
+    manifest = config.get("qwen_exo_runtime_lora")
+    if not isinstance(manifest, dict):
+        return frozenset()
+    return frozenset(
+        ref.lora_id for ref in lora_refs or () if ref.lora_name == manifest.get("name")
+    )
+
+
+@functools.cache
+def _served_lora_ids() -> frozenset[str]:
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    return runtime_profile_lora_ids(server_args.model_path, server_args.lora_paths)
 
 
 def attention_diagnostic_specs(requests) -> list[dict[str, Any] | None] | None:
@@ -47,7 +73,7 @@ def attention_diagnostic_specs(requests) -> list[dict[str, Any] | None] | None:
             and getattr(req, "input_embeds", None) is None
             and getattr(req, "positional_embed_overrides", None) is None
             and not getattr(req, "session_id", None)
-            and not getattr(req, "lora_id", None)
+            and (not getattr(req, "lora_id", None) or req.lora_id in _served_lora_ids())
             and not any(
                 key.startswith(
                     (
@@ -86,7 +112,6 @@ def _diagnostic_backend():
         type(backend).__name__ not in ("TritonAttnBackend", "FlashInferAttnBackend")
         or getattr(backend, "dcp_size", 1) != 1
         or getattr(backend, "use_mla", False)
-        or getattr(backend, "prefill_uses_dequant_workspace", False)
         or getattr(backend, "enable_mis", False)
     ):
         return None
@@ -98,11 +123,19 @@ def _diagnostic_backend():
     if (
         type(pool).__name__ != "MHATokenToKVPool"
         or getattr(pool, "use_hnd", False)
-        or getattr(pool, "is_quantized_kv_cache", False)
         or getattr(pool, "kv_cache_layout", None) == "vectorized_5d"
     ):
         return None
-    return backend
+    # Cached K is read back through backend.token_to_kv_pool.get_kv_tokens, so
+    # packed FP4 caches (and their FlashInfer dequant-workspace prefill) work.
+    return backend, pool
+
+
+def _cached_key_descale(layer, pool) -> float | None:
+    # FP4 caches dequantize on read with their global and block scales.
+    if pool.is_quantized_kv_cache:
+        return 1.0
+    return _key_descale(layer, pool.dtype)
 
 
 def _key_descale(layer, dtype: torch.dtype) -> float | None:
@@ -124,11 +157,14 @@ def _key_descale(layer, dtype: torch.dtype) -> float | None:
     return float(value)
 
 
-def mean_cached_attention(query, keys, mapping, *, scaling: float, key_descale: float):
-    """FP32 softmax per query head, then head mean; one KV head resident at a time.
+def mean_cached_attention(query, keys, *, scaling: float, key_descale: float):
+    """FP32 softmax per query head, then head mean; one KV head upcast at a time.
 
-    Q and cached K already include RoPE. The result reconstructs cached-key
-    attention, not fused-kernel probabilities (fresh FP8-prefill K may differ).
+    ``keys`` are the request's cached keys in token order (tokens, KV heads,
+    head dim), read back through the KV pool so packed FP4 caches arrive
+    dequantized. Q and cached K already include RoPE. The result reconstructs
+    cached-key attention, not fused-kernel probabilities (fresh prefill K may
+    differ from its quantized cache entry).
     """
     num_heads, head_dim = query.shape
     num_kv_heads = keys.shape[1] if keys.ndim == 3 else 0
@@ -138,29 +174,37 @@ def mean_cached_attention(query, keys, mapping, *, scaling: float, key_descale: 
         or num_kv_heads < 1
         or num_heads < 1
         or num_heads % num_kv_heads != 0
-        or not 1 <= mapping.numel() <= ATTENTION_DIAGNOSTIC_MAX_TOKENS
+        or not 1 <= keys.shape[0] <= ATTENTION_DIAGNOSTIC_MAX_TOKENS
     ):
         raise ValueError("Invalid diagnostic attention geometry")
     group_size = num_heads // num_kv_heads
-    result = torch.zeros(mapping.numel(), dtype=torch.float32, device=query.device)
+    result = torch.zeros(keys.shape[0], dtype=torch.float32, device=query.device)
     for kv_head in range(num_kv_heads):
-        source = keys[:, kv_head, :]
-        if keys.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            # Byte gather also works on torch versions without FP8 index_select.
-            selected = (
-                source.view(torch.uint8)
-                .index_select(0, mapping)
-                .view(keys.dtype)
-                .float()
-            )
-        else:
-            selected = source.index_select(0, mapping).float()
+        selected = keys[:, kv_head, :].float()
         # Scaling Q instead of making a second dequantized K allocation is
         # algebraically identical for the scalar-scaled cache contract.
         for head in range(kv_head * group_size, (kv_head + 1) * group_size):
             scores = torch.mv(selected, query[head].float() * (scaling * key_descale))
             result.add_(torch.softmax(scores, dim=0))
     return result.div_(num_heads)
+
+
+def _unsupported_attention(layer, metadata, forward_batch) -> bool:
+    """Attention variants that a plain causal cached-key softmax cannot reproduce."""
+    # FlashInfer extend metadata always carries a (normally disabled)
+    # multi-item scoring object; only an enabled one changes the mask.
+    multi_item = getattr(metadata, "multi_item_params", None)
+    return bool(
+        layer.is_cross_attention
+        or layer.logit_cap != 0
+        or layer.sliding_window_size not in (None, -1)
+        or layer.xai_temperature_len not in (None, -1)
+        or layer.attn_type.value != "decoder"
+        or layer.pos_encoding_mode != "NONE"
+        or getattr(metadata, "custom_mask", None) is not None
+        or getattr(forward_batch, "cross_attention_custom_mask", None) is not None
+        or (multi_item is not None and multi_item.is_enabled())
+    )
 
 
 def diagnostic_position_matches(positions, end: int, count: int) -> bool:
@@ -205,7 +249,7 @@ def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> No
         return
     errors = torch.zeros(len(specs), dtype=torch.float32, device=query.device)
     parallel = get_parallel()
-    backend = (
+    resolved = (
         None
         if (
             get_is_capture_mode()
@@ -218,6 +262,7 @@ def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> No
         )
         else _diagnostic_backend()
     )
+    backend, full_pool = resolved if resolved is not None else (None, None)
     layer = decoder.attn
     full_layers = {
         index
@@ -240,27 +285,20 @@ def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> No
         return
     weights = None
     if valid_rows:
-        metadata = backend.forward_metadata
-        unsupported = (
-            layer.is_cross_attention
-            or layer.logit_cap != 0
-            or layer.sliding_window_size not in (None, -1)
-            or layer.xai_temperature_len not in (None, -1)
-            or layer.attn_type.value != "decoder"
-            or layer.pos_encoding_mode != "NONE"
-            or getattr(metadata, "custom_mask", None) is not None
-            or getattr(forward_batch, "cross_attention_custom_mask", None) is not None
-            or getattr(metadata, "multi_item_params", None) is not None
-        )
-        if unsupported:
+        if _unsupported_attention(layer, backend.forward_metadata, forward_batch):
             errors[valid_rows] = 1
         else:
-            keys = backend.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            descale = _key_descale(layer, keys.dtype)
+            descale = _cached_key_descale(layer, full_pool)
+            # Plain caches are read exactly in their own dtype; FP4 dequantizes
+            # to BF16, the native output of the dequant kernel.
+            read_dtype = (
+                torch.bfloat16 if full_pool.is_quantized_kv_cache else full_pool.dtype
+            )
+            slot_limit = full_pool.size + full_pool.page_size
             if (
                 descale is None
-                or keys.ndim != 3
-                or keys.shape[1:] != (decoder.num_kv_heads, decoder.head_dim)
+                or full_pool.head_num != decoder.num_kv_heads
+                or full_pool.head_dim != decoder.head_dim
             ):
                 errors[valid_rows] = 1
             else:
@@ -292,7 +330,7 @@ def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> No
                         errors[row] = 3
                         continue
                     mapping = mapping_table[slot, :count].long()
-                    if bool(((mapping <= 0) | (mapping >= keys.shape[0])).any().item()):
+                    if bool(((mapping <= 0) | (mapping >= slot_limit)).any().item()):
                         errors[row] = 3
                         continue
                     # Verify the final chunk is really the cache just written.
@@ -302,10 +340,12 @@ def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> No
                     ):
                         errors[row] = 3
                         continue
+                    keys, _ = backend.token_to_kv_pool.get_kv_tokens(
+                        layer.layer_id, mapping, read_dtype
+                    )
                     weights[row, :count] = mean_cached_attention(
                         q[end - 1],
                         keys,
-                        mapping,
                         scaling=layer.scaling,
                         key_descale=descale,
                     )
