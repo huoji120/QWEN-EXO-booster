@@ -1295,12 +1295,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 if req.mamba_ping_pong_track_buffer is None:
                     self._alloc_ping_pong_buffer(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert (
-            len(select_index) == len(mamba_indices)
+        assert len(select_index) == len(
+            mamba_indices
         ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
-            assert (
-                len(select_index) == len(mamba_ping_pong_track_buffers)
+            assert len(select_index) == len(
+                mamba_ping_pong_track_buffers
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
@@ -1430,13 +1430,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]
             )
             if mamba_ping_pong_track_buffer_to_keep is not None:
-                assert (
-                    mamba_ping_pong_track_buffer_to_keep
-                    in [
-                        0,
-                        1,
-                    ]
-                ), f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                assert mamba_ping_pong_track_buffer_to_keep in [
+                    0,
+                    1,
+                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1731,9 +1728,7 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim
-            if v_head_dim is not None
-            else head_dim
+            else v_head_dim if v_head_dim is not None else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -2249,6 +2244,36 @@ class MHATokenToKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_kv_tokens(
+        self,
+        layer_id: int,
+        indices: torch.Tensor,
+        dtype: torch.dtype,
+        *,
+        layer_id_override: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read cached K/V at ``indices`` as ``dtype``, dequantizing FP4 storage.
+
+        For readers outside attention (e.g. state export); attention backends
+        keep using their raw or workspace views. ``layer_id`` is the global
+        layer id that indexes FP4 global scales; ``layer_id_override`` is the
+        pool layer id when a wrapper pool translates ids.
+        """
+        pool_layer_id = layer_id if layer_id_override is None else layer_id_override
+        if not self.is_quantized_kv_cache:
+            key = self.get_key_buffer(pool_layer_id).index_select(0, indices)
+            value = self.get_value_buffer(pool_layer_id).index_select(0, indices)
+            return key.to(dtype), value.to(dtype)
+        k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(pool_layer_id)
+        return self.quant_method.dequantize_kv(
+            k_fp4[indices],
+            k_scales[indices],
+            v_fp4[indices],
+            v_scales[indices],
+            layer_id,
+            dtype=dtype,
+        )
 
     def set_kv_buffer(
         self,
@@ -3679,6 +3704,17 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def get_kv_tokens(
+        self, layer_id: int, indices: torch.Tensor, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_kv_tokens(
+            layer_id,
+            indices,
+            dtype,
+            layer_id_override=self._transfer_full_attention_id(layer_id),
+        )
 
     def get_raw_kv_buffer(
         self, layer_id: int

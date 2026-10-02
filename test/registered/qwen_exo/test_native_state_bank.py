@@ -41,6 +41,12 @@ class _KVPool:
     def get_value_buffer(self, _layer_id):
         return self.value
 
+    def get_kv_tokens(self, _layer_id, indices, dtype):
+        return (
+            self.key.index_select(0, indices).to(dtype),
+            self.value.index_select(0, indices).to(dtype),
+        )
+
     def set_kv_buffer(self, layer, loc, key, value, *, k_scale=None, v_scale=None):
         self.set_calls.append((layer, loc.clone(), k_scale, v_scale))
         self.key[loc] = key.to(self.key.dtype)

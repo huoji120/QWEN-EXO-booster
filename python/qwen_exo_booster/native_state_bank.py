@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
-
 from qwen_exo_booster.attention_signals import inverse_qwen35_rope
 from qwen_exo_booster.contracts import stable_digest
 from qwen_exo_booster.hybrid_state import qwen_exo_model_state_directory
@@ -959,8 +958,8 @@ class NativeStateBankManager:
                 raise NativeStateBankError(
                     f"Full-Attention layer {layer_id} exposes no rotary embedding"
                 )
-            key = self.kv_pool.get_key_buffer(layer_id).index_select(0, mapping)
-            value = self.kv_pool.get_value_buffer(layer_id).index_select(0, mapping)
+            # Read through the pool so packed FP4 caches are dequantized.
+            key, value = self.kv_pool.get_kv_tokens(layer_id, mapping, torch.bfloat16)
             raw_key = _inverse_rotary_key(
                 key, positions=source_positions, rotary=rotary
             )

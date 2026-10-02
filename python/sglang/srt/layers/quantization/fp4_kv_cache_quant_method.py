@@ -267,6 +267,21 @@ class KVCacheQuantMethodBase(ABC):
             Dequantized K/V tensors with shape matching the input after unpacking.
         """
 
+    def dequantize_kv(
+        self,
+        k_fp4: Tensor,
+        k_scales: Tensor,
+        v_fp4: Tensor,
+        v_scales: Tensor,
+        layer_id: int,
+        *,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        """Dequantize stored FP4 KV (selected token indices already applied) to
+        ``dtype`` for readers outside attention, such as state export."""
+        k, v = self.dequantize_prev_kv(k_fp4, k_scales, v_fp4, v_scales, layer_id)
+        return k.to(dtype), v.to(dtype)
+
     def dequantize_kv_tensor(
         self,
         fp4_tensor: Tensor,
@@ -512,6 +527,28 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         k_scale_buffer[loc] = cache_k_fp4_sf
         v_scale_buffer[loc] = cache_v_fp4_sf
 
+    def dequantize_kv(
+        self,
+        k_fp4: Tensor,
+        k_scales: Tensor,
+        v_fp4: Tensor,
+        v_scales: Tensor,
+        layer_id: int,
+        *,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+
+        cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
+        cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
+        k = NVFP4KVQuantizeUtil.dequantize(
+            k_fp4.view(torch.uint8), k_scales, cur_k_scale, dtype=dtype
+        )
+        v = NVFP4KVQuantizeUtil.dequantize(
+            v_fp4.view(torch.uint8), v_scales, cur_v_scale, dtype=dtype
+        )
+        return k, v
+
     def dequantize_prev_kv(
         self,
         k_fp4: Tensor,
@@ -521,15 +558,8 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
         """Dequantize FP4 KV (indexed tokens) → FP8 E4M3."""
-        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
-
-        cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
-        cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
-        k_bf16 = NVFP4KVQuantizeUtil.dequantize(
-            k_fp4.view(torch.uint8), k_scales, cur_k_scale
-        )
-        v_bf16 = NVFP4KVQuantizeUtil.dequantize(
-            v_fp4.view(torch.uint8), v_scales, cur_v_scale
+        k_bf16, v_bf16 = self.dequantize_kv(
+            k_fp4, k_scales, v_fp4, v_scales, layer_id, dtype=torch.bfloat16
         )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
 
