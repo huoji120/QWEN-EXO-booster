@@ -1053,6 +1053,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         return_logprob=qwen_exo_observe,
                         logprob_start_len=0 if qwen_exo_score_bias else None,
                         no_logs=qwen_exo_runtime is not None,
+                        # Same contract as chat: a tool-call grammar (strict
+                        # tools) must stay inactive until </think>, otherwise it
+                        # masks </think> and forces a tool call out of the
+                        # reasoning phase.
+                        require_reasoning=self._is_thinking_enabled_for_request(
+                            request
+                        ),
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -3847,6 +3854,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     text=None,
                     input_ids=continuation_prompt_ids,
                     sampling_params=continuation_sampling_params,
+                    # </think> is already in the prompt: the answer grammar
+                    # applies from the first continuation token.
+                    require_reasoning=False,
                 )
                 if score_bias_logprob_start_len is not None:
                     # Keep the phase-one logprob window on phase two. With
