@@ -16,14 +16,12 @@ _DFLASH_ELIGIBLE_JOB_TYPES = frozenset(
         InternalJobType.REFLECTION_MEMORY,
     }
 )
-_DFLASH_STRUCTURED_KEYS = ("json_schema", "regex", "ebnf", "structural_tag")
 
 
 def _internal_custom_params(
     job: InternalJob,
     base_custom: dict[str, Any],
     override: dict[str, Any],
-    sampling_params: dict[str, Any],
     *,
     allow_dflash: bool,
 ) -> dict[str, Any]:
@@ -43,9 +41,6 @@ def _internal_custom_params(
         and allow_dflash
         and (job.job_type in _DFLASH_ELIGIBLE_JOB_TYPES or requested)
         and job.token_budget >= 32
-        and not any(
-            sampling_params.get(key) is not None for key in _DFLASH_STRUCTURED_KEYS
-        )
     )
     if eligible:
         custom["qwen_exo_dflash"] = "eligible"
@@ -182,7 +177,9 @@ class InternalJobRunner:
         for extra_key in per_job_extra_keys:
             self._validate_cache_namespace(extra_key)
         self._check_liveness(parent_request_id, job_list)
-        lane_limit = self._lane_limits[current_internal_work_class(job_list[0].job_type)]
+        lane_limit = self._lane_limits[
+            current_internal_work_class(job_list[0].job_type)
+        ]
         if len(job_list) > lane_limit:
             results = []
             normalized_prompts = next(iter(prompt_kwargs.values()))
@@ -213,7 +210,6 @@ class InternalJobRunner:
                             job,
                             sampling_params.get("custom_params") or {},
                             per_job_custom[index],
-                            sampling_params,
                             allow_dflash=True,
                         ),
                     }
@@ -313,7 +309,9 @@ class InternalJobRunner:
         for extra_key in per_job_extra_keys:
             self._validate_cache_namespace(extra_key)
         self._check_liveness(parent_request_id, job_list)
-        lane_limit = self._lane_limits[current_internal_work_class(job_list[0].job_type)]
+        lane_limit = self._lane_limits[
+            current_internal_work_class(job_list[0].job_type)
+        ]
         if len(job_list) > lane_limit:
             results = []
             for start in range(0, len(job_list), lane_limit):
@@ -347,7 +345,6 @@ class InternalJobRunner:
                             job,
                             base_sampling.get("custom_params") or {},
                             per_job_custom[index],
-                            base_sampling,
                             allow_dflash=False,
                         ),
                     }
@@ -433,7 +430,9 @@ class InternalJobRunner:
             raise ContractViolation("Option score batch must share one prefix key")
         self._validate_cache_namespace(job_list[0].shared_prefix_key)
         self._check_liveness(parent_request_id, job_list)
-        lane_limit = self._lane_limits[current_internal_work_class(job_list[0].job_type)]
+        lane_limit = self._lane_limits[
+            current_internal_work_class(job_list[0].job_type)
+        ]
         if len(job_list) > lane_limit:
             results = []
             for start in range(0, len(job_list), lane_limit):
@@ -459,7 +458,9 @@ class InternalJobRunner:
                         "max_new_tokens": 0,
                         "temperature": 1,
                         "custom_params": _internal_custom_params(
-                            job, {}, {"qwen_exo_dflash": "target_only"}, {},
+                            job,
+                            {},
+                            {"qwen_exo_dflash": "target_only"},
                             allow_dflash=False,
                         ),
                     }
@@ -481,11 +482,15 @@ class InternalJobRunner:
             deadline = self._earliest_deadline(job_list)
             timeout = None if deadline is None else deadline - time.monotonic()
             if timeout is not None and timeout <= 0:
-                raise asyncio.TimeoutError("Option score deadline elapsed before dispatch")
+                raise asyncio.TimeoutError(
+                    "Option score deadline elapsed before dispatch"
+                )
             outputs = await asyncio.wait_for(self._collect(request), timeout=timeout)
             self._check_liveness(parent_request_id, job_list)
             if len(outputs) != len(job_list):
-                raise RuntimeError("Option score batch returned an incorrect result count")
+                raise RuntimeError(
+                    "Option score batch returned an incorrect result count"
+                )
             elapsed = time.perf_counter() - started
             return tuple(
                 self._option_score_result(job, tokens, options, output, elapsed)
@@ -508,7 +513,9 @@ class InternalJobRunner:
         def sequence(value: Any, size: int) -> bool:
             return isinstance(value, (list, tuple)) and len(value) == size
 
-        if not isinstance(output, dict) or not isinstance(output.get("meta_info"), dict):
+        if not isinstance(output, dict) or not isinstance(
+            output.get("meta_info"), dict
+        ):
             raise RuntimeError("Option score result has no metadata")
         meta = output["meta_info"]
         if meta.get("id") != job.job_id:
@@ -520,7 +527,9 @@ class InternalJobRunner:
             or type(finish_reason.get("length")) is not int
             or finish_reason["length"] != 0
         ):
-            raise RuntimeError("Option score result did not finish a zero-token prefill")
+            raise RuntimeError(
+                "Option score result did not finish a zero-token prefill"
+            )
         if (
             type(meta.get("completion_tokens")) is not int
             or meta["completion_tokens"] != 0
@@ -556,7 +565,9 @@ class InternalJobRunner:
                 or type(entry[0]) not in (int, float)
                 or not math.isfinite(entry[0])
             ):
-                raise RuntimeError("Option score result contains invalid option logprobs")
+                raise RuntimeError(
+                    "Option score result contains invalid option logprobs"
+                )
             scores.append(float(entry[0]))
         return InternalOptionScoreResult(
             job=job,
@@ -631,7 +642,9 @@ class InternalJobRunner:
             for job_id in job_ids:
                 self._active_lanes[parent_request_id, job_id] = lane
             self._lane_active[lane] += len(jobs)
-            self._reserved_tokens[parent_request_id] = reserved_tokens + requested_tokens
+            self._reserved_tokens[parent_request_id] = (
+                reserved_tokens + requested_tokens
+            )
 
     async def _release(
         self, parent_request_id: str, jobs: tuple[InternalJob, ...]

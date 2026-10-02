@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -43,6 +44,10 @@ class DFlashVerifyInput(SpecInput):
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
+    # Any grammar of the batch; set by the per-position mask builder and used
+    # to apply that mask to the verify logits.
+    grammar: Optional[BaseGrammarObject] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

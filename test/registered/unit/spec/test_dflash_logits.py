@@ -84,38 +84,8 @@ def test_selector_rejects_a_quantized_target_lm_head():
 
 
 def test_dflash_unsupported_features_use_target_only_fallback():
-    from sglang.srt.speculative.dflash_utils import (
-        is_dflash_target_only_request,
-        validate_dflash_request,
-    )
-
-    req = SimpleNamespace(
-        return_logprob=False,
-        return_hidden_states=False,
-        sampling_params=SimpleNamespace(
-            json_schema={"type": "object"},
-            regex=None,
-            ebnf=None,
-            structural_tag=None,
-            custom_params={"qwen_exo_kind": "internal"},
-        ),
-    )
-    assert is_dflash_target_only_request(req)
-    assert validate_dflash_request(req, enable_overlap=True) is None
-
-    req.sampling_params.custom_params = {
-        "qwen_exo_kind": "user",
-    }
-    assert is_dflash_target_only_request(req)
-    assert validate_dflash_request(req, enable_overlap=True) is None
-
-    req.sampling_params.json_schema = None
-    req.return_hidden_states = True
-    assert is_dflash_target_only_request(req)
-    assert validate_dflash_request(req, enable_overlap=True) is None
-
-
-def test_plain_internal_generation_can_use_dflash_but_grammar_stays_target_only():
+    """Hidden-state capture is the per-request feature DFLASH still routes to
+    the target; internal jobs stay target-only unless marked eligible."""
     from sglang.srt.speculative.dflash_utils import (
         is_dflash_target_only_request,
         validate_dflash_request,
@@ -129,18 +99,104 @@ def test_plain_internal_generation_can_use_dflash_but_grammar_stays_target_only(
             regex=None,
             ebnf=None,
             structural_tag=None,
-            custom_params={
-                "qwen_exo_kind": "internal",
-                "qwen_exo_dflash": "eligible",
-            },
+            custom_params={"qwen_exo_kind": "internal"},
+        ),
+    )
+    assert is_dflash_target_only_request(req)
+    assert validate_dflash_request(req, enable_overlap=True) is None
+
+    req.sampling_params.custom_params = {"qwen_exo_kind": "user"}
+    req.return_hidden_states = True
+    assert is_dflash_target_only_request(req)
+    assert validate_dflash_request(req, enable_overlap=True) is None
+
+
+def test_grammar_constrained_requests_run_dflash():
+    """Strict tool calls carry a structural_tag. Routing grammar requests
+    target-only made every agent turn decode without DFLASH (eager, ~16 tok/s
+    at bs1) and parked them out of DFLASH batches; verify now applies a
+    per-draft-position grammar mask instead."""
+    from sglang.srt.speculative.dflash_utils import (
+        is_dflash_target_only_request,
+        validate_dflash_request,
+    )
+
+    req = SimpleNamespace(
+        return_logprob=False,
+        return_hidden_states=False,
+        sampling_params=SimpleNamespace(
+            json_schema=None,
+            regex=None,
+            ebnf=None,
+            structural_tag='{"type": "structural_tag"}',
+            custom_params={"qwen_exo_kind": "user"},
         ),
     )
     assert not is_dflash_target_only_request(req)
     assert validate_dflash_request(req, enable_overlap=True) is None
 
+    req.sampling_params.structural_tag = None
     req.sampling_params.json_schema = {"type": "object"}
-    assert is_dflash_target_only_request(req)
+    req.sampling_params.custom_params = {
+        "qwen_exo_kind": "internal",
+        "qwen_exo_dflash": "eligible",
+    }
+    assert not is_dflash_target_only_request(req)
     assert validate_dflash_request(req, enable_overlap=True) is None
+
+
+class _CountingGrammar:
+    """Allows exactly token ``10 + accepted`` next; tracks net acceptance."""
+
+    def __init__(self):
+        self.accepted = []
+
+    def allocate_vocab_mask(self, vocab_size, batch_size, device):
+        return torch.full((batch_size, (vocab_size + 31) // 32), -1, dtype=torch.int32)
+
+    def fill_vocab_mask(self, vocab_mask, idx):
+        allowed = 10 + len(self.accepted)
+        vocab_mask[idx] = 0
+        vocab_mask[idx, allowed // 32] = 1 << (allowed % 32)
+
+    def accept_token(self, token):
+        self.accepted.append(token)
+
+    def rollback(self, count):
+        del self.accepted[-count:]
+
+    def is_terminated(self):
+        return False
+
+
+def test_grammar_vocab_mask_follows_the_draft_chain_and_rolls_back():
+    """Row i must be the grammar mask after the committed bonus token plus
+    draft tokens 1..i; rows past the first grammar-invalid draft and rows of
+    non-grammar requests stay all-allowed, and the matcher ends unchanged."""
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+    from sglang.srt.speculative.dflash_utils import build_dflash_grammar_vocab_mask
+
+    grammar = _CountingGrammar()
+    reqs = [SimpleNamespace(grammar=grammar), SimpleNamespace(grammar=None)]
+    draft_tokens = torch.tensor([[7, 10, 11, 40, 13], [1, 2, 3, 4, 5]])
+    verify_input = DFlashVerifyInput(
+        draft_token=draft_tokens.flatten(),
+        positions=torch.zeros(10, dtype=torch.int64),
+        draft_token_num=5,
+    )
+
+    mask = build_dflash_grammar_vocab_mask(
+        reqs=reqs, draft_tokens=draft_tokens, vocab_size=64, verify_input=verify_input
+    )
+
+    def allowed(row):
+        bits = mask[row].tolist()
+        return [t for t in range(64) if (bits[t // 32] >> (t % 32)) & 1]
+
+    assert [allowed(row) for row in range(3)] == [[10], [11], [12]]
+    assert all(len(allowed(row)) == 64 for row in range(3, 10))
+    assert grammar.accepted == []
+    assert verify_input.grammar is grammar
 
 
 def test_dflash_target_logprob_need_is_request_scoped():

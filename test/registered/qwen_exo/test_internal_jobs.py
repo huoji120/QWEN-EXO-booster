@@ -127,7 +127,10 @@ def test_plain_long_internal_generation_marks_dflash_eligible():
     assert custom["qwen_exo_dflash"] == "eligible"
 
 
-def test_structured_internal_generation_remains_target_only():
+def test_structured_internal_generation_can_use_dflash():
+    """DFLASH verifies grammar-constrained blocks with per-position masks, so
+    a structured output no longer forces an eligible job onto the slow
+    target-only path that also blocks DFLASH user batches."""
     manager = FakeTokenizerManager(
         outputs=[{"text": "{}", "meta_info": {"completion_tokens": 2}}]
     )
@@ -153,7 +156,7 @@ def test_structured_internal_generation_remains_target_only():
     )
 
     custom = manager.requests[0].sampling_params[0]["custom_params"]
-    assert "qwen_exo_dflash" not in custom
+    assert custom["qwen_exo_dflash"] == "eligible"
 
 
 def test_explicit_target_only_overrides_dflash_eligible_job_type():
@@ -471,25 +474,39 @@ def test_global_admission_honors_waiting_job_deadline(monkeypatch):
     )
 
     async def exercise():
-        first = asyncio.create_task(runner.run_batch(
-            [job(0, parent_request_id="parent-a", job_id="job-a")],
-            ["first"], {"temperature": 0},
-        ))
+        first = asyncio.create_task(
+            runner.run_batch(
+                [job(0, parent_request_id="parent-a", job_id="job-a")],
+                ["first"],
+                {"temperature": 0},
+            )
+        )
         await started.wait()
         deadline = time.monotonic() + 60
         try:
             # Advance only the admission clock; do not race a 10 ms OS timer
             # against the pre-dispatch cancellation check or the event loop.
             with monkeypatch.context() as patch:
-                patch.setattr(internal_jobs, "time", SimpleNamespace(
-                    monotonic=lambda: deadline + 1,
-                    perf_counter=time.perf_counter,
-                ))
+                patch.setattr(
+                    internal_jobs,
+                    "time",
+                    SimpleNamespace(
+                        monotonic=lambda: deadline + 1,
+                        perf_counter=time.perf_counter,
+                    ),
+                )
                 with pytest.raises(asyncio.TimeoutError):
                     await runner.run_batch(
-                        [job(1, parent_request_id="parent-b", job_id="job-b",
-                             deadline_monotonic=deadline)],
-                        ["second"], {"temperature": 0},
+                        [
+                            job(
+                                1,
+                                parent_request_id="parent-b",
+                                job_id="job-b",
+                                deadline_monotonic=deadline,
+                            )
+                        ],
+                        ["second"],
+                        {"temperature": 0},
                     )
         finally:
             release.set()
@@ -521,7 +538,10 @@ def test_single_job_probe_is_admitted_while_a_sibling_job_runs():
 
     manager = BlockingTokenizerManager()
     runner = InternalJobRunner(
-        manager, max_fanout=4, max_tokens_per_parent=256, request_factory=request_factory
+        manager,
+        max_fanout=4,
+        max_tokens_per_parent=256,
+        request_factory=request_factory,
     )
 
     async def exercise():
@@ -584,15 +604,22 @@ def option_runner(manager):
 
 
 def test_option_scores_read_same_prefix_distribution_without_generation():
-    manager = FakeTokenizerManager(outputs=[
-        option_output(),
-        option_output(1, prefix=(12,), scores=(-3.0, -0.1)),
-    ])
+    manager = FakeTokenizerManager(
+        outputs=[
+            option_output(),
+            option_output(1, prefix=(12,), scores=(-3.0, -0.1)),
+        ]
+    )
     runner = option_runner(manager)
     jobs = (job(), job(1))
-    results = asyncio.run(runner.run_option_score_batch(jobs, ((10, 11), (12,)), (32, 33)))
+    results = asyncio.run(
+        runner.run_option_score_batch(jobs, ((10, 11), (12,)), (32, 33))
+    )
     assert tuple(result.job for result in results) == jobs
-    assert tuple(result.option_logprobs for result in results) == ((-0.25, -2.5), (-3.0, -0.1))
+    assert tuple(result.option_logprobs for result in results) == (
+        (-0.25, -2.5),
+        (-3.0, -0.1),
+    )
     assert tuple(result.prompt_tokens for result in results) == (3, 2)
     assert tuple(result.completion_tokens for result in results) == (0, 0)
     assert len(manager.requests) == 1
@@ -613,17 +640,20 @@ def test_option_scores_read_same_prefix_distribution_without_generation():
     assert not runner._reserved_tokens
 
 
-@pytest.mark.parametrize("jobs,prefixes,options", [
-    ((), (), (32, 33)),
-    ((job(),), (), (32, 33)),
-    ((job(),), ((),), (32, 33)),
-    ((job(),), ((10,),), (32, 32)),
-    ((job(),), ((10,),), (32,)),
-    ((job(),), ((10,),), (32, 33, 34)),
-    ((job(),), ((True,),), (32, 33)),
-    ((job(),), ((10,),), (32, -1)),
-    ((job(), job()), ((10,), (11,)), (32, 33)),
-])
+@pytest.mark.parametrize(
+    "jobs,prefixes,options",
+    [
+        ((), (), (32, 33)),
+        ((job(),), (), (32, 33)),
+        ((job(),), ((),), (32, 33)),
+        ((job(),), ((10,),), (32, 32)),
+        ((job(),), ((10,),), (32,)),
+        ((job(),), ((10,),), (32, 33, 34)),
+        ((job(),), ((True,),), (32, 33)),
+        ((job(),), ((10,),), (32, -1)),
+        ((job(), job()), ((10,), (11,)), (32, 33)),
+    ],
+)
 def test_option_scores_reject_invalid_inputs_before_dispatch(jobs, prefixes, options):
     manager = FakeTokenizerManager()
     runner = option_runner(manager)
@@ -634,23 +664,32 @@ def test_option_scores_reject_invalid_inputs_before_dispatch(jobs, prefixes, opt
     assert not runner._reserved_tokens
 
 
-@pytest.mark.parametrize("field,value", [
-    ("id", "different-job"),
-    ("completion_tokens", 1),
-    ("completion_tokens", None),
-    ("finish_reason", {"type": "abort"}),
-    ("finish_reason", {"type": "length", "length": 1}),
-    ("prompt_tokens", 2),
-    ("input_token_logprobs", [(None, 10, None), (-8.0, 0, None)]),
-    ("input_token_logprobs", [(None, 11, None), (-8.0, 5, None)]),
-    ("input_token_ids_logprobs", []),
-    ("input_token_ids_logprobs", [[(-0.25, 32, None), (-2.5, 33, None)]]),
-    ("input_token_ids_logprobs", [None, [(-2.5, 33, None), (-0.25, 32, None)]]),
-    ("input_token_ids_logprobs", [None, [(float("nan"), 32, None), (-2.5, 33, None)]]),
-    ("input_token_ids_logprobs", [None, [(-0.25, 32, None), (float("-inf"), 33, None)]]),
-    ("input_token_ids_logprobs", [None, [(-0.25, 32, None), (None, 33, None)]]),
-    ("input_token_ids_logprobs", [None, [(-0.25, 32, None)]]),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("id", "different-job"),
+        ("completion_tokens", 1),
+        ("completion_tokens", None),
+        ("finish_reason", {"type": "abort"}),
+        ("finish_reason", {"type": "length", "length": 1}),
+        ("prompt_tokens", 2),
+        ("input_token_logprobs", [(None, 10, None), (-8.0, 0, None)]),
+        ("input_token_logprobs", [(None, 11, None), (-8.0, 5, None)]),
+        ("input_token_ids_logprobs", []),
+        ("input_token_ids_logprobs", [[(-0.25, 32, None), (-2.5, 33, None)]]),
+        ("input_token_ids_logprobs", [None, [(-2.5, 33, None), (-0.25, 32, None)]]),
+        (
+            "input_token_ids_logprobs",
+            [None, [(float("nan"), 32, None), (-2.5, 33, None)]],
+        ),
+        (
+            "input_token_ids_logprobs",
+            [None, [(-0.25, 32, None), (float("-inf"), 33, None)]],
+        ),
+        ("input_token_ids_logprobs", [None, [(-0.25, 32, None), (None, 33, None)]]),
+        ("input_token_ids_logprobs", [None, [(-0.25, 32, None)]]),
+    ],
+)
 def test_option_scores_reject_malformed_results_and_release_capacity(field, value):
     output = option_output()
     output["meta_info"][field] = value
@@ -666,9 +705,11 @@ def test_option_scores_reject_reordered_batch_and_abort_every_job():
     manager = FakeTokenizerManager(outputs=[option_output(1), option_output(0)])
     runner = option_runner(manager)
     with pytest.raises(RuntimeError, match="identity"):
-        asyncio.run(runner.run_option_score_batch(
-            (job(), job(1)), ((10, 11), (10, 11)), (32, 33)
-        ))
+        asyncio.run(
+            runner.run_option_score_batch(
+                (job(), job(1)), ((10, 11), (10, 11)), (32, 33)
+            )
+        )
     assert manager.aborted == ["job-0", "job-1"]
     assert not runner._active
 
@@ -695,9 +736,9 @@ def test_option_scores_cancel_inflight_and_release_capacity():
 
         manager = BlockingManager()
         runner = option_runner(manager)
-        task = asyncio.create_task(runner.run_option_score_batch(
-            (job(),), ((10, 11),), (32, 33)
-        ))
+        task = asyncio.create_task(
+            runner.run_option_score_batch((job(),), ((10, 11),), (32, 33))
+        )
         await entered.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -721,9 +762,9 @@ def test_option_scores_parent_cancellation_rejects_even_a_returned_result():
 
         manager = BlockingManager()
         runner = option_runner(manager)
-        task = asyncio.create_task(runner.run_option_score_batch(
-            (job(),), ((10, 11),), (32, 33)
-        ))
+        task = asyncio.create_task(
+            runner.run_option_score_batch((job(),), ((10, 11),), (32, 33))
+        )
         await entered.wait()
         await runner.cancel_parent("parent-1")
         release.set()
@@ -764,17 +805,22 @@ def test_background_lanes_do_not_consume_foreground_admission():
     async def exercise():
         manager = LaneTokenizerManager()
         runner = InternalJobRunner(
-            manager, max_fanout=2, max_tokens_per_parent=64,
+            manager,
+            max_fanout=2,
+            max_tokens_per_parent=64,
             request_factory=request_factory,
         )
 
         def submit(lane, index):
             with internal_task_scope(lane):
-                return asyncio.create_task(runner.run_batch(
-                    [job(index, parent_request_id=f"parent-{index}")],
-                    ["prompt"], {},
-                    custom_params_per_job=[{"qwen_exo_work_class": "foreground"}],
-                ))
+                return asyncio.create_task(
+                    runner.run_batch(
+                        [job(index, parent_request_id=f"parent-{index}")],
+                        ["prompt"],
+                        {},
+                        custom_params_per_job=[{"qwen_exo_work_class": "foreground"}],
+                    )
+                )
 
         tasks = [submit("reflection", 0)]
         tasks.extend(submit("maintenance", index) for index in range(1, 4))
@@ -782,9 +828,7 @@ def test_background_lanes_do_not_consume_foreground_admission():
             await asyncio.wait_for(manager.entered.get(), 1)
         waiting = [submit("reflection", 4), submit("maintenance", 5)]
         foreground = [submit("foreground", index) for index in (6, 7)]
-        admitted = {
-            await asyncio.wait_for(manager.entered.get(), 1) for _ in range(2)
-        }
+        admitted = {await asyncio.wait_for(manager.entered.get(), 1) for _ in range(2)}
         assert admitted == {("job-6",), ("job-7",)}
         assert manager.active == {"foreground": 2, "reflection": 1, "maintenance": 3}
         assert not any(task.done() for task in waiting)
@@ -819,14 +863,21 @@ def test_scopes_follow_spawned_children_without_leaking_or_promotion():
         release.set()
         assert await task == "reflection"
         assert await descendant() == "foreground"
-        assert current_internal_work_class(InternalJobType.REFLECTION_MEMORY) == "reflection"
+        assert (
+            current_internal_work_class(InternalJobType.REFLECTION_MEMORY)
+            == "reflection"
+        )
 
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("work_class,expected_sizes", [
-    ("reflection", [1, 1, 1, 1]), ("maintenance", [3, 1]),
-])
+@pytest.mark.parametrize(
+    "work_class,expected_sizes",
+    [
+        ("reflection", [1, 1, 1, 1]),
+        ("maintenance", [3, 1]),
+    ],
+)
 @pytest.mark.parametrize("method", ["generation", "score", "options"])
 def test_background_batches_split_without_losing_results_or_budgets(
     work_class, expected_sizes, method
@@ -838,15 +889,25 @@ def test_background_batches_split_without_losing_results_or_budgets(
             for index, rid in enumerate(request.rid):
                 ordinal = int(rid.split("-")[-1])
                 if method == "options":
-                    outputs.append(option_output(
-                        ordinal, prefix=tuple(request.input_ids[index][:-1]),
-                        scores=(-ordinal - 0.25, -2.5),
-                    ))
+                    outputs.append(
+                        option_output(
+                            ordinal,
+                            prefix=tuple(request.input_ids[index][:-1]),
+                            scores=(-ordinal - 0.25, -2.5),
+                        )
+                    )
                 elif method == "score":
-                    outputs.append({"meta_info": {
-                        "input_token_logprobs": [(None, 1), (-ordinal - 1.0, 2)],
-                        "prompt_tokens": 2,
-                    }})
+                    outputs.append(
+                        {
+                            "meta_info": {
+                                "input_token_logprobs": [
+                                    (None, 1),
+                                    (-ordinal - 1.0, 2),
+                                ],
+                                "prompt_tokens": 2,
+                            }
+                        }
+                    )
                 else:
                     outputs.append({"text": str(ordinal), "meta_info": {}})
             yield outputs
@@ -861,12 +922,13 @@ def test_background_batches_split_without_losing_results_or_budgets(
                     jobs, [(10, 11)] * 4, (32, 33)
                 )
                 assert [item.option_logprobs[0] for item in result] == [
-                    -0.25, -1.25, -2.25, -3.25,
+                    -0.25,
+                    -1.25,
+                    -2.25,
+                    -3.25,
                 ]
             elif method == "score":
-                result = await runner.run_score_batch(
-                    jobs, [(1, 2)] * 4, [1] * 4
-                )
+                result = await runner.run_score_batch(jobs, [(1, 2)] * 4, [1] * 4)
                 assert [item.mean_nll for item in result] == [1, 2, 3, 4]
             else:
                 result = await runner.run_batch(jobs, ["prompt"] * 4, {})
@@ -886,9 +948,13 @@ def test_cancelled_background_waiter_and_active_job_release_lane():
 
         def submit(index):
             with internal_task_scope("reflection"):
-                return asyncio.create_task(runner.run_batch(
-                    [job(index, parent_request_id=f"parent-{index}")], ["prompt"], {}
-                ))
+                return asyncio.create_task(
+                    runner.run_batch(
+                        [job(index, parent_request_id=f"parent-{index}")],
+                        ["prompt"],
+                        {},
+                    )
+                )
 
         active = submit(0)
         assert await asyncio.wait_for(manager.entered.get(), 1) == ("job-0",)
@@ -916,13 +982,15 @@ def test_waiting_background_batches_recheck_cumulative_budget_after_admission():
     async def exercise():
         manager = LaneTokenizerManager()
         runner = InternalJobRunner(
-            manager, max_fanout=4, max_tokens_per_parent=16,
+            manager,
+            max_fanout=4,
+            max_tokens_per_parent=16,
             request_factory=request_factory,
         )
         with internal_task_scope("reflection"):
-            blocker = asyncio.create_task(runner.run_batch(
-                [job(0, parent_request_id="blocker")], ["hold"], {}
-            ))
+            blocker = asyncio.create_task(
+                runner.run_batch([job(0, parent_request_id="blocker")], ["hold"], {})
+            )
             assert await asyncio.wait_for(manager.entered.get(), 1) == ("job-0",)
             waiting = [
                 asyncio.create_task(runner.run_batch([job(index)], ["prompt"], {}))
@@ -947,9 +1015,14 @@ def test_queued_background_deadline_is_timeout_not_parent_cancellation(monkeypat
     from qwen_exo_booster import internal_jobs
 
     clock = [time.monotonic()]
-    monkeypatch.setattr(internal_jobs, "time", SimpleNamespace(
-        monotonic=lambda: clock[0], perf_counter=time.perf_counter,
-    ))
+    monkeypatch.setattr(
+        internal_jobs,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0],
+            perf_counter=time.perf_counter,
+        ),
+    )
 
     async def exercise():
         manager = LaneTokenizerManager()
@@ -963,17 +1036,34 @@ def test_queued_background_deadline_is_timeout_not_parent_cancellation(monkeypat
 
         runner._capacity_changed = AdmissionCondition(runner._lock)
         with internal_task_scope("reflection"):
-            active = asyncio.create_task(runner.run_batch(
-                [job(0, parent_request_id="active",
-                     job_type=InternalJobType.REFLECTION_MEMORY,
-                     deadline_monotonic=None)],
-                ["hold"], {},
-            ))
+            active = asyncio.create_task(
+                runner.run_batch(
+                    [
+                        job(
+                            0,
+                            parent_request_id="active",
+                            job_type=InternalJobType.REFLECTION_MEMORY,
+                            deadline_monotonic=None,
+                        )
+                    ],
+                    ["hold"],
+                    {},
+                )
+            )
             assert await asyncio.wait_for(manager.entered.get(), 1) == ("job-0",)
-            queued = asyncio.create_task(runner.run_batch(
-                [job(1, parent_request_id="queued", deadline_monotonic=clock[0] + 60)],
-                ["queued"], {},
-            ))
+            queued = asyncio.create_task(
+                runner.run_batch(
+                    [
+                        job(
+                            1,
+                            parent_request_id="queued",
+                            deadline_monotonic=clock[0] + 60,
+                        )
+                    ],
+                    ["queued"],
+                    {},
+                )
+            )
         await asyncio.wait_for(waiting.wait(), 1)
         clock[0] += 61
         async with runner._capacity_changed:
@@ -995,9 +1085,14 @@ def test_option_score_deadline_after_output_remains_execution_timeout(monkeypatc
 
     clock = [time.monotonic()]
     deadline = clock[0] + 60
-    monkeypatch.setattr(internal_jobs, "time", SimpleNamespace(
-        monotonic=lambda: clock[0], perf_counter=time.perf_counter,
-    ))
+    monkeypatch.setattr(
+        internal_jobs,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0],
+            perf_counter=time.perf_counter,
+        ),
+    )
 
     class ExpiringManager(FakeTokenizerManager):
         async def generate_request(self, request, raw_request):
@@ -1008,9 +1103,11 @@ def test_option_score_deadline_after_output_remains_execution_timeout(monkeypatc
     manager = ExpiringManager()
     runner = option_runner(manager)
     with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(runner.run_option_score_batch(
-            [job(deadline_monotonic=deadline)], [(10, 11)], (32, 33)
-        ))
+        asyncio.run(
+            runner.run_option_score_batch(
+                [job(deadline_monotonic=deadline)], [(10, 11)], (32, 33)
+            )
+        )
     assert manager.aborted == ["job-0"]
     assert not any(runner._lane_active.values())
     assert not runner._cancelled_parents

@@ -14,14 +14,12 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
-    accept_sampling,
-)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -33,21 +31,21 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    DFLASH_THINK_ACCEPT_MODES,
+    QWEN_EXO_DFLASH_THINK_ACCEPT_MODE_KEY,
+    QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY_KEY,
+    QWEN_EXO_DFLASH_THINK_PHASE_KEY,
     apply_dflash_verify_logits_adjustments,
+    build_dflash_grammar_vocab_mask,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
     dflash_request_needs_target_logprobs,
     dflash_think_acceptance_mask,
-    DFLASH_THINK_ACCEPT_MODES,
-    QWEN_EXO_DFLASH_THINK_ACCEPT_MODE_KEY,
-    QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY_KEY,
-    QWEN_EXO_DFLASH_THINK_PHASE_KEY,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -60,6 +58,9 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
+    accept_sampling,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
@@ -514,9 +515,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size = int(self.block_size)
             vocab_size = int(self.model_runner.model_config.vocab_size)
             device = self.device
-            candidates = torch.zeros(
-                (1, block_size), dtype=torch.int64, device=device
-            )
+            candidates = torch.zeros((1, block_size), dtype=torch.int64, device=device)
             target_probs = torch.full(
                 (1, block_size, vocab_size),
                 1.0 / vocab_size,
@@ -1712,9 +1711,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> dict[str, torch.Tensor] | None:
         if self.think_accept_mode == "off":
             return None
-        if not any(
-            self._request_is_think_accept_phase(req) for req in batch.reqs
-        ):
+        if not any(self._request_is_think_accept_phase(req) for req in batch.reqs):
             return None
         if candidates.shape[1] <= 1 or (
             getattr(self, "think_end_id", None) is None
@@ -1807,16 +1804,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             int(result["force_accept_ct"]) / candidate_ct if candidate_ct else 0.0
         )
         result["force_nonexact_rate"] = (
-            int(result["force_nonexact_ct"]) / candidate_ct
-            if candidate_ct
-            else 0.0
+            int(result["force_nonexact_ct"]) / candidate_ct if candidate_ct else 0.0
         )
-        result["relaxed_gain_draft_tokens"] = int(
-            result["relaxed_draft_tokens"]
-        ) - int(result["strict_draft_tokens"])
-        result["actual_gain_draft_tokens"] = int(
-            result["actual_draft_tokens"]
-        ) - int(result["strict_draft_tokens"])
+        result["relaxed_gain_draft_tokens"] = int(result["relaxed_draft_tokens"]) - int(
+            result["strict_draft_tokens"]
+        )
+        result["actual_gain_draft_tokens"] = int(result["actual_draft_tokens"]) - int(
+            result["strict_draft_tokens"]
+        )
         if verify_ct:
             result["avg_strict_draft_tokens"] = (
                 int(result["strict_draft_tokens"]) / verify_ct
@@ -2211,11 +2206,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        grammar_vocab_mask = None
+        if batch.has_grammar and sampling_info is not None:
+            grammar_vocab_mask = build_dflash_grammar_vocab_mask(
+                reqs=batch.reqs,
+                draft_tokens=draft_tokens,
+                vocab_size=sampling_info.vocab_size,
+                verify_input=verify_input,
+            )
+            # The batch mask is a single row per request from the last step;
+            # the verify block needs one mask per draft position instead.
+            sampling_info.vocab_mask = None
+
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+            )
+        if grammar_vocab_mask is not None:
+            verify_input.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=grammar_vocab_mask
             )
 
         candidates = draft_tokens

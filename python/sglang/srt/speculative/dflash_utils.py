@@ -5,7 +5,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,9 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 QWEN_EXO_DFLASH_MODE_KEY = "qwen_exo_dflash"
@@ -792,9 +795,7 @@ def dflash_think_acceptance_mask(
     candidate_logits = candidate_logits.float()
     max_logits = max_logits.float()
     if temperatures is None:
-        temperature = torch.ones(
-            (bs, 1), device=logits.device, dtype=torch.float32
-        )
+        temperature = torch.ones((bs, 1), device=logits.device, dtype=torch.float32)
     else:
         if temperatures.numel() != bs:
             raise ValueError(
@@ -1057,22 +1058,43 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def _dflash_grammar_requested(req: Req) -> bool:
-    return any(
-        value is not None
-        for value in (
-            req.sampling_params.json_schema,
-            req.sampling_params.regex,
-            req.sampling_params.ebnf,
-            req.sampling_params.structural_tag,
-        )
+def build_dflash_grammar_vocab_mask(
+    *,
+    reqs: List[Req],
+    draft_tokens: torch.Tensor,
+    vocab_size: int,
+    verify_input: DFlashVerifyInput,
+) -> Optional[torch.Tensor]:
+    """Per-draft-position grammar bitmask for a DFLASH verify block.
+
+    The block is a linear chain whose position 0 is the bonus token each
+    grammar has already accepted. Every valid draft token is accepted to fill
+    the next row's mask, then rolled back; rows of non-grammar requests and
+    rows past the first grammar-invalid draft stay all-allowed (acceptance
+    stops there). Sets ``verify_input.grammar`` for ``apply_vocab_mask``.
+    """
+    from sglang.srt.speculative.spec_utils import generate_token_bitmask
+
+    bs, block_size = draft_tokens.shape
+    next_token = torch.arange(1, block_size + 1, dtype=torch.int64)
+    next_token[-1] = -1
+    vocab_mask = generate_token_bitmask(
+        reqs,
+        verify_input,
+        next_token.expand(bs, block_size),
+        torch.full((bs, block_size), -1, dtype=torch.int64),
+        draft_tokens.cpu(),
+        vocab_size,
     )
+    if vocab_mask is None:
+        return None
+    return vocab_mask.to(draft_tokens.device, non_blocking=True)
 
 
 def is_dflash_target_only_request(req: Req) -> bool:
     """Return whether DFLASH must route this request through the target only."""
     custom_params = req.sampling_params.custom_params or {}
-    if _dflash_grammar_requested(req) or bool(req.return_hidden_states):
+    if bool(req.return_hidden_states):
         return True
     if custom_params.get("qwen_exo_kind") == "internal":
         return custom_params.get(QWEN_EXO_DFLASH_MODE_KEY) != QWEN_EXO_DFLASH_ELIGIBLE
@@ -1094,9 +1116,4 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
         return None
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-    if _dflash_grammar_requested(req):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
     return None
