@@ -23,14 +23,34 @@ from typing import (
 )
 
 import jinja2
+import openai.types.responses as openai_responses_types
 import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse
+from openai.types.responses import (
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponseReasoningItem,
+)
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_reasoning_item import (
+    Content as ResponseReasoningTextContent,
+)
+from openai.types.responses.response_reasoning_item import (
+    Summary as ResponseReasoningSummary,
+)
+from openai.types.responses.response_reasoning_summary_part_added_event import (
+    Part as ResponseReasoningSummaryAddedPart,
+)
+from openai.types.responses.response_reasoning_summary_part_done_event import (
+    Part as ResponseReasoningSummaryDonePart,
+)
 from openai_harmony import Message as OpenAIMessage
 from openai_harmony import Role
 from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
 from qwen_exo_booster.memory_span import locate_memory_span
 from qwen_exo_booster.pipeline import response_memory_metadata
+
 from sglang.srt.entrypoints.context import (
     ConversationContext,
     HarmonyContext,
@@ -66,26 +86,6 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
-
-import openai.types.responses as openai_responses_types
-from openai.types.responses import (
-    ResponseOutputMessage,
-    ResponseOutputText,
-    ResponseReasoningItem,
-)
-from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from openai.types.responses.response_reasoning_item import (
-    Content as ResponseReasoningTextContent,
-)
-from openai.types.responses.response_reasoning_item import (
-    Summary as ResponseReasoningSummary,
-)
-from openai.types.responses.response_reasoning_summary_part_added_event import (
-    Part as ResponseReasoningSummaryAddedPart,
-)
-from openai.types.responses.response_reasoning_summary_part_done_event import (
-    Part as ResponseReasoningSummaryDonePart,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -3006,6 +3006,64 @@ class OpenAIServingResponses(OpenAIServingChat):
             state["done"] = True
             return events
 
+        def _tool_call_is_open(tool_index: int) -> bool:
+            state = tool_call_states.get(tool_index)
+            return state is not None and not state["done"]
+
+        def _tool_call_delta_events(call):
+            nonlocal current_output_index
+            events = []
+            state = tool_call_states.get(call.tool_index)
+            if state is None or state["done"]:
+                current_output_index += 1
+                state = {
+                    "item_id": f"fc_{random_uuid()[:8]}",
+                    "call_id": f"call_{random_uuid()[:24]}",
+                    "output_index": current_output_index,
+                    "name": call.name or "",
+                    "arguments": "",
+                    "added": False,
+                    "done": False,
+                }
+                tool_call_states[call.tool_index] = state
+            if not state["added"]:
+                state["added"] = True
+                # Capture ``call.name`` before the ``added`` event so the
+                # name is set on the first emitted item.
+                if call.name and not state["name"]:
+                    state["name"] = call.name
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseOutputItemAddedEvent(
+                            type="response.output_item.added",
+                            sequence_number=-1,
+                            output_index=state["output_index"],
+                            item=ResponseFunctionToolCall(
+                                arguments="",
+                                call_id=state["call_id"],
+                                name=state["name"],
+                                type="function_call",
+                                id=state["item_id"],
+                                status="in_progress",
+                            ),
+                        )
+                    )
+                )
+            if call.parameters:
+                state["arguments"] += call.parameters
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                            type="response.function_call_arguments.delta",
+                            sequence_number=-1,
+                            item_id=state["item_id"],
+                            output_index=state["output_index"],
+                            delta=call.parameters,
+                        )
+                    )
+                )
+            return events
+
         try:
             async for ctx in result_generator:
                 if isinstance(ctx, dict):
@@ -3121,6 +3179,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
+                # The parser does not order normal text against calls within
+                # one chunk. A multi-token chunk (speculative decoding) can end
+                # an open call and then carry text after </tool_call>, so the
+                # open call's remaining arguments go out before the text closes
+                # it; text inside a tool call is never returned as normal text.
+                is_open = [_tool_call_is_open(c.tool_index) for c in tool_calls]
+                continuing = [c for c, o in zip(tool_calls, is_open) if o]
+                tool_calls = [c for c, o in zip(tool_calls, is_open) if not o]
+                for call in continuing:
+                    for ev in _tool_call_delta_events(call):
+                        yield ev
+
                 # Close any open tool-call item before opening a message so
                 # ``output_item.done`` lands before the next ``added``.
                 if normal_text:
@@ -3185,54 +3255,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         yield ev
 
                 for call in tool_calls:
-                    tool_index = call.tool_index
-                    state = tool_call_states.get(tool_index)
-                    if state is None or state.get("done"):
-                        current_output_index += 1
-                        item_id = f"fc_{random_uuid()[:8]}"
-                        call_id = f"call_{random_uuid()[:24]}"
-                        state = {
-                            "item_id": item_id,
-                            "call_id": call_id,
-                            "output_index": current_output_index,
-                            "name": call.name or "",
-                            "arguments": "",
-                            "added": False,
-                            "done": False,
-                        }
-                        tool_call_states[tool_index] = state
-                    if not state["added"]:
-                        state["added"] = True
-                        # Capture ``call.name`` before the ``added`` event so
-                        # the name is set on the first emitted item.
-                        if call.name and not state["name"]:
-                            state["name"] = call.name
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=state["output_index"],
-                                item=ResponseFunctionToolCall(
-                                    arguments="",
-                                    call_id=state["call_id"],
-                                    name=state["name"],
-                                    type="function_call",
-                                    id=state["item_id"],
-                                    status="in_progress",
-                                ),
-                            )
-                        )
-                    if call.parameters:
-                        state["arguments"] += call.parameters
-                        yield _send_event(
-                            openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
-                                type="response.function_call_arguments.delta",
-                                sequence_number=-1,
-                                item_id=state["item_id"],
-                                output_index=state["output_index"],
-                                delta=call.parameters,
-                            )
-                        )
+                    for ev in _tool_call_delta_events(call):
+                        yield ev
         except Exception as exc:
             if isinstance(exc, HTTPException):
                 logger.info(
@@ -3776,12 +3800,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 assert reasoning_end_token_id is not None
                 assert qwen_exo_runtime is not None
                 if forced_reasoning_boundary:
-                    injection = (
-                        await qwen_exo_runtime.build_reasoning_cutoff_injection(
-                            request_id,
-                            observed_tokens=len(phase_output_ids),
-                            generation_index=generation_index,
-                        )
+                    injection = await qwen_exo_runtime.build_reasoning_cutoff_injection(
+                        request_id,
+                        observed_tokens=len(phase_output_ids),
+                        generation_index=generation_index,
                     )
                 else:
                     injection = await qwen_exo_runtime.await_think_context(request_id)

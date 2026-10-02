@@ -259,6 +259,46 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         self.assertEqual(output[1]["name"], "get_weather")
         self.assertEqual(output[2]["content"][0]["text"], "It's sunny.")
 
+    def test_multi_token_chunk_finishes_open_tool_call_before_text(self):
+        """Speculative decoding streams several tokens per chunk, so one chunk
+        can carry a call's closing arguments and the newline after
+        </tool_call>. The parser returns that newline as normal text, which
+        closed the open call before its closing arguments were applied: the
+        real call lost its closing brace and a nameless call with arguments
+        "}" followed, so agents saw malformed tool calls."""
+        import json
+
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "qwen3_coder"
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "run_shell",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                }
+            ],
+        )
+        head = "<tool_call>\n<function=run_shell>\n<parameter=command>\nls -la"
+        full = head + "\n</parameter>\n</function>\n</tool_call>\n"
+
+        events = _StreamFixture(serving, request).run(
+            [_engine_chunk(head, 8), _engine_chunk(full, 16, finish=True)]
+        )
+
+        output = find_completed_event(events)["response"]["output"]
+        calls = [item for item in output if item["type"] == "function_call"]
+        self.assertEqual([call["name"] for call in calls], ["run_shell"])
+        self.assertEqual(json.loads(calls[0]["arguments"]), {"command": "ls -la"})
+
 
 if __name__ == "__main__":
     unittest.main()
