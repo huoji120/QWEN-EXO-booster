@@ -19,6 +19,10 @@ from sglang.srt.utils.common import torch_release
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
+from sglang.kernels.ops.quantization.fp8_decode_gemv import (
+    can_use_fp8_decode_gemv,
+    fp8_decode_gemv,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -34,6 +38,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_align,
@@ -62,6 +67,7 @@ _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
+_use_fp8_decode_gemv = _is_sm120_supported and envs.SGLANG_OPT_USE_FP8_DECODE_GEMV.get()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
 
@@ -1812,6 +1818,14 @@ def apply_fp8_linear(
             output = triton_scaled_mm(
                 qinput, weight, x_scale, weight_scale, input.dtype, bias
             )
+        elif (
+            _use_fp8_decode_gemv
+            and bias is None
+            and can_use_fp8_decode_gemv(
+                qinput, weight, x_scale, weight_scale, input.dtype
+            )
+        ):
+            output = fp8_decode_gemv(qinput, weight, x_scale, weight_scale)
         else:
             output = fp8_scaled_mm(
                 qinput,

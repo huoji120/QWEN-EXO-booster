@@ -616,6 +616,9 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
+    # Route decode-sized (<=16 row) per-channel FP8 linears on SM120 to
+    # bandwidth-bound Triton kernels instead of the single-tile CUTLASS kernel.
+    SGLANG_OPT_USE_FP8_DECODE_GEMV = EnvBool(True)
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
     # Quantization (Humming)
