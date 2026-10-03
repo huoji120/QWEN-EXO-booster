@@ -22,6 +22,7 @@ from qwen_exo_booster.engram import (
     engram_requested,
     extend_inputs_host,
     hash_rows,
+    is_confident_surface_token,
     reader_delta,
     ring_update_and_read,
     ring_width_for,
@@ -93,6 +94,7 @@ class QwenExoEngram:
         self.reader = load_reader_weights(manifest, device=device)
         self.hash = EngramHashTensors(manifest.hash, device)
         self.ring = torch.full((num_req_slots, self.ring_width), self.eos_id, dtype=torch.int64, device=device)
+        self.suppress = self._build_suppress_mask(model_path, device)
         self._self_test(manifest, device)
         text_model.attach_qwen_exo_engram(self)
         logger.info(
@@ -104,6 +106,25 @@ class QwenExoEngram:
             self.num_heads,
             manifest.table.head_dim,
         )
+
+    def _build_suppress_mask(self, model_path: str, device: str) -> torch.Tensor:
+        """Per-vocab flag: do not inject the Engram delta when the current token
+        is a numeric / hex / separator token (IP octets, versions, hashes),
+        where it would only flip a correct greedy argmax."""
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        mask = torch.zeros(self.vocab_size, dtype=torch.bool)
+        for token_id in range(self.vocab_size):
+            try:
+                text = tokenizer.decode([token_id])
+            except Exception:
+                text = ""
+            if is_confident_surface_token(text):
+                mask[token_id] = True
+        logger.info("Engram: suppressing injection on %d / %d numeric-or-separator tokens",
+                    int(mask.sum()), self.vocab_size)
+        return mask.to(device)
 
     def _self_test(self, manifest: EngramManifest, device: str) -> None:
         """Golden hash rows and a JIT-vs-reference gather; also compiles the
@@ -203,7 +224,10 @@ class QwenExoEngram:
             rows = hash_rows(x0[start:end], x1[start:end], x2[start:end], self.hash)
             deltas.append(reader_delta(h[start:end], self._gather(rows), self.reader))
         delta = deltas[0] if len(deltas) == 1 else torch.cat(deltas)
-        return delta * token_mask.unsqueeze(-1).to(delta.dtype)
+        # Suppress injection where the current token is numeric / separator, so
+        # an Engram nudge cannot flip an already-confident IP / version / hash.
+        keep = token_mask & ~self.suppress[x0]
+        return delta * keep.unsqueeze(-1).to(delta.dtype)
 
 
 __all__ = ["QwenExoEngram", "drop_page_cache"]

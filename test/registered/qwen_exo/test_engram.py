@@ -13,6 +13,7 @@ from qwen_exo_booster.engram import (
     engram_radix_extra_key,
     extend_inputs_host,
     hash_rows,
+    is_confident_surface_token,
     reader_delta,
     ring_update_and_read,
     ring_width_for,
@@ -148,6 +149,16 @@ def test_reader_delta_matches_trained_adapter_formula():
     )
     expected = (gate * (e_n @ state["value.weight"].T)).to(h.dtype)
     torch.testing.assert_close(reader_delta(h, e, weights).float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
+def test_confident_surface_tokens_are_suppressed():
+    """Numeric / hex / separator tokens (the 10.0.186.74 regression: an Engram
+    nudge flipped a correct IP octet) suppress injection; plain word tokens do
+    not, so Engram still acts on language."""
+    for text in (" 10", "0", "186", "3f9", "v2", ".", "...", ":", "/", "-", " 2.14"):
+        assert is_confident_surface_token(text)
+    for text in (" server", "reachable", "the", "", "   ", " and", "http"):
+        assert not is_confident_surface_token(text)
 
 
 def test_opted_out_requests_get_their_own_radix_namespace():
