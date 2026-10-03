@@ -145,20 +145,17 @@ def sanitize_token_ids(ids: np.ndarray, *, vocab_size: int, eos_id: int) -> np.n
     return np.where((ids < 0) | (ids >= vocab_size), eos_id, ids)
 
 
-_SEPARATOR_CHARS = set(".:/-")
-
-
-def is_confident_surface_token(text: str) -> bool:
-    """Numeric / hex / separator tokens (IP octets, version numbers, commit
-    hashes) where the next token is already near-deterministic. An Engram delta
-    on these only flips a correct greedy argmax, so injection is suppressed when
-    the current token is one of them (see the 10.0.186.74 regression)."""
+def is_injectable_token(text: str) -> bool:
+    """Whitelist: Engram injects only on natural-language tokens, i.e. the token
+    is non-empty and every visible character is a letter (CJK included) or
+    whitespace. Digits, punctuation and markup -- IP octets, version numbers,
+    commit hashes, ``<tool_call>``, code symbols -- are suppressed, where an
+    Engram delta only flips predictions the model is already confident about
+    (the 10.0.186.74 and <> regressions)."""
     stripped = text.strip()
     if not stripped:
         return False
-    if any(ch.isdigit() for ch in stripped):
-        return True
-    return all(ch in _SEPARATOR_CHARS for ch in stripped)
+    return all(ch.isalpha() or ch.isspace() for ch in stripped)
 
 
 class EngramExtendInputs(msgspec.Struct, kw_only=True):
@@ -341,7 +338,7 @@ __all__ = [
     "engram_requested",
     "extend_inputs_host",
     "hash_rows",
-    "is_confident_surface_token",
+    "is_injectable_token",
     "reader_delta",
     "ring_update_and_read",
     "ring_width_for",

@@ -22,7 +22,7 @@ from qwen_exo_booster.engram import (
     engram_requested,
     extend_inputs_host,
     hash_rows,
-    is_confident_surface_token,
+    is_injectable_token,
     reader_delta,
     ring_update_and_read,
     ring_width_for,
@@ -108,9 +108,10 @@ class QwenExoEngram:
         )
 
     def _build_suppress_mask(self, model_path: str, device: str) -> torch.Tensor:
-        """Per-vocab flag: do not inject the Engram delta when the current token
-        is a numeric / hex / separator token (IP octets, versions, hashes),
-        where it would only flip a correct greedy argmax."""
+        """Per-vocab flag: inject the Engram delta only when the current token is
+        a natural-language (letter/whitespace) token; suppress on digits,
+        punctuation and markup, where it would only flip a prediction the model
+        is already confident about (IP octets, versions, <tool_call>, code)."""
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -120,10 +121,10 @@ class QwenExoEngram:
                 text = tokenizer.decode([token_id])
             except Exception:
                 text = ""
-            if is_confident_surface_token(text):
+            if not is_injectable_token(text):
                 mask[token_id] = True
-        logger.info("Engram: suppressing injection on %d / %d numeric-or-separator tokens",
-                    int(mask.sum()), self.vocab_size)
+        logger.info("Engram: injecting on %d / %d letter tokens, suppressing the other %d",
+                    self.vocab_size - int(mask.sum()), self.vocab_size, int(mask.sum()))
         return mask.to(device)
 
     def _self_test(self, manifest: EngramManifest, device: str) -> None:

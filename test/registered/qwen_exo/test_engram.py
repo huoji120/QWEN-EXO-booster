@@ -13,7 +13,7 @@ from qwen_exo_booster.engram import (
     engram_radix_extra_key,
     extend_inputs_host,
     hash_rows,
-    is_confident_surface_token,
+    is_injectable_token,
     reader_delta,
     ring_update_and_read,
     ring_width_for,
@@ -151,14 +151,15 @@ def test_reader_delta_matches_trained_adapter_formula():
     torch.testing.assert_close(reader_delta(h, e, weights).float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
-def test_confident_surface_tokens_are_suppressed():
-    """Numeric / hex / separator tokens (the 10.0.186.74 regression: an Engram
-    nudge flipped a correct IP octet) suppress injection; plain word tokens do
-    not, so Engram still acts on language."""
-    for text in (" 10", "0", "186", "3f9", "v2", ".", "...", ":", "/", "-", " 2.14"):
-        assert is_confident_surface_token(text)
-    for text in (" server", "reachable", "the", "", "   ", " and", "http"):
-        assert not is_confident_surface_token(text)
+def test_only_letter_tokens_are_injectable():
+    """Whitelist: Engram injects on letter/whitespace tokens only. Digits,
+    punctuation and markup are suppressed (the 10.0.186.74 IP and <tool_call> /
+    <> regressions, where a nudge flips an already-confident prediction)."""
+    for text in (" server", "reachable", "the", "http", "中文", "你好 世界", "GPT"):
+        assert is_injectable_token(text)
+    for text in (" 10", "0", "3f9", "v2", "GPT-4", ".", ":", "/", "-", "<", ">",
+                 "<tool_call", "://", "<|im_start|>", "", "   "):
+        assert not is_injectable_token(text)
 
 
 def test_opted_out_requests_get_their_own_radix_namespace():
