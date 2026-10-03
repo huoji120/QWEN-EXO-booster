@@ -1819,6 +1819,12 @@ class Qwen3_5ForCausalLM(nn.Module):
             else None
         )
         self.qwen_exo_latent_capture_accumulator = LatentCaptureAccumulator()
+        self.qwen_exo_engram = None
+
+    def attach_qwen_exo_engram(self, engram) -> None:
+        """Install the Engram runtime (built after the memory pools, before
+        CUDA-graph capture); it adds its delta at ``engram.layer_index``."""
+        self.qwen_exo_engram = engram
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1914,6 +1920,21 @@ class Qwen3_5ForCausalLM(nn.Module):
                     if latent_strengths is None
                     else torch.maximum(latent_strengths, strengths)
                 )
+            if (
+                self.qwen_exo_engram is not None
+                and layer_idx == self.qwen_exo_engram.layer_index
+            ):
+                engram_addition = self.qwen_exo_engram.compute_addition(
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    forward_batch=forward_batch,
+                )
+                if engram_addition is not None:
+                    latent_addition = (
+                        engram_addition
+                        if latent_addition is None
+                        else latent_addition + engram_addition
+                    )
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):

@@ -306,6 +306,7 @@ def _scheduler(*, kv_tokens=512, mode=None):
         tokenizer_path="tokenizer",
         tokenizer_revision=None,
         tokenizer_mode="auto",
+        qwen_exo_engram_path=None,
     )
     scheduler.ps = SimpleNamespace(tp_rank=0, pp_size=1)
     req_to_token = torch.zeros((4, 256), dtype=torch.int64)

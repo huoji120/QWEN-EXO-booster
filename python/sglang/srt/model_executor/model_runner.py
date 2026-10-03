@@ -141,6 +141,9 @@ from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
 )
+from sglang.srt.model_executor.model_runner_components.qwen_exo_engram import (
+    QwenExoEngram,
+)
 from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transporter import (
     RemoteInstanceWeightTransporter,
 )
@@ -510,6 +513,21 @@ class ModelRunner:
             device=self.device,
         )
 
+    def maybe_init_qwen_exo_engram(self):
+        self.qwen_exo_engram = None
+        if not self.server_args.qwen_exo_engram_path or self.is_draft_worker:
+            return
+        self.qwen_exo_engram = QwenExoEngram(
+            engram_path=self.server_args.qwen_exo_engram_path,
+            model=self.model,
+            model_path=self.model_config.model_path,
+            num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
+            tokens_per_req=self.decode_num_tokens_per_req(),
+            hidden_size=self.model_config.hidden_size,
+            num_layers=self.model_config.num_hidden_layers,
+            device=self.device,
+        )
+
     def init_kv_cache_configurator(self):
         self.kv_cache_configurator = KVCacheConfigurator(
             device=self.device,
@@ -762,6 +780,7 @@ class ModelRunner:
 
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
+        self.maybe_init_qwen_exo_engram()
 
         self.maybe_init_hisparse_coordinator()
 

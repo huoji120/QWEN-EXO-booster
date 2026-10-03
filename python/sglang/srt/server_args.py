@@ -3139,6 +3139,18 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
     ] = False
+    qwen_exo_engram_path: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Experimental: Engram artifact (engram.json or its directory). "
+                "Its n-gram table is pinned in host memory and its reader adds "
+                "a gated delta to the residual stream at one layer. On for "
+                "every request unless custom_params qwen_exo_engram is false. "
+                "Qwen3.5, TP=1, eager prefill."
+            ),
+        ),
+    ] = None
     qwen_exo_context_integrity_mode: A[
         str,
         Arg(
@@ -3968,6 +3980,24 @@ class ServerArgs:
             raise ValueError("--qwen-exo-moe-top-k requires --enable-qwen-exo")
         if self.qwen_exo_moe_extra_experts < 0:
             raise ValueError("--qwen-exo-moe-extra-experts must be non-negative")
+        if self.qwen_exo_engram_path:
+            from qwen_exo_booster.engram import validate_engram_server_config
+
+            validate_engram_server_config(
+                enable_qwen_exo=self.enable_qwen_exo,
+                tp_size=self.tp_size,
+                pp_size=self.pp_size,
+                dp_size=self.dp_size,
+                enable_dp_attention=self.enable_dp_attention,
+                enable_two_batch_overlap=self.enable_two_batch_overlap,
+                enable_mixed_chunk=self.enable_mixed_chunk,
+                enable_torch_compile=self.enable_torch_compile,
+                speculative_algorithm=self.speculative_algorithm,
+                cuda_graph_backend_prefill=self.cuda_graph_backend_prefill,
+            )
+            # Extend batches carry host-built token triples; breakable prefill
+            # graphs would freeze them at capture time.
+            self.disable_prefill_cuda_graph = True
         if not self.enable_qwen_exo:
             return
         if self.qwen_exo_dflash_think_accept_mode not in {
