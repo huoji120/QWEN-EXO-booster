@@ -162,6 +162,22 @@ def test_only_letter_tokens_are_injectable():
         assert not is_injectable_token(text)
 
 
+def test_sparse_table_reads_zero_for_unwritten_rows():
+    """A trained knowledge table stores only written rows; any other n-gram row
+    must read exactly 0 (unwritten = empty), and written rows read their value."""
+    from qwen_exo_booster.engram_artifact import SparseEngramTable
+
+    uniq = torch.tensor([3, 10, 10_000_000, 290_000_000], dtype=torch.int64)
+    weight = torch.arange(4 * 5, dtype=torch.float32).reshape(4, 5)
+    table = SparseEngramTable(uniq, weight.to(torch.bfloat16))
+    rows = torch.tensor([[10, 5, 3, 290_000_000]], dtype=torch.int64)  # 5 unwritten
+    out = table.gather(rows).view(4, 5).float()
+    assert torch.equal(out[0], weight[1].to(torch.bfloat16).float())  # row 10
+    assert torch.equal(out[1], torch.zeros(5))  # unwritten -> 0
+    assert torch.equal(out[2], weight[0].to(torch.bfloat16).float())  # row 3
+    assert torch.equal(out[3], weight[3].to(torch.bfloat16).float())  # row 290M
+
+
 def test_opted_out_requests_get_their_own_radix_namespace():
     assert engram_radix_extra_key("qwen-exo=abc", {}) == "qwen-exo=abc"
     off = engram_radix_extra_key("qwen-exo=abc", {"qwen_exo_engram": False})
@@ -278,3 +294,108 @@ def test_jit_gather_from_pinned_host_matches_reference_inside_cuda_graph(tmp_pat
         graph.replay()
         reference = gather_rows_reference(table.data, table.scale, rows.cpu())
         assert torch.equal(out.cpu(), reference.reshape(out.shape))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_sparse_host_table_missing_rows_and_graph_replay(tmp_path):
+    from safetensors.torch import save_file
+    from qwen_exo_booster.engram_artifact import SparseEngramTable
+
+    manifest = _manifest(tmp_path, num_shards=1, rows_per_shard=4, head_dim=160)
+    uniq = torch.tensor([3, 10, 100, 290_000_000], dtype=torch.int64)
+    weight = (torch.arange(4 * 160).reshape(4, 160) % 31 - 15).to(torch.bfloat16)
+    save_file({"uniq": uniq, "weight": weight}, str(tmp_path / "sparse.safetensors"))
+    payload = json.loads((tmp_path / "engram.json").read_text())
+    payload["table"] = {
+        "kind": "sparse_trained", "head_dim": 160, "rows_file": "sparse.safetensors",
+        "num_rows": 4, "dtype": "bfloat16",
+    }
+    (tmp_path / "engram.json").write_text(json.dumps(payload))
+    table = SparseEngramTable.load(type(manifest).load(tmp_path), device="cuda")
+    assert table.weight.device.type == "cpu"
+    rows = torch.tensor([[3, 0, 290_000_000, 290_000_001]], device="cuda")
+    table.gather(rows)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = table.gather(rows)
+    for query in ([3, 0, 290_000_000, 290_000_001], [10, 5, 100, 101], [0, 1, 2, 290_000_001]):
+        rows.copy_(torch.tensor([query], device="cuda"))
+        graph.replay()
+        expected = torch.stack([
+            weight[int((uniq == row).nonzero()[0])] if bool((uniq == row).any()) else torch.zeros(160)
+            for row in query
+        ]).to(torch.bfloat16)
+        assert torch.equal(output.cpu().reshape(4, 160), expected)
+
+
+def test_knowledge_switch_and_reenable_cannot_reuse_another_component_cache():
+    from qwen_exo_booster.engram import engram_knowledge_requested, engram_requested
+
+    both = engram_radix_extra_key("session", {})
+    base_only = engram_radix_extra_key(both, {"qwen_exo_engram_knowledge": False})
+    all_off = engram_radix_extra_key(base_only, {"qwen_exo_engram": False})
+    assert len({both, base_only, all_off}) == 3
+    assert engram_requested({"qwen_exo_engram_knowledge": False})
+    assert not engram_knowledge_requested({"qwen_exo_engram_knowledge": False})
+    assert not engram_knowledge_requested({"qwen_exo_engram": False})
+    assert engram_radix_extra_key(all_off, {}) == both
+    assert engram_radix_extra_key(base_only, {}) == both
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_dual_table_switch_preserves_frozen_base_during_graph_replay(tmp_path):
+    from types import SimpleNamespace
+    from qwen_exo_booster.engram_artifact import HostEngramTable, SparseEngramTable
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.model_runner_components.qwen_exo_engram import QwenExoEngram
+
+    gen = torch.Generator().manual_seed(4)
+    expected_base = _write_table(tmp_path / "table", num_shards=4, rows_per_shard=128, head_dim=16)
+    manifest = _manifest(tmp_path, num_shards=4, rows_per_shard=128, head_dim=16)
+    runtime = object.__new__(QwenExoEngram)
+    runtime.table = HostEngramTable.load(manifest, pin=True)
+    runtime.sparse = False
+    runtime.num_heads, runtime.embed_dim = 4, 64
+    runtime.hash = EngramHashTensors(SPEC, "cuda")
+    runtime.eos_id = EOS
+    runtime.ring = torch.full((4, 16), EOS, dtype=torch.int64, device="cuda")
+    runtime.suppress = torch.zeros(SPEC.vocab_size, dtype=torch.bool, device="cuda")
+
+    def weights():
+        return EngramReaderWeights.from_state_dict({
+            "in_norm.weight": torch.ones(64),
+            "key.weight": torch.randn(24, 64, generator=gen) * 0.01,
+            "value.weight": torch.randn(24, 64, generator=gen) * 0.01,
+            "h_norm.weight": torch.ones(24), "k_norm.weight": torch.ones(24),
+        }, eps=1e-6, device="cuda")
+
+    runtime.reader, runtime.knowledge_reader = weights(), weights()
+    inputs = torch.tensor([10, 20], dtype=torch.int64, device="cuda")
+    eos = torch.full_like(inputs, EOS)
+    rows = hash_rows(inputs, eos, eos, runtime.hash)
+    unique_rows = rows.cpu().unique(sorted=True)
+    values = torch.randn(unique_rows.numel(), 16, generator=gen).to(torch.bfloat16)
+    runtime.knowledge_table = SparseEngramTable(unique_rows.cuda(), values.pin_memory())
+    masks = torch.tensor([[True, True], [True, False]], device="cuda")
+    forward = SimpleNamespace(
+        qwen_exo_engram_mask=masks, forward_mode=ForwardMode.DECODE,
+        req_pool_indices=torch.tensor([1, 2], device="cuda"),
+        positions=torch.zeros(2, dtype=torch.int64, device="cuda"), input_ids=inputs,
+    )
+    hidden = torch.randn(2, 24, generator=gen).to(device="cuda", dtype=torch.bfloat16)
+    residual = torch.zeros_like(hidden)
+    base = reader_delta(hidden, expected_base[rows.cpu()].flatten(-2).to(device="cuda", dtype=torch.bfloat16), runtime.reader)
+    extra = reader_delta(hidden, runtime.knowledge_table.gather(rows), runtime.knowledge_reader)
+
+    def addition():
+        return runtime.compute_addition(hidden_states=hidden, residual=residual, forward_batch=forward)
+
+    addition()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = addition()
+    for flags in ([[True, True], [True, False]], [[True, False], [False, False]], [[False, False], [True, True]]):
+        masks.copy_(torch.tensor(flags, device="cuda"))
+        graph.replay()
+        expected = base * masks[:, 0:1] + extra * masks[:, 1:2]
+        assert torch.equal(output, expected)

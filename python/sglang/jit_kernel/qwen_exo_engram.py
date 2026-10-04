@@ -17,7 +17,10 @@ def _jit_qwen_exo_engram_module(*, num_heads: int, head_dim: int) -> Module:
         "qwen_exo_engram",
         *args,
         cuda_files=["qwen_exo_engram.cuh"],
-        cuda_wrappers=[("gather_dequant", f"&QwenExoEngramKernel<{args}>::gather_dequant")],
+        cuda_wrappers=[
+            ("gather_dequant", f"&QwenExoEngramKernel<{args}>::gather_dequant"),
+            ("gather_sparse", f"&QwenExoEngramKernel<{args}>::gather_sparse"),
+        ],
     )
 
 
@@ -40,3 +43,17 @@ def engram_gather_dequant(
     """
     module = _jit_qwen_exo_engram_module(num_heads=num_heads, head_dim=table_data.shape[1])
     module.gather_dequant(table_data, table_scale, rows, out)
+
+
+@debug_kernel_api
+def engram_gather_sparse(
+    *,
+    table_data: torch.Tensor,
+    unique_rows: torch.Tensor,
+    rows: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+) -> None:
+    """Gather bf16 rows from a registered host table; absent global ids read zero."""
+    module = _jit_qwen_exo_engram_module(num_heads=num_heads, head_dim=table_data.shape[1])
+    module.gather_sparse(table_data, unique_rows, rows, out)

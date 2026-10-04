@@ -19,6 +19,7 @@ import math
 import os
 import struct
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -35,11 +36,17 @@ MANIFEST_SCHEMA = 1
 
 
 class EngramTableSpec(msgspec.Struct, frozen=True, kw_only=True):
-    dir: str
-    num_shards: int
-    rows_per_shard: int
     head_dim: int
+    # kind "fp8_shards": Flash-Next dense FP8 table (pinned host, JIT gather).
+    # kind "sparse_trained": a zero-init table we trained; only written rows are
+    # stored (uniq ids + weight), everything else reads 0.
+    kind: str = "fp8_shards"
+    dir: str = ""
+    num_shards: int = 0
+    rows_per_shard: int = 0
     dtype: str = "fp8_e4m3_rowscale"
+    rows_file: str = ""
+    num_rows: int = 0
 
     @property
     def rows(self) -> int:
@@ -61,6 +68,7 @@ class EngramManifest(msgspec.Struct, frozen=True, kw_only=True):
     hash: EngramHashSpec
     table: EngramTableSpec
     reader: EngramReaderSpec
+    knowledge_path: str = ""
     # Hash self-check: check_tokens[i] = (x0, x1, x2) must map to check_rows[i].
     check_tokens: tuple[tuple[int, int, int], ...] = ()
     check_rows: tuple[tuple[int, ...], ...] = ()
@@ -82,12 +90,20 @@ class EngramManifest(msgspec.Struct, frozen=True, kw_only=True):
         if self.schema != MANIFEST_SCHEMA:
             raise ValueError(f"Engram manifest schema {self.schema} != {MANIFEST_SCHEMA}")
         self.hash.validate()
-        if self.table.dtype != "fp8_e4m3_rowscale":
-            raise ValueError(f"Unsupported Engram table dtype {self.table.dtype!r}")
+        if self.table.kind == "fp8_shards":
+            if self.table.dtype != "fp8_e4m3_rowscale":
+                raise ValueError(f"Unsupported Engram table dtype {self.table.dtype!r}")
+            if max(o + s for o, s in zip(self.hash.head_offsets, self.hash.head_sizes)) > self.table.rows:
+                raise ValueError("Engram hash addresses rows beyond the table")
+        elif self.table.kind == "sparse_trained":
+            if not self.table.rows_file:
+                raise ValueError("sparse_trained Engram table needs a rows_file")
+            if self.table.dtype != "bfloat16":
+                raise ValueError("sparse_trained Engram table must contain bfloat16 values")
+        else:
+            raise ValueError(f"Unknown Engram table kind {self.table.kind!r}")
         if self.hash.num_heads * self.table.head_dim != self.reader.embed_dim:
             raise ValueError("Engram heads x head_dim must equal the reader embed_dim")
-        if max(o + s for o, s in zip(self.hash.head_offsets, self.hash.head_sizes)) > self.table.rows:
-            raise ValueError("Engram hash addresses rows beyond the table")
         if self.reader.hidden_size != hidden_size:
             raise ValueError(
                 f"Engram reader hidden size {self.reader.hidden_size} does not match the model ({hidden_size})"
@@ -233,7 +249,70 @@ class HostEngramTable:
             time.monotonic() - started - read_s,
             cgroup_memory_current(),
         )
-        return cls(data, scale)
+        instance = cls(data, scale)
+        if pin:
+            from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+
+            weakref.finalize(instance, _cuda_host_unregister, data)
+            weakref.finalize(instance, _cuda_host_unregister, scale)
+        return instance
+
+
+class SparseEngramTable:
+    """Sorted trained row ids with bf16 values in registered host memory.
+
+    Only the compact row-id index is on the GPU; table values stay in RAM.
+    """
+
+    def __init__(self, uniq: torch.Tensor, weight: torch.Tensor):
+        self.uniq = uniq
+        self.weight = weight
+        self.head_dim = weight.shape[1]
+
+    @classmethod
+    def load(cls, manifest: "EngramManifest", *, device) -> "SparseEngramTable":
+        from safetensors.torch import load_file
+
+        from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+        from sglang.srt.mem_cache.pool_host.common import _cuda_host_register
+
+        tensors = load_file(str(manifest.resolve(manifest.table.rows_file)))
+        uniq = tensors["uniq"].to(dtype=torch.int64)
+        weight = tensors["weight"]
+        if uniq.ndim != 1 or not uniq.numel() or not bool((uniq[1:] > uniq[:-1]).all()):
+            raise ValueError("sparse Engram row ids must be nonempty and strictly increasing")
+        if tuple(weight.shape) != (uniq.numel(), manifest.table.head_dim):
+            raise ValueError("sparse Engram weight shape does not match row ids and head dimension")
+        if uniq.numel() != manifest.table.num_rows:
+            raise ValueError("sparse Engram row count does not match manifest")
+        data = alloc_mmap(tuple(weight.shape), torch.bfloat16)
+        data.copy_(weight)
+        _cuda_host_register(data)
+        from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+
+        instance = cls(uniq.to(device=device), data)
+        weakref.finalize(instance, _cuda_host_unregister, data)
+        return instance
+
+    def gather(self, rows: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
+        """rows [..., heads] (global ids) -> [..., heads * head_dim]; unwritten rows read 0."""
+        if rows.device.type == "cuda":
+            from sglang.jit_kernel.qwen_exo_engram import engram_gather_sparse
+
+            out = torch.empty((rows.numel(), self.head_dim), dtype=torch.bfloat16, device=rows.device)
+            engram_gather_sparse(
+                table_data=self.weight,
+                unique_rows=self.uniq,
+                rows=rows.reshape(-1),
+                out=out,
+                num_heads=rows.shape[-1],
+            )
+            return out.reshape(*rows.shape[:-1], -1).to(dtype)
+        unique_rows = self.uniq.cpu()
+        idx = torch.searchsorted(unique_rows, rows).clamp(max=unique_rows.numel() - 1)
+        hit = (unique_rows[idx] == rows).unsqueeze(-1)
+        vec = torch.where(hit, self.weight[idx], self.weight.new_zeros(()))
+        return vec.flatten(-2).to(dtype)
 
 
 def gather_rows_reference(data: torch.Tensor, scale: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
@@ -259,6 +338,7 @@ __all__ = [
     "EngramReaderSpec",
     "EngramTableSpec",
     "HostEngramTable",
+    "SparseEngramTable",
     "MANIFEST_NAME",
     "cgroup_memory_current",
     "gather_rows_reference",

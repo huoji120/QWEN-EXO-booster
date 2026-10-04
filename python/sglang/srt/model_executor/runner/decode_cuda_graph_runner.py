@@ -427,7 +427,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffer_registry.register_slot(
                 GraphSlot(
                     "qwen_exo_engram_mask",
-                    lambda bs, _mt: (bs,),
+                    lambda bs, _mt: (bs, 2),
                     torch.bool,
                     axis="bs",
                     padding_policy=PaddingPolicy.ZERO,

@@ -37,6 +37,8 @@ import torch
 
 ENGRAM_PARAM = "qwen_exo_engram"
 ENGRAM_DISABLED_CACHE_MARKER = "qwen-exo-engram=off"
+ENGRAM_KNOWLEDGE_PARAM = "qwen_exo_engram_knowledge"
+ENGRAM_KNOWLEDGE_DISABLED_CACHE_MARKER = "qwen-exo-engram-knowledge=off"
 ENGRAM_MIN_RING_WIDTH = 16
 
 
@@ -45,19 +47,23 @@ def engram_requested(custom_params: Any) -> bool:
     return not (isinstance(custom_params, dict) and custom_params.get(ENGRAM_PARAM) is False)
 
 
-def engram_radix_extra_key(extra_key: Optional[str], custom_params: Any) -> Optional[str]:
-    """Give opted-out requests their own radix namespace.
+def engram_knowledge_requested(custom_params: Any) -> bool:
+    return engram_requested(custom_params) and not (
+        isinstance(custom_params, dict) and custom_params.get(ENGRAM_KNOWLEDGE_PARAM) is False
+    )
 
-    Prefix KV and recurrent state computed with Engram must not be reused by a
-    request that runs without it, and vice versa.
-    """
-    if engram_requested(custom_params):
-        return extra_key
-    if not extra_key:
-        return ENGRAM_DISABLED_CACHE_MARKER
-    if ENGRAM_DISABLED_CACHE_MARKER in extra_key.split("|"):
-        return extra_key
-    return f"{extra_key}|{ENGRAM_DISABLED_CACHE_MARKER}"
+
+def engram_radix_extra_key(extra_key: Optional[str], custom_params: Any) -> Optional[str]:
+    """Separate both/all-off/base-only prefixes, including switch transitions."""
+    markers = {ENGRAM_DISABLED_CACHE_MARKER, ENGRAM_KNOWLEDGE_DISABLED_CACHE_MARKER}
+    base = "|".join(part for part in (extra_key or "").split("|") if part not in markers)
+    if not engram_requested(custom_params):
+        marker = ENGRAM_DISABLED_CACHE_MARKER
+    elif not engram_knowledge_requested(custom_params):
+        marker = ENGRAM_KNOWLEDGE_DISABLED_CACHE_MARKER
+    else:
+        return base if extra_key is not None else None
+    return f"{base}|{marker}" if base else marker
 
 
 class EngramHashSpec(msgspec.Struct, frozen=True, kw_only=True):
@@ -166,7 +172,7 @@ class EngramExtendInputs(msgspec.Struct, kw_only=True):
     """
 
     tokens: torch.Tensor  # [3, T] int64
-    token_mask: torch.Tensor  # [T] bool
+    token_mask: torch.Tensor  # [T, 2] bool: frozen base, additional knowledge
     tail_rows: torch.Tensor  # [K] int64 req_pool_idx
     tail_cols: torch.Tensor  # [K] int64 position % ring width
     tail_tokens: torch.Tensor  # [K] int64
@@ -336,6 +342,7 @@ __all__ = [
     "EngramReaderWeights",
     "engram_radix_extra_key",
     "engram_requested",
+    "engram_knowledge_requested",
     "extend_inputs_host",
     "hash_rows",
     "is_injectable_token",

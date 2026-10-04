@@ -14,11 +14,13 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional, Sequence
 
+import numpy as np
 import torch
 
 from qwen_exo_booster.engram import (
     EngramExtendInputs,
     EngramHashTensors,
+    engram_knowledge_requested,
     engram_requested,
     extend_inputs_host,
     hash_rows,
@@ -30,6 +32,7 @@ from qwen_exo_booster.engram import (
 from qwen_exo_booster.engram_artifact import (
     EngramManifest,
     HostEngramTable,
+    SparseEngramTable,
     gather_rows_reference,
     load_reader_weights,
 )
@@ -90,8 +93,24 @@ class QwenExoEngram:
         self.vocab_size = manifest.hash.vocab_size
         self.eos_id = manifest.hash.eos_id
         self.ring_width = ring_width_for(tokens_per_req)
-        self.table = HostEngramTable.load(manifest, pin=True)
+        self.sparse = manifest.table.kind == "sparse_trained"
+        if self.sparse:
+            self.table = SparseEngramTable.load(manifest, device=device)
+        else:
+            self.table = HostEngramTable.load(manifest, pin=True)
         self.reader = load_reader_weights(manifest, device=device)
+        self.knowledge_table = None
+        self.knowledge_reader = None
+        if manifest.knowledge_path:
+            knowledge = EngramManifest.load(manifest.resolve(manifest.knowledge_path))
+            knowledge.validate(hidden_size=hidden_size, num_layers=num_layers)
+            if knowledge.knowledge_path or knowledge.table.kind != "sparse_trained":
+                raise ValueError("Additional Engram knowledge must be one independently trained sparse table")
+            if knowledge.hash != manifest.hash or knowledge.reader.layer != self.layer_index:
+                raise ValueError("Additional Engram knowledge must share base hash and injection layer")
+            self.knowledge_table = SparseEngramTable.load(knowledge, device=device)
+            self.knowledge_reader = load_reader_weights(knowledge, device=device)
+            logger.info("Engram knowledge %s loaded alongside base %s", knowledge.name, manifest.name)
         self.hash = EngramHashTensors(manifest.hash, device)
         self.ring = torch.full((num_req_slots, self.ring_width), self.eos_id, dtype=torch.int64, device=device)
         self.suppress = self._build_suppress_mask(model_path, device)
@@ -128,8 +147,7 @@ class QwenExoEngram:
         return mask.to(device)
 
     def _self_test(self, manifest: EngramManifest, device: str) -> None:
-        """Golden hash rows and a JIT-vs-reference gather; also compiles the
-        kernel before CUDA-graph capture."""
+        """Validate hash/gather and compile the host gather before graph capture."""
         if not manifest.check_tokens:
             raise ValueError("Engram manifest has no hash check rows")
         tokens = torch.tensor(manifest.check_tokens, dtype=torch.int64, device=device)
@@ -138,11 +156,25 @@ class QwenExoEngram:
         if not torch.equal(rows, expected):
             raise RuntimeError("Engram hash self-check failed: rows differ from the manifest")
         gathered = self._gather(rows)
-        reference = gather_rows_reference(self.table.data, self.table.scale, rows).reshape(gathered.shape)
+        if self.sparse:
+            cpu_rows = rows.cpu()
+            unique_rows = self.table.uniq.cpu()
+            idx = torch.searchsorted(unique_rows, cpu_rows).clamp(max=unique_rows.numel() - 1)
+            hit = (unique_rows[idx] == cpu_rows).unsqueeze(-1)
+            reference = torch.where(hit, self.table.weight[idx], self.table.weight.new_zeros(())).flatten(-2)
+        else:
+            reference = gather_rows_reference(self.table.data, self.table.scale, rows).reshape(gathered.shape)
         if not torch.equal(gathered.cpu(), reference):
-            raise RuntimeError("Engram gather self-check failed: JIT kernel differs from the reference")
+            raise RuntimeError("Engram gather self-check failed: host kernel differs from reference")
+        if self.knowledge_table is not None:
+            gathered = self.knowledge_table.gather(rows)
+            reference = self.knowledge_table.gather(rows.cpu())
+            if not torch.equal(gathered.cpu(), reference):
+                raise RuntimeError("Engram knowledge gather differs from host reference")
 
     def _gather(self, rows: torch.Tensor) -> torch.Tensor:
+        if self.sparse:
+            return self.table.gather(rows.reshape(-1, self.num_heads))
         out = torch.empty((rows.shape[0], self.embed_dim), dtype=torch.bfloat16, device=rows.device)
         engram_gather_dequant(
             table_data=self.table.data,
@@ -165,7 +197,11 @@ class QwenExoEngram:
         """Per-request on/off mask (always set while Engram is on, so CUDA-graph
         replays never see a stale mask) and, for EXTEND, exact token triples."""
         on = [engram_requested(req.sampling_params.custom_params) for req in reqs]
-        mask = torch.tensor(on, dtype=torch.bool).to(device, non_blocking=True)
+        knowledge_on = [
+            self.knowledge_table is not None and engram_knowledge_requested(req.sampling_params.custom_params)
+            for req in reqs
+        ]
+        mask = torch.tensor(list(zip(on, knowledge_on)), dtype=torch.bool).reshape(-1, 2).to(device, non_blocking=True)
         if forward_mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, ForwardMode.IDLE):
             return mask, None
         if forward_mode != ForwardMode.EXTEND:
@@ -186,7 +222,7 @@ class QwenExoEngram:
 
         return mask, EngramExtendInputs(
             tokens=to_device(host.tokens),
-            token_mask=to_device(host.token_mask),
+            token_mask=to_device(np.stack((host.token_mask, np.repeat(knowledge_on, extend_lens)), axis=1)),
             tail_rows=to_device(host.tail_rows),
             tail_cols=to_device(host.tail_cols),
             tail_tokens=to_device(host.tail_tokens),
@@ -212,7 +248,7 @@ class QwenExoEngram:
                 input_ids=forward_batch.input_ids,
                 eos_id=self.eos_id,
             )
-            token_mask = mask.repeat_interleave(hidden_states.shape[0] // mask.shape[0])
+            token_mask = mask.repeat_interleave(hidden_states.shape[0] // mask.shape[0], dim=0)
         else:
             extend = forward_batch.qwen_exo_engram_extend
             self.ring[extend.tail_rows, extend.tail_cols] = extend.tail_tokens
@@ -223,11 +259,18 @@ class QwenExoEngram:
         for start in range(0, h.shape[0], _EXTEND_CHUNK_TOKENS):
             end = start + _EXTEND_CHUNK_TOKENS
             rows = hash_rows(x0[start:end], x1[start:end], x2[start:end], self.hash)
-            deltas.append(reader_delta(h[start:end], self._gather(rows), self.reader))
+            chunk = reader_delta(h[start:end], self._gather(rows), self.reader)
+            chunk = chunk * token_mask[start:end, 0].unsqueeze(-1).to(chunk.dtype)
+            if self.knowledge_table is not None:
+                addition = reader_delta(
+                    h[start:end], self.knowledge_table.gather(rows), self.knowledge_reader
+                )
+                chunk = chunk + addition * token_mask[start:end, 1].unsqueeze(-1).to(addition.dtype)
+            deltas.append(chunk)
         delta = deltas[0] if len(deltas) == 1 else torch.cat(deltas)
         # Suppress injection where the current token is numeric / separator, so
         # an Engram nudge cannot flip an already-confident IP / version / hash.
-        keep = token_mask & ~self.suppress[x0]
+        keep = ~self.suppress[x0]
         return delta * keep.unsqueeze(-1).to(delta.dtype)
 
 

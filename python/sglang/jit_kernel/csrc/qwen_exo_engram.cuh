@@ -64,6 +64,44 @@ __global__ void __launch_bounds__(kHeads* kRowBytes / kChunkBytes) engram_gather
   }
 }
 
+template <uint32_t kHeads, uint32_t kHeadDim>
+__global__ void __launch_bounds__(kHeads * kHeadDim / 8) engram_gather_sparse_kernel(
+    const __nv_bfloat16* __restrict__ data,
+    const int64_t* __restrict__ unique_rows,
+    const int64_t* __restrict__ rows,
+    __nv_bfloat16* __restrict__ out,
+    int64_t table_rows,
+    uint32_t num_tokens) {
+  constexpr uint32_t kThreadsPerRow = kHeadDim / 8;
+  __shared__ int64_t s_index[kHeads];
+  const uint32_t head = threadIdx.x / kThreadsPerRow;
+  const uint32_t chunk = threadIdx.x % kThreadsPerRow;
+  for (uint32_t token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+    if (threadIdx.x < kHeads) {
+      const int64_t row = rows[static_cast<int64_t>(token) * kHeads + threadIdx.x];
+      int64_t lo = 0;
+      int64_t hi = table_rows;
+      while (lo < hi) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        if (unique_rows[mid] < row) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      s_index[threadIdx.x] = lo < table_rows && unique_rows[lo] == row ? lo : -1;
+    }
+    __syncthreads();
+    const int64_t index = s_index[head];
+    const uint4 packed = index < 0
+                             ? make_uint4(0, 0, 0, 0)
+                             : *reinterpret_cast<const uint4*>(data + index * kHeadDim + chunk * 8);
+    *reinterpret_cast<uint4*>(out + (static_cast<int64_t>(token) * kHeads + head) * kHeadDim + chunk * 8) =
+        packed;
+    __syncthreads();
+  }
+}
+
 template <uint32_t kHeads, uint32_t kRowBytes>
 struct QwenExoEngramKernel {
   static_assert(kRowBytes % kChunkBytes == 0, "Engram row bytes must be a multiple of 16");
@@ -109,6 +147,41 @@ struct QwenExoEngramKernel {
         static_cast<const int64_t*>(rows.data_ptr()),
         static_cast<__nv_bfloat16*>(out.data_ptr()),
         num_tokens);
+  }
+
+  static void gather_sparse(
+      const tvm::ffi::TensorView data,
+      const tvm::ffi::TensorView unique_rows,
+      const tvm::ffi::TensorView rows,
+      const tvm::ffi::TensorView out) {
+    using namespace host;
+    auto R = SymbolicSize{"sparse table rows"};
+    auto M = SymbolicSize{"gathered rows"};
+    auto device = SymbolicDevice{};
+    TensorMatcher({R, static_cast<int64_t>(kRowBytes)})
+        .with_dtype<bf16_t>()
+        .with_device<kDLGPUHost, kDLCPU>()
+        .verify(data);
+    TensorMatcher({R}).with_dtype<int64_t>().with_device<kDLGPU>(device).verify(unique_rows);
+    TensorMatcher({M}).with_dtype<int64_t>().with_device<kDLGPU>(device).verify(rows);
+    TensorMatcher({M, static_cast<int64_t>(kRowBytes)})
+        .with_dtype<bf16_t>()
+        .with_device<kDLGPU>(device)
+        .verify(out);
+    const auto count = static_cast<uint64_t>(M.unwrap());
+    RuntimeCheck(count % kHeads == 0, "Engram sparse gather: rows must be a multiple of head count");
+    const auto tokens = static_cast<uint32_t>(count / kHeads);
+    if (tokens == 0) {
+      return;
+    }
+    LaunchKernel(std::min<uint32_t>(tokens, kMaxBlocks), kHeads * kRowBytes / 8, device.unwrap())(
+        engram_gather_sparse_kernel<kHeads, kRowBytes>,
+        static_cast<const __nv_bfloat16*>(data.data_ptr()),
+        static_cast<const int64_t*>(unique_rows.data_ptr()),
+        static_cast<const int64_t*>(rows.data_ptr()),
+        static_cast<__nv_bfloat16*>(out.data_ptr()),
+        R.unwrap(),
+        tokens);
   }
 };
 
