@@ -189,6 +189,10 @@ Responses 请求可设置 `qwen_exo_engram=false` 关闭全部 Engram，或仅�
 
 当前 Flash-Next 在线配置仍不设置 `QWEN_EXO_ENGRAM_PATH`，不会因合并代码自动启用 27B Engram reader。
 
+原生 Flash-Next 知识植入使用独立的稀疏 PLE 增量，不训练或复用 27B reader。`scripts/qwen_exo/prepare_native_ple_data.py` 的 `--inventory`／`--prepare`／`--check` 只使用 CPU：按新模型实际 tokenizer／模板渲染完整会话，再切成最多 32768-token 的因果监督窗口，保留真实前两 token 的 n-gram 历史。非 assistant 标签为 `-100`，零监督记录仅计入来源清单，不生成训练窗口；原始角色和工具历史不删减。旧 heldout 可以通过 `--prior-records` 冻结整个首任务分组；这种精确首提示分组不等于已验证的语义任务独立性。
+
+`qwen_exo_booster.native_ple_knowledge` 绑定模型配置、索引、原生表 manifest 和实际 reader 权重字节，提供零初始化稀疏增量、`off`／`real`／`shuffled` 查表与 artifact 往返。打乱只作用于同一 hash head 内的增量值，不改冻结基表。`scripts/qwen_exo/prepare_native_ple_job.py` 记录准备状态和训练硬门禁；不加载主模型、不发生成、不安装包、不自动训练。缺少精确 Qwen4Exp 可微后端或尚未验证 NVFP4 原生反向时，状态明确为 `blocked_native_training_backend`，不能拿推理成功或稀疏表自身的 CPU 梯度冒充全模型可微。PPL／NLL 只作辅助；验收还需相同 heldout 的任务成功、知识相关决策、工具有效性及知识关闭回归。数据、计划和产物必须放在公开源码目录之外。
+
 ### Qwen3.8-Flash-Next NVFP4：隔离单卡路径
 
 `Qwen4ExpForConditionalGeneration` 使用 GDN + QSA、四分支 Gated Residual 和原生 PLE，不能按旧 Qwen3.5 模型直接换目录。官方 NVIDIA checkpoint 是混合精度：主模型 routed experts 为 NVFP4，PLE 为 FP8，MTP experts 为 FP8 分块权重；运行量化名称是 `modelopt_mixed`。
@@ -246,6 +250,8 @@ js4090 的真实组合验收：固定空闲单请求、相同原生 prompt、温
 真实网关 SSE 中文问答在 `0.82s` 返回正确结果并以 `response.completed` 结束；三个并发请求的算术、排序、12648-token 上下文记号检查均通过。运行配置保持 `context_length=200000`，实分配 KV 容量 `250560`，`mem_fraction_static=0.93`、Mamba 槽 `64`，decode Graph 捕获 batch 1–5，超过捕获范围走 eager。会话摘要胶囊也已关闭，避免每轮回答后再生成 256-token 隐藏摘要；知识、PolicyData、反思和压缩继续关闭。
 
 Qwen4 长历史 FP8 K/V 可通过 `QWEN_EXO_HOST_KV_CACHE=1` 使用显存优先、pinned 主存溢出的混合布局。启动时从现有显存预算扣除完整逻辑跨度的 QSA 索引，再按页分配主模型＋MTP 共用的 GPU 槽位前缀；只为剩余槽位分配主存，不保留完整双份镜像。新分配和已释放的槽位优先复用显存；已有主存行不做后台 LRU 迁回。GPU 同时保留 QSA 索引、GDN／PLE 状态和选中工作集，CUDA kernel 根据逻辑槽位直接访问对应银行。预算足够时整个原始 KV 银行均可驻留显存。前缀预填充、目标验证和草稿 decode 保留原有语义及 Graph 路径；接受行搬运必须保留快照式并行赋值，避免跨层级或重叠搬运破坏历史。该路径限制 CUDA TP/EP/PP/DP=1、FP8 E4M3、NHD、原生 topk=1 MTP 和 FlashInfer TRTLLM 稀疏注意力；不与通用 HiCache、unified-memory、disaggregation 或 FP4 混用。
+
+Host KV 同时要求 `DCP=1`，未实现的解码上下文并行直接拒绝。原生 Bank 导出在 inverse RoPE 前恢复全局 FP8 K/V scale，还原时把 BF16 激活放到逻辑槽位所在 CUDA 设备后经池 API 写入；缩放各应用一次，不把 pinned CPU 缓冲误当执行设备。Bank 快照协议已升为 `qwen-exo-native-state-bank-v2`，旧版本需重建，不复用旧缩放语义的产物。该源码修复不代表在线服务已部署此版本。
 
 六路 200K profile 保持 `QWEN_EXO_MAX_RUNNING_REQUESTS=6`、`QWEN_EXO_MAX_TOTAL_TOKENS=1300032`、`QWEN_EXO_CUDA_GRAPH_MAX_BS=6`、上下文 `200000`、原生 MTP 和磁盘 PLE。当前在线启动预算自动得到 255616 个 GPU 有效槽位及 1044416 个主存溢出槽位，主模型＋MTP 原始 K/V 分别约 3.17GiB 显存、12.95GiB pinned 主存；dummy page 计入 GPU 字节，QSA 索引、GDN 和工作区另计。这是启动预算下的固定分段，不是每次请求按 `nvidia-smi` 空闲量搬运整个会话。
 

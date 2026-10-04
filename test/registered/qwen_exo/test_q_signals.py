@@ -401,7 +401,7 @@ class _BankRunner:
                         .repeat(count, 1, 1)
                     )
                     payload = {
-                        "schema": "qwen-exo-native-state-bank-v1",
+                        "schema": "qwen-exo-native-state-bank-v2",
                         "source_digest": export["source_digest"],
                         "page_id": export["page_id"],
                         "rank": rank,

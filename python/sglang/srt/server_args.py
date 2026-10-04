@@ -3723,8 +3723,8 @@ class ServerArgs:
     def _handle_host_kv_compatibility(self):
         if not self.qwen4_host_kv_cache:
             return
-        if self.device != "cuda" or (self.tp_size, self.ep_size, self.pp_size, self.dp_size) != (1, 1, 1, 1):
-            raise ValueError("Qwen4 host KV requires CUDA and TP/EP/PP/DP=1")
+        if self.device != "cuda" or (self.tp_size, self.ep_size, self.pp_size, self.dp_size, self.dcp_size) != (1, 1, 1, 1, 1):
+            raise ValueError("Qwen4 host KV requires CUDA and TP/EP/PP/DP/DCP=1")
         if self.kv_cache_dtype != "fp8_e4m3":
             raise ValueError("Qwen4 host KV requires --kv-cache-dtype=fp8_e4m3")
         if self.enable_unified_memory or self.enable_page_major_kv_layout or self.disaggregation_mode != "null":

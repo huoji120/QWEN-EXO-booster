@@ -664,7 +664,7 @@ class _BankBuildRunner:
                 key[:, 0, 1] = 1
             value = torch.zeros_like(key)
             payload = {
-                "schema": "qwen-exo-native-state-bank-v1",
+                "schema": "qwen-exo-native-state-bank-v2",
                 "source_digest": export["source_digest"],
                 "page_id": export["page_id"],
                 "rank": 0,
@@ -1362,7 +1362,7 @@ def test_load_page_key_heads_selects_the_configured_full_attention_layer(tmp_pat
         "7": torch.full((4, 1, 2), 7.0),
     }
     payload = {
-        "schema": "qwen-exo-native-state-bank-v1",
+        "schema": "qwen-exo-native-state-bank-v2",
         "source_digest": digest,
         "page_id": 0,
         "rank": 0,

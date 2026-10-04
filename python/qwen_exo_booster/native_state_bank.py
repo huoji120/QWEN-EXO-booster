@@ -13,7 +13,7 @@ from qwen_exo_booster.attention_signals import inverse_qwen35_rope
 from qwen_exo_booster.contracts import stable_digest
 from qwen_exo_booster.hybrid_state import qwen_exo_model_state_directory
 
-_SCHEMA = "qwen-exo-native-state-bank-v1"
+_SCHEMA = "qwen-exo-native-state-bank-v2"
 _SESSION_INITIAL_GDN_SCHEMA = "qwen-exo-session-initial-gdn-v1"
 _QWEN4_STATE_SCHEMA = "qwen-exo-qwen4-qsa-ple-v1"
 _SESSION_GDN_MAX_SOURCES = 2
@@ -1261,6 +1261,17 @@ class NativeStateBankManager:
                 )
             # Read through the pool so packed FP4 caches are dequantized.
             key, value = self.kv_pool.get_kv_tokens(layer_id, mapping, torch.bfloat16)
+            # Global FP8 accessors expose stored values without their descales.
+            # Export effective activations before inverse RoPE; restore applies
+            # the same layer scales once when quantizing into the live pool.
+            if self.kv_pool.get_key_buffer(layer_id).dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                attention = getattr(layer, "attn", None)
+                k_scale = getattr(attention, "k_scale", None)
+                v_scale = getattr(attention, "v_scale", None)
+                if k_scale is not None:
+                    key.mul_(k_scale)
+                if v_scale is not None:
+                    value.mul_(v_scale)
             raw_key = _inverse_rotary_key(
                 key, positions=source_positions, rotary=rotary
             )
@@ -1493,15 +1504,13 @@ class NativeStateBankManager:
             full_attention = payload["full_attention"]
             for layer_id in self.full_layer_ids:
                 layer_payload = full_attention[str(layer_id)]
-                key_buffer = self.kv_pool.get_key_buffer(layer_id)
-                value_buffer = self.kv_pool.get_value_buffer(layer_id)
                 # Native pages are stored independently from the live KV cache
                 # dtype. Restore BF16 activations through the pool API so FP8
                 # caches apply their quantization scale and use supported CUDA
                 # store kernels instead of torch.index_copy on Float8 tensors.
                 raw_key = _dequantize_fp8(
                     layer_payload["key"],
-                    device=key_buffer.device,
+                    device=kv_indices.device,
                     dtype=torch.bfloat16,
                     indices=selected,
                 )
@@ -1513,7 +1522,7 @@ class NativeStateBankManager:
                         tracker.register_memory_keys(memory_key, raw_key)
                 value = _dequantize_fp8(
                     layer_payload["value"],
-                    device=value_buffer.device,
+                    device=kv_indices.device,
                     dtype=torch.bfloat16,
                     indices=selected,
                 )
