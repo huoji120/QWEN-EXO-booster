@@ -106,6 +106,35 @@ _CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
 _MEMORY_ATTACHMENT_TOOL_CALL_ID = "qwen_exo_memory"
 
 
+def _log_response_shape(*, request_id, stream, status, items, finish_reason, usage):
+    """One structural line per response for diagnosing agent turns that end
+    without a tool call: item kinds, malformed calls and token counts only,
+    never generated text."""
+    kinds = [item.type for item in items]
+    calls = [item for item in items if item.type == "function_call"]
+    malformed_json = 0
+    for call in calls:
+        try:
+            json.loads(call.arguments or "")
+        except ValueError:
+            malformed_json += 1
+    logger.warning(
+        "QWEN_EXO_RESPONSE_SHAPE request_id=%s stream=%s status=%s items=%s "
+        "function_calls=%d nameless_calls=%d malformed_json_calls=%d "
+        "completion_tokens=%s reasoning_tokens=%s finish_reason=%s",
+        request_id,
+        stream,
+        status,
+        kinds,
+        len(calls),
+        sum(not call.name for call in calls),
+        malformed_json,
+        usage.completion_tokens if usage else None,
+        usage.reasoning_tokens if usage else None,
+        finish_reason,
+    )
+
+
 class _QwenExoSelfAskSpillRouter:
     """Keeps phase-two Self-Ask continuations in the reasoning channel."""
 
@@ -1360,6 +1389,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         response_status, incomplete_details = self._response_terminal_status(
             finish_reason
         )
+        if not self.use_harmony:
+            _log_response_shape(
+                request_id=request.request_id,
+                stream=False,
+                status=response_status,
+                items=output,
+                finish_reason=finish_reason,
+                usage=usage,
+            )
         response = ResponsesResponse.from_request(
             request,
             sampling_params,
@@ -3329,6 +3367,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         response_status, incomplete_details = self._response_terminal_status(
             finish_reason
         )
+        _log_response_shape(
+            request_id=request.request_id,
+            stream=True,
+            status=response_status,
+            items=final_output_items,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
         final_response = ResponsesResponse.from_request(
             request,
             sampling_params,
@@ -3891,6 +3937,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if hasattr(context, "num_processed_tokens"):
                     context.num_processed_tokens = 0
                 continuation_output_ids: list[int] = []
+                continuation_text_seen = ""
                 continuation_runtime_ids = 0
                 continuation_runtime_text = ""
                 continuation_runtime_signals = 0
@@ -3977,6 +4024,28 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         public_result["meta_info"] = public_meta
                     context.append_output(public_result)
+                    chunk_text = str(continuation_result.get("text") or "")
+                    continuation_text_seen = (
+                        continuation_text_seen + chunk_text
+                        if incremental_logprobs
+                        else chunk_text
+                    )
+                    if continuation_finish:
+                        # Structure only (marker counts, ids); never the text.
+                        logger.warning(
+                            "QWEN_EXO_CONTINUATION_RESULT request_id=%s "
+                            "generation_index=%d forced=%s output_id_count=%d "
+                            "tool_call_open=%d tool_call_close=%d "
+                            "output_id_tail=%s finish_reason=%s",
+                            request_id,
+                            generation_index,
+                            forced_reasoning_boundary,
+                            len(continuation_output_ids),
+                            continuation_text_seen.count("<tool_call>"),
+                            continuation_text_seen.count("</tool_call>"),
+                            continuation_output_ids[-16:],
+                            continuation_finish,
+                        )
                     yield context
                 context.num_prompt_tokens = phase_prompt_tokens or len(prompt_token_ids)
                 context.num_cached_tokens = phase_cached_tokens
