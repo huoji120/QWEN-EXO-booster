@@ -1500,6 +1500,12 @@ class ResponsesRequest(BaseModel):
     )
     session_id: Optional[str] = None
     priority: int = Field(default=0, description="Request priority")
+    qwen_exo_engram: Optional[bool] = Field(
+        default=None, description="Override the default Engram behavior for this request"
+    )
+    qwen_exo_engram_knowledge: Optional[bool] = Field(
+        default=None, description="Disable only the additional trained Engram table"
+    )
     extra_key: Optional[str] = Field(
         default=None,
         description="Extra key for classifying the request (e.g. cache_salt)",
@@ -1632,6 +1638,17 @@ class ResponsesRequest(BaseModel):
         for key, value in default_params.items():
             if key not in params or params[key] is None:
                 params[key] = value
+
+        if self.qwen_exo_engram is not None:
+            params["custom_params"] = {
+                **(params.get("custom_params") or {}),
+                "qwen_exo_engram": self.qwen_exo_engram,
+            }
+        if self.qwen_exo_engram_knowledge is not None:
+            params["custom_params"] = {
+                **(params.get("custom_params") or {}),
+                "qwen_exo_engram_knowledge": self.qwen_exo_engram_knowledge,
+            }
 
         has_existing_constraints = (
             params.get("regex")

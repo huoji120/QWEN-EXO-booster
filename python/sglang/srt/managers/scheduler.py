@@ -43,6 +43,7 @@ from qwen_exo_booster.contracts import (
     HybridStateNamespace,
     stable_digest,
 )
+from qwen_exo_booster.engram import engram_radix_extra_key
 from qwen_exo_booster.hybrid_state import (
     HybridRequestPhase,
     HybridRuntimePolicy,
@@ -2772,6 +2773,10 @@ class Scheduler(
                 req.extra_key = f"{req.extra_key}|{namespace_marker}"
         else:
             req.extra_key = namespace_marker
+        if self.server_args.qwen_exo_engram_path:
+            req.extra_key = engram_radix_extra_key(
+                req.extra_key, req.sampling_params.custom_params
+            )
         req.qwen_exo_hybrid_state = policy.new_request_state(
             request_id=req.rid,
             token_ids=req.origin_input_ids,

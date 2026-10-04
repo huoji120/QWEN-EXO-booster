@@ -423,6 +423,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     padding_policy=PaddingPolicy.ZERO,
                 )
             )
+        if self.model_runner.qwen_exo_engram is not None:
+            self.buffer_registry.register_slot(
+                GraphSlot(
+                    "qwen_exo_engram_mask",
+                    lambda bs, _mt: (bs, 2),
+                    torch.bool,
+                    axis="bs",
+                    padding_policy=PaddingPolicy.ZERO,
+                )
+            )
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -747,6 +757,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if registry.has_slot("qwen_exo_observe_mask")
             else None
         )
+        qwen_exo_engram_mask = (
+            _slot("qwen_exo_engram_mask")
+            if registry.has_slot("qwen_exo_engram_mask")
+            else None
+        )
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
@@ -846,6 +861,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_cpu=global_num_tokens_cpu,
             mrope_positions=mrope_positions,
             qwen_exo_observe_mask=qwen_exo_observe_mask,
+            qwen_exo_engram_mask=qwen_exo_engram_mask,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,

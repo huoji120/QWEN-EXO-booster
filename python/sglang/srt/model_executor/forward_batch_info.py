@@ -50,6 +50,7 @@ from qwen_exo_booster.activation_editor import (
     parse_activation_editor_spec,
     resolve_default_activation_editor_spec,
 )
+from qwen_exo_booster.engram import EngramExtendInputs
 from qwen_exo_booster.memory_span import parse_private_memory_span
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -713,6 +714,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     qwen_exo_latent_transplants: Optional[List[Optional[dict[str, object]]]] = None
     qwen_exo_activation_editors: Optional[List[Optional[dict[str, object]]]] = None
     qwen_exo_attention_diagnostics: Optional[List[Optional[dict[str, object]]]] = None
+    # Engram: per-request on/off (a decode-graph slot) and EXTEND token triples.
+    qwen_exo_engram_mask: Optional[torch.Tensor] = None
+    qwen_exo_engram_extend: Optional[EngramExtendInputs] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -1070,6 +1074,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if ret.qwen_exo_observe is not None:
             ret.qwen_exo_observe_mask = torch.tensor(
                 ret.qwen_exo_observe, dtype=torch.bool, device=device
+            )
+        if model_runner.qwen_exo_engram is not None:
+            ret.qwen_exo_engram_mask, ret.qwen_exo_engram_extend = (
+                model_runner.qwen_exo_engram.forward_inputs(
+                    reqs=batch.reqs,
+                    forward_mode=batch.forward_mode,
+                    prefix_lens=extend_prefix_lens,
+                    extend_lens=extend_seq_lens,
+                    device=device,
+                )
             )
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():

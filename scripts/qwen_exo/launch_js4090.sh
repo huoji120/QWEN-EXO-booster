@@ -30,6 +30,7 @@ fi
 : "${QWEN_EXO_KV_CACHE_DTYPE:=fp8_e4m3}"
 : "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:=0}"
 : "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY:=0}"
+: "${QWEN_EXO_ENGRAM_PATH:=}"
 : "${QWEN_EXO_SPECULATIVE_ALGORITHM:=}"
 : "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_PATH:=}"
 : "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_REVISION:=main}"
@@ -443,6 +444,15 @@ if [[ "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING}" == "1" ]]; then
 fi
 if [[ "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY}" == "1" ]]; then
   server_args+=( --qwen-exo-experimental-context-integrity )
+fi
+# Engram's 52 GB table is pinned from host files the manifest points at, so it
+# runs natively only.
+if [[ -n "${QWEN_EXO_ENGRAM_PATH}" ]]; then
+  if [[ "${native_mode}" != "1" ]]; then
+    echo "QWEN_EXO_ENGRAM_PATH requires QWEN_EXO_NATIVE=1." >&2
+    exit 1
+  fi
+  server_args+=( --qwen-exo-engram-path "${QWEN_EXO_ENGRAM_PATH}" )
 fi
 if [[ -n "${QWEN_EXO_QUANTIZATION}" ]]; then
   server_args+=( --quantization "${QWEN_EXO_QUANTIZATION}" )
