@@ -10,6 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -96,6 +98,7 @@ def _make_model_runner(
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
+    mc.hf_text_config = mc.hf_config
     mc.linear_attn_registry_result = None
     mr.model_config = mc
 
@@ -119,6 +122,7 @@ def _make_model_runner(
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
+    sa.qwen4_host_kv_cache = False
     mr.server_args = sa
 
     spec = MagicMock()
@@ -214,6 +218,153 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+
+class TestHostQwenKVConfigurator(unittest.TestCase):
+    PAGE_SIZE = 64
+    LOGICAL_TOKENS = 1300032
+    RAW_BYTES = 13 * 2 * (256 + 256)
+    QSA_BYTES = 13 * 128 * 2 // 4
+
+    def _from_budget(self, budget, *, tokens=None, cap_tokens=None, draft=True, host=True):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        mr = _make_model_runner(
+            num_layers=12, num_kv_heads=2, head_dim=256, v_head_dim=256,
+            page_size=self.PAGE_SIZE,
+        )
+        mr.server_args.qwen4_host_kv_cache = host
+        mr.server_args.max_total_tokens = tokens or self.LOGICAL_TOKENS
+        mr.server_args.pp_size = 1
+        mr.model_config.hf_text_config = SimpleNamespace(
+            model_type="qwen4_exp_text", indexer_n_heads=4, indexer_kv_heads=1,
+            indexer_head_dim=128, indexer_budget=2048, indexer_compress_ratio=4,
+        )
+        mr.spec_algorithm.is_eagle.return_value = draft
+        mr.spec_algorithm.is_none.return_value = not draft
+        mr.spec_aux_config.eagle_draft_num_layers = 1 if draft else None
+        mr._apply_token_constraints = lambda n: (
+            KVCacheConfigurator._apply_token_constraints(mr, n)
+        )
+        with mock_cpu_env(kv_size=1):
+            return KVCacheConfigurator.config_from_budget(
+                mr, budget, cap_tokens=cap_tokens
+            )
+
+    def _budget(self, tokens, gpu_tokens, *, draft=True):
+        layers = 13 if draft else 12
+        metadata = (tokens + self.PAGE_SIZE) * layers * 64
+        raw = (gpu_tokens + self.PAGE_SIZE) * layers * 1024 if gpu_tokens else 0
+        return metadata + raw
+
+    def test_six_full_contexts_fit_with_metadata_only_budget(self):
+        budget = self._budget(self.LOGICAL_TOKENS, 0)
+        result = self._from_budget(budget)
+        self.assertEqual(result.max_total_num_tokens, self.LOGICAL_TOKENS)
+        self.assertEqual(result.qwen4_gpu_kv_tokens, 0)
+        self.assertGreaterEqual(result.max_total_num_tokens, 6 * (200000 + 4096))
+        resident = self._from_budget(budget, host=False)
+        self.assertLess(resident.max_total_num_tokens, 200000)
+
+    def test_gpu_dummy_page_and_first_valid_page_boundary(self):
+        tokens = 4096
+        metadata = self._budget(tokens, 0)
+        raw_page = self.PAGE_SIZE * self.RAW_BYTES
+        for raw_budget, expected in (
+            (0, 0),
+            (raw_page, 0),
+            (2 * raw_page - 1, 0),
+            (2 * raw_page, self.PAGE_SIZE),
+            (3 * raw_page - 1, self.PAGE_SIZE),
+            (3 * raw_page, 2 * self.PAGE_SIZE),
+        ):
+            with self.subTest(raw_budget=raw_budget):
+                result = self._from_budget(metadata + raw_budget, tokens=tokens)
+                self.assertEqual(result.max_total_num_tokens, tokens)
+                self.assertEqual(result.qwen4_gpu_kv_tokens, expected)
+
+    def test_mixed_prefix_charges_target_and_mtp_once(self):
+        gpu_tokens = 4096
+        budget = self._budget(self.LOGICAL_TOKENS, gpu_tokens)
+        result = self._from_budget(budget)
+        self.assertEqual(result.max_total_num_tokens, self.LOGICAL_TOKENS)
+        self.assertEqual(result.qwen4_gpu_kv_tokens, gpu_tokens)
+        used = (
+            (result.max_total_num_tokens + self.PAGE_SIZE) * self.QSA_BYTES
+            + (result.qwen4_gpu_kv_tokens + self.PAGE_SIZE) * self.RAW_BYTES
+        )
+        self.assertEqual(used, budget)
+
+    def test_all_gpu_boundary_and_surplus_budget(self):
+        tokens = 4096
+        full_budget = self._budget(tokens, tokens)
+        for budget, expected in (
+            (full_budget - 1, tokens - self.PAGE_SIZE),
+            (full_budget, tokens),
+            (full_budget + 10000000, tokens),
+        ):
+            with self.subTest(budget=budget):
+                result = self._from_budget(budget, tokens=tokens)
+                self.assertEqual(result.max_total_num_tokens, tokens)
+                self.assertEqual(result.qwen4_gpu_kv_tokens, expected)
+
+    def test_target_only_and_native_mtp_use_their_exact_shared_budget(self):
+        for draft in (False, True):
+            with self.subTest(draft=draft):
+                result = self._from_budget(
+                    self._budget(8192, 512, draft=draft), tokens=8192, draft=draft
+                )
+                self.assertEqual(result.max_total_num_tokens, 8192)
+                self.assertEqual(result.qwen4_gpu_kv_tokens, 512)
+
+    def test_constraint_reuses_original_budget_after_page_alignment(self):
+        budget = self._budget(8192, 128)
+        initial = self._from_budget(budget, tokens=8192)
+        self.assertEqual(initial.qwen4_gpu_kv_tokens, 128)
+        constrained = self._from_budget(budget, tokens=8192, cap_tokens=4097)
+        self.assertEqual(constrained.max_total_num_tokens, 4096)
+        # Releasing 4096 QSA slots buys four more raw pages (832 / 13312).
+        self.assertEqual(constrained.qwen4_gpu_kv_tokens, 384)
+        self.assertEqual(self._budget(4096, 384), budget)
+
+    def test_metadata_budget_includes_logical_dummy_page(self):
+        budget = self._budget(4096, 0) - 1
+        result = self._from_budget(budget, tokens=4096)
+        self.assertEqual(result.max_total_num_tokens, 4096 - self.PAGE_SIZE)
+        self.assertEqual(result.qwen4_gpu_kv_tokens, 0)
+
+
+class TestMixedQwenKVAllocator(unittest.TestCase):
+    def _allocator(self):
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        return PagedTokenToKVPoolAllocator(
+            size=384, page_size=64, dtype=torch.float8_e4m3fn,
+            device="cpu", kvcache=None, need_sort=False, gpu_size=128,
+        )
+
+    def test_freed_gpu_page_precedes_remaining_host_pages(self):
+        allocator = self._allocator()
+        allocated = allocator.alloc(192)
+        self.assertEqual(allocated.tolist(), list(range(64, 256)))
+        allocator.free(allocated[:64])
+        self.assertEqual(
+            allocator.alloc(128).tolist(),
+            list(range(64, 128)) + list(range(256, 320)),
+        )
+
+    def test_grouped_free_and_branch_state_keep_gpu_first(self):
+        allocator = self._allocator()
+        allocated = allocator.alloc(256)
+        allocator.free_group_begin()
+        allocator.free(allocated[192:])
+        allocator.free(allocated[64:128])
+        allocator.free_group_end()
+        branch_state = allocator.backup_state()
+        expected = list(range(128, 192)) + list(range(256, 320))
+        self.assertEqual(allocator.alloc(128).tolist(), expected)
+        allocator.restore_state(branch_state)
+        self.assertEqual(allocator.alloc(128).tolist(), expected)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

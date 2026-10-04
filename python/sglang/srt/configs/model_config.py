@@ -636,6 +636,24 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
+        ):
+            # The target's ModelConfig shares this hf_config object; deep-copy
+            # before the MTP rewrites below so the target keeps its full depth.
+            self.hf_config = copy.deepcopy(self.hf_config)
+            self.hf_text_config = get_hf_text_config(self.hf_config)
+            self.hf_config.architectures[0] = "Qwen4ExpForCausalLMMTP"
+            text_config = self.hf_text_config
+            text_config.num_nextn_predict_layers = 1
+            # Collapse to a single full_attention layer so the draft's
+            # full_attention_layer_ids is [0]. Qwen4ExpTextConfig.layers_block_type
+            # bypasses num_hidden_layers when layer_types is set.
+            text_config.num_hidden_layers = 1
+            text_config.layer_types = ["full_attention"]
+            text_config.full_attention_interval = 1
+
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3MoeForCausalLM":
             self.hf_config.architectures[0] = "Qwen3MoeForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
@@ -965,12 +983,14 @@ class ModelConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
-        hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
+        hc_mult = getattr(
+            self.hf_text_config, "hc_mult", getattr(self.hf_text_config, "hc_count", 1)
+        )
         self.spec_hidden_size = (
             self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
         )
-        # mHC-flattened hidden size; None when not running an mHC model
-        # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
+        # Flattened hyper-connection stream: DeepSeek mHC uses hc_mult,
+        # while Qwen4 GR uses hc_count. Ordinary models keep no HC buffer.
         self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
@@ -1733,6 +1753,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
@@ -1786,6 +1807,8 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    # Qwen4-Exp is intentionally absent: QSA builds host-side sparse metadata
+    # per forward and cannot serve the breakable prefill capture.
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():

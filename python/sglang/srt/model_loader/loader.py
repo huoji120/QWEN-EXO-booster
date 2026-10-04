@@ -134,6 +134,11 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    if getattr(module, "qwen_exo_moe_cpu_offload", False):
+        # The packed expert bank stays on the host; its bounded working layer
+        # performs post-load transforms only when those experts are staged.
+        yield module
+        return
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module

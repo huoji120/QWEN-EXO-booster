@@ -2057,9 +2057,7 @@ def test_post_tool_recall_hard_budget_wins_over_cooldown(tmp_path):
     ]
 
 
-def test_response_conversation_keys_use_prompt_cache_then_crc_fallback(
-    tmp_path, monkeypatch
-):
+def test_response_conversation_keys_use_prompt_cache_then_discriminated_fallback(tmp_path):
     value = runtime(tmp_path)
     shared_input = [
         {"role": "system", "content": "system\r\nrules"},
@@ -2088,9 +2086,16 @@ def test_response_conversation_keys_use_prompt_cache_then_crc_fallback(
     assert resolve(prompt_a) != resolve(prompt_b)
 
     crc_a = replace(prompt_a, request_id="resp-crc-a", prompt_cache_key=None)
-    crc_b = replace(crc_a, request_id="resp-crc-b")
+    crc_b = replace(
+        crc_a,
+        request_id="resp-crc-b",
+        input=[
+            *shared_input,
+            {"role": "assistant", "content": "Inspected the parser."},
+            {"role": "user", "content": "Continue with the repair."},
+        ],
+    )
     assert resolve(crc_a) == resolve(crc_b)
-    assert resolve(crc_a).startswith("responses-crc32:")
 
     role_changed = replace(
         crc_a,
@@ -2102,18 +2107,124 @@ def test_response_conversation_keys_use_prompt_cache_then_crc_fallback(
     )
     assert resolve(crc_a) != resolve(role_changed)
 
-    monkeypatch.setattr("qwen_exo_booster.runtime.zlib.crc32", lambda _payload: 7)
-    collision_a = replace(crc_a, request_id="resp-collision-a")
-    collision_b = replace(
+    same_label_a = replace(
         crc_a,
-        request_id="resp-collision-b",
-        input=[{"role": "user", "content": "a different task"}],
+        request_id="resp-common-first-line-a",
+        input=[{"role": "user", "content": "Inspect the task\nRepair parser A"}],
     )
-    key_a = resolve(collision_a)
-    key_b = resolve(collision_b)
-    assert key_a.startswith("responses-crc32:00000007:")
-    assert key_b.startswith("responses-crc32:00000007:")
+    same_label_b = replace(
+        same_label_a,
+        request_id="resp-common-first-line-b",
+        input=[{"role": "user", "content": "Inspect the task\nRepair parser B"}],
+    )
+    identity_a = value._canonical_response_identity(same_label_a)
+    identity_b = value._canonical_response_identity(same_label_b)
+    assert identity_a.first_lines_digest == identity_b.first_lines_digest
+    assert identity_a.payload_digest != identity_b.payload_digest
+    key_a = resolve(same_label_a)
+    key_b = resolve(same_label_b)
     assert key_a != key_b
+
+
+def test_first_lines_and_full_head_normalize_crlf_only(tmp_path):
+    value = runtime(tmp_path)
+    crlf = FakeRequest(
+        request_id="resp-crlf",
+        instructions="Rules\r\nPreserve boundaries",
+        input=[{"role": "user", "content": "Task\r\nRepair the parser"}],
+    )
+    lf = replace(
+        crlf,
+        request_id="resp-lf",
+        instructions="Rules\nPreserve boundaries",
+        input=[{"role": "user", "content": "Task\nRepair the parser"}],
+    )
+    crlf_identity = value._canonical_response_identity(crlf)
+    lf_identity = value._canonical_response_identity(lf)
+    assert crlf_identity.first_lines_digest == lf_identity.first_lines_digest
+    assert crlf_identity.payload_digest == lf_identity.payload_digest
+    assert crlf_identity.conversation_key == lf_identity.conversation_key
+    changed_rules = value._canonical_response_identity(
+        replace(lf, instructions="Rules\nDo not repair the parser")
+    )
+    assert changed_rules.first_lines_digest == lf_identity.first_lines_digest
+    assert changed_rules.conversation_key != lf_identity.conversation_key
+
+
+@pytest.mark.asyncio
+async def test_response_cache_scope_keeps_explicit_continuity_and_model_isolation(tmp_path):
+    value = runtime(tmp_path)
+    value.model_identity = SimpleNamespace(fingerprint="model-a")
+    first = FakeRequest(
+        request_id="resp-cache-first",
+        prompt_cache_key="client-conversation-a",
+        input=[{"role": "user", "content": "Repair the parser"}],
+    )
+    await value.prepare_responses_request(first)
+    first_namespace = value.response_cache_namespace(first.request_id)
+    continued = replace(
+        first,
+        request_id="resp-cache-continued",
+        input=[
+            *first.input,
+            {"role": "assistant", "content": "I found the boundary error."},
+            {"role": "user", "content": "Apply the fix."},
+        ],
+    )
+    await value.prepare_responses_request(continued)
+    assert value.response_cache_namespace(continued.request_id) == first_namespace
+    isolated = replace(
+        continued,
+        request_id="resp-cache-isolated",
+        prompt_cache_key="client-conversation-b",
+    )
+    await value.prepare_responses_request(isolated)
+    assert value.response_cache_namespace(isolated.request_id) != first_namespace
+    lineage = replace(
+        continued,
+        request_id="resp-cache-lineage",
+        previous_response_id=first.request_id,
+        prompt_cache_key="different-client-key",
+    )
+    await value.prepare_responses_request(lineage)
+    assert value.response_cache_namespace(lineage.request_id) == first_namespace
+    value.model_identity = SimpleNamespace(fingerprint="model-b")
+    assert value.response_cache_namespace(first.request_id) != first_namespace
+    value.model_identity = None
+    assert value.response_cache_namespace(first.request_id) != value.response_cache_namespace(
+        continued.request_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_parallel_same_conversation_keeps_request_local_mutable_state(tmp_path):
+    value = runtime(tmp_path)
+    first = FakeRequest(
+        request_id="resp-parallel-a",
+        prompt_cache_key="shared-conversation",
+        input=[{"role": "user", "content": "Repair the parser"}],
+    )
+    second = replace(first, request_id="resp-parallel-b")
+    await asyncio.gather(
+        value.prepare_responses_request(first),
+        value.prepare_responses_request(second),
+    )
+    assert value._request_conversation_keys[first.request_id] == value._request_conversation_keys[
+        second.request_id
+    ]
+    assert value._active_foreground_requests() == 2
+    value.record_tool_event(first.request_id, "branch A found an overflow")
+    value.record_tool_event(second.request_id, "branch B found a null pointer")
+    value.record_tool_event(first.request_id, "branch A repaired its overflow")
+    assert value._request_tool_observations[first.request_id] == [
+        "branch A found an overflow",
+        "branch A repaired its overflow",
+    ]
+    assert value._request_tool_observations[second.request_id] == [
+        "branch B found a null pointer"
+    ]
+    assert first.request_id not in value._parent_response_ids
+    assert second.request_id not in value._parent_response_ids
 
 
 def test_learned_call_alias_points_to_prompt_cache_conversation(tmp_path):
@@ -2172,6 +2283,31 @@ def test_learned_call_alias_points_to_prompt_cache_conversation(tmp_path):
         )
         != seed_key
     )
+    conflicting = replace(
+        seed, request_id="resp-conflicting-seed", prompt_cache_key="another-session"
+    )
+    conflicting_key = value._response_conversation_key(
+        request_id=conflicting.request_id,
+        previous_response_id=None,
+        request=conflicting,
+        canonical_identity=value._canonical_response_identity(conflicting),
+        call_ids=("call-known",),
+    )
+    ambiguous = replace(fallback, request_id="resp-ambiguous")
+    ambiguous_key = value._response_conversation_key(
+        request_id=ambiguous.request_id,
+        previous_response_id=None,
+        request=ambiguous,
+        call_ids=("call-known",),
+    )
+    assert ambiguous_key not in {seed_key, conflicting_key}
+    ambiguous_next = replace(ambiguous, request_id="resp-ambiguous-next")
+    assert value._response_conversation_key(
+        request_id=ambiguous_next.request_id,
+        previous_response_id=None,
+        request=ambiguous_next,
+        call_ids=("call-known",),
+    ) != ambiguous_key
 
 
 @pytest.mark.asyncio

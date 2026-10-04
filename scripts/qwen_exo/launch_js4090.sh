@@ -40,6 +40,8 @@ fi
 # whose FlashInfer prefill path would dequantize every context per step).
 : "${QWEN_EXO_SPECULATIVE_ATTENTION_MODE:=}"
 : "${QWEN_EXO_SPECULATIVE_DRAFT_WINDOW_SIZE:=}"
+: "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_QUANTIZATION:=}"
+: "${QWEN_EXO_SPECULATIVE_MOE_RUNNER_BACKEND:=}"
 # Experimental only: keep relaxed acceptance disabled unless explicitly benchmarked.
 : "${QWEN_EXO_DFLASH_THINK_ACCEPT_MODE:=off}"
 : "${QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY:=0.60}"
@@ -54,10 +56,24 @@ fi
 : "${QWEN_EXO_LOGPROB_CHUNK_SIZE:=512}"
 : "${QWEN_EXO_MEM_FRACTION_STATIC:=0.80}"
 : "${QWEN_EXO_MAX_RUNNING_REQUESTS:=10}"
+: "${QWEN_EXO_MAX_TOTAL_TOKENS:=}"
 : "${QWEN_EXO_CPU_OFFLOAD_GB:=0}"
+# Optional isolated Qwen4 native PLE and expert paging. These never change
+# num_experts_per_tok: all checkpoint-selected experts still execute.
+: "${QWEN_EXO_NATIVE_PLE_DISK_PATH:=}"
+: "${QWEN_EXO_NATIVE_PLE_BACKEND:=pread}"
+: "${QWEN_EXO_HOST_KV_CACHE:=0}"
+: "${QWEN_EXO_CPU_EXPERT_PAGING:=0}"
+: "${QWEN_EXO_MOE_RUNNER_BACKEND:=}"
 : "${QWEN_EXO_CUDA_GRAPH_MAX_BS:=5}"
 : "${QWEN_EXO_CUDA_GRAPH_BACKEND_DECODE:=full}"
 : "${QWEN_EXO_CUDA_GRAPH_BACKEND_PREFILL:=disabled}"
+if [[ "${QWEN_EXO_CPU_EXPERT_PAGING}" == "1" ]]; then
+  # CPU expert transfers remain eager-only. Disk PLE is staged before full
+  # decode graph replay and therefore does not require disabling that graph.
+  QWEN_EXO_CUDA_GRAPH_BACKEND_DECODE=disabled
+  QWEN_EXO_CUDA_GRAPH_BACKEND_PREFILL=disabled
+fi
 : "${QWEN_EXO_PORT:=30000}"
 : "${QWEN_EXO_MAX_INTERNAL_FANOUT:=32}"
 : "${QWEN_EXO_MAX_INTERNAL_TOKENS:=12288}"
@@ -147,6 +163,26 @@ case "${QWEN_EXO_ENABLED}" in
     exit 1
     ;;
 esac
+case "${QWEN_EXO_CPU_EXPERT_PAGING}" in
+  0|1) ;;
+  *)
+    echo "Invalid QWEN_EXO_CPU_EXPERT_PAGING; expected 0 or 1." >&2
+    exit 1
+    ;;
+esac
+if [[ -n "${QWEN_EXO_NATIVE_PLE_DISK_PATH}" ]]; then
+  if [[ ! -d "${QWEN_EXO_NATIVE_PLE_DISK_PATH}" ]]; then
+    echo "Native PLE checkpoint directory not found: ${QWEN_EXO_NATIVE_PLE_DISK_PATH}" >&2
+    exit 1
+  fi
+  case "${QWEN_EXO_NATIVE_PLE_BACKEND}" in
+    pread|mmap) ;;
+    *)
+      echo "Native PLE backend must be pread or mmap." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 if [[ -z "${QWEN_EXO_MODEL_PATH:-}" ]]; then
   echo "QWEN_EXO_MODEL_PATH is required; set it to a local checkpoint directory." >&2
@@ -236,15 +272,24 @@ if [[ ! -f "${QWEN_EXO_SOURCE_PATH}/python/sglang/srt/server_args.py" ]]; then
   exit 1
 fi
 
-if [[ "${QWEN_EXO_ENABLED}" == "1" ]] && ! "${QWEN_EXO_PYTHON:-python3}" \
-  "${QWEN_EXO_SOURCE_PATH}/python/qwen_exo_booster/fingerprint.py" \
-  "${QWEN_EXO_MODEL_PATH}"; then
-  echo "QWEN-EXO startup aborted before Docker launch." >&2
-  printf '%s\n' \
-    "Directory names and marketing labels are never trusted." \
-    "Set QWEN_EXO_MODEL_PATH to a Qwen-series checkpoint with one of the exact" \
-    "verified Dense 27B, MoE 35B-A3B, or MoE 122B-A10B Qwen3_5* runtime structures." >&2
-  exit 2
+if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
+  if ! model_variant="$("${QWEN_EXO_PYTHON:-python3}" \
+    "${QWEN_EXO_SOURCE_PATH}/python/qwen_exo_booster/fingerprint.py" \
+    --print-variant "${QWEN_EXO_MODEL_PATH}")"; then
+    echo "QWEN-EXO startup aborted before GPU admission." >&2
+    exit 2
+  fi
+  echo "QWEN-EXO model accepted: ${model_variant} (${QWEN_EXO_MODEL_PATH})"
+  if [[ "${model_variant}" == "qwen4-exp-flash-next" ]]; then
+    if [[ -n "${QWEN_EXO_ENGRAM_PATH:-}" ]]; then
+      echo "Qwen4 GR is incompatible with the old external Engram reader; unset QWEN_EXO_ENGRAM_PATH." >&2
+      exit 2
+    fi
+    if [[ "${QWEN_EXO_SCORE_BIAS_MODE}" != "off" ]]; then
+      echo "Qwen4 QSA does not implement dense Score Bias; set QWEN_EXO_SCORE_BIAS_MODE=off." >&2
+      exit 2
+    fi
+  fi
 fi
 
 active_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits | sed '/^$/d' | sort -u)"
@@ -359,6 +404,9 @@ docker_args=(
   -v "${QWEN_EXO_PRE_COMPLETE_PATH}:/data/qwen-exo-pre-complete"
   -v "${QWEN_EXO_SOURCE_PATH}/python:/sgl-workspace/sglang/python:ro"
 )
+if [[ -n "${QWEN_EXO_NATIVE_PLE_DISK_PATH}" ]]; then
+  docker_args+=( -v "${QWEN_EXO_NATIVE_PLE_DISK_PATH}:/models/native-ple:ro" )
+fi
 for environment in "${runtime_env[@]}"; do
   docker_args+=( -e "${environment}" )
 done
@@ -399,6 +447,33 @@ server_args=(
   --host 127.0.0.1
   --port "${QWEN_EXO_PORT}"
 )
+if [[ -n "${QWEN_EXO_NATIVE_PLE_DISK_PATH}" ]]; then
+  if [[ "${native_mode}" == "1" ]]; then
+    runtime_ple_disk_path="${QWEN_EXO_NATIVE_PLE_DISK_PATH}"
+  else
+    runtime_ple_disk_path=/models/native-ple
+  fi
+  server_args+=(
+    --qwen4-ple-disk-path "${runtime_ple_disk_path}"
+    --qwen4-ple-backend "${QWEN_EXO_NATIVE_PLE_BACKEND}"
+  )
+fi
+if [[ "${QWEN_EXO_CPU_EXPERT_PAGING}" == "1" ]]; then
+  server_args+=(
+    --qwen-exo-moe-cpu-offload
+    --moe-runner-backend flashinfer_cutlass
+    --disable-shared-experts-fusion
+  )
+fi
+if [[ "${QWEN_EXO_CPU_EXPERT_PAGING}" != "1" && -n "${QWEN_EXO_MOE_RUNNER_BACKEND}" ]]; then
+  server_args+=( --moe-runner-backend "${QWEN_EXO_MOE_RUNNER_BACKEND}" --disable-shared-experts-fusion )
+fi
+if [[ "${QWEN_EXO_HOST_KV_CACHE}" == "1" ]]; then
+  server_args+=( --qwen4-host-kv-cache )
+fi
+if [[ -n "${QWEN_EXO_MAX_TOTAL_TOKENS}" ]]; then
+  server_args+=( --max-total-tokens "${QWEN_EXO_MAX_TOTAL_TOKENS}" )
+fi
 if [[ -n "${QWEN_EXO_CHUNKED_PREFILL_SIZE}" ]]; then
   server_args+=( --chunked-prefill-size "${QWEN_EXO_CHUNKED_PREFILL_SIZE}" )
 fi
@@ -436,6 +511,12 @@ if [[ -n "${QWEN_EXO_SPECULATIVE_ALGORITHM}" ]]; then
   fi
   if [[ -n "${QWEN_EXO_SPECULATIVE_DRAFT_WINDOW_SIZE}" ]]; then
     server_args+=( --speculative-draft-window-size "${QWEN_EXO_SPECULATIVE_DRAFT_WINDOW_SIZE}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_QUANTIZATION}" ]]; then
+    server_args+=( --speculative-draft-model-quantization "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_QUANTIZATION}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_MOE_RUNNER_BACKEND}" ]]; then
+    server_args+=( --speculative-moe-runner-backend "${QWEN_EXO_SPECULATIVE_MOE_RUNNER_BACKEND}" )
   fi
 fi
 if [[ "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING}" == "1" ]]; then

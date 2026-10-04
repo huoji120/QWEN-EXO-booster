@@ -2113,6 +2113,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
+        if moe_runner_backend.is_flashinfer_cutlass() or moe_runner_backend.is_flashinfer_cutedsl():
+            # Mixed checkpoints use NVFP4 routed experts but FP8 block-scale
+            # MTP experts. The NVFP4-only runner cannot execute that MTP layer.
+            moe_runner_backend = MoeRunnerBackend.TRITON
+
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()

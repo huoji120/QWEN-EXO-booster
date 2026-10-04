@@ -146,7 +146,8 @@ def can_fuse_shared_expert(
     Caller must still gate on the model/backend support flag.
     """
     if (
-        get_server_args().disable_shared_experts_fusion is True
+        getattr(get_server_args(), "qwen_exo_moe_cpu_offload", False)
+        or get_server_args().disable_shared_experts_fusion is True
         or getattr(config, "shared_expert_intermediate_size", 0) <= 0
         or config.shared_expert_intermediate_size != config.moe_intermediate_size
         or get_moe_a2a_backend().is_deepep()
@@ -233,6 +234,69 @@ def _resolve_qwen_exo_moe_top_k(config: PretrainedConfig) -> int:
     return override
 
 
+class RouterPagedFusedMoE(FusedMoE):
+    """Native MoE dispatch with a pageable NVFP4 host expert bank."""
+
+    def __init__(self, *args, **kwargs):
+        from qwen_exo_booster.expert_paging import NVFP4ExpertBank
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        server_args = get_server_args()
+        parallel = get_parallel()
+        if (
+            parallel.tp_size != 1
+            or parallel.moe_ep_size != 1
+            or parallel.moe_tp_size != 1
+            or not get_moe_a2a_backend().is_none()
+        ):
+            raise ValueError("Router expert paging requires TP=EP=1 and no MoE all-to-all")
+        if server_args.moe_runner_backend not in (
+            "flashinfer_cutlass", "flashinfer_trtllm_routed"
+        ):
+            raise ValueError("Router expert paging requires a native StandardTopK MoE backend")
+        if (
+            server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+            or server_args.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError("Router expert paging requires both CUDA graph modes disabled")
+        if kwargs.get("num_fused_shared_experts", 0):
+            raise ValueError("Router expert paging requires separate shared experts")
+        quant_config = kwargs.get("quant_config")
+        resolver = getattr(quant_config, "resolve_quant_algo", None)
+        if resolver is not None:
+            is_nvfp4 = resolver(kwargs.get("prefix", "")) == "NVFP4"
+        else:
+            is_nvfp4 = (
+                getattr(quant_config, "is_checkpoint_nvfp4_serialized", False)
+                and not getattr(quant_config, "is_nvfp4_online", False)
+            )
+        if not is_nvfp4:
+            raise ValueError("Router expert paging requires serialized ModelOpt NVFP4 experts")
+        # ModelOpt sees this before create_weights; no full CUDA expert tensor
+        # is ever allocated and subsequently 'offloaded'.
+        self.qwen_exo_moe_cpu_offload = True
+        super().__init__(*args, **kwargs)
+        self.supports_deferred_finalize = False
+        self.expert_bank = NVFP4ExpertBank(self)
+
+    def forward(self, hidden_states, topk_output):
+        return self.expert_bank.forward(hidden_states, topk_output)
+
+    def _apply(self, fn, recurse=True):
+        # A generic model.to(cuda) must not migrate the expert bank. This
+        # applies only to this expert module; router/shared MLPs are siblings.
+        host_parameters = {
+            name: param for name, param in self._parameters.items()
+            if param is not None and param.device.type == "cpu"
+        }
+        for name in host_parameters:
+            del self._parameters[name]
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            self._parameters.update(host_parameters)
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -288,7 +352,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         )
-        self.experts = get_moe_impl_class(quant_config)(
+        # The mixed checkpoint's MTP experts remain in their native FP8 path.
+        # Only primary NVFP4 routed layers use the router-selected host bank.
+        experts_class = (
+            RouterPagedFusedMoE
+            if getattr(get_server_args(), "qwen_exo_moe_cpu_offload", False)
+            and not is_nextn
+            else get_moe_impl_class(quant_config)
+        )
+        self.experts = experts_class(
             layer_id=self.layer_id,
             top_k=(
                 routed_top_k

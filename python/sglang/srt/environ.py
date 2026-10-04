@@ -226,6 +226,23 @@ class Envs:
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
+    # instead of gathering DP tokens for a global-TP lookup.
+    SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
+    # and phases fall back to the original implementation.
+    SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Native GR kernels remain guarded by device capability and shape.
+    SGLANG_HC_MIX_CUDA = EnvBool(True)
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
+    SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
+    SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
+    # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
+    # path is ported, so setting this fails loudly instead of degrading.
+    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
+    # Native PLE table paging via POSIX pread or portable mmap.
+    SGLANG_QWEN4_PLE_NVME_PATH = EnvStr("")
+    SGLANG_QWEN4_PLE_NVME_BACKEND = EnvStr("pread")
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 

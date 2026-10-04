@@ -120,8 +120,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        gpu_size: int = 0,
     ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        self._prefer_gpu = 0 < gpu_size < size
+        super().__init__(
+            size, page_size, dtype, device, kvcache, need_sort or self._prefer_gpu
+        )
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
@@ -266,6 +270,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             free_page_indices = torch.unique(free_index // self.page_size)
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
+                if self._prefer_gpu:
+                    # Logical GPU pages precede host pages. Reuse the existing
+                    # free-list merge so newly freed GPU pages are eligible
+                    # immediately, not only after the host list is exhausted.
+                    self.merge_and_sort_free()
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:

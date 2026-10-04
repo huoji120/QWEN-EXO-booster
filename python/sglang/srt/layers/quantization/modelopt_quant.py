@@ -34,7 +34,7 @@ from sglang.srt.layers.quantization.fp4_utils import (
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
@@ -608,10 +608,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         fp8_config: ModelOptFp8Config,
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
+        fp8_block_config: Fp8Config,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
+        self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
 
@@ -668,6 +670,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules = quantization_section.get("exclude_modules")
             quantized_layers = quantization_section.get("quantized_layers", {})
 
+        exclude_modules = list(exclude_modules or [])
+
         if quant_algo != "MIXED_PRECISION":
             raise ValueError(
                 "ModelOptMixedPrecisionConfig only supports MIXED_PRECISION checkpoints."
@@ -695,6 +699,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules=[],
             packed_modules_mapping=packed_modules_mapping,
         )
+        fp8_block_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            packed_modules_mapping=packed_modules_mapping,
+        )
         nvfp4_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -717,6 +727,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
+            fp8_block_config=fp8_block_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
@@ -775,8 +786,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             candidates.append(
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
+            candidates.append("model." + prefix[len("model.language_model.") :])
+        elif prefix.startswith("model."):
+            candidates.append("model.language_model." + prefix[len("model.") :])
 
         return tuple(dict.fromkeys(candidates))
+
+    def resolve_quant_algo(self, prefix: str) -> Optional[str]:
+        return self._resolve_quant_algo(prefix)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -794,6 +811,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo in {"FP8_BLOCK_SCALES", "FP8_PB_WO"}:
+                return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -808,6 +827,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return None
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
+            if quant_algo in {"FP8_BLOCK_SCALES", "FP8_PB_WO"}:
+                return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -1959,6 +1980,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if getattr(layer, "qwen_exo_moe_cpu_offload", False):
+            from qwen_exo_booster.expert_paging import create_nvfp4_host_weights
+
+            return create_nvfp4_host_weights(
+                self, layer, num_experts, hidden_size,
+                intermediate_size_per_partition, params_dtype, **extra_weight_attrs
+            )
         is_nvfp4_online = getattr(self.quant_config, "is_nvfp4_online", False)
         if not self.quant_config.is_checkpoint_nvfp4_serialized and not is_nvfp4_online:
             raise ValueError(
@@ -2126,6 +2154,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        if getattr(layer, "qwen_exo_moe_cpu_offload", False):
+            return layer.expert_bank.finalize()
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):

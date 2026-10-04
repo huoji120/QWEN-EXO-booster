@@ -28,6 +28,7 @@ def _file_sha256(path: Path) -> str | None:
 
 _QWEN_EXO_DENSE_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
 _QWEN_EXO_MOE_ARCHITECTURE = "Qwen3_5MoeForConditionalGeneration"
+_QWEN_EXO_QWEN4_ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
 
 _COMMON_TEXT_STRUCTURE = {
     "head_dim": 256,
@@ -96,12 +97,53 @@ _QWEN_EXO_LAYOUTS = {
             },
         },
     ),
+    # NVIDIA config.json, revision fc694b54fb0174e0913e6adf86691ef85a4ead47.
+    _QWEN_EXO_QWEN4_ARCHITECTURE: (
+        {
+            "variant": "qwen4-exp-flash-next",
+            "model_type": "qwen4_exp",
+            "text_model_type": "qwen4_exp_text",
+            "text_structure": {
+                **_COMMON_TEXT_STRUCTURE,
+                "num_hidden_layers": 48,
+                "hidden_size": 2560,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 2,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 48,
+                "num_experts": 512,
+                "num_experts_per_tok": 10,
+                "moe_intermediate_size": 640,
+                "shared_expert_intermediate_size": 640,
+                "hc_count": 4,
+                "hc_lowrank": 320,
+                "indexer_budget": 2048,
+                "indexer_compress_ratio": 4,
+                "indexer_head_dim": 128,
+                "indexer_kv_heads": 1,
+                "indexer_n_heads": 4,
+                "ngram_size": 3,
+                "ngram_vocab_size_base": 20_000_000,
+                "heads_per_ngram": 8,
+                "split_ngram_parts": 128,
+                "make_ngram_vocab_size_divisible_by": 128,
+                "ple_embed_dim": 2560,
+                "ple_conv_kernel_size": 4,
+                "ple_layer_ids": [2],
+                "number_of_conv_states": 3,
+                "mtp_num_hidden_layers": 1,
+                "mtp_use_dedicated_embeddings": False,
+                "output_gate_type": "sigmoid",
+                "norm_topk_prob": True,
+            },
+        },
+    ),
 }
 _COMPATIBILITY_GUIDANCE = (
     "Directory names and marketing labels are never trusted. Set "
     "QWEN_EXO_MODEL_PATH to a Qwen-series checkpoint with one of the exact "
-    "verified Dense 27B, MoE 35B-A3B, or MoE 122B-A10B Qwen3_5* runtime "
-    "structures"
+    "verified Dense 27B, MoE 35B-A3B, MoE 122B-A10B Qwen3_5*, or NVIDIA "
+    "Qwen4Exp Flash-Next runtime structures"
 )
 
 
@@ -111,19 +153,24 @@ def _config_value(config: Any, name: str, default: Any = None) -> Any:
     return getattr(config, name, default)
 
 
-def _normalize_layer_type(value: Any) -> str:
+def _normalize_layer_type(value: Any, *, qwen4: bool = False) -> str:
     raw = getattr(value, "value", value)
     name = str(raw)
     if name.startswith("HybridLayerType."):
         name = name.rsplit(".", 1)[-1]
-    return "full_attention" if name == "attention" else name
+    return (
+        "full_attention"
+        if name == "attention"
+        or (qwen4 and name in {"qwen_sparse_attention", "sparse_attention"})
+        else name
+    )
 
 
 def _layout_mismatches(
     config: Any, text: Any, architecture: str, expected: dict[str, Any]
 ) -> list[str]:
     layer_types = tuple(
-        _normalize_layer_type(value)
+        _normalize_layer_type(value, qwen4=architecture == _QWEN_EXO_QWEN4_ARCHITECTURE)
         for value in (
             _config_value(text, "layer_types", None)
             or _config_value(text, "layers_block_type", ())
@@ -160,7 +207,19 @@ def _layout_mismatches(
     )
     if layer_types != expected_pattern:
         mismatches.append("layer_types does not match the verified 3:1 GDN/Full layout")
-    if _config_value(text, "attn_output_gate", None) is not True:
+    if architecture == _QWEN_EXO_QWEN4_ARCHITECTURE:
+        mtp = _config_value(text, "mtp", {}) or {}
+        for name, wanted in {
+            "hybrid": True,
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+            "rope_theta": 10_000_000,
+        }.items():
+            if _config_value(mtp, name, None) != wanted:
+                mismatches.append(f"mtp.{name} does not match the verified Qwen4 layout")
+        if _config_value(text, "attn_output_gate", True) is not True:
+            mismatches.append("attn_output_gate is disabled")
+    elif _config_value(text, "attn_output_gate", None) is not True:
         mismatches.append("attn_output_gate is not enabled")
     rope = _config_value(text, "rope_parameters", None) or _config_value(
         text, "rope_scaling", None
@@ -241,6 +300,54 @@ def _validate_weight_artifacts(root: Path, index: dict[str, Any]) -> None:
         )
 
 
+def _external_ple_manifest(root: Path, config: dict[str, Any]) -> str | None:
+    declared = config.get("qwen_exo_native_ple")
+    if declared is None:
+        if (
+            config.get("architectures") == [_QWEN_EXO_QWEN4_ARCHITECTURE]
+            and (root / "native-ple.json").exists()
+        ):
+            raise ValueError("external PLE must be explicitly bound in config.json")
+        return None
+    if (
+        config.get("architectures") != [_QWEN_EXO_QWEN4_ARCHITECTURE]
+        or not isinstance(declared, dict)
+        or declared.get("schema") != 1
+        or declared.get("manifest") != "native-ple.json"
+    ):
+        raise ValueError("unsupported external native PLE model binding")
+    path = root / "native-ple.json"
+    if _file_sha256(path) != declared.get("manifest_sha256"):
+        raise ValueError("external PLE manifest hash does not match model config")
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("external PLE manifest is unreadable") from exc
+    if manifest.get("schema") != 1 or manifest.get("global_scale") != 1.0:
+        raise ValueError("external PLE manifest has an unsupported source scale/schema")
+    table_root = Path(str(manifest.get("root", "")))
+    shards = manifest.get("shards")
+    text = config["text_config"]
+    if (
+        not table_root.is_absolute()
+        or not isinstance(shards, list)
+        or not all(isinstance(item, dict) and isinstance(item.get("rows"), int) and item["rows"] > 0 for item in shards)
+        or len(shards) != text["split_ngram_parts"]
+        or manifest.get("num_shards") != len(shards)
+        or manifest.get("embedding_dim") != text["ple_embed_dim"] // ((text["ngram_size"] - 1) * text["heads_per_ngram"])
+        or manifest.get("num_embeddings") != sum(int(item.get("rows", 0)) for item in shards)
+    ):
+        raise ValueError("external PLE source geometry does not match this model")
+    table_root = table_root.resolve()
+    for item in shards:
+        source = (table_root / str(item.get("file", ""))).resolve()
+        if not source.is_relative_to(table_root) or not source.is_file():
+            raise ValueError("external PLE source shard is missing or escapes its root")
+        if source.stat().st_size != item.get("size") or not isinstance(item.get("sha256"), str) or len(item["sha256"]) != 64:
+            raise ValueError("external PLE source shard provenance is stale")
+    return path.name
+
+
 def validate_qwen_exo_model_path(model_path: Path | str) -> str:
     root = Path(model_path).expanduser().resolve()
     config_path = root / "config.json"
@@ -262,6 +369,7 @@ def validate_qwen_exo_model_path(model_path: Path | str) -> str:
     variant = validate_qwen_exo_config(config)
     index = _load_weight_index(root)
     _validate_weight_artifacts(root, index)
+    _external_ple_manifest(root, config)
     return variant
 
 
@@ -294,11 +402,19 @@ class ModelIdentity:
         raw_layer_types = (
             text_config.get("layer_types") or text_config.get("layers_block_type") or ()
         )
-        layer_types = tuple(_normalize_layer_type(value) for value in raw_layer_types)
+        layer_types = tuple(
+            _normalize_layer_type(
+                value, qwen4=architecture == _QWEN_EXO_QWEN4_ARCHITECTURE
+            )
+            for value in raw_layer_types
+        )
         layer_count = int(text_config.get("num_hidden_layers") or len(layer_types))
         full_attention_layers = layer_types.count("full_attention")
         linear_attention_layers = layer_types.count("linear_attention")
         file_hashes = {name: _file_sha256(root / name) for name in _FINGERPRINT_FILES}
+        ple_manifest = _external_ple_manifest(root, config)
+        if ple_manifest is not None:
+            file_hashes[ple_manifest] = _file_sha256(root / ple_manifest)
         fingerprint_payload = {
             "architecture": architecture,
             "model_type": config.get("model_type"),
@@ -364,12 +480,18 @@ def main(argv: list[str] | None = None) -> int:
         description="Validate a checkpoint against QWEN-EXO's verified tensor layouts."
     )
     parser.add_argument("model_path", help="Local Hugging Face checkpoint directory")
+    parser.add_argument(
+        "--print-variant", action="store_true", help="Print only the validated layout ID"
+    )
     args = parser.parse_args(argv)
     try:
         variant = validate_qwen_exo_model_path(args.model_path)
     except ValueError as exc:
         parser.exit(2, f"QWEN-EXO startup blocked: {exc}\n")
-    print(f"QWEN-EXO model accepted: {variant} ({Path(args.model_path).resolve()})")
+    if args.print_variant:
+        print(variant)
+    else:
+        print(f"QWEN-EXO model accepted: {variant} ({Path(args.model_path).resolve()})")
     return 0
 
 

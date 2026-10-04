@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import math
 from dataclasses import dataclass, field
@@ -150,6 +151,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_pool_size: int
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
+    qwen4_gpu_kv_tokens: int = 0
 
 
 @dataclass(slots=True, kw_only=True)
@@ -292,6 +294,7 @@ class KVCacheConfigurator:
             c128_state_pool_size=c128_state_pool_size,
             c4_state_dtype=c4_state_dtype,
             c128_state_dtype=c128_state_dtype,
+            qwen4_gpu_kv_tokens=config.qwen4_gpu_kv_tokens,
         )
 
     def _init_pools(
@@ -424,6 +427,8 @@ class KVCacheConfigurator:
 
         config = self.mambaish_config
         assert config is not None
+        if getattr(config, "model_type", "") in {"qwen4_exp", "qwen4_exp_text"}:
+            raise ValueError("Qwen4 QSA/PLE pools are incompatible with --enable-unified-memory")
         assert (
             not self.use_mla_backend
         ), "unified memory pool does not support MLA-hybrid-Mamba yet"
@@ -651,6 +656,8 @@ class KVCacheConfigurator:
         from sglang.srt.disaggregation.decode import (
             HybridMambaDecodeReqToTokenPool,
         )
+        if getattr(self.mambaish_config, "model_type", "") in {"qwen4_exp", "qwen4_exp_text"}:
+            raise ValueError("Qwen4 QSA/PLE state transfer is not supported by the disaggregated decode pool")
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
@@ -699,6 +706,20 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        ple_kwargs = {}
+        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            ple_kwargs = dict(
+                short_conv_layer_ids=[
+                    i
+                    for i in self.mambaish_config.short_conv_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ],
+                short_conv_state_shape=self.mambaish_config.short_conv_state_shape,
+                ngram_context_len=self.mambaish_config.ngram_context_len,
+                ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
+            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=self.server_args.max_mamba_cache_size,
@@ -719,6 +740,7 @@ class KVCacheConfigurator:
             speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
             speculative_eagle_topk=self.server_args.speculative_eagle_topk,
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+            **ple_kwargs,
             start_layer=self.layer_info.start_layer,
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
@@ -846,8 +868,10 @@ class KVCacheConfigurator:
             elif self.mambaish_config:
                 token_to_kv_pool = self._build_hybrid_linear_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
+                    max_running_requests=sizes.max_running_requests,
                     req_to_token_pool=req_to_token_pool,
                     mha_pool_class=mha_pool_class,
+                    gpu_kv_tokens=sizes.qwen4_gpu_kv_tokens,
                 )
             else:
                 quant_method = None
@@ -1264,8 +1288,10 @@ class KVCacheConfigurator:
         self,
         *,
         max_total_num_tokens: int,
+        max_running_requests: int,
         req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
+        gpu_kv_tokens: int = 0,
     ) -> KVCache:
         extra_args = {}
         if self.use_mla_backend:
@@ -1292,7 +1318,40 @@ class KVCacheConfigurator:
             if self.server_args.kv_cache_dtype == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
-        token_to_kv_pool = HybridLinearKVPool(
+        if self.server_args.qwen4_host_kv_cache:
+            from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostFP8KVPool
+            full_pool_class = QwenHostFP8KVPool
+            extra_args["full_kv_pool_gpu_size"] = gpu_kv_tokens
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_TOKENWISE,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
+
+        qsa_profile = parse_qsa_profile(self.model_config.hf_text_config)
+        if qsa_profile is None:
+            pool_class = HybridLinearKVPool
+            extra_args["use_mla"] = self.use_mla_backend
+        elif qsa_profile.variant == QSA_VARIANT_TOKENWISE:
+            pool_class = QwenDSATokenToKVPool
+            extra_args.update(
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_token_budget=qsa_profile.budget,
+            )
+        else:
+            pool_class = QSATokenToKVPool
+            extra_args.update(
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_compress_ratio=qsa_profile.compress_ratio,
+                qsa_token_topk=qsa_profile.budget,
+                num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            )
+        token_to_kv_pool = pool_class(
             page_size=self.server_args.page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
@@ -1304,7 +1363,6 @@ class KVCacheConfigurator:
             mamba_pool=req_to_token_pool.mamba_pool,
             enable_memory_saver=self.server_args.enable_memory_saver,
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
-            use_mla=self.use_mla_backend,
             start_layer=self.layer_info.start_layer,
             full_kv_pool_class=full_pool_class,
             quant_method=quant_method,
@@ -1481,6 +1539,7 @@ class KVCacheConfigurator:
                             device=self.device,
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
+                            gpu_size=sizes.qwen4_gpu_kv_tokens,
                         )
 
             if self.server_args.enable_hisparse and is_dsv4_model:
@@ -1496,6 +1555,7 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
+            # The draft's QSA page ledger is registered with its pools at the
             if self.is_hybrid_swa:
                 if self.draft_swa_full_capacity:
                     # Banded depth: the SWA ring is full draft capacity, so use
@@ -1528,6 +1588,8 @@ class KVCacheConfigurator:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        # Release weight-loading references before measuring the KV budget.
+        gc.collect()
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,

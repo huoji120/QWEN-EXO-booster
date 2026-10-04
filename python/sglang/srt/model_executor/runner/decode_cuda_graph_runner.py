@@ -426,6 +426,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
+        self._disk_ple_graph_buffers = {}
+        self._allocate_disk_ple_graph = (
+            getattr(model_runner.model, "allocate_disk_ple_graph_buffers", None)
+            if not model_runner.is_draft_worker else None
+        )
+        self._prepare_disk_ple_graph = (
+            getattr(model_runner.model, "prepare_disk_ple_graph_inputs", None)
+            if self._allocate_disk_ple_graph is not None else None
+        )
 
         # --- capture --------------------------------------------------
         try:
@@ -529,15 +538,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
-        # A QWEN-EXO internal/target-only batch is marked NONE while the shared
-        # target ModelRunner still owns the DFLASH algorithm. Its decode graph is
-        # captured at DFLASH verify width (block_size, e.g. 8), so replaying that
-        # graph for a one-token target-only request returns block_size sampled
-        # rows and corrupts the FutureMap relay. There is no width-1 graph in this
-        # runner; use the eager target path and keep DFLASH graphs for real spec
-        # batches.
+        # A target-only request has width 1. Do not replay a speculative
+        # target graph captured at a wider draft stride for that request.
         if (
-            self.model_runner.spec_algorithm.is_dflash_family()
+            self.captured_req_width > 1
             and forward_batch.spec_algorithm is not None
             and forward_batch.spec_algorithm.is_none()
         ):
@@ -549,6 +553,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         if ragged_layout is not None:
+            if self._allocate_disk_ple_graph is not None:
+                # PLE history currently follows complete uniform draft strides.
+                return False
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
         if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
             return False
@@ -1049,6 +1056,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                 )
+                if self._allocate_disk_ple_graph is not None:
+                    ple_buffers = self._allocate_disk_ple_graph(forward_batch)
+                    if ple_buffers:
+                        forward_batch.qwen4_ple_graph_embeddings = ple_buffers
+                        self._disk_ple_graph_buffers[shape_key] = ple_buffers
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -1097,6 +1109,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.backend.cleanup()
+            self._disk_ple_graph_buffers.clear()
             self.capture()
 
     def load_batch(
@@ -1280,6 +1293,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            ple_buffers = self._disk_ple_graph_buffers.get(self._replay_graph_key)
+            if ple_buffers is not None:
+                self._prepare_disk_ple_graph(forward_batch, ple_buffers)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",

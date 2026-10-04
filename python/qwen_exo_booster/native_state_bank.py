@@ -15,6 +15,7 @@ from qwen_exo_booster.hybrid_state import qwen_exo_model_state_directory
 
 _SCHEMA = "qwen-exo-native-state-bank-v1"
 _SESSION_INITIAL_GDN_SCHEMA = "qwen-exo-session-initial-gdn-v1"
+_QWEN4_STATE_SCHEMA = "qwen-exo-qwen4-qsa-ple-v1"
 _SESSION_GDN_MAX_SOURCES = 2
 _FP8_MAX = 448.0
 _SAFE_DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -171,6 +172,22 @@ def _load_page_payload(
     }
 
 
+def load_page_compression_ratio(
+    root: str | Path, *, source_digest: str, page_id: int
+) -> int:
+    """Read the native artifact's selection granularity without loading tensors."""
+    payload = _load_page_payload(Path(root), source_digest=source_digest, page_id=page_id, rank=0)
+    state = payload.get("qwen4_state")
+    if state is None:
+        return 1
+    if not isinstance(state, dict) or state.get("schema") != _QWEN4_STATE_SCHEMA:
+        raise NativeStateBankError("native Qwen4 state schema is stale")
+    ratio = int(state.get("compress_ratio", 0))
+    if ratio < 2 or 64 % ratio:
+        raise NativeStateBankError("native Qwen4 compression layout is invalid")
+    return ratio
+
+
 def reuse_page_artifacts(
     root: Path,
     *,
@@ -293,6 +310,120 @@ def _load_session_initial_gdn_payload(
     return payload
 
 
+def _validate_session_initial_gdn_state(payload: dict[str, Any]) -> None:
+    """Validate the single-slot Dense, ReplaySSM, and PLE host layouts.
+
+    Pool-specific geometry is checked again by the manager before adoption.
+    """
+    state = payload.get("mamba_state")
+    if (
+        not isinstance(state, (tuple, list))
+        or len(state) not in {2, 3, 4}
+        or not isinstance(state[0], (tuple, list))
+        or not state[0]
+    ):
+        raise NativeStateBankError(
+            "session-initial GDN artifact recurrent payload is incomplete"
+        )
+    components = payload.get("mamba_state_components")
+    if "mamba_state_components" in payload:
+        if (
+            not isinstance(components, (tuple, list))
+            or tuple(components) not in (
+                ("conv", "temporal"),
+                ("conv", "temporal", "replayssm_cursors"),
+                ("conv", "temporal", "slot_siblings"),
+                ("conv", "temporal", "replayssm_cursors", "slot_siblings"),
+            )
+            or len(components) != len(state)
+        ):
+            raise NativeStateBankError(
+                "session-initial GDN artifact declared component layout is incomplete or invalid"
+            )
+    conv, temporal = state[:2]
+    state_dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    for source in (*conv, temporal):
+        if (
+            not isinstance(source, torch.Tensor)
+            or source.ndim < 3
+            or source.shape[1] != 1
+            or any(size < 1 for size in source.shape)
+            or source.dtype not in state_dtypes
+            or not bool(torch.isfinite(source).all().item())
+        ):
+            raise NativeStateBankError(
+                "session-initial GDN artifact recurrent tensor shape/dtype/value is invalid"
+            )
+    if any(source.shape[0] != temporal.shape[0] for source in conv):
+        raise NativeStateBankError(
+            "session-initial GDN artifact convolution layer count is stale"
+        )
+
+    if len(state) == 2:
+        return
+    # Historical three-part states have no declaration; distinguish their
+    # cursor triple from the differently shaped PLE tensors.
+    third = state[2]
+    has_cursors = (
+        "replayssm_cursors" in components
+        if components is not None
+        else len(state) == 4 or (
+            isinstance(third, (tuple, list)) and len(third) == 3
+        )
+    )
+    if has_cursors:
+        if not isinstance(third, (tuple, list)) or len(third) != 3:
+            raise NativeStateBankError(
+                "session-initial GDN artifact ReplaySSM cursors are invalid"
+            )
+        for cursor, dtype in zip(third, (torch.int32, torch.int32, torch.int8)):
+            if (
+                not isinstance(cursor, torch.Tensor)
+                or tuple(cursor.shape) != (1,)
+                or cursor.dtype != dtype
+            ):
+                raise NativeStateBankError(
+                    "session-initial GDN artifact ReplaySSM cursor shape/dtype is invalid"
+                )
+            if bool((cursor != 0).any().item()):
+                raise NativeStateBankError(
+                    "session-initial GDN artifact contains an unflushed ReplaySSM ring"
+                )
+        if len(state) == 3:
+            return
+
+    siblings = state[-1]
+    if not isinstance(siblings, (tuple, list)) or len(siblings) not in {1, 2}:
+        raise NativeStateBankError(
+            "session-initial PLE side states are incomplete"
+        )
+    for index, source in enumerate(siblings):
+        # Disabled side pools do not register a sibling. A one-part bundle
+        # may therefore hold either short-conv or token context.
+        is_short_conv = isinstance(source, torch.Tensor) and source.ndim == 4
+        if is_short_conv:
+            valid = (
+                (len(siblings) == 1 or index == 0)
+                and source.shape[1] == 1
+                and all(size > 0 for size in source.shape)
+                and source.dtype in state_dtypes
+                and bool(torch.isfinite(source).all().item())
+            )
+        else:
+            valid = (
+                (len(siblings) == 1 or index == 1)
+                and isinstance(source, torch.Tensor)
+                and source.ndim == 2
+                and source.shape[0] == 1
+                and source.shape[1] > 0
+                and source.dtype == torch.int64
+            )
+        if not valid:
+            raise NativeStateBankError(
+                "session-initial PLE state shape/dtype/value is invalid"
+            )
+
+
 def validate_session_initial_gdn_artifacts(
     root: str | Path,
     *,
@@ -322,18 +453,7 @@ def validate_session_initial_gdn_artifacts(
             raise NativeStateBankError(
                 "session-initial GDN artifact model fingerprint is stale"
             )
-        mamba_state = payload.get("mamba_state")
-        if (
-            not isinstance(mamba_state, (tuple, list))
-            or len(mamba_state) not in {2, 3}
-            or not isinstance(mamba_state[0], (tuple, list))
-            or not mamba_state[0]
-            or not all(isinstance(item, torch.Tensor) for item in mamba_state[0])
-            or not isinstance(mamba_state[1], torch.Tensor)
-        ):
-            raise NativeStateBankError(
-                "session-initial GDN artifact recurrent payload is incomplete"
-            )
+        _validate_session_initial_gdn_state(payload)
         rank_prompt_tokens = int(payload.get("prompt_tokens", -1))
         rank_completion_tokens = int(payload.get("completion_tokens", -1))
         if rank_prompt_tokens < 1 or rank_completion_tokens < 0:
@@ -559,6 +679,11 @@ def _model_fingerprint(model_config: Any) -> str:
     hf_config = getattr(model_config, "hf_text_config", None) or getattr(
         model_config, "hf_config", model_config
     )
+    if str(getattr(hf_config, "model_type", "")) in {"qwen4_exp", "qwen4_exp_text"}:
+        # Fallback identities still bind all hybrid/indexer/PLE/RoPE geometry.
+        import json
+        config_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
+        return stable_digest(model_path, json.dumps(config_dict, sort_keys=True, default=str))
     return stable_digest(
         model_path,
         getattr(hf_config, "model_type", ""),
@@ -626,6 +751,156 @@ class NativeStateBankManager:
         self.session_gdn_sources = OrderedDict()
         self.session_gdn_loads = 0
         self.session_gdn_binds = 0
+
+    def _qwen4_layout(self) -> dict[str, Any] | None:
+        hf_config = getattr(self.model_config, "hf_config", self.model_config)
+        config = getattr(self.model_config, "hf_text_config", None) or hf_config
+        if str(getattr(config, "model_type", "")) not in {"qwen4_exp", "qwen4_exp_text"}:
+            architectures = tuple(getattr(hf_config, "architectures", ()) or ())
+            if "Qwen4ExpForConditionalGeneration" not in architectures:
+                return None
+        pool = self.kv_pool
+        if not hasattr(pool, "qsa_compress_ratio"):
+            raise NativeStateBankError("Qwen4 native Bank requires its compressed QSA pool")
+        short = getattr(self.req_pool, "short_conv_pool", None)
+        ngram = getattr(self.req_pool, "ngram_pool", None)
+        if short is None or ngram is None or not short.enabled or not ngram.enabled:
+            raise NativeStateBankError("Qwen4 native Bank requires complete PLE state pools")
+        return {
+            "compress_ratio": int(pool.qsa_compress_ratio),
+            "index_heads": int(pool.qsa_index_kv_heads),
+            "index_head_dim": int(pool.qsa_index_head_dim),
+            "token_topk": int(pool.qsa_token_topk),
+            "short_conv_layers": tuple(short.layer_map),
+            "short_conv_shape": tuple(short.conv_state.shape[2:]),
+            "ngram_shape": tuple(ngram.context.shape[1:]),
+            "ngram_eos_token_id": int(ngram.eos_token_id),
+        }
+
+    def _export_qwen4_state(
+        self, req: Any, mapping: torch.Tensor, capture_start: int,
+        capture_count: int, physical_mamba: torch.Tensor,
+    ) -> dict[str, Any] | None:
+        layout = self._qwen4_layout()
+        if layout is None:
+            return None
+        ratio = layout["compress_ratio"]
+        write_pos = getattr(self.req_pool.mamba_pool, "replayssm_write_pos", None)
+        if write_pos is not None and bool((write_pos[physical_mamba.long()] != 0).any().item()):
+            raise NativeStateBankError("Qwen4 native export requires fully flushed GDN ReplaySSM")
+        if capture_start % ratio or capture_count % ratio:
+            raise NativeStateBankError("Qwen4 native export must contain complete compression groups")
+        if capture_start + capture_count != len(req.origin_input_ids):
+            raise NativeStateBankError("Qwen4 native export must end at its complete document state")
+        groups = mapping.reshape(-1, ratio)
+        if bool((groups // ratio != groups[:, :1] // ratio).any().item()):
+            raise NativeStateBankError("Qwen4 KV mapping splits a compression group")
+        compressed_slots = groups[:, 0] // ratio
+        source_positions = torch.arange(
+            capture_start, capture_start + capture_count, ratio,
+            device=mapping.device, dtype=torch.long,
+        )
+        ring_slots = torch.arange(ratio, device=mapping.device) + int(req.req_pool_idx) * ratio
+        layers = {}
+        for layer_id in self.full_layer_ids:
+            compressed = self.kv_pool.get_qsa_compressed_k_buffer(layer_id)[compressed_slots]
+            layers[str(layer_id)] = {
+                # Compression keys are already normalized, but carry source RoPE.
+                "compressed_key": compressed.cpu().clone(),
+                "pending_key": self.kv_pool.get_qsa_key_state_buffer(layer_id)[ring_slots].cpu().clone(),
+            }
+        return {
+            "schema": _QWEN4_STATE_SCHEMA, **layout,
+            "capture_start": capture_start,
+            "source_group_positions": source_positions.cpu(),
+            "layers": layers,
+            "pending_rope": self.kv_pool.get_qsa_rope_position_buffer(ring_slots).cpu().clone(),
+            "pending_count": len(req.origin_input_ids) % ratio,
+            "short_conv": self.req_pool.short_conv_pool.conv_state[:, physical_mamba].cpu().clone(),
+            "ngram": self.req_pool.ngram_pool.context[physical_mamba.long()].cpu().clone(),
+        }
+
+    def _validate_qwen4_state(
+        self, payload: dict[str, Any], local_positions: tuple[int, ...],
+    ) -> None:
+        layout = self._qwen4_layout()
+        state = payload.get("qwen4_state")
+        if layout is None:
+            if state is not None:
+                raise NativeStateBankError("Qwen4 state cannot restore into a non-Qwen4 pool")
+            return
+        if not isinstance(state, dict) or state.get("schema") != _QWEN4_STATE_SCHEMA:
+            raise NativeStateBankError("Qwen4 artifact lacks complete QSA and PLE state; rebuild the Bank")
+        if any(state.get(key) != value for key, value in layout.items()):
+            raise NativeStateBankError("Qwen4 QSA/PLE layout is stale")
+        ratio = layout["compress_ratio"]
+        if len(local_positions) % ratio:
+            raise NativeStateBankError("Qwen4 selection splits compression groups")
+        for offset in range(0, len(local_positions), ratio):
+            start = local_positions[offset]
+            if start % ratio or local_positions[offset:offset + ratio] != tuple(range(start, start + ratio)):
+                raise NativeStateBankError("Qwen4 selection must preserve complete ordered source groups")
+        count = int(payload["capture_count"])
+        if count <= 0 or count % ratio:
+            raise NativeStateBankError("Qwen4 artifact contains an incomplete compression group")
+        expected_groups = count // ratio
+        layers = state.get("layers")
+        if not isinstance(layers, dict) or set(layers) != {str(i) for i in self.full_layer_ids}:
+            raise NativeStateBankError("Qwen4 QSA layer map is incomplete")
+        for value in layers.values():
+            if not isinstance(value, dict):
+                raise NativeStateBankError("Qwen4 QSA layer payload is invalid")
+            for name, shape in (
+                ("compressed_key", (expected_groups, layout["index_heads"], layout["index_head_dim"])),
+                ("pending_key", (ratio, layout["index_heads"], layout["index_head_dim"])),
+            ):
+                tensor = value.get(name)
+                if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape or tensor.dtype != torch.bfloat16:
+                    raise NativeStateBankError(f"Qwen4 {name} shape/dtype is stale")
+        for name, shape, dtype in (
+            ("short_conv", (len(layout["short_conv_layers"]), 1, *layout["short_conv_shape"]), self.req_pool.short_conv_pool.conv_state.dtype),
+            ("ngram", (1, *layout["ngram_shape"]), self.req_pool.ngram_pool.context.dtype),
+            ("pending_rope", (ratio, 3), torch.int64),
+            ("source_group_positions", (expected_groups,), torch.int64),
+        ):
+            tensor = state.get(name)
+            if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape or tensor.dtype != dtype:
+                raise NativeStateBankError(f"Qwen4 {name} shape/dtype is stale")
+        capture_start = int(state.get("capture_start", -1))
+        if capture_start < 0 or capture_start % ratio or not torch.equal(
+            state["source_group_positions"], torch.arange(capture_start, capture_start + count, ratio)
+        ):
+            raise NativeStateBankError("Qwen4 group RoPE provenance is stale")
+        if int(state.get("pending_count", -1)) != 0:
+            raise NativeStateBankError("Qwen4 native artifact ends inside a pending compression group")
+
+    def _restore_qwen4_state(
+        self, payload: dict[str, Any], local_positions: tuple[int, ...],
+        kv_indices: torch.Tensor, physical_mamba: torch.Tensor,
+    ) -> None:
+        state = payload.get("qwen4_state")
+        if state is None:
+            return
+        ratio = int(state["compress_ratio"])
+        groups = kv_indices.long().reshape(-1, ratio)
+        if bool((groups // ratio != groups[:, :1] // ratio).any().item()):
+            raise NativeStateBankError("Qwen4 restored KV allocation splits compression groups")
+        selected_groups = torch.tensor(local_positions[::ratio], dtype=torch.long) // ratio
+        compressed_slots = groups[:, 0] // ratio
+        positions = torch.arange(0, len(local_positions), ratio, device=kv_indices.device)
+        for layer_id in self.full_layer_ids:
+            compressed_source = state["layers"][str(layer_id)]["compressed_key"][selected_groups].to(kv_indices.device)
+            source_positions = state["source_group_positions"][selected_groups].to(kv_indices.device)
+            raw = _inverse_rotary_key(
+                compressed_source.float(), positions=source_positions, rotary=self.layers[layer_id].rotary_emb,
+            )
+            compressed = _apply_rotary_key(raw, positions=positions, rotary=self.layers[layer_id].rotary_emb)
+            self.kv_pool.set_qsa_compressed_k_buffer(layer_id, compressed_slots, compressed)
+        # Prefixes are page/group aligned: there are no live pending ring members.
+        # Stored ring rows retain export provenance but must not be treated as
+        # pending members of the selected (possibly sparse) virtual prefix.
+        self.req_pool.short_conv_pool.load_cpu_slots(state["short_conv"], physical_mamba)
+        self.req_pool.ngram_pool.load_cpu_slots(state["ngram"], physical_mamba)
 
     @classmethod
     def from_scheduler(cls, scheduler: Any) -> NativeStateBankManager:
@@ -700,6 +975,11 @@ class NativeStateBankManager:
             raise NativeStateBankError(
                 "session-initial GDN export requires a fully flushed ReplaySSM state"
             )
+        components = ["conv", "temporal"]
+        if getattr(mamba_pool, "replayssm_cache_base", None) is not None:
+            components.append("replayssm_cursors")
+        if getattr(mamba_pool, "_slot_siblings", ()):
+            components.append("slot_siblings")
         payload = {
             "schema": _SESSION_INITIAL_GDN_SCHEMA,
             "source_digest": source_digest,
@@ -710,6 +990,7 @@ class NativeStateBankManager:
             "prompt_tokens": len(req.origin_input_ids),
             "completion_tokens": len(req.output_ids_through_stop),
             "mamba_state": mamba_pool.get_cpu_copy(physical_mamba),
+            "mamba_state_components": tuple(components),
         }
         _atomic_torch_save(
             payload,
@@ -740,11 +1021,30 @@ class NativeStateBankManager:
         if (
             mamba_pool is None
             or not isinstance(state, (tuple, list))
-            or len(state) not in {2, 3}
+            or len(state) not in {2, 3, 4}
         ):
             raise NativeStateBankError(
                 "session-initial GDN artifact has an invalid recurrent payload"
             )
+        _validate_session_initial_gdn_state(payload)
+        siblings = tuple(getattr(mamba_pool, "_slot_siblings", ()))
+        has_spec_cursors = getattr(mamba_pool, "replayssm_cache_base", None) is not None
+        expected_length = 2 + int(has_spec_cursors) + int(bool(siblings))
+        if len(state) != expected_length:
+            raise NativeStateBankError("session-initial GDN/Ple state layout is stale")
+        if siblings:
+            sources = state[-1]
+            if not isinstance(sources, (tuple, list)) or len(sources) != len(siblings):
+                raise NativeStateBankError("session-initial PLE side states are incomplete")
+            for sibling, source in zip(siblings, sources):
+                target = getattr(sibling, "conv_state", None)
+                if target is not None:
+                    shape = (target.shape[0], 1, *target.shape[2:])
+                else:
+                    target = sibling.context
+                    shape = (1, *target.shape[1:])
+                if not isinstance(source, torch.Tensor) or tuple(source.shape) != shape or source.dtype != target.dtype:
+                    raise NativeStateBankError("session-initial PLE state shape/dtype is stale")
         conv, temporal = state[:2]
         current_conv = tuple(mamba_pool.mamba_cache.conv)
         if not isinstance(conv, (tuple, list)) or len(conv) != len(current_conv):
@@ -755,6 +1055,7 @@ class NativeStateBankManager:
             if (
                 not isinstance(source, torch.Tensor)
                 or source.ndim != target.ndim
+                or source.dtype != target.dtype
                 or source.shape[0] != target.shape[0]
                 or source.shape[1] != 1
                 or tuple(source.shape[2:]) != tuple(target.shape[2:])
@@ -766,6 +1067,7 @@ class NativeStateBankManager:
         if (
             not isinstance(temporal, torch.Tensor)
             or temporal.ndim != target_temporal.ndim
+            or temporal.dtype != target_temporal.dtype
             or temporal.shape[0] != target_temporal.shape[0]
             or temporal.shape[1] != 1
             or tuple(temporal.shape[2:]) != tuple(target_temporal.shape[2:])
@@ -773,12 +1075,11 @@ class NativeStateBankManager:
             raise NativeStateBankError(
                 "session-initial GDN artifact temporal shape is stale"
             )
-        has_spec_cursors = getattr(mamba_pool, "replayssm_cache_base", None) is not None
-        if (len(state) == 3) != has_spec_cursors:
+        if len(state) - int(bool(siblings)) != 2 + int(has_spec_cursors):
             raise NativeStateBankError(
                 "session-initial GDN artifact ReplaySSM layout is stale"
             )
-        if len(state) == 3:
+        if has_spec_cursors:
             cursors = state[2]
             if not isinstance(cursors, (tuple, list)) or len(cursors) != 3:
                 raise NativeStateBankError(
@@ -974,6 +1275,9 @@ class NativeStateBankManager:
             req.mamba_pool_idx.reshape(1)
         )
         conv_states, temporal_states = mamba_pool.get_cpu_copy(physical_mamba)[:2]
+        qwen4_state = self._export_qwen4_state(
+            req, mapping, capture_start, capture_count, physical_mamba,
+        )
         section_delta = {
             "conv": tuple(
                 _quantize_fp8(value, reduce_dims=(value.ndim - 1,))
@@ -1005,6 +1309,8 @@ class NativeStateBankManager:
             "full_attention": full_attention,
             "section_delta": section_delta,
         }
+        if qwen4_state is not None:
+            payload["qwen4_state"] = qwen4_state
         _atomic_torch_save(
             payload, _page_path(self.root, source_digest, page_id, self.rank)
         )
@@ -1139,6 +1445,7 @@ class NativeStateBankManager:
             raise NativeStateBankError(
                 "native Bank artifact lacks its complete document GDN state"
             )
+        self._validate_qwen4_state(payload, local_positions)
 
     def _restore_prefix(
         self,
@@ -1236,7 +1543,14 @@ class NativeStateBankManager:
             )
             temporal = _dequantize_fp8(section_delta["temporal"], dtype=torch.bfloat16)
             physical_mamba = self.req_pool.translate_mamba_indices(mamba_index)
-            self.req_pool.mamba_pool.load_cpu_copy((conv, temporal), physical_mamba)
+            state = (conv, temporal)
+            if payload.get("qwen4_state") is not None:
+                # Complete PLE slot siblings accompany the GDN slot lifecycle.
+                if getattr(self.req_pool.mamba_pool, "replayssm_cache_base", None) is not None:
+                    state = (*state, tuple(torch.zeros(1, dtype=torch.int64) for _ in range(3)))
+                state = (*state, [payload["qwen4_state"]["short_conv"], payload["qwen4_state"]["ngram"]])
+            self.req_pool.mamba_pool.load_cpu_copy(state, physical_mamba)
+            self._restore_qwen4_state(payload, local_positions, kv_indices, physical_mamba)
             insert_params_factory = self.insert_params_factory
             if insert_params_factory is None:
                 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
@@ -1275,6 +1589,7 @@ __all__ = [
     "NativeStateBankError",
     "NativeStateBankManager",
     "load_page_key_heads",
+    "load_page_compression_ratio",
     "validate_page_artifacts",
     "validate_session_initial_gdn_artifacts",
 ]

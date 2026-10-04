@@ -181,6 +181,85 @@ CUDA 单阶段、非 speculative 调度在后台 prefill 分块边界交替让�
 
 未合并 LoRA 可作为固定模型 profile 运行：在独立模型目录的 `config.json` 中设置 `qwen_exo_runtime_lora`，字段为 `schema: 1`、adapter 的 `name`、相对模型目录的 `path`、以及 `file_hashes`（`adapter_config.json` 与 `adapter_model.bin` 或 `adapter_model.safetensors` 的 SHA-256）。不修改原始权重；使用硬链接组织 checkpoint 时，不得原地修改链接文件。配置内容参与模型指纹，adapter 哈希在启动时校验。`service_launcher` 自动加载单个 adapter，TokenizerManager 在批处理规范化前给所有外部与内部请求绑定该 adapter；禁止请求另一个 adapter，以及动态加载/卸载绕过 profile 身份。更换 adapter 要切换 profile 并重启，原生状态重新构建，不能沿用另一 adapter 的 GDN/KV。已验证单卡 Dense Qwen 的原始底模在线 FP8 + 独立 rank-4 LoRA、FlashInfer、六请求 Decode Graph 捕获；这不是量化精度或模型能力提升证明。
 
+### 可选 Engram 外挂表
+
+`QWEN_EXO_ENGRAM_PATH` 指向预先打包的 Engram artifact；这是 Qwen3.5 路径的额外残差注入，与 Flash-Next 的原生 PLE 不同。冻结的基表和 reader 不原地修改；额外训练的稀疏表及 reader 可独立打包，未写入行读取为零。数字、符号和格式 token 不参与注入，字母 token 使用白名单门控。
+
+Responses 请求可设置 `qwen_exo_engram=false` 关闭全部 Engram，或仅设置 `qwen_exo_engram_knowledge=false` 关闭额外训练表、保留冻结基表。两种关闭状态使用各自的 radix 缓存标签，不能复用另一注入状态的历史。`scripts/qwen_exo/build_knowledge_artifact.py` 检查完整训练覆盖、冻结基表／reader 哈希、寻址和权重有限性后打包；模型、数据、reader 和训练产物仍由操作者提供，代码发布不包含这些私有文件，也不代表 Agent 能力收益。
+
+当前 Flash-Next 在线配置仍不设置 `QWEN_EXO_ENGRAM_PATH`，不会因合并代码自动启用 27B Engram reader。
+
+### Qwen3.8-Flash-Next NVFP4：隔离单卡路径
+
+`Qwen4ExpForConditionalGeneration` 使用 GDN + QSA、四分支 Gated Residual 和原生 PLE，不能按旧 Qwen3.5 模型直接换目录。官方 NVIDIA checkpoint 是混合精度：主模型 routed experts 为 NVFP4，PLE 为 FP8，MTP experts 为 FP8 分块权重；运行量化名称是 `modelopt_mixed`。
+
+```bash
+export QWEN_EXO_PYTHON=/path/to/venv/bin/python
+export QWEN_EXO_MODEL_PATH=/path/to/Qwen3.8-Flash-Next-NVFP4
+export QWEN_EXO_DATA_PATH=/path/to/isolated-flashnext-runtime
+export QWEN_EXO_TP_SIZE=1
+export QWEN_EXO_QUANTIZATION=modelopt_mixed
+export QWEN_EXO_KV_CACHE_DTYPE=auto
+export QWEN_EXO_SCORE_BIAS_MODE=off
+export QWEN_EXO_NATIVE_PLE_DISK_PATH="$QWEN_EXO_MODEL_PATH"
+export QWEN_EXO_NATIVE_PLE_BACKEND=pread
+export QWEN_EXO_CPU_EXPERT_PAGING=1
+export QWEN_EXO_SPECULATIVE_ALGORITHM=
+unset QWEN_EXO_ENGRAM_PATH
+bash scripts/qwen_exo/launch_native_js4090.sh
+```
+
+PLE 从原始 safetensors 按需读行，不把约 51GB 表常驻 CPU/GPU；`pread` 用于 POSIX，`mmap` 是可选后端，不包含未安装的 io_uring 扩展。CPU expert paging 保留模型原生 Top-10 路由和权重，每层仅保留当前专家集；prefill 按实际路由集合分组执行，不能把整批 token 当成只会选同十个专家。启动器选择 `flashinfer_cutlass`、独立 shared experts，并禁用两个阶段的 CUDA graphs。
+
+已有 PLE 可绑定到独立模型 profile，不必重新下载 NVIDIA 的整张表。磁盘读取支持原始 checkpoint 的 BF16/FP8，以及 `native-ple.json` 声明的 BF16/F16 或逐行 FP8 + FP32 scale。原始 checkpoint FP8 保留 checkpoint 的全表 scale；外部逐行 FP8 先按行 scale 解码为 BF16，原生 PLE 的后续 scale 固定为 1，不能再次乘 NVIDIA 的全表 scale。仅复用表数据，仍加载新模型的原生 PLE key/value 投影，不复用 27B Engram reader。
+
+```bash
+python scripts/qwen_exo/build_native_ple_profile.py \
+  --source /path/to/original-nvfp4-checkpoint \
+  --ple-root /path/to/existing-ple/table \
+  --engram-manifest /path/to/existing-ple/engram.json \
+  --recovered-mtp /path/to/recovered-mtp.safetensors \
+  --combined-source model-fp8-mtp-ple.safetensors \
+  --output /path/to/independent-existing-ple-profile
+```
+
+构建器校验官方主分片 SHA、MTP 恢复凭据和全部 PLE 源分片，硬链接未修改的主模型/MTP 文件，重建 index，并将 PLE manifest SHA 显式绑定到新 `config.json` 和模型指纹；启动时拒绝源布局/哈希不符。`--source` 须包含 `download-manifest.json` 和 `recovered-mtp-receipt.json`。选择性恢复 MTP 的凭据记录不可变镜像版本、精确 HTTP 206 字节区间和恢复产物 SHA；未下载的 PLE/MTP 合并文件不能宣称通过完整官方 SHA 校验。启动时将 `QWEN_EXO_MODEL_PATH` 与 `QWEN_EXO_NATIVE_PLE_DISK_PATH` 均指向新 profile，使用独立状态目录。
+
+js4090 已实测既有 128 分片、320001536 × 160 的逐行 FP8 表：22 个跨分片、重复及末行查询在 `pread`/`mmap` 的 CPU/CUDA 输出与独立 safetensors 解码完全一致；原生 PLE lookup、异步预取消费和实际 checkpoint key/value 投影也完全一致。该组件 smoke 的 GPU 峰值分配为 144.88 MiB，不是全模型内存指标或端到端生成验收。对原始 BF16 的前 64 行抽查中，既有逐行 FP8/NVIDIA 全表 scale FP8 的 MSE 分别为 `4.20e-8`/`4.41e-8`，不能外推整表精度或 Agent 能力。
+
+原生 Bank 同时保存 KV/GDN、QSA 压缩索引键/坐标，以及 PLE short-conv/ngram 状态；稀疏选择保留完整压缩组和 64-token 对齐。验证阶段只提交接受的 QSA/PLE 状态，普通 GDN 与 ReplaySSM 使用同一接受边界；会话快照显式声明状态组件并拒绝缺项。新模型使用独立指纹和状态目录，不复用旧编译产物或 27B Engram reader。当前路径限制 TP/EP/PP/MoE-DP=1，KV 需 BF16/FP8，不支持旧 NVFP4 KV、dense Score Bias、unified-memory/disaggregation 或通用权重 offload 混用。HiCache、LMCache 与 FlexKV 的 QSA/PLE 主机传输尚未适配，因此明确拒绝启用，不会静默丢失上下文；普通 radix cache 和原生 Bank 不受此限制。
+
+这不是吞吐提升承诺：冷专家换入和高多样性 prefill 会增加 PCIe 传输与布局转换。CPU bank 会校验真实 cgroup 内存限额，不能与占用大量主存的生产模型强行同载。组件回归、按行读表和小型内核验证不等于全量 checkpoint 已生成成功；切换前仍须完成全部权重校验及独立端到端生成验收。
+
+CPU 专家库准入按 `memory.stat` 扣除可回收的干净文件缓存，而非将 `memory.current` 全部视为必须常驻；共享、脏页、写回和锁页不计作可用容量，未触页的专家预留仍累计，并保留 8GiB 余量。PLE 仍使用硬盘 `pread`，不整表加载或锁页。BF16 GEMM 默认分支也须检查实际 GPU：SM120 不启用仅供 SM100/103 的 split-K 内核，不能因分支内导入造成初始化异常。
+
+主模型可容纳于显存时，设置 `QWEN_EXO_CPU_EXPERT_PAGING=0`，并用 `QWEN_EXO_MOE_RUNNER_BACKEND=flashinfer_cutlass` 显式选择 SM120 专家执行后端；`QWEN_EXO_NATIVE_PLE_DISK_PATH` 与 `pread` 保持不变。这仅把主模型专家留在 GPU，不会把 PLE 整表搬入 RAM/GPU。js4090 此组合已完成完整权重加载与启动预热；CPU Top-10 换入路径则曾因长文档编译超过 120 秒而无法完成启动，不能把单层数值一致性当成可用吞吐证明。PLE offload 加载后的清理使用统一 `current_platform.empty_cache()`，其导入必须在完整加载路径可用。
+
+主模型常驻 GPU 时，磁盘 PLE 支持 `QWEN_EXO_CUDA_GRAPH_BACKEND_DECODE=full`，prefill 仍需 `disabled`。每个捕获 shape 分配固定 BF16 PLE 行缓冲；replay 前在图外根据当前 token／请求槽历史按需读行、解码并填充，补齐行清零。Graph 内只读这些缓冲，并由原生 forward 提交 ngram／短卷积或 MTP 候选状态；图外准备不能提前提交。真实 CUDA 回归覆盖 token 变化、请求重排、padding 和 TARGET_VERIFY，检查数值与状态边界；不能删除 NVMe reader 的捕获期 I/O 拒绝来冒充支持。
+
+原生 MTP 使用同一 profile 的 `EAGLE` 路径，可设置 `QWEN_EXO_SPECULATIVE_NUM_STEPS=3`、`QWEN_EXO_SPECULATIVE_EAGLE_TOPK=1`、`QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS=4`。草稿路径指向同一 profile，草稿量化为 `QWEN_EXO_SPECULATIVE_DRAFT_MODEL_QUANTIZATION=modelopt_mixed`，其 block-FP8 专家后端为 `QWEN_EXO_SPECULATIVE_MOE_RUNNER_BACKEND=triton`；主模型仍用 FlashInfer CUTLASS。Qwen4 GR 的推测隐藏缓冲宽度必须取 `hidden_size × hc_count`（当前为 10240），不能错误地按 2560 分配。必须以真实接受长度和请求延迟验证加速，配置存在不是性能证据。
+
+压缩 QSA 的 `draft_extend_cuda_graph=false` 是动态接受长度的能力边界，MTP 草稿 extend 保持 eager；目标 TARGET_VERIFY 和草稿 decode 捕获 full Graph。QSA 不导入未使用的 DeepSeek DSV4/FlashMLA 依赖。MTP LM head 的 `enable_dp_lm_head` 来自运行 `ServerArgs`，不是 `ParallelContext` 字段。
+
+js4090 的真实组合验收：固定空闲单请求、相同原生 prompt、温度 0、强制 128 token，原 eager 总耗时 `10.412s`（TTFT `0.237s`，decode `12.48 token/s`）；full Graph + 原生 MTP 两次为 `1.397s`/`1.209s`（decode `105.52`/`121.86 token/s`）。MTP 草稿接受率 `0.644`/`0.699`，每次验证输出长度 `2.909`/`3.122`；真实日志有 `cuda graph: True`。这是固定短请求的组合收益，不是 Graph/MTP 独立归因，也不是所有任务或 200K 长窗吞吐承诺；混合精度下前后及重复生成非逐 token 一致，不宣称 bit-exact。
+
+真实网关 SSE 中文问答在 `0.82s` 返回正确结果并以 `response.completed` 结束；三个并发请求的算术、排序、12648-token 上下文记号检查均通过。运行配置保持 `context_length=200000`，实分配 KV 容量 `250560`，`mem_fraction_static=0.93`、Mamba 槽 `64`，decode Graph 捕获 batch 1–5，超过捕获范围走 eager。会话摘要胶囊也已关闭，避免每轮回答后再生成 256-token 隐藏摘要；知识、PolicyData、反思和压缩继续关闭。
+
+Qwen4 长历史 FP8 K/V 可通过 `QWEN_EXO_HOST_KV_CACHE=1` 使用显存优先、pinned 主存溢出的混合布局。启动时从现有显存预算扣除完整逻辑跨度的 QSA 索引，再按页分配主模型＋MTP 共用的 GPU 槽位前缀；只为剩余槽位分配主存，不保留完整双份镜像。新分配和已释放的槽位优先复用显存；已有主存行不做后台 LRU 迁回。GPU 同时保留 QSA 索引、GDN／PLE 状态和选中工作集，CUDA kernel 根据逻辑槽位直接访问对应银行。预算足够时整个原始 KV 银行均可驻留显存。前缀预填充、目标验证和草稿 decode 保留原有语义及 Graph 路径；接受行搬运必须保留快照式并行赋值，避免跨层级或重叠搬运破坏历史。该路径限制 CUDA TP/EP/PP/DP=1、FP8 E4M3、NHD、原生 topk=1 MTP 和 FlashInfer TRTLLM 稀疏注意力；不与通用 HiCache、unified-memory、disaggregation 或 FP4 混用。
+
+六路 200K profile 保持 `QWEN_EXO_MAX_RUNNING_REQUESTS=6`、`QWEN_EXO_MAX_TOTAL_TOKENS=1300032`、`QWEN_EXO_CUDA_GRAPH_MAX_BS=6`、上下文 `200000`、原生 MTP 和磁盘 PLE。当前在线启动预算自动得到 255616 个 GPU 有效槽位及 1044416 个主存溢出槽位，主模型＋MTP 原始 K/V 分别约 3.17GiB 显存、12.95GiB pinned 主存；dummy page 计入 GPU 字节，QSA 索引、GDN 和工作区另计。这是启动预算下的固定分段，不是每次请求按 `nvidia-smi` 空闲量搬运整个会话。
+
+混合方案完成 88 项回归及 11 项 subtests；两轮六路长请求各输入 199744 tokens、生成 128 tokens，并返回各自正确记号。在线混合负载采样到 6 路运行，驻留峰值分别为 845120／904640，未重现此前 1199232 的满驻留峰值，因此不能沿用旧结果宣称混合模式已通过该峰值验收。后续测试按用户要求停止，模型服务继续运行。证据位于 `bench/mixed-kv-20261005/{acceptance,replay-acceptance}.json`。
+
+以下为此前全主存模式的验收记录，不是当前混合布局的峰值证明：
+
+六路实际验收已通过：六个独立 namespace 各输入 199744 tokens，均生成 128 tokens 并返回各自正确记号；采样峰值为 6 路运行、1199232 个驻留 KV tokens，日志对应 `cuda graph: True`。第二轮重复流式请求也通过相同容量与隔离检查。第一次串行灌入每路耗时 28.67–35.72s；之后六路请求总耗时约 174s（五路前缀未命中、重做 prefill），重复流式轮约 92.15–92.55s（部分前缀命中）。这些端到端时间包含冷 prefill、排队和其他长请求对 decode 的影响，不能当作稳态 decode 速度；不保证六个长会话都快速命中。普通网关短问答在该模式下已返回 `response.completed`。实际 Response ID 的两个并行分支及后续查询分别保持 LEFT731／RIGHT842，未串线。证据位于 `bench/six-way-host-kv-20261005/{acceptance,stream-recovery-acceptance,session-branch-acceptance}.json`。
+
+Responses 会话关联优先已验证的 `previous_response_id`／压缩 lineage，其次 `prompt_cache_key`，再用 system／instructions 和首条 user 首行的版本化 SHA256 标签兜底。完整 canonical head SHA256 仍作为区分符，并将模型指纹加入 radix namespace；首行相同或 CRC 相同不能直接共享可写状态。实际 KV 复用仍匹配完整 token 前缀，平行分支各自持有 GDN／PLE 工作槽。标准 Anthropic Messages 没有统一的会话 ID，不从 `metadata.user_id` 猜造，也不改变 SGLang 原有 `session_id` 传输契约。
+
+该 GPU 常驻组合随后通过真实网关 `/v1/responses` 流式生成：中文算术请求正常返回并以 `response.completed` 结束；本机控制台也完成实际聊天。当前试用配置按用户决定关闭外部知识、PolicyData、反思记忆及依赖外部记忆的 Responses 压缩，原始文件保留。关闭 adaptive refresh 时必须同时将 CLI-only 的 `QWEN_EXO_CONTEXT_INTEGRITY_MODE=off`，否则启动校验失败，托管配置可能自动回退；以在线 `applied_revision == healthy_revision == revision` 和实际功能开关确认生效。
+
+
 ### Apple Silicon
 
 macOS 不需要 Docker，也不需要 CUDA，走原生 MLX：
