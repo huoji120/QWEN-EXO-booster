@@ -6,6 +6,8 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -21,16 +23,27 @@ def digest_file(path):
     return value.hexdigest()
 
 
-def backend_status():
+def backend_status(backend_python=None):
+    if backend_python is not None:
+        environment = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+        environment.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [str(backend_python), "-B", __file__, "--backend-probe"],
+            env=environment, capture_output=True, text=True, check=True, timeout=120,
+        )
+        return json.loads(result.stdout)
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
     from transformers.models.auto.modeling_auto import (
         MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
         MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
     )
+    from transformers.quantizers.auto import AUTO_QUANTIZER_MAPPING
     model = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get("qwen4_exp")
     conditional = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.get("qwen4_exp")
     config = CONFIG_MAPPING_NAMES.get("qwen4_exp")
     return {"transformers_version": importlib.metadata.version("transformers"),
+            "python_executable": sys.executable,
+            "modelopt_mixed_loader_registered": "modelopt" in AUTO_QUANTIZER_MAPPING,
             "config_class": config, "causal_model_class": model,
             "conditional_model_class": conditional,
             "native_architecture_registered": bool(config and (model or conditional)),
@@ -38,7 +51,7 @@ def backend_status():
             "quantized_backbone_autograd_verified": False}
 
 
-def prepare(data, output):
+def prepare(data, output, backend_python=None):
     from qwen_exo_booster.native_ple_knowledge import NativePLEIdentity
     manifest_path = data / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -47,10 +60,12 @@ def prepare(data, output):
     identity = NativePLEIdentity.from_profile(manifest["model_path"])
     if identity.fingerprint() != manifest["native_identity_sha256"]:
         raise ValueError("Native model/reader/table identity changed after data preparation")
-    backend = backend_status()
+    backend = backend_status(backend_python)
     reasons = []
     if not backend["native_architecture_registered"]:
         reasons.append("Installed Transformers has no exact Qwen4Exp differentiable model/config registration")
+    if not backend["modelopt_mixed_loader_registered"]:
+        reasons.append("Exact checkpoint modelopt MIXED_PRECISION loader is absent; generic NVFP4 is not interchangeable")
     reasons.append("Real native NVFP4 frozen-backbone-to-PLE gradient gate has not run; serving no_grad is not a training backend")
     code_paths = (
         "python/qwen_exo_booster/native_ple_knowledge.py",
@@ -123,12 +138,19 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--prepare", action="store_true")
     mode.add_argument("--check", action="store_true")
+    mode.add_argument("--backend-probe", action="store_true")
     parser.add_argument("--data", type=Path)
-    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--plan", type=Path)
+    parser.add_argument("--backend-python", type=Path)
     args = parser.parse_args()
+    if args.backend_probe:
+        print(json.dumps(backend_status(), sort_keys=True))
+        return
+    if args.plan is None:
+        parser.error("--prepare/--check requires --plan")
     if args.prepare and args.data is None:
         parser.error("--prepare requires --data")
-    report = prepare(args.data.resolve(), args.plan) if args.prepare else check(args.plan)
+    report = prepare(args.data.resolve(), args.plan, args.backend_python) if args.prepare else check(args.plan)
     print(json.dumps({key: report[key] for key in (
         "status", "training_started", "automatic_start", "gpu_model_loaded",
         "source_records", "splits", "backend", "blocking_prerequisites")}, sort_keys=True))

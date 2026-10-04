@@ -193,6 +193,8 @@ Responses 请求可设置 `qwen_exo_engram=false` 关闭全部 Engram，或仅�
 
 `qwen_exo_booster.native_ple_knowledge` 绑定模型配置、索引、原生表 manifest 和实际 reader 权重字节，提供零初始化稀疏增量、`off`／`real`／`shuffled` 查表与 artifact 往返。打乱只作用于同一 hash head 内的增量值，不改冻结基表。`scripts/qwen_exo/prepare_native_ple_job.py` 记录准备状态和训练硬门禁；不加载主模型、不发生成、不安装包、不自动训练。缺少精确 Qwen4Exp 可微后端或尚未验证 NVFP4 原生反向时，状态明确为 `blocked_native_training_backend`，不能拿推理成功或稀疏表自身的 CPU 梯度冒充全模型可微。PPL／NLL 只作辅助；验收还需相同 heldout 的任务成功、知识相关决策、工具有效性及知识关闭回归。数据、计划和产物必须放在公开源码目录之外。
 
+准备器支持 `--backend-python /path/to/isolated/python`，仅在指定的已安装环境执行 CPU 元信息探测，不改在线环境。实查中，在线 Transformers 5.12.1 没有 Qwen4Exp 注册，而既有独立环境的 5.17.0 已有原生模型；但后者没有该 checkpoint 的 `modelopt` 混合量化加载注册，通用 HF NVFP4 quantizer 也声明 `is_trainable=False`。因此“有架构源码”和“能对这份混合精度 checkpoint 做冻结主模型的激活反向”是两件事，不能只改量化名称或训练标志绕过门禁。
+
 ### Qwen3.8-Flash-Next NVFP4：隔离单卡路径
 
 `Qwen4ExpForConditionalGeneration` 使用 GDN + QSA、四分支 Gated Residual 和原生 PLE，不能按旧 Qwen3.5 模型直接换目录。官方 NVIDIA checkpoint 是混合精度：主模型 routed experts 为 NVFP4，PLE 为 FP8，MTP experts 为 FP8 分块权重；运行量化名称是 `modelopt_mixed`。
