@@ -36,6 +36,7 @@ from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.native_state_bank import (
     NativeStateBankError,
     load_page_key_heads,
+    load_page_compression_ratio,
     reuse_page_artifacts,
     validate_page_artifacts,
 )
@@ -205,6 +206,7 @@ class TensorBankPage:
     surprisal_peak: float
     surprisal_mean: float
     compile_identity: str = ""
+    compression_ratio: int = 1
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -222,6 +224,7 @@ class TensorBankPage:
             "radix_namespace": self.radix_namespace,
             "prefix_identity": self.prefix_identity,
             "compile_identity": self.compile_identity,
+            "compression_ratio": self.compression_ratio,
             "salient_positions": list(self.salient_positions),
             "salient_tokens": len(self.salient_positions),
             "anchor_count": self.anchor_count,
@@ -335,6 +338,7 @@ class TensorBank:
         tp_size: int | None = None,
         qk_layer_id: int | None = None,
         qk_query_heads: tuple[int, ...] = (),
+        compression_ratio: int = 1,
     ):
         if max_document_tokens < _NATIVE_PREFIX_ALIGNMENT:
             raise ValueError("Tensor Bank document limit must hold one radix page")
@@ -371,6 +375,9 @@ class TensorBank:
         self.span_tokens = int(span_tokens)
         self.timeout_seconds = float(timeout_seconds)
         self.tp_size = int(tp_size) if tp_size is not None else None
+        self.compression_ratio = int(compression_ratio)
+        if self.compression_ratio < 1 or _NATIVE_PREFIX_ALIGNMENT % self.compression_ratio:
+            raise ValueError("Tensor Bank compression ratio must divide its 64-token page")
         # Recall layer and retrieval-head subset. Q comes from the same layer
         # via the probe capture; both default to the final full-attention layer
         # and every head, which is the pre-existing behaviour.
@@ -537,6 +544,7 @@ class TensorBank:
             self.salient_token_budget,
             self.surprisal_threshold,
             self.span_tokens,
+            *((self.compression_ratio,) if self.compression_ratio > 1 else ()),
             *source_parts,
         )
         if self._snapshot.source_digest != source_digest:
@@ -594,6 +602,13 @@ class TensorBank:
                     raise RuntimeError(
                         "Tensor Bank compiler qualifier encoded no tokens"
                     )
+                if self.compression_ratio > 1:
+                    padding = (-len(qualifier_ids)) % self.compression_ratio
+                    if padding:
+                        padding_ids = tuple(int(token) for token in self.tokenizer.encode(_STATE_PADDING, add_special_tokens=False))
+                        if not padding_ids:
+                            raise RuntimeError("Tensor Bank qualifier padding encoded no tokens")
+                        qualifier_ids += (padding_ids * (padding // len(padding_ids) + 1))[:padding]
                 for document in repository.snapshot.documents:
                     if (
                         lane == "knowledge"
@@ -862,6 +877,9 @@ class TensorBank:
                     radix_namespace=self._radix_namespace(source_digest),
                     prefix_identity=str(descriptor["page_identity"]),
                     compile_identity=str(descriptor["compile_identity"]),
+                    compression_ratio=load_page_compression_ratio(
+                        self.native_root, source_digest=source_digest, page_id=int(descriptor["page_id"]),
+                    ),
                     salient_positions=tuple(descriptor["salient_positions"]),
                     anchor_count=int(descriptor["anchor_count"]),
                     span_count=int(descriptor["span_count"]),
@@ -870,6 +888,8 @@ class TensorBank:
                 )
                 for descriptor in descriptors
             )
+            if any(page.compression_ratio != self.compression_ratio for page in pages):
+                raise NativeStateBankError("native Bank compilation omitted its QSA state")
             snapshot = TensorBankSnapshot(
                 source_digest=source_digest,
                 model_fingerprint=self.model_fingerprint,
@@ -2165,6 +2185,13 @@ class TensorBank:
             state_token_count=len(state_token_ids),
             query_anchor_positions=query_anchor_positions,
         )
+        ratio = page.compression_ratio
+        if ratio > 1:
+            local_positions = self._compression_group_positions(
+                local_positions, ratio=ratio, state_token_count=len(state_token_ids),
+                query_anchor_positions=query_anchor_positions,
+                required_prefix_count=page.cognition_token_count,
+            )
         if (
             not local_positions
             or len(local_positions) % _NATIVE_PREFIX_ALIGNMENT
@@ -2190,6 +2217,48 @@ class TensorBank:
             token_ids=token_ids,
             prefix_identity=prefix_identity,
             radix_namespace=(f"qwen-exo:v1:tensor-bank-native:{prefix_identity[:32]}"),
+        )
+
+    def _compression_group_positions(
+        self, positions: tuple[int, ...], *, ratio: int, state_token_count: int,
+        query_anchor_positions: tuple[int, ...], required_prefix_count: int,
+    ) -> tuple[int, ...]:
+        """QSA selection keeps source groups intact, within the native budget."""
+        capacity = min(
+            self.salient_token_budget,
+            state_token_count // _NATIVE_PREFIX_ALIGNMENT * _NATIVE_PREFIX_ALIGNMENT,
+        )
+        if capacity < _NATIVE_PREFIX_ALIGNMENT or capacity % ratio:
+            raise NativeStateBankError("QSA native selection has no aligned group capacity")
+        required = set(range((required_prefix_count + ratio - 1) // ratio))
+        if len(required) * ratio > capacity:
+            raise NativeStateBankError("QSA required prefix exceeds native group budget")
+        votes: dict[int, int] = {}
+        for position in positions:
+            group = int(position) // ratio
+            votes[group] = votes.get(group, 0) + 1
+        anchor_groups = {
+            int(position) // ratio for position in query_anchor_positions
+            if 0 <= int(position) < state_token_count
+        }
+        ordered = sorted(
+            votes, key=lambda group: (group not in anchor_groups, -votes[group], group),
+        )
+        selected = set(required)
+        for group in ordered:
+            if (group + 1) * ratio <= state_token_count and len(selected) < capacity // ratio:
+                selected.add(group)
+        aligned_tokens = min(
+            capacity, max(_NATIVE_PREFIX_ALIGNMENT,
+                          math.ceil(len(selected) * ratio / _NATIVE_PREFIX_ALIGNMENT) * _NATIVE_PREFIX_ALIGNMENT),
+        )
+        for group in range(state_token_count // ratio):
+            if len(selected) * ratio >= aligned_tokens:
+                break
+            selected.add(group)
+        return tuple(
+            position for group in sorted(selected)
+            for position in range(group * ratio, (group + 1) * ratio)
         )
 
     def _query_conditioned_positions(
@@ -2378,6 +2447,9 @@ class TensorBank:
                     radix_namespace=str(item["radix_namespace"]),
                     prefix_identity=str(item["prefix_identity"]),
                     compile_identity=str(item.get("compile_identity") or ""),
+                    compression_ratio=load_page_compression_ratio(
+                        self.native_root, source_digest=expected_digest, page_id=int(item["page_id"]),
+                    ),
                     salient_positions=tuple(
                         int(value) for value in item["salient_positions"]
                     ),
@@ -2395,6 +2467,7 @@ class TensorBank:
                     or page.radix_namespace != self._radix_namespace(expected_digest)
                     or page.lane not in self.repositories
                     or not page.model_native
+                    or page.compression_ratio != self.compression_ratio
                     or page.token_start != 0
                     or page.token_end <= 0
                 ):
@@ -2445,6 +2518,19 @@ class TensorBank:
                         qualifier, add_special_tokens=False
                     )
                 )
+                if self.compression_ratio > 1:
+                    padding = (-len(qualifier_ids)) % self.compression_ratio
+                    if padding:
+                        padding_ids = tuple(
+                            int(token) for token in self.tokenizer.encode(
+                                _STATE_PADDING, add_special_tokens=False
+                            )
+                        )
+                        if not padding_ids:
+                            return None
+                        qualifier_ids += (
+                            padding_ids * (padding // len(padding_ids) + 1)
+                        )[:padding]
                 required_prefix_count = (
                     len(document_ids)
                     if page.lane == "cognition"

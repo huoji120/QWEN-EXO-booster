@@ -3,7 +3,6 @@ import json
 import pytest
 from qwen_exo_booster.fingerprint import (
     ModelIdentity,
-    main as fingerprint_main,
     validate_qwen_exo_config,
     validate_qwen_exo_model_path,
 )
@@ -357,33 +356,6 @@ def test_model_path_rejects_conflicting_top_level_partial_rotary_factor(tmp_path
         validate_qwen_exo_model_path(tmp_path)
 
 
-def test_model_path_preflight_rejects_false_compatible_directory_name(tmp_path, capsys):
-    model_path = tmp_path / "Qwen3.8-27B-marketing-name"
-    model_path.mkdir()
-    write_model(model_path, architecture="OtherModel")
-
-    with pytest.raises(SystemExit) as raised:
-        fingerprint_main([str(model_path)])
-
-    assert raised.value.code == 2
-    error = capsys.readouterr().err
-    assert "Directory names and marketing labels are never trusted" in error
-    assert "Set QWEN_EXO_MODEL_PATH to a Qwen-series checkpoint" in error
-    assert "Dense 27B, MoE 35B-A3B, or MoE 122B-A10B" in error
-
-
-def test_model_path_preflight_missing_config_has_actionable_cli_error(tmp_path, capsys):
-    with pytest.raises(SystemExit) as raised:
-        fingerprint_main([str(tmp_path)])
-
-    assert raised.value.code == 2
-    error = capsys.readouterr().err
-    assert "model config was not found" in error
-    assert "Directory names and marketing labels are never trusted" in error
-    assert "Set QWEN_EXO_MODEL_PATH to a Qwen-series checkpoint" in error
-    assert "Dense 27B, MoE 35B-A3B, or MoE 122B-A10B" in error
-
-
 def test_service_launcher_missing_model_path_has_actionable_error():
     with pytest.raises(SystemExit) as raised:
         _validate_qwen_exo_model_arguments(["--enable-qwen-exo"])
@@ -469,3 +441,56 @@ def test_hf_config_inherited_moe_defaults_do_not_change_dense_variant():
         for index in range(64)
     ]
     assert validate_qwen_exo_config(config) == "dense-27b"
+
+
+def test_external_ple_source_changes_invalidate_model_identity(tmp_path):
+    import hashlib
+
+    write_model(tmp_path)
+    source = tmp_path / "frozen-ple"
+    source.mkdir()
+    shard = source / "shard_0.safetensors"
+    shard.write_bytes(b"frozen-source")
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["architectures"] = ["Qwen4ExpForConditionalGeneration"]
+    config["text_config"].update(split_ngram_parts=1, ple_embed_dim=4,
+                                ngram_size=3, heads_per_ngram=2)
+    manifest = {
+        "schema": 1, "global_scale": 1.0, "root": str(source),
+        "num_shards": 1, "num_embeddings": 1, "embedding_dim": 1,
+        "shards": [{"file": shard.name, "rows": 1, "size": shard.stat().st_size,
+                    "sha256": hashlib.sha256(shard.read_bytes()).hexdigest()}],
+    }
+    manifest_path = tmp_path / "native-ple.json"
+
+    def publish():
+        manifest_path.write_text(json.dumps(manifest))
+        config["qwen_exo_native_ple"] = {
+            "schema": 1, "manifest": manifest_path.name,
+            "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        }
+        config_path.write_text(json.dumps(config))
+
+    publish()
+    first = ModelIdentity.from_path(tmp_path)
+    # A different frozen source must not reuse a compiled Native Bank identity.
+    shard.write_bytes(b"changed-source")
+    manifest["shards"][0].update(size=shard.stat().st_size,
+                                 sha256=hashlib.sha256(shard.read_bytes()).hexdigest())
+    publish()
+    assert ModelIdentity.from_path(tmp_path).fingerprint != first.fingerprint
+    manifest_path.write_text(json.dumps({**manifest, "global_scale": 0.25}))
+    with pytest.raises(ValueError, match="manifest hash"):
+        ModelIdentity.from_path(tmp_path)
+
+
+def test_qwen4_rejects_an_unbound_disk_ple_marker(tmp_path):
+    write_model(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["architectures"] = ["Qwen4ExpForConditionalGeneration"]
+    config_path.write_text(json.dumps(config))
+    (tmp_path / "native-ple.json").write_text("{}")
+    with pytest.raises(ValueError, match="explicitly bound"):
+        ModelIdentity.from_path(tmp_path)

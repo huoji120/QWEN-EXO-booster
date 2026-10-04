@@ -75,6 +75,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
+                    "ple_offload_embedding",
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
@@ -324,11 +325,75 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_control_arch_keeps_pristine_dtype(self):
         sa = self._construct("LlamaForCausalLM", "llama")
         self.assertEqual(sa.dtype, "auto")
+        self.assertIsNone(sa.ple_offload_embedding)
         declared = {f for _s, d in sa._resolved_overrides for f in d}
         self.assertNotIn("dtype", declared)  # no arch declaration for Llama
         # publish still materializes the whitelisted leaf with the pristine
         # value: readers only ever read flags.
         self.assertEqual(self._publish(sa).dtype, "auto")
+
+    def test_qwen4_ple_offload_default(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        with patch.object(overrides_module, "is_cuda", return_value=True):
+            for kwargs, expected in (
+                ({}, True),
+                ({"dtype": "float16"}, False),
+                ({"ple_offload_embedding": False}, False),
+                ({"ple_offload_embedding": False, "cpu_offload_gb": 1}, False),
+            ):
+                with self.subTest(kwargs=kwargs):
+                    self.assertEqual(
+                        self._construct(*qwen4, **kwargs).ple_offload_embedding,
+                        expected,
+                    )
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                self._construct(*qwen4, cpu_offload_gb=1)
+        with patch.object(overrides_module, "is_cuda", return_value=False):
+            self.assertFalse(self._construct(*qwen4).ple_offload_embedding)
+
+    def test_qwen4_rejects_unsupported_host_cache_routes_during_resolution(self):
+        routes = (
+            ({"enable_hierarchical_cache": True}, "--enable-hierarchical-cache"),
+            ({"enable_lmcache": True}, "--enable-lmcache"),
+            ({"enable_flexkv": True}, "--enable-flexkv"),
+            ({"radix_cache_backend": "flexkv"}, "--radix-cache-backend=flexkv"),
+        )
+        with (
+            patch.object(overrides_module, "is_cuda", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            for kwargs, flag in routes:
+                with self.subTest(flag=flag):
+                    with self.assertRaises(ValueError) as error:
+                        self._construct(
+                            "Qwen4ExpForConditionalGeneration", "qwen4_exp", **kwargs
+                        )
+                    self.assertIn("Qwen4-Exp", str(error.exception))
+                    self.assertIn(flag, str(error.exception))
+                    self.assertIn("compressed QSA and PLE state", str(error.exception))
+
+    def test_qwen4_host_cache_gate_preserves_ordinary_radix_and_dense_routes(self):
+        with (
+            patch.object(overrides_module, "is_cuda", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            qwen4 = self._construct(
+                "Qwen4ExpForConditionalGeneration",
+                "qwen4_exp",
+                disable_radix_cache=False,
+                ple_offload_embedding=False,
+            )
+            self.assertFalse(qwen4.disable_radix_cache)
+            for kwargs in (
+                {"enable_hierarchical_cache": True},
+                {"enable_lmcache": True},
+                {"enable_flexkv": True},
+                {"radix_cache_backend": "flexkv"},
+            ):
+                with self.subTest(kwargs=kwargs):
+                    dense = self._construct("LlamaForCausalLM", "llama", **kwargs)
+                    for field, value in kwargs.items():
+                        self.assertEqual(getattr(dense, field), value)
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")

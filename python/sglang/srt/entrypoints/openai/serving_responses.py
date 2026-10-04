@@ -944,6 +944,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                             previous_response_id=request.previous_response_id,
                             response_id=request.request_id,
                         )
+                        session_namespace = qwen_exo_runtime.response_cache_namespace(
+                            request.request_id
+                        )
+                        bound_extra_key = f"{bound_extra_key}|{session_namespace}"
                         custom_params["qwen_exo_kind"] = "user"
                         if memory_state is not None:
                             memory_span = locate_memory_span(

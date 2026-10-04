@@ -937,6 +937,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     if (
@@ -971,6 +972,77 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     }
 
 
+@_register_for("Qwen4ExpForConditionalGeneration")
+def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Qwen4-Exp keeps the MoE config under ``text_config``; every layer is
+    sparse, so a dense-MLP TP size of 1 only stalls the DP MoE path.
+
+    Compressed QSA additionally pins page_size=64 (overriding the hybrid
+    family's triton default of 1, last-writer-wins): its compressed cache is
+    addressed as ``full_slot // compress_ratio`` (the DSV4 scheme), which
+    requires page-aligned full-KV allocation with the page a multiple of the
+    compress ratio, and page-granular prefix sharing so shared pages share
+    their compressed slots. MambaRadixCache supports page_size > 1 only with
+    the mamba extra-buffer strategy or --disable-radix-cache; an explicitly
+    incompatible strategy fails at pool initialization.
+    """
+    unsupported_cache_flags = [
+        flag
+        for field, flag in (
+            ("enable_hierarchical_cache", "--enable-hierarchical-cache"),
+            ("enable_lmcache", "--enable-lmcache"),
+            ("enable_flexkv", "--enable-flexkv"),
+        )
+        if getattr(server_args, field, False)
+    ]
+    if getattr(server_args, "radix_cache_backend", None) == "flexkv":
+        unsupported_cache_flags.append("--radix-cache-backend=flexkv")
+    if unsupported_cache_flags:
+        raise ValueError(
+            "Qwen4-Exp does not support hierarchical/host-tier KV cache "
+            f"({', '.join(unsupported_cache_flags)}): host export/restore does "
+            "not preserve compressed QSA and PLE state. Use the ordinary "
+            "device radix cache/native Bank; native PLE disk offload and CPU "
+            "expert paging do not require hierarchical cache."
+        )
+    overrides: Dict[str, Any] = {}
+    if server_args.ple_offload_embedding is None:
+        import torch
+
+        overrides["ple_offload_embedding"] = (
+            is_cuda() and server_args.get_model_config().dtype == torch.bfloat16
+        )
+
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if (
+        getattr(text_config, "num_experts", None) is not None
+        and server_args.moe_dense_tp_size == 1
+    ):
+        overrides["moe_dense_tp_size"] = None
+
+    from sglang.srt.layers.attention.qsa.config import (
+        QSA_VARIANT_COMPRESSED,
+        parse_qsa_profile,
+    )
+
+    profile = parse_qsa_profile(hf_config)
+    if profile is not None and profile.variant == QSA_VARIANT_COMPRESSED:
+        # Unconditional, like DeepSeek-V4's page-256 declaration: compressed
+        # addressing is full_slot // ratio and requires page-aligned
+        # allocation on every backend. Do not gate this on
+        # mamba_radix_cache_strategy — that field resolves in a later pass
+        # (mid-resolution it still holds the unresolved default, which made
+        # this declaration silently skip on non-SM100 boxes); if the finally
+        # resolved strategy cannot support page > 1, MambaRadixCache's own
+        # boot assertion reports it.
+        overrides["page_size"] = 64
+        logger.info(
+            "Setting page size to 64 for compressed QSA "
+            "(full//ratio compressed addressing)."
+        )
+    return overrides
+
+
 @_register_for("Qwen3VLForConditionalGeneration")
 def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
     if (
@@ -985,6 +1057,18 @@ def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
+def _mixed_precision_moe_quant_algos(hf_config: Any) -> set:
+    """Return ModelOpt mixed-precision algorithms for routed expert layers."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return set()
+    return {
+        str(info.get("quant_algo", "")).upper()
+        for name, info in quantization_config.get("quantized_layers", {}).items()
+        if ".experts" in name and isinstance(info, dict)
+    }
+
+
 @_register_for(
     "Qwen3MoeForCausalLM",
     "Qwen3VLMoeForConditionalGeneration",
@@ -992,6 +1076,7 @@ def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
 )
 def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
@@ -1005,8 +1090,19 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             overrides["quantization"] = quant_method
             quantization = quant_method
-        if (
-            (quantization in ("fp8", "modelopt_fp4") or quantization is None)
+        has_w4a16_moe_layers = (
+            quantization == "modelopt_mixed"
+            and "W4A16_NVFP4" in _mixed_precision_moe_quant_algos(hf_config)
+        )
+        if has_w4a16_moe_layers:
+            if server_args.moe_runner_backend not in ("auto", "marlin"):
+                raise ValueError(
+                    "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
+                )
+            if server_args.moe_runner_backend == "auto":
+                overrides["moe_runner_backend"] = "marlin"
+        elif (
+            (quantization in ("fp8", "modelopt_fp4", "modelopt_mixed") or quantization is None)
             and server_args.moe_a2a_backend == "none"
             and server_args.moe_runner_backend == "auto"
         ):
@@ -1118,6 +1214,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -1138,6 +1235,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
@@ -1524,6 +1622,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",

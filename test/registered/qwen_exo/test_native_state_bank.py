@@ -7,6 +7,7 @@ import torch
 from qwen_exo_booster.knowledge import KnowledgeRepository
 from qwen_exo_booster.native_state_bank import (
     NativeStateBankManager,
+    NativeStateBankError,
     _apply_rotary_key,
     _atomic_torch_save,
     _dequantize_fp8,
@@ -14,6 +15,8 @@ from qwen_exo_booster.native_state_bank import (
     _node_mamba_value,
     _page_path,
     _quantize_fp8,
+    _session_initial_gdn_path,
+    validate_session_initial_gdn_artifacts,
 )
 from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.tensor_bank import TensorBank, TensorBankCompileError
@@ -179,26 +182,56 @@ def test_native_bank_exports_raw_kv_and_complete_section_delta(tmp_path):
 
 
 class _SessionMambaPool:
-    def __init__(self):
+    def __init__(self, *, replay=False, ple=False):
         self.mamba_cache = SimpleNamespace(
             conv=[torch.zeros(1, 4, 2, 2, dtype=torch.bfloat16)],
             temporal=torch.zeros(1, 4, 1, 2, 2, dtype=torch.bfloat16),
         )
-        self.replayssm_write_pos = None
-        self.replayssm_cache_base = None
+        self.replayssm_write_pos = torch.zeros(4, dtype=torch.int32) if replay else None
+        self.replayssm_cache_base = torch.zeros(4, dtype=torch.int32) if replay else None
+        self.replayssm_is_flush = torch.zeros(4, dtype=torch.int8) if replay else None
+        self._slot_siblings = (
+            (
+                SimpleNamespace(conv_state=torch.zeros(2, 4, 2, 3, dtype=torch.bfloat16)),
+                SimpleNamespace(context=torch.zeros(4, 2, dtype=torch.int64)),
+            )
+            if ple
+            else ()
+        )
 
     def get_cpu_copy(self, indices):
         indices = indices.to(dtype=torch.long)
-        return (
+        state = [
             [self.mamba_cache.conv[0][:, indices].cpu().clone()],
             self.mamba_cache.temporal[:, indices].cpu().clone(),
-        )
+        ]
+        if self.replayssm_cache_base is not None:
+            state.append(
+                [cursor[indices].clone() for cursor in (
+                    self.replayssm_write_pos, self.replayssm_cache_base, self.replayssm_is_flush
+                )]
+            )
+        if self._slot_siblings:
+            state.append([
+                self._slot_siblings[0].conv_state[:, indices].clone(),
+                self._slot_siblings[1].context[indices].clone(),
+            ])
+        return tuple(state)
 
     def load_cpu_copy(self, state, indices):
         indices = indices.to(dtype=torch.long)
         conv, temporal = state[:2]
         self.mamba_cache.conv[0][:, indices] = conv[0]
         self.mamba_cache.temporal[:, indices] = temporal
+        if self.replayssm_cache_base is not None:
+            for target, source in zip(
+                (self.replayssm_write_pos, self.replayssm_cache_base, self.replayssm_is_flush),
+                state[2],
+            ):
+                target[indices] = source
+        if self._slot_siblings:
+            self._slot_siblings[0].conv_state[:, indices] = state[-1][0]
+            self._slot_siblings[1].context[indices] = state[-1][1]
 
 
 class _SessionMambaAllocator:
@@ -214,7 +247,211 @@ class _SessionMambaAllocator:
         return None
 
 
-def test_session_initial_gdn_refresh_keeps_previous_identity_bindable(tmp_path):
+def _session_artifact(state, rank=0):
+    return {
+        "schema": "qwen-exo-session-initial-gdn-v1",
+        "source_digest": "a" * 64,
+        "state_identity": "b" * 64,
+        "rank": rank,
+        "world_size": 1,
+        "model_fingerprint": "session-model",
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+        "mamba_state": state,
+    }
+
+
+def _validate_public_session_artifact(tmp_path, payload):
+    _atomic_torch_save(
+        payload,
+        _session_initial_gdn_path(
+            tmp_path, source_digest="a" * 64, state_identity="b" * 64, rank=0
+        ),
+    )
+    return validate_session_initial_gdn_artifacts(
+        tmp_path,
+        source_digest="a" * 64,
+        state_identity="b" * 64,
+        world_size=1,
+        model_fingerprint="session-model",
+    )
+
+
+def _session_state_layout(*, replay=True, ple=True):
+    state = [
+        [torch.zeros(1, 1, 2, 2, dtype=torch.bfloat16)],
+        torch.zeros(1, 1, 1, 2, 2, dtype=torch.bfloat16),
+    ]
+    if replay:
+        state.append(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int8),
+            ]
+        )
+    if ple:
+        state.append(
+            [
+                torch.zeros(2, 1, 2, 3, dtype=torch.bfloat16),
+                torch.tensor([[11, 12]], dtype=torch.int64),
+            ]
+        )
+    return state
+
+
+def _session_validator_manager(*, replay=True, ple=True):
+    pool = _SessionMambaPool(replay=replay, ple=ple)
+    manager = object.__new__(NativeStateBankManager)
+    manager.req_pool = SimpleNamespace(mamba_pool=pool)
+    manager.world_size = 1
+    manager.model_fingerprint = "session-model"
+    return manager
+
+
+def _export_session_artifact(tmp_path):
+    manager = _session_validator_manager()
+    manager.root = tmp_path
+    manager.rank = 0
+    manager.req_pool.translate_mamba_indices = lambda indices: indices
+    manager._export_session_initial_gdn(
+        SimpleNamespace(
+            mamba_pool_idx=torch.tensor(1),
+            origin_input_ids=list(range(7)),
+            output_ids_through_stop=[8, 9, 10],
+        ),
+        {"source_digest": "a" * 64, "state_identity": "b" * 64},
+    )
+    return torch.load(
+        _session_initial_gdn_path(
+            tmp_path, source_digest="a" * 64, state_identity="b" * 64, rank=0
+        ),
+        map_location="cpu",
+        weights_only=True,
+    )
+
+
+@pytest.mark.parametrize("replay,ple", [(False, False), (True, False), (False, True), (True, True)])
+def test_session_artifact_accepts_dense_replay_and_ple_layouts(tmp_path, replay, ple):
+    payload = _session_artifact(_session_state_layout(replay=replay, ple=ple))
+    assert _validate_public_session_artifact(tmp_path, payload) == {
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+    }
+    _session_validator_manager(replay=replay, ple=ple)._validate_session_initial_gdn_payload(payload)
+
+
+@pytest.mark.parametrize("sibling_index", [0, 1])
+def test_session_artifact_accepts_one_enabled_ple_sibling(tmp_path, sibling_index):
+    state = _session_state_layout(replay=False)
+    state[2] = [state[2][sibling_index]]
+    payload = _session_artifact(state)
+    assert _validate_public_session_artifact(tmp_path, payload) == {
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+    }
+    manager = _session_validator_manager(replay=False)
+    manager.req_pool.mamba_pool._slot_siblings = (
+        manager.req_pool.mamba_pool._slot_siblings[sibling_index],
+    )
+    manager._validate_session_initial_gdn_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("conv", []),
+        ("conv", [torch.zeros(1, 2, 2, 2)]),
+        ("conv", [torch.zeros(2, 1, 2, 2)]),
+        ("conv", [torch.zeros(1, 1, 2, 2, dtype=torch.int64)]),
+        ("conv", [torch.full((1, 1, 2, 2), float("nan"))]),
+        ("temporal", None),
+        ("temporal", torch.zeros(1, 2, 1, 2, 2)),
+        ("temporal", torch.full((1, 1, 1, 2, 2), float("inf"))),
+        ("cursors", None),
+        ("cursors", [torch.zeros(1, dtype=torch.int32)]),
+        ("cursor_0", torch.ones(1, dtype=torch.int32)),
+        ("cursor_1", torch.ones(1, dtype=torch.int32)),
+        ("cursor_2", torch.ones(1, dtype=torch.int8)),
+        ("cursor_0", torch.zeros(1, dtype=torch.float32)),
+        ("cursor_1", torch.zeros(1, dtype=torch.int64)),
+        ("cursor_2", torch.zeros(1, dtype=torch.int32)),
+        ("cursor_0", torch.zeros(1, 1, dtype=torch.int32)),
+        ("cursor_0", torch.zeros(2, dtype=torch.int32)),
+        ("siblings", None),
+        ("siblings", []),
+        ("siblings", [torch.zeros(2, 2)]),
+        ("sibling_0", torch.zeros(2, 2, 2, 3)),
+        ("sibling_0", torch.zeros(2, 1, 2, 3, dtype=torch.int64)),
+        ("sibling_0", torch.full((2, 1, 2, 3), float("nan"))),
+        ("sibling_1", torch.zeros(2, 2, dtype=torch.int64)),
+        ("sibling_1", torch.zeros(1, 2, dtype=torch.float32)),
+    ],
+)
+def test_session_artifact_rejects_malformed_four_part_state(tmp_path, field, replacement):
+    payload = _export_session_artifact(tmp_path)
+    state = list(payload["mamba_state"])
+    if field.startswith("cursor_"):
+        state[2][int(field[-1])] = replacement
+    elif field.startswith("sibling_"):
+        state[3][int(field[-1])] = replacement
+    else:
+        state[{"conv": 0, "temporal": 1, "cursors": 2, "siblings": 3}[field]] = replacement
+    payload["mamba_state"] = state
+    with pytest.raises(NativeStateBankError):
+        _validate_public_session_artifact(tmp_path, payload)
+    with pytest.raises(NativeStateBankError):
+        _session_validator_manager()._validate_session_initial_gdn_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "components",
+    [
+        None,
+        ("conv", "temporal", "slot_siblings", "replayssm_cursors"),
+        ("conv", "temporal", "replayssm_cursors", "unknown"),
+        ("conv", "temporal", "replayssm_cursors"),
+    ],
+)
+def test_session_artifact_rejects_invalid_component_declaration(tmp_path, components):
+    payload = _export_session_artifact(tmp_path)
+    payload["mamba_state_components"] = components
+    with pytest.raises(NativeStateBankError, match="declared component layout"):
+        _validate_public_session_artifact(tmp_path, payload)
+
+
+@pytest.mark.parametrize("third_part", [2, 3])
+def test_session_artifact_requires_declared_cursor_or_sibling_bundle_type(tmp_path, third_part):
+    payload = _export_session_artifact(tmp_path)
+    state = payload["mamba_state"]
+    payload["mamba_state"] = (state[0], state[1], state[third_part])
+    payload["mamba_state_components"] = (
+        "conv", "temporal",
+        "slot_siblings" if third_part == 2 else "replayssm_cursors",
+    )
+    with pytest.raises(NativeStateBankError):
+        _validate_public_session_artifact(tmp_path, payload)
+
+
+@pytest.mark.parametrize("missing", ["cursors", "siblings", "both"])
+def test_session_adoption_rejects_missing_required_replay_or_ple_state(tmp_path, missing):
+    payload = _export_session_artifact(tmp_path)
+    state = list(payload["mamba_state"])
+    if missing == "cursors":
+        del state[2]
+    elif missing == "siblings":
+        del state[3]
+    else:
+        del state[2:]
+    payload["mamba_state"] = state
+    with pytest.raises(NativeStateBankError, match="declared component layout"):
+        _validate_public_session_artifact(tmp_path, payload)
+    with pytest.raises(NativeStateBankError, match="declared component layout"):
+        _session_validator_manager()._validate_session_initial_gdn_payload(payload)
+
+
+@pytest.mark.parametrize("replay,ple", [(False, False), (True, True)])
+def test_session_initial_gdn_refresh_keeps_previous_identity_bindable(tmp_path, replay, ple):
     """A refreshed identity must not reject requests queued under the old one.
 
     The scheduler prepares the source slot when a request arrives and binds it
@@ -223,7 +460,7 @@ def test_session_initial_gdn_refresh_keeps_previous_identity_bindable(tmp_path):
     rejected at bind time. The bank keeps the previous identity resident and
     only recycles the least recently used slot for a third identity.
     """
-    mamba_pool = _SessionMambaPool()
+    mamba_pool = _SessionMambaPool(replay=replay, ple=ple)
     allocator = _SessionMambaAllocator()
     req_pool = SimpleNamespace(
         mamba_pool=mamba_pool,
@@ -261,6 +498,9 @@ def test_session_initial_gdn_refresh_keeps_previous_identity_bindable(tmp_path):
     def export(identity, value):
         mamba_pool.mamba_cache.conv[0][:, 1].fill_(value)
         mamba_pool.mamba_cache.temporal[:, 1].fill_(value)
+        if ple:
+            mamba_pool._slot_siblings[0].conv_state[:, 1].fill_(value)
+            mamba_pool._slot_siblings[1].context[1].fill_(int(value) + 10)
         request = SimpleNamespace(
             sampling_params=SimpleNamespace(
                 custom_params={
@@ -276,6 +516,13 @@ def test_session_initial_gdn_refresh_keeps_previous_identity_bindable(tmp_path):
         )
         assert manager.maybe_export(request) is True
         assert request.qwen_exo_session_initial_gdn_status == "exported"
+        assert validate_session_initial_gdn_artifacts(
+            tmp_path,
+            source_digest=identity[0],
+            state_identity=identity[1],
+            world_size=1,
+            model_fingerprint=manager.model_fingerprint,
+        ) == {"prompt_tokens": 3, "completion_tokens": 2}
 
     def selection(identity):
         return SimpleNamespace(
@@ -331,6 +578,14 @@ def test_session_initial_gdn_refresh_keeps_previous_identity_bindable(tmp_path):
     assert manager.bind_session_initial_gdn(revived_request) is True
     assert tuple(revived_request.mamba_cow_src_index.tolist()) == (3,)
     assert torch.all(mamba_pool.mamba_cache.temporal[:, 3] == 3)
+    if ple:
+        assert torch.all(mamba_pool._slot_siblings[0].conv_state[:, 3] == 3)
+        assert torch.all(mamba_pool._slot_siblings[1].context[3] == 13)
+        assert torch.all(mamba_pool._slot_siblings[0].conv_state[:, 2] == 9)
+        assert torch.all(mamba_pool._slot_siblings[1].context[2] == 19)
+    if replay:
+        assert torch.equal(mamba_pool.replayssm_cache_base[2:4], torch.zeros(2, dtype=torch.int32))
+        assert torch.equal(mamba_pool.replayssm_is_flush[2:4], torch.zeros(2, dtype=torch.int8))
     assert manager.stats()["session_gdn_loads"] == 4
     assert manager.stats()["session_gdn_binds"] == 4
 
@@ -1135,3 +1390,89 @@ def test_load_page_key_heads_selects_the_configured_full_attention_layer(tmp_pat
         load_page_key_heads(
             root, source_digest=digest, page_id=0, world_size=1, layer_id=5
         )
+
+
+def test_qwen4_bank_restores_sparse_groups_with_index_rope_and_ple(tmp_path):
+    torch.manual_seed(41)
+    rotary = _rotary(rows=256)
+    ratio = 4
+    raw_index_keys = torch.randn(24, 1, 8, dtype=torch.bfloat16)
+    source_positions = torch.arange(8, 104, ratio)
+    compressed = torch.zeros(256, 1, 8, dtype=torch.bfloat16)
+    compressed[16:40] = _apply_rotary_key(
+        raw_index_keys, positions=source_positions, rotary=rotary,
+    )
+    pending = torch.randn(8, 1, 8, dtype=torch.bfloat16)
+    pending_rope = torch.arange(24).reshape(8, 3)
+    kv_pool = SimpleNamespace(
+        qsa_compress_ratio=ratio, qsa_index_kv_heads=1, qsa_index_head_dim=8,
+        qsa_token_topk=2048,
+        get_qsa_compressed_k_buffer=lambda layer_id: compressed,
+        get_qsa_key_state_buffer=lambda layer_id: pending,
+        get_qsa_rope_position_buffer=lambda indices: pending_rope[indices],
+        set_qsa_compressed_k_buffer=lambda layer_id, indices, data: compressed.index_copy_(0, indices, data.to(compressed.dtype)),
+    )
+    short_state = torch.randn(1, 8, 2, 3, dtype=torch.bfloat16)
+    ngram_state = torch.arange(16).reshape(8, 2)
+    short = SimpleNamespace(
+        enabled=True, layer_map={0: 0}, conv_state=short_state,
+        load_cpu_slots=lambda data, indices: short_state.index_copy_(1, indices, data),
+    )
+    ngram = SimpleNamespace(
+        enabled=True, context=ngram_state, eos_token_id=7,
+        load_cpu_slots=lambda data, indices: ngram_state.index_copy_(0, indices, data),
+    )
+    manager = NativeStateBankManager(
+        root=tmp_path,
+        model_config=SimpleNamespace(model_path="", hf_text_config=SimpleNamespace(
+            model_type="qwen4_exp_text", layers_block_type=["attention"],
+        )),
+        model=SimpleNamespace(layers=[SimpleNamespace(rotary_emb=rotary)]),
+        kv_pool=kv_pool, kv_allocator=object(),
+        req_pool=SimpleNamespace(short_conv_pool=short, ngram_pool=ngram, mamba_pool=SimpleNamespace()),
+        tree_cache=object(), rank=0, world_size=1, page_size=64, consensus=lambda value: value,
+    )
+    request = SimpleNamespace(req_pool_idx=1, origin_input_ids=list(range(104)))
+    state = manager._export_qwen4_state(
+        request, torch.arange(64, 160), 8, 96, torch.tensor([2]),
+    )
+    payload = {"capture_count": 96, "qwen4_state": state}
+    selected = tuple(range(32)) + tuple(range(64, 96))
+    manager._validate_qwen4_state(payload, selected)
+    stored_short = state["short_conv"].clone()
+    stored_ngram = state["ngram"].clone()
+    assert torch.equal(state["layers"]["0"]["compressed_key"], compressed[16:40])
+    assert torch.equal(state["layers"]["0"]["pending_key"], pending[4:8])
+    assert torch.equal(state["pending_rope"], pending_rope[4:8])
+    short_state[:, 3].zero_()
+    ngram_state[3].fill_(-1)
+    manager._restore_qwen4_state(payload, selected, torch.arange(192, 256), torch.tensor([3]))
+    selected_groups = torch.tensor(selected[::ratio]) // ratio
+    expected = _apply_rotary_key(
+        raw_index_keys[selected_groups], positions=torch.arange(0, 64, ratio), rotary=rotary,
+    )
+    assert torch.allclose(compressed[48:64].float(), expected.float(), atol=0.025, rtol=0.025)
+    assert torch.equal(short_state[:, 3:4], stored_short)
+    assert torch.equal(ngram_state[3:4], stored_ngram)
+    with pytest.raises(NativeStateBankError):
+        manager._validate_qwen4_state({"capture_count": 96}, selected)
+    with pytest.raises(NativeStateBankError):
+        manager._validate_qwen4_state(payload, tuple(range(1, 65)))
+
+
+def test_qwen4_query_selection_keeps_compression_groups_within_budget():
+    bank = object.__new__(TensorBank)
+    bank.salient_token_budget = 64
+    sparse = tuple(range(5, 37)) + tuple(range(125, 157))
+    selected = bank._compression_group_positions(
+        sparse, ratio=4, state_token_count=256, query_anchor_positions=(135,),
+        required_prefix_count=4,
+    )
+    assert len(selected) == 64
+    assert set(range(4)).issubset(selected)
+    assert set(range(132, 136)).issubset(selected)
+    assert any(position >= 124 for position in selected)
+    for offset in range(0, len(selected), 4):
+        start = selected[offset]
+        assert start % 4 == 0
+        assert selected[offset:offset + 4] == tuple(range(start, start + 4))

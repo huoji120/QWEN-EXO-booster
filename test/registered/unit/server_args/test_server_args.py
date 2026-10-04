@@ -41,6 +41,58 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_ple_embedding_offload_rejects_generic_weight_offload(self):
+        for generic_offload in (
+            {"cpu_offload_gb": 1},
+            {"offload_group_size": 1},
+        ):
+            with (
+                self.subTest(generic_offload=generic_offload),
+                self.assertRaisesRegex(
+                    ValueError, "ple-offload-embedding cannot be combined"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    ple_offload_embedding=True,
+                    **generic_offload,
+                )
+
+    def test_cpu_expert_paging_rejects_incompatible_execution(self):
+        supported = dict(
+            model_path="dummy",
+            qwen_exo_moe_cpu_offload=True,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.DISABLED),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
+            disable_shared_experts_fusion=True,
+            moe_runner_backend="flashinfer_cutlass",
+        )
+        for incompatible in (
+            {"tp_size": 2},
+            {"ep_size": 2},
+            {"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend=Backend.FULL), prefill=PhaseConfig(backend=Backend.DISABLED))},
+            {"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend=Backend.DISABLED), prefill=PhaseConfig(backend=Backend.TC_PIECEWISE))},
+            {"moe_runner_backend": "flashinfer_trtllm"},
+            {"disable_shared_experts_fusion": False},
+            {"enable_eplb": True},
+            {"cpu_offload_gb": 1},
+            {"qwen_exo_moe_top_k": 32},
+            {"qwen_exo_moe_extra_experts": 8},
+        ):
+            with self.subTest(incompatible=incompatible), self.assertRaises(ValueError):
+                ServerArgs(**(supported | incompatible))
+
+    def test_disk_ple_rejects_parallel_prefill_or_segmented_graph_execution(self):
+        for incompatible in (
+            {"tp_size": 2},
+            {"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend=Backend.BREAKABLE), prefill=PhaseConfig(backend=Backend.DISABLED))},
+            {"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend=Backend.DISABLED), prefill=PhaseConfig(backend=Backend.TC_PIECEWISE))},
+        ):
+            with self.subTest(incompatible=incompatible), self.assertRaises(ValueError):
+                ServerArgs(model_path="dummy", qwen4_ple_disk_path="/tables/native", **incompatible)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")

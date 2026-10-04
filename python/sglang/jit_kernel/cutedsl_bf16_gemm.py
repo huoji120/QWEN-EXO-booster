@@ -1367,3 +1367,56 @@ def cutedsl_bf16_gemm(
 ) -> torch.Tensor:
     """out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N]), all bf16, fp32 accum."""
     return torch.ops.sglang.cutedsl_tgv_bf16_gemm(x, weight, bias)
+
+
+def _tgv_bf16_gemm_out_run(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> None:
+    if get_device_sm() not in (100, 103):
+        raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
+    assert x.dtype == weight.dtype == out.dtype == torch.bfloat16
+    assert out.device == x.device
+    assert x.ndim == weight.ndim == out.ndim == 2
+    assert x.stride(-1) == weight.stride(-1) == 1
+    assert out.is_contiguous() and out.shape == (x.shape[0], weight.shape[0])
+    if x.shape[0] != 0:
+        _run_tgv(
+            x,
+            weight.t(),
+            bias,
+            out,
+            pdl=True,
+            tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
+        )
+
+
+def _tgv_bf16_gemm_out_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="cutedsl_tgv_bf16_gemm_out",
+    op_func=_tgv_bf16_gemm_out_run,
+    mutates_args=["out"],
+    fake_impl=_tgv_bf16_gemm_out_fake,
+)
+
+
+@debug_kernel_api
+def cutedsl_bf16_gemm_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Write a BF16 GEMM into caller-owned contiguous storage."""
+    torch.ops.sglang.cutedsl_tgv_bf16_gemm_out(x, weight, out, bias)
+    return out

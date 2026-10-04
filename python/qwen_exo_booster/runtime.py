@@ -299,6 +299,7 @@ class CompactionReflectionCheckpoint:
 class ResponseConversationIdentity:
     conversation_key: str
     crc32: str
+    first_lines_digest: str
     payload_digest: str
     original_task: str
 
@@ -1494,6 +1495,15 @@ class QwenExoRuntime:
                         },
                         model_fingerprint=self.model_identity.fingerprint,
                         tp_size=self.config.tp_size,
+                        compression_ratio=int(
+                            getattr(
+                                getattr(
+                                    getattr(self.tokenizer_manager, "model_config", None),
+                                    "hf_text_config", None,
+                                ),
+                                "indexer_compress_ratio", 1,
+                            ) or 1
+                        ),
                         max_document_tokens=(
                             self.config.tensor_bank_max_document_tokens
                         ),
@@ -4890,9 +4900,27 @@ class QwenExoRuntime:
         ).encode("utf-8")
         crc32 = f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}"
         payload_digest = hashlib.sha256(payload).hexdigest()
+        # First lines provide the requested stable label, not authorization to
+        # restore state. The complete canonical head remains a discriminator.
+        first_lines_payload = json.dumps(
+            {
+                "schema": "qwen-exo-responses-first-lines-v1",
+                "instructions": [
+                    {"role": item["role"], "content": item["content"].split("\n", 1)[0]}
+                    for item in instructions
+                ],
+                "first_user": {"role": "user", "content": first_user.split("\n", 1)[0]},
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        first_lines_digest = hashlib.sha256(first_lines_payload).hexdigest()
         return ResponseConversationIdentity(
-            conversation_key=f"responses-crc32:{crc32}:{payload_digest}",
+            conversation_key=(
+                f"responses-first-lines-v1:{first_lines_digest}:{payload_digest}"
+            ),
             crc32=crc32,
+            first_lines_digest=first_lines_digest,
             payload_digest=payload_digest,
             original_task=first_user,
         )
@@ -5015,6 +5043,27 @@ class QwenExoRuntime:
         while len(canonical_digests) > max_conversation_keys:
             canonical_digests.popitem(last=False)
         return conversation_key
+
+    def response_cache_namespace(self, request_id: str) -> str:
+        """Scope radix lookup, never select a response's final recurrent state.
+
+        The scheduler still matches the complete token prefix and copies cached
+        recurrent state into an independent request slot. Neither a client key
+        nor a first-line label replaces that match or the model fingerprint.
+        """
+        request_id = str(request_id)
+        conversation_key = self._request_conversation_keys.get(request_id)
+        model_fingerprint = (
+            self.model_identity.fingerprint if self.model_identity is not None else ""
+        )
+        identity = (
+            stable_digest("responses-session-cache-v1", model_fingerprint, conversation_key)
+            if model_fingerprint and conversation_key
+            else stable_digest("responses-request-cache-v1", request_id)
+        )
+        return HybridRuntimePolicy.namespace_key(
+            HybridStateNamespace.REQUEST_PREFIX, identity
+        )
 
     def _remember_memory_parent(self, conversation_key: str, response_id: str) -> None:
         parents = getattr(self, "_memory_parents_by_conversation", None)

@@ -40,6 +40,21 @@ from sglang.srt.utils import add_prefix, is_npu
 logger = logging.getLogger(__name__)
 
 
+def _mtp_quant_config(quant_config):
+    if quant_config and quant_config.get_name() == "modelopt_mixed":
+        # NVIDIA mixed checkpoints may quantize mtp.* independently of the target.
+        if any(name.startswith("mtp.") for name in quant_config.quantized_layers):
+            return quant_config
+        return None
+    if (
+        quant_config
+        and quant_config.get_name() == "modelopt_fp4"
+        and quant_config.is_checkpoint_nvfp4_serialized
+    ):
+        return None
+    return quant_config
+
+
 class Qwen3_5ForCausalLMMTP(nn.Module):
 
     def __init__(
@@ -57,12 +72,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() in (
-            "modelopt_fp4",
-            "modelopt_mixed",
-        ):
-            quant_config = None
+        quant_config = _mtp_quant_config(quant_config)
         if is_npu() and get_server_args().speculative_draft_model_quantization is None:
             quant_config = None
 

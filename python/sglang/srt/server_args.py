@@ -199,6 +199,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
+    "qsa",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
@@ -2170,6 +2171,30 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned memory.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
+    qwen_exo_moe_cpu_offload: A[
+        bool,
+        "Page native routed MoE experts from CPU, preserving the model's Top-K.",
+    ] = False
+    qwen4_ple_disk_path: A[
+        str,
+        "Path to the native Qwen4 PLE disk-backed table.",
+    ] = ""
+    qwen4_ple_backend: A[
+        str,
+        Arg(help="Native Qwen4 PLE disk reader.", choices=["pread", "mmap"]),
+    ] = "pread"
+    qwen4_host_kv_cache: A[
+        bool,
+        "Keep active Qwen4 FP8 K/V GPU-first with pinned host overflow; retain QSA/GDN/PLE state on CUDA.",
+    ] = False
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[
@@ -2201,7 +2226,9 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     # Hierarchical cache
     # -------------------------------------------------------------------------
-    enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
+    enable_hierarchical_cache: A[
+        bool, "Enable hierarchical cache (not supported for Qwen4-Exp)."
+    ] = False
     hicache_ratio: A[
         float,
         "The ratio of the size of host KV cache memory pool to the size of device pool.",
@@ -2439,7 +2466,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     enable_lmcache: A[
         bool,
-        "Using LMCache as an alternative hierarchical cache solution",
+        "Using LMCache as an alternative hierarchical cache solution (not supported for Qwen4-Exp).",
     ] = False
     lmcache_config_file: A[
         Optional[str],
@@ -2455,7 +2482,7 @@ class ServerArgs:
             "Route the default RadixCache through FlexKV's KVManager for "
             "host-tier (CPU / SSD / Remote) KV cache offload. Equivalent "
             "to --radix-cache-backend=flexkv but also participates in the "
-            "auto-selection chain alongside --enable-lmcache."
+            "auto-selection chain alongside --enable-lmcache. Not supported for Qwen4-Exp."
         ),
     ] = False
     flexkv_config_file: A[
@@ -3474,6 +3501,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_offload_compatibility()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3647,6 +3675,70 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._handle_offload_compatibility()
+        self._handle_host_kv_compatibility()
+
+    def _handle_offload_compatibility(self):
+        if self.ple_offload_embedding and (
+            self.cpu_offload_gb > 0 or self.offload_group_size > 0
+        ):
+            raise ValueError(
+                "--ple-offload-embedding cannot be combined with "
+                "--cpu-offload-gb or --offload-group-size: generic layer offload "
+                "would stage the pinned PLE embedding back to the device."
+            )
+        if self.qwen4_ple_disk_path or envs.SGLANG_QWEN4_PLE_NVME_PATH.get():
+            if self.tp_size != 1:
+                raise ValueError("disk-backed Qwen4 PLE requires --tp-size=1")
+            if self.cuda_graph_config is not None:
+                if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                    raise ValueError("disk-backed Qwen4 PLE requires eager prefill")
+                if self.cuda_graph_config.decode.backend not in {Backend.DISABLED, Backend.FULL}:
+                    raise ValueError("disk-backed Qwen4 PLE supports only full decode CUDA graphs")
+            if self.qwen4_ple_disk_path:
+                envs.SGLANG_QWEN4_PLE_NVME_PATH.set(self.qwen4_ple_disk_path)
+                envs.SGLANG_QWEN4_PLE_NVME_BACKEND.set(self.qwen4_ple_backend)
+            if envs.SGLANG_QWEN4_PLE_NVME_BACKEND.get() not in {"pread", "mmap"}:
+                raise ValueError("Qwen4 PLE backend must be pread or mmap")
+        if not self.qwen_exo_moe_cpu_offload:
+            return
+        if self.tp_size != 1 or self.ep_size != 1 or self.pp_size != 1 or self.moe_dp_size != 1:
+            raise ValueError("CPU expert paging requires TP/EP/PP/MoE-DP=1")
+        if self.cuda_graph_config is not None and (
+            self.cuda_graph_config.decode.backend != Backend.DISABLED
+            or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError("CPU expert paging requires disabled CUDA graphs")
+        if self.moe_runner_backend not in {"flashinfer_cutlass", "flashinfer_trtllm_routed"}:
+            raise ValueError("CPU expert paging requires a StandardTopK FlashInfer runner")
+        if self.moe_a2a_backend != "none" or not self.disable_shared_experts_fusion:
+            raise ValueError("CPU expert paging requires no A2A and disabled shared expert fusion")
+        if self.enable_eplb or self.ep_num_redundant_experts or self.enable_waterfill:
+            raise ValueError("CPU expert paging cannot use EPLB, redundant experts or waterfill")
+        if self.cpu_offload_gb > 0 or self.offload_group_size > 0:
+            raise ValueError("CPU expert paging cannot combine generic weight offload")
+        if self.qwen_exo_moe_top_k is not None or self.qwen_exo_moe_extra_experts:
+            raise ValueError("CPU expert paging preserves native Top-K; experiments are incompatible")
+
+    def _handle_host_kv_compatibility(self):
+        if not self.qwen4_host_kv_cache:
+            return
+        if self.device != "cuda" or (self.tp_size, self.ep_size, self.pp_size, self.dp_size) != (1, 1, 1, 1):
+            raise ValueError("Qwen4 host KV requires CUDA and TP/EP/PP/DP=1")
+        if self.kv_cache_dtype != "fp8_e4m3":
+            raise ValueError("Qwen4 host KV requires --kv-cache-dtype=fp8_e4m3")
+        if self.enable_unified_memory or self.enable_page_major_kv_layout or self.disaggregation_mode != "null":
+            raise ValueError("Qwen4 host KV cannot use unified memory, page-major layout or disaggregation")
+        from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED, parse_qsa_profile
+        hf_config = self.get_model_config().hf_config
+        profile = parse_qsa_profile(hf_config)
+        if hf_config.architectures != ["Qwen4ExpForConditionalGeneration"] or profile is None or profile.variant != QSA_VARIANT_COMPRESSED:
+            raise ValueError("Qwen4 host KV requires the native compressed QSA model")
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import _resolve_trtllm_sparse_decode
+        if _resolve_trtllm_sparse_decode() is None:
+            raise ValueError("Qwen4 host KV requires native FlashInfer TRTLLM sparse attention")
+        if self.speculative_algorithm not in {None, "EAGLE"} or self.speculative_eagle_topk not in {None, 1}:
+            raise ValueError("Qwen4 host KV supports ordinary decoding or native topk=1 MTP")
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -5551,6 +5643,7 @@ class ServerArgs:
             "Qwen3_5MoeForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
         ]:
             # The quantization/moe_runner_backend resolution moved to the
             # override registry (arg_groups/overrides.py:
@@ -7241,6 +7334,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",

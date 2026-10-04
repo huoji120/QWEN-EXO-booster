@@ -704,20 +704,49 @@ def commit_mamba_states_after_verify(
     accept_index: torch.Tensor,
     draft_token_num: int,
 ) -> None:
-    """Commit accepted per-step mamba states into the persistent caches.
+    """Commit accepted GDN, model PLE, and QSA state at one shared boundary.
 
-    During TARGET_VERIFY, hybrid linear attention backends keep per-step
-    states in intermediate caches instead of advancing the persistent
-    conv/ssm caches. After acceptance, the state of each request's last
-    accepted step is committed back, plus the interval-crossing state used
-    for prefix-cache tracking (mamba extra_buffer mode).
-
-    No-op for models without mamba-style state or backends without the
-    commit hook.
+    Per-request tree steps also select interval-crossing prefix-cache states.
+    ReplaySSM changes the GDN commit mechanism, not the model-side boundary.
     """
     model_runner = target_worker.model_runner
     if mambaish_config(model_runner.model_config) is None:
         return
+    if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        return
+    bs = accept_lens.shape[0]
+    accept_indices_offset = torch.arange(
+        0, bs * draft_token_num, step=draft_token_num,
+        dtype=accept_lens.dtype, device=accept_lens.device,
+    )
+    req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+    # The accepted chain's final tree node need not be accept_lens - 1.
+    last_correct_step_indices = (
+        accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+        - accept_indices_offset
+    )
+    if batch.mamba_track_indices is not None:
+        seq_lens_pre_verify = batch.seq_lens
+        seq_lens_post_verify = batch.seq_lens + accept_lens
+        mamba_track_interval = get_server_args().mamba_track_interval
+        to_track_mask = (
+            seq_lens_pre_verify // mamba_track_interval
+            != seq_lens_post_verify // mamba_track_interval
+        )
+        tracking_point = (
+            seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+        )
+        to_track_ith = torch.clamp(
+            tracking_point - seq_lens_pre_verify - 1, min=0,
+            max=accept_index.shape[1] - 1,
+        ).to(torch.int64)
+        candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
+        mamba_steps_to_track = torch.where(
+            to_track_mask, candidate_track_steps,
+            torch.full_like(candidate_track_steps, -1),
+        )
+    else:
+        mamba_steps_to_track = None
 
     # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
     # live in the per-slot circular ring (written during verify). Instead of
@@ -734,8 +763,6 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_cache_base", None) is not None
         and not getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-            return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_spec,
         )
@@ -744,7 +771,6 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         # Advance the per-slot circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
@@ -760,78 +786,16 @@ def commit_mamba_states_after_verify(
         )
         # Roll back / commit the conv state to the last accepted draft step
         # (same logic as the recurrent commit, but conv-only).
-        accept_indices_offset = torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            dtype=accept_lens.dtype,
-            device=accept_lens.device,
-        )
-        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        last_correct_step_indices = (
-            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-            - accept_indices_offset
-        )
         fused_conv_window_scatter_with_mask(
             spec_state.conv[0],
             spec_state.intermediate_conv_window[0],
             state_batch_indices,
             last_correct_step_indices,
         )
-        # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
-        # a device-side force-flush so `temporal` reflects the ring before a
-        # snapshot; not wired for Part B (server_args forbids extra_buffer with
-        # --enable-gdn-replayssm-spec), so the per-track scatters are intentionally
-        # skipped here.
-        return
-
-    attn_backend = model_runner.attn_backend
-
-    bs = accept_lens.shape[0]
-    # `accept_lens` already includes the bonus token (drafts + 1 per req).
-    if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        accept_indices_offset = torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            dtype=accept_lens.dtype,
-            device=accept_lens.device,
-        )
-        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        # Per-req tree step of the last accepted node, i.e. the step whose
-        # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
-        last_correct_step_indices = (
-            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-            - accept_indices_offset
-        )
-
-        if batch.mamba_track_indices is not None:
-            # If after verify, the request's seq_lens has crossed a mamba track interval,
-            # we need to update the mamba state for the request at the crossing point.
-            seq_lens_pre_verify = batch.seq_lens
-            seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_server_args().mamba_track_interval
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != seq_lens_post_verify // mamba_track_interval
-            )
-            tracking_point = (
-                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(
-                tracking_point - seq_lens_pre_verify - 1, min=0
-            ).to(torch.int64)
-            candidate_track_steps = (
-                accept_index[req_idx, to_track_ith] - accept_indices_offset
-            )
-            mamba_steps_to_track = torch.where(
-                to_track_mask,
-                candidate_track_steps,
-                torch.full_like(candidate_track_steps, -1),
-            )
-        else:
-            mamba_steps_to_track = None
-
+        # ReplaySSM forbids mamba extra-buffer tracking: snapshotting its
+        # cursor-owned SSM state requires a force-flush, not an ordinary scatter.
+    else:
+        attn_backend = model_runner.attn_backend
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
                 last_correct_step_indices=last_correct_step_indices,
@@ -839,16 +803,22 @@ def commit_mamba_states_after_verify(
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
             )
-        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
-            # Models whose conv layers bypass the attention-backend wrapper
-            # (Inkling) own the commit themselves.
-            model_runner.model.update_conv_state_after_mtp_verify(
-                req_to_token_pool=model_runner.req_to_token_pool,
-                req_pool_indices=batch.req_pool_indices[:bs],
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-            )
+    if hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
+        model_runner.model.update_conv_state_after_mtp_verify(
+            req_to_token_pool=req_pool,
+            req_pool_indices=batch.req_pool_indices[:bs],
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+        )
+    if hasattr(model_runner.model, "update_qsa_state_after_mtp_verify"):
+        model_runner.model.update_qsa_state_after_mtp_verify(
+            token_to_kv_pool=model_runner.token_to_kv_pool,
+            req_pool_indices=batch.req_pool_indices[:bs],
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            draft_token_num=draft_token_num,
+        )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:

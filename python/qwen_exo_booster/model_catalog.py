@@ -112,6 +112,23 @@ def _runtime_quantization(config: dict[str, Any], variant: str) -> str | None:
     method = str(quantization.get("quant_method") or "").lower()
     if method == "modelopt" and str(quantization.get("quant_algo") or "").upper() == "NVFP4":
         return "modelopt_fp4"
+    if (
+        method == "modelopt"
+        and str(quantization.get("quant_algo") or "").upper() == "MIXED_PRECISION"
+    ):
+        layers = quantization.get("quantized_layers")
+        if isinstance(layers, dict) and layers:
+            algorithms = {
+                str(value.get("quant_algo") or "").upper()
+                for value in layers.values()
+                if isinstance(value, dict)
+            }
+            if (
+                len(layers) == sum(isinstance(value, dict) for value in layers.values())
+                and "NVFP4" in algorithms
+                and algorithms <= {"NVFP4", "FP8", "FP8_PB_WO"}
+            ):
+                return "modelopt_mixed"
     if method == "fp8":
         return "fp8"
     if (
@@ -145,6 +162,8 @@ def _checkpoint_quantization(config: dict[str, Any]) -> dict[str, Any]:
             "checkpoint_quantization_bits": None,
             "checkpoint_quantization_group_size": None,
             "checkpoint_quantization_exclusions": [],
+            "checkpoint_quantization_algo": None,
+            "checkpoint_quantized_layers": {},
         }
     dynamic = quantization.get("dynamic")
     exclusions = (
@@ -156,12 +175,19 @@ def _checkpoint_quantization(config: dict[str, Any]) -> dict[str, Any]:
         if isinstance(dynamic, dict)
         else []
     )
+    ignored = quantization.get("ignore", quantization.get("exclude_modules", ()))
+    if isinstance(ignored, (list, tuple)):
+        exclusions = sorted(
+            set(exclusions).union(value for value in ignored if isinstance(value, str))
+        )
     return {
         "checkpoint_quantization": quantization.get("quant_method")
         or quantization.get("mode"),
         "checkpoint_quantization_bits": quantization.get("bits"),
         "checkpoint_quantization_group_size": quantization.get("group_size"),
         "checkpoint_quantization_exclusions": exclusions,
+        "checkpoint_quantization_algo": quantization.get("quant_algo"),
+        "checkpoint_quantized_layers": quantization.get("quantized_layers") or {},
     }
 
 

@@ -51,6 +51,9 @@ class MemoryPoolConfig:
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
 
+    # Shared valid-token CUDA prefix of Qwen4 raw FP8 K/V (dummy page excluded).
+    qwen4_gpu_kv_tokens: int = 0
+
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
     c128_max_total_num_tokens: int = 0
@@ -143,6 +146,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     coeff = cell_size (bytes per token across all layers)
     bias = 0
+
+    Qwen4 host overflow instead prices all logical QSA metadata first, including
+    the dummy page, then fills a raw CUDA prefix from the original byte budget.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -157,6 +163,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
+        self._available_bytes = 0
+        self._host_raw_cell_size = 0
+        if kvc.server_args.qwen4_host_kv_cache:
+            self._host_raw_cell_size = (
+                kvc.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+                * (kvc.model_config.head_dim + kvc.model_config.v_head_dim)
+                * num_layers
+                * torch._utils._element_size(kvc.kv_cache_dtype)
+            )
         self._cell_size = self._compute_cell_size(kvc, num_layers)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -172,10 +187,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
-                )
+                if self._host_raw_cell_size:
+                    # Native MTP owns the same logical slot span as the target.
+                    total_layers = int(num_layers) + int(eagle_draft_num_layers)
+                    self._cell_size = self._cell_size * total_layers // int(num_layers)
+                    self._host_raw_cell_size = (
+                        self._host_raw_cell_size * total_layers // int(num_layers)
+                    )
+                else:
+                    self._cell_size = int(
+                        self._cell_size
+                        * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
@@ -211,6 +234,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc, num_layers
         )
 
+        if kvc.server_args.qwen4_host_kv_cache:
+            # Price QSA metadata over the whole logical span first. The raw
+            # GPU prefix consumes the remainder; GDN/PLE keep their own budget.
+            return self._compute_qsa_cell_size(
+                hf_config=model_config.hf_text_config, num_layers=effective_num_layers
+            )
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
 
@@ -312,20 +341,70 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
 
+        cell_size += self._compute_qsa_cell_size(
+            hf_config=model_config.hf_text_config, num_layers=num_layers
+        )
         return cell_size
+
+    @staticmethod
+    def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_COMPRESSED,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
+
+        if num_layers == 0:
+            return 0
+        qsa_profile = parse_qsa_profile(hf_config)
+        if qsa_profile is None:
+            return 0
+        if qsa_profile.variant == QSA_VARIANT_COMPRESSED:
+            return QSATokenToKVPool.qsa_bytes_per_token(
+                kv_heads=qsa_profile.kv_heads,
+                head_dim=qsa_profile.head_dim,
+                compress_ratio=qsa_profile.compress_ratio,
+                num_layers=num_layers,
+            )
+        return QwenDSATokenToKVPool.qsa_bytes_per_token(
+            kv_heads=qsa_profile.kv_heads,
+            head_dim=qsa_profile.head_dim,
+            num_layers=num_layers,
+        )
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        self._available_bytes = available_bytes
         max_total_num_tokens = available_bytes // self._cell_size
-        max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        if self._host_raw_cell_size:
+            # QSA indices also back the reserved logical dummy page.
+            max_total_num_tokens -= page_size
+        return self.calculate_pool_sizes_from_max_tokens(
+            max_total_num_tokens, page_size
+        )
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        gpu_tokens = 0
+        if self._host_raw_cell_size:
+            metadata_bytes = (max_total_num_tokens + page_size) * self._cell_size
+            raw_budget = max(0, self._available_bytes - metadata_bytes)
+            # Every nonempty GPU bank includes its own raw dummy page. Do not
+            # charge that page when the bank is entirely pinned on the host.
+            raw_pages = raw_budget // (page_size * self._host_raw_cell_size)
+            gpu_tokens = min(
+                max_total_num_tokens, max(0, raw_pages - 1) * page_size
+            )
+        return MemoryPoolConfig(
+            max_total_num_tokens=max_total_num_tokens,
+            qwen4_gpu_kv_tokens=gpu_tokens,
+        )
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):

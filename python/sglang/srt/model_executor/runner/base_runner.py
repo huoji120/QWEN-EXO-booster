@@ -567,6 +567,12 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
+        allocate_disk_ple = (
+            getattr(mr.model, "allocate_disk_ple_graph_buffers", None)
+            if not mr.is_draft_worker else None
+        )
+        if allocate_disk_ple is not None:
+            forward_batch.qwen4_ple_graph_embeddings = allocate_disk_ple(forward_batch) or None
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
