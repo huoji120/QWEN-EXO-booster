@@ -94,6 +94,10 @@ Score Bias can surface relevant system rules, tool traces, and history to the at
 
 Long reasoning and multi-round tool calls break at boundaries: truncations, half tool calls, leaked reasoning. QWEN-EXO keeps reasoning, tool calls, tool outputs, and final answers strictly separate, and provides a controlled recovery path for incomplete responses. Even when the model stops at a budget boundary, a half-finished internal thought is never passed off as the final answer.
 
+Responses enforces `max_reasoning_tokens` independently of Observer, Adaptive Refresh and external-memory retrieval. The cap applies to target-generated reasoning tokens, including when EAGLE/MTP remains enabled. Explicit THINK opt-out bypasses the two-phase path; a cutoff continues the answer within the remaining total output budget, with exhaustion still reported as `incomplete`. Self-Ask cutoff-question injection retains its original Observer/refresh-context gate, so an independent cap does not launch extra internal generation. `reasoning.budget_forced.observed_tokens` records the actual cutoff; API `reasoning_tokens` also counts synthetic boundary/cutoff-control text and is not identical to the generated-token cap.
+
+Managed `default_enable_thinking` controls thinking when the request does not specify it; `default_preserve_thinking` controls historical assistant reasoning in the template. Preservation cannot restore THINK omitted by the client: historical reasoning must still be supplied. Explicit request settings take precedence.
+
 ### Observability: no black-box magic
 
 Which queries ran, which K matched, which candidates the Judge rejected, whether native state was used, whether thinking was truncated—everything is visible in the console and telemetry. Performance gains are measurable, wrong recalls are locatable, reflection memory is reversible—**an unverified "the model seems to remember" is never treated as fact**.

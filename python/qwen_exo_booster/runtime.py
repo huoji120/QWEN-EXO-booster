@@ -5653,7 +5653,7 @@ class QwenExoRuntime:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         questions = None
-        if self.mid_think_questions is not None:
+        if self.think_context_enabled and self.mid_think_questions is not None:
             try:
                 questions = await self.mid_think_questions.generate(
                     parent_request_id=request_id,

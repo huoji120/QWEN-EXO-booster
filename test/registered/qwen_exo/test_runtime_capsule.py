@@ -1033,6 +1033,10 @@ def test_function_call_output_queues_native_think_context_before_generation(tmp_
 @pytest.mark.asyncio
 async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
     value = runtime(tmp_path)
+    async def unexpected_self_ask(**kwargs):
+        raise AssertionError("Independent reasoning cutoff must not launch Self-Ask")
+
+    value.mid_think_questions = SimpleNamespace(generate=unexpected_self_ask)
     request_id = "resp-reasoning-budget"
     turn_id = f"{request_id}:post_tool:0"
     value._pending_think_contexts[request_id] = SimpleNamespace(turn_id=turn_id)
@@ -1046,9 +1050,8 @@ async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
     value._replay_tasks[request_id] = replay_task
     await asyncio.sleep(0)
 
-    # No MidThinkQuestionService is wired in this bare fixture, so the cutoff
-    # falls back to the plain stop-and-go boundary (returns None) while still
-    # clearing the stale pending context and cancelling in-flight tasks.
+    # Budget enforcement must not launch internal generation when the Observer
+    # and refresh context lane are inactive, even if the service exists.
     injection = await value.build_reasoning_cutoff_injection(
         request_id,
         observed_tokens=3072,

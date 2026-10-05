@@ -1592,7 +1592,7 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
 
         class FakeRuntime:
             reasoning_end_token_id = 99
-            think_context_enabled = True
+            think_context_enabled = False
             max_reasoning_tokens = 4
 
             def __init__(self):
@@ -1651,7 +1651,6 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
         )
         self.assertNotIn("finish_reason", snapshots[0]["meta_info"])
         self.assertTrue(snapshots[1]["text"].endswith("</think>"))
-        self.assertNotIn("Self-question", snapshots[1]["text"])
         self.assertFalse(snapshots[1]["meta_info"]["qwen_exo_self_ask_boundary"])
         self.assertEqual(serving.tokenizer_manager.requests[1].input_ids[-1], 99)
         self.assertEqual(

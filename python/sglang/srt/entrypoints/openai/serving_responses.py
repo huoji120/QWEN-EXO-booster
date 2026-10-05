@@ -3718,10 +3718,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         },
                     )
 
+            # Budget stopping applies to target-accepted tokens independently
+            # of Observer/refresh; only memory injection needs that context lane.
             reasoning_end_token_id = (
                 qwen_exo_runtime.reasoning_end_token_id
                 if qwen_exo_runtime is not None
-                and qwen_exo_runtime.think_context_enabled
                 and thinking_enabled is not False
                 and prompt_token_ids is not None
                 else None

@@ -94,6 +94,10 @@ Score Bias 可以把相关的系统规约、工具轨迹和历史证据提供给
 
 长思考和多轮工具调用最容易出现截断、半个 tool call 或 reasoning 泄漏。QWEN-EXO 将 reasoning、tool call、tool output 和最终 output 分开处理，并对不完整响应提供受控恢复路径。即使模型在预算边界停止，也不会把半截内部思考直接冒充最终答案。
 
+Responses 的 `max_reasoning_tokens` 截断独立于 Observer、Adaptive Refresh 和外部知识检索；它限制目标模型实际生成的思考 tokens，因此保留 EAGLE/MTP 也可执行预算截断。显式关闭 THINK 时不进入两阶段路径；截断后用剩余总输出预算继续回答，耗尽总预算仍标记 `incomplete`。Self-Ask 截断问题注入仍要求原有 Observer／刷新上下文通道启用，不会因独立限额而额外启动内部生成。`reasoning.budget_forced.observed_tokens` 是实际截断位置；API `reasoning_tokens` 还会计入合成边界／截断控制文本，不应直接等同于该生成限额。
+
+托管设置 `default_enable_thinking` 控制未显式指定时是否思考；`default_preserve_thinking` 控制模板是否保留历史 assistant 思考。保留历史不会恢复客户端未发送的 THINK，客户端仍须提供历史推理；显式请求设置优先。
+
 ### 可观测性：不是黑盒魔法
 
 一次请求到底看到了哪些 query、命中了哪些 K、哪些候选被 Judge 拒绝、是否使用了原生状态、是否发生了 Think 截断，都可以通过控制台和 telemetry 查看。性能提升可以测量，错误召回可以定位，反思记忆可以回滚——**未经验证的"模型好像记住了"不会被当成事实**。
