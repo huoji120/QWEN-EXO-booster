@@ -195,6 +195,10 @@ Responses 请求可设置 `qwen_exo_engram=false` 关闭全部 Engram，或仅�
 
 准备器支持 `--backend-python /path/to/isolated/python`，仅在指定的已安装环境执行 CPU 元信息探测，不改在线环境。实查中，在线 Transformers 5.12.1 没有 Qwen4Exp 注册，而既有独立环境的 5.17.0 已有原生模型；但后者没有该 checkpoint 的 `modelopt` 混合量化加载注册，通用 HF NVFP4 quantizer 也声明 `is_trainable=False`。因此“有架构源码”和“能对这份混合精度 checkpoint 做冻结主模型的激活反向”是两件事，不能只改量化名称或训练标志绕过门禁。
 
+独立后端现由 `qwen_exo_booster.native_ple_checkpoint` 和 `native_ple_training_backend` 实现，而不是修改 HF 的训练标志：严格读取原始 safetensors，保留每个专家的 NVFP4 E2M1 nibble、FP8 block-16 scale 和 FP32 global scale；冻结线性的 backward 重新按需解码权重计算输入梯度，不把全量专家 BF16 权重保存到反向图。主模型从原生 HF Qwen4Exp 的 meta 构造开始，替换专家库和磁盘 PLE 后才放置普通权重；只允许独立 delta 参数有梯度。原生 key/value 投影、四流 GR、GDN、QSA 和 short-conv 保留，窗口历史／知识模式在非重入 checkpoint 的反向重算中固定。
+
+训练参考采用 **W4A16：原始量化权重＋BF16／FP32 激活**，不是在线 W4A4 激活量化的逐位复现；没有偷偷改路由或声称 serving 数值一致。`scripts/qwen_exo/check_native_ple_backend.py --verify-code --profile PROFILE --output PRIVATE_RECEIPT` 仅用 CPU，检查真实 checkpoint 全部文本张量映射、真实专家权重切片解码／输入梯度，以及实际混合加载器上的小型原生模型 causal loss → PLE 梯度。实测 delta 最大梯度 `0.006175774`，关闭增量与相同冻结参考完全一致，原始权重和 artifact 字节不变、原始梯度为零、optimizer steps 为零。准备计划可通过 `--backend-receipt PRIVATE_RECEIPT` 转为 `code_prepared_gpu_validation_pending`；完整模型 GPU backward、32K 显存容量及知识任务收益仍未验证，命令不会自动训练或修改在线服务。
+
 ### Qwen3.8-Flash-Next NVFP4：隔离单卡路径
 
 `Qwen4ExpForConditionalGeneration` 使用 GDN + QSA、四分支 Gated Residual 和原生 PLE，不能按旧 Qwen3.5 模型直接换目录。官方 NVIDIA checkpoint 是混合精度：主模型 routed experts 为 NVFP4，PLE 为 FP8，MTP experts 为 FP8 分块权重；运行量化名称是 `modelopt_mixed`。

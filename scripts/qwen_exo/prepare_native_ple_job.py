@@ -51,7 +51,7 @@ def backend_status(backend_python=None):
             "quantized_backbone_autograd_verified": False}
 
 
-def prepare(data, output, backend_python=None):
+def prepare(data, output, backend_python=None, backend_receipt=None):
     from qwen_exo_booster.native_ple_knowledge import NativePLEIdentity
     manifest_path = data / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -64,19 +64,39 @@ def prepare(data, output, backend_python=None):
     reasons = []
     if not backend["native_architecture_registered"]:
         reasons.append("Installed Transformers has no exact Qwen4Exp differentiable model/config registration")
-    if not backend["modelopt_mixed_loader_registered"]:
-        reasons.append("Exact checkpoint modelopt MIXED_PRECISION loader is absent; generic NVFP4 is not interchangeable")
-    reasons.append("Real native NVFP4 frozen-backbone-to-PLE gradient gate has not run; serving no_grad is not a training backend")
+    implementation = (REPO / "python/qwen_exo_booster/native_ple_checkpoint.py").is_file() and (
+        REPO / "python/qwen_exo_booster/native_ple_training_backend.py").is_file()
+    backend["custom_frozen_mixed_checkpoint_reference"] = implementation
+    receipt = None
+    if backend_receipt is not None:
+        receipt = json.loads(backend_receipt.read_text(encoding="utf-8"))
+        if (receipt.get("status") != "code_prepared_cpu_verified"
+                or receipt.get("identity_sha256") != identity.fingerprint()
+                or receipt.get("training_started") or receipt.get("GPU_used")
+                or receipt.get("optimizer_steps") != 0):
+            raise ValueError("Native backend receipt does not prove this exact CPU preparation")
+        for name, sha in receipt["backend_code_sha256"].items():
+            if digest_file(REPO / name) != sha:
+                raise ValueError("Native backend implementation changed after CPU verification")
+        backend["native_backbone_gradient_gate"] = "tiny_native_mixed_cpu_verified"
+    if not implementation:
+        reasons.append("Independent frozen mixed-checkpoint reference implementation is missing")
+    elif receipt is None:
+        reasons.append("Independent mixed-checkpoint CPU backward verification is pending")
+    reasons.append("Full real-checkpoint GPU backward and 32K capacity remain unverified; training must be explicitly authorized")
     code_paths = (
         "python/qwen_exo_booster/native_ple_knowledge.py",
         "scripts/qwen_exo/prepare_native_ple_data.py",
         "scripts/qwen_exo/prepare_native_ple_job.py",
+        "python/qwen_exo_booster/native_ple_checkpoint.py",
+        "python/qwen_exo_booster/native_ple_training_backend.py",
+        "scripts/qwen_exo/check_native_ple_backend.py",
     )
     output = output.resolve()
     if output.is_relative_to(REPO):
         raise ValueError("Private job plans must remain outside the public source tree")
     report = {
-        "schema": 1, "status": "blocked_native_training_backend",
+        "schema": 1, "status": "code_prepared_gpu_validation_pending" if receipt is not None and implementation and backend["native_architecture_registered"] else "blocked_native_training_backend",
         "training_started": False, "automatic_start": False,
         "requires_explicit_training_start": True,
         "live_service_changes": False, "gpu_model_loaded": False,
@@ -85,6 +105,8 @@ def prepare(data, output, backend_python=None):
         "model_identity": identity.to_dict(), "model_identity_sha256": identity.fingerprint(),
         "tokenizer": manifest["tokenizer"], "source_records": manifest["source_records"],
         "splits": manifest["splits"], "split_provenance": manifest["split_provenance"],
+        "backend_receipt_sha256": digest_file(backend_receipt) if backend_receipt is not None else None,
+        "training_reference": "frozen packed NVFP4 weights with BF16/F32 activations (W4A16), not bit-exact serving W4A4",
         "backend": backend, "blocking_prerequisites": reasons,
         "adaptation": {
             "trainable": "separate sparse native PLE delta rows only",
@@ -142,6 +164,7 @@ def main():
     parser.add_argument("--data", type=Path)
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--backend-python", type=Path)
+    parser.add_argument("--backend-receipt", type=Path)
     args = parser.parse_args()
     if args.backend_probe:
         print(json.dumps(backend_status(), sort_keys=True))
@@ -150,7 +173,7 @@ def main():
         parser.error("--prepare/--check requires --plan")
     if args.prepare and args.data is None:
         parser.error("--prepare requires --data")
-    report = prepare(args.data.resolve(), args.plan, args.backend_python) if args.prepare else check(args.plan)
+    report = prepare(args.data.resolve(), args.plan, args.backend_python, args.backend_receipt) if args.prepare else check(args.plan)
     print(json.dumps({key: report[key] for key in (
         "status", "training_started", "automatic_start", "gpu_model_loaded",
         "source_records", "splits", "backend", "blocking_prerequisites")}, sort_keys=True))
