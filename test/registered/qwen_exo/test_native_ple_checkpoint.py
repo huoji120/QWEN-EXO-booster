@@ -1,4 +1,4 @@
-"""Bounded CPU analytical checks for the mixed frozen checkpoint reference."""
+"""CPU codec checks and opt-in CUDA parity for the frozen checkpoint reference."""
 import json
 import struct
 
@@ -10,6 +10,7 @@ from qwen_exo_booster.native_ple_checkpoint import (
     FrozenCheckpointExperts,
     IndexedCheckpoint,
     frozen_linear,
+    validate_cuda_linear_parity,
 )
 
 
@@ -20,7 +21,7 @@ _SAFETENSOR_DTYPES = {
 }
 
 
-def _checkpoint(root, tensors):
+def _checkpoint(root, tensors, **reader_options):
     header, body, offset = {}, [], 0
     for name, tensor in tensors.items():
         tensor = tensor.detach().contiguous()
@@ -36,7 +37,7 @@ def _checkpoint(root, tensors):
     (root / "model.safetensors.index.json").write_text(json.dumps({
         "weight_map": {name: "weights.safetensors" for name in tensors}
     }), encoding="utf-8")
-    return IndexedCheckpoint(root)
+    return IndexedCheckpoint(root, **reader_options)
 
 
 def _nvfp4(prefix="linear", *, scale=2.0, global_scale=0.25):
@@ -224,3 +225,94 @@ def test_changed_shard_cannot_be_read_from_stale_metadata(tmp_path):
             source.write(b"\0")
         with pytest.raises(ValueError, match="changed after validation"):
             checkpoint.read("a.weight")
+
+
+def test_cached_contract_still_rejects_modified_shard(tmp_path):
+    with _checkpoint(tmp_path, _nvfp4()) as checkpoint:
+        assert checkpoint.validate_linear("linear") == (1, 16)
+        shard = tmp_path / "weights.safetensors"
+        with shard.open("ab") as source:
+            source.write(b"\0")
+        with pytest.raises(ValueError, match="changed after validation"):
+            checkpoint.validate_linear("linear")
+
+
+@pytest.mark.parametrize("scale_key,value", [
+    ("weight_scale", 0.0), ("weight_scale", float("nan")),
+    ("weight_scale_2", float("inf")), ("input_scale", -2.0),
+])
+def test_startup_contract_rejects_invalid_scales(tmp_path, scale_key, value):
+    tensors = _nvfp4()
+    tensors["linear." + scale_key].fill_(value)
+    with _checkpoint(tmp_path, tensors) as checkpoint:
+        with pytest.raises(ValueError, match="finite and strictly positive"):
+            checkpoint.validate_linear("linear")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA codec validation")
+@pytest.mark.parametrize("codec", ["nvfp4", "fp8_e4m3", "fp8_e5m2", "bf16"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cuda_codec_forward_and_activation_backward(tmp_path, codec, dtype):
+    if codec == "nvfp4":
+        tensors = _nvfp4(global_scale=0.13)
+        tensors["linear.weight"] = tensors["linear.weight"].repeat(129, 4)
+        scales = torch.tensor([[0.5, 1.25, 2.75, 16.0]], dtype=torch.float8_e4m3fn)
+        tensors["linear.weight_scale"] = scales.repeat(129, 1)
+    else:
+        # Noncontiguous source plus ragged final row/column blocks.
+        values = torch.linspace(-3, 3, 129 * 131).reshape(131, 129).T
+        weight_dtype = {"fp8_e4m3": torch.float8_e4m3fn,
+                        "fp8_e5m2": torch.float8_e5m2,
+                        "bf16": torch.bfloat16}[codec]
+        tensors = {"linear.weight": values.to(weight_dtype)}
+        if codec != "bf16":
+            tensors["linear.weight_scale_inv"] = torch.tensor([[0.5, 2.0], [4.0, 8.0]]).T
+    with _checkpoint(tmp_path, tensors) as checkpoint:
+        result = validate_cuda_linear_parity(checkpoint, "linear", dtype=dtype)
+        assert result["decode_max_abs_error"] == 0
+        assert result["forward_max_abs_error"] == 0
+        assert result["dx_max_abs_error"] == 0
+        if codec == "bf16":
+            assert checkpoint.device_cache_info()["bytes"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA codec validation")
+def test_cuda_tensor_decoder_retains_signed_zero_and_scale_order(tmp_path, monkeypatch):
+    import qwen_exo_booster.native_ple_checkpoint as codec
+    monkeypatch.setattr(codec, "_NVFP4_CUDA_KERNEL", False)
+    with _checkpoint(tmp_path, _nvfp4(global_scale=0.13)) as checkpoint:
+        validate_cuda_linear_parity(checkpoint, "linear", dtype=torch.float32)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA cache validation")
+@pytest.mark.parametrize("cache_bytes", [0, 12, 26])
+def test_cuda_eviction_and_cross_stream_backward_redecode(tmp_path, cache_bytes):
+    tensors = {}
+    for i in range(3):
+        tensors.update(_nvfp4(f"linear{i}", global_scale=0.25 * (i + 1)))
+    checkpoint = _checkpoint(tmp_path, tensors, packed_cache_bytes=cache_bytes)
+    try:
+        inputs = torch.arange(16, device="cuda", dtype=torch.float32).reshape(1, 16).requires_grad_()
+        reference = checkpoint.decode_linear("linear0", "cpu", torch.float32).cuda()
+        first = torch.cuda.Stream()
+        first.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(first):
+            output = frozen_linear(inputs, checkpoint, "linear0")
+        torch.cuda.current_stream().wait_stream(first)
+        # Consume a cache hit on another stream, then force its eviction.
+        torch.testing.assert_close(checkpoint.decode_linear("linear0", "cuda", torch.float32), reference)
+        for prefix in ("linear1", "linear2"):
+            validate_cuda_linear_parity(checkpoint, prefix, dtype=torch.float32)
+            assert checkpoint.device_cache_info()["bytes"] <= cache_bytes
+        output.sum().backward()
+        torch.testing.assert_close(output, F.linear(inputs.detach(), reference), rtol=0, atol=0)
+        torch.testing.assert_close(inputs.grad, reference, rtol=0, atol=0)
+        assert checkpoint.device_cache_info()["bytes"] <= cache_bytes
+        checkpoint.clear_device_cache()
+        assert checkpoint.device_cache_info()["bytes"] == 0
+        torch.testing.assert_close(checkpoint.decode_linear("linear0", "cuda", torch.float32), reference)
+    finally:
+        checkpoint.close()
+    assert checkpoint.device_cache_info()["bytes"] == 0
+    with pytest.raises(RuntimeError, match="closed"):
+        checkpoint.decode_linear("linear0", "cuda", torch.float32)

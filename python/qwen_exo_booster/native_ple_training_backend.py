@@ -343,11 +343,19 @@ def load_native_ple_training_model(profile, delta, device="cpu", dtype=torch.bfl
     config = config_type(**raw["text_config"])
     config._attn_implementation = "sdpa" if torch.device(device).type == "cuda" else "eager"
     config.use_cache = False
+    fast_paths = {}
+    if torch.device(device).type == "cuda" and not metadata_only:
+        from qwen_exo_booster.native_ple_gdn_training import install_training_gdn
+        fast_paths.update(install_training_gdn(native))
     checkpoint = IndexedCheckpoint(root)
     try:
         with torch.device("meta"):
             model = _reference_class(native)(config)
         model.ple_identity = identity
+        if torch.device(device).type == "cuda" and not metadata_only:
+            from qwen_exo_booster.native_ple_qsa_training import install_chunked_qsa
+            fast_paths.update(install_chunked_qsa(model, native))
+        model.native_fast_path_report = fast_paths
         consumed = set()
         names = set(checkpoint.tensor_names())
         for i, layer in enumerate(model.model.layers):

@@ -18,6 +18,7 @@ import signal
 import sqlite3
 import sys
 import tempfile
+import time
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
@@ -360,7 +361,8 @@ def execute(args):
              "tokenizer_fingerprint": document["tokenizer"]["files_sha256"],
              "runner_sha256": sha(__file__), "original_files_sha256": sha(run / "original-files.json"),
              "implementation_sha256": {name: sha(REPO_ROOT / "python" / "qwen_exo_booster" / name)
-                 for name in ("native_ple_training_backend.py", "native_ple_checkpoint.py", "native_ple_knowledge.py")},
+                 for name in ("native_ple_training_backend.py", "native_ple_checkpoint.py", "native_ple_knowledge.py",
+                              "native_ple_qsa_training.py", "native_ple_gdn_training.py")},
              "attention_implementation": "native_sdpa_cuda_math_fallback_disabled",
              "rows_provenance_sha256": sha(run / "row-provenance.sqlite"),
              "row_count": rows.numel(), "min_count": args.min_count, "seed": seed,
@@ -373,6 +375,8 @@ def execute(args):
     try:
         model = load_native_ple_training_model(args.profile, delta, device=args.device,
                                                dtype=torch.bfloat16, gradient_checkpointing=True)
+        state["fast_paths"] = model.native_fast_path_report
+        state["gpu_name"] = torch.cuda.get_device_name(args.device)
         optimizer = torch.optim.SparseAdam([delta.weight], lr=args.lr)
         require(not abort[0], "training_aborted_before_gate")
         gate, gate_source = short_source_gate(root, document, identity, rows, args.gate_tokens)
@@ -383,6 +387,9 @@ def execute(args):
         require(bool((delta.weight == 0).all()), "pre_optimizer_delta_mutation")
         gate_metrics.update(gate_source)
         gate_metrics["loss"] = float(gate_loss.detach())
+        print(json.dumps({"event": "first_gradient_gate", "loss": gate_metrics["loss"],
+                          "gradient_abs_max": gate_metrics["gradient_abs_max"],
+                          "device": args.device}), file=sys.__stdout__, flush=True)
         atomic_json(run / "first-gradient-gate.json", gate_metrics)
         del gate_loss
         optimizer.zero_grad(set_to_none=True)
@@ -393,6 +400,8 @@ def execute(args):
                 break
             payload = read_window(root, document, window, identity)
             optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize(args.device)
+            window_started = time.monotonic()
             loss = loss_for(model, payload, args.device, args.ce_chunk_size)
             require(bool(torch.isfinite(loss)), "nonfinite_training_loss")
             gradient_metrics = {"gradient_norm": 0.0}
@@ -412,6 +421,12 @@ def execute(args):
             state["group_targets_seen"][window["case_group"]] += window["assistant_targets"]
             state["last_loss"] = float(loss.detach())
             state["last_gradient_norm"] = gradient_metrics["gradient_norm"]
+            torch.cuda.synchronize(args.device)
+            state["last_window_seconds"] = time.monotonic() - window_started
+            state["peak_gpu_allocated_bytes"] = torch.cuda.max_memory_allocated(args.device)
+            print(json.dumps({"event": "optimizer_progress", **{key: state[key] for key in
+                ("windows_complete", "optimizer_steps", "targets_seen", "last_loss", "last_gradient_norm",
+                 "last_window_seconds", "peak_gpu_allocated_bytes")}}), file=sys.__stdout__, flush=True)
             del loss
             optimizer.zero_grad(set_to_none=True)
             save_progress(run, delta, optimizer, state)

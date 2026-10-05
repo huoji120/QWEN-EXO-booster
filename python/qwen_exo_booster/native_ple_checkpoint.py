@@ -12,6 +12,7 @@ import math
 import mmap
 import struct
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
@@ -58,17 +59,71 @@ def _positive_scale(scale, name):
     return value
 
 
+_NVFP4_CUDA_KERNEL = None
+
+
+def _nvfp4_cuda(weight, blocks, global_scale, shape, dtype):
+    """Decode on the current CUDA stream; the optional fused kernel saves scratch."""
+    global _NVFP4_CUDA_KERNEL, tl
+    if _NVFP4_CUDA_KERNEL is None:
+        try:
+            import triton
+            import triton.language as tl
+        except ImportError:
+            _NVFP4_CUDA_KERNEL = False
+        else:
+            @triton.jit
+            def decode(P, S, G, O, N: tl.constexpr, BLOCK: tl.constexpr):
+                i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+                packed = tl.load(P + i // 2, i < N, 0).to(tl.int32)
+                code = (packed >> ((i % 2) * 4)) & 15
+                magnitude = code & 7
+                value = tl.where(magnitude < 4, magnitude.to(tl.float32) * 0.5,
+                                 tl.where(magnitude == 4, 2.0,
+                                          tl.where(magnitude == 5, 3.0,
+                                                   tl.where(magnitude == 6, 4.0, 6.0))))
+                # Set the IEEE sign bit rather than subtracting from zero.
+                value = (value.to(tl.int32, bitcast=True) | ((code >> 3) << 31)).to(tl.float32, bitcast=True)
+                scale = tl.load(S + i // 16, i < N, 1.0).to(tl.float32)
+                scale = scale * tl.load(G).to(tl.float32)
+                tl.store(O + i, value * scale, i < N)
+            _NVFP4_CUDA_KERNEL = decode
+    if _NVFP4_CUDA_KERNEL is not False:
+        output = torch.empty(shape, dtype=dtype, device=weight.device)
+        count = math.prod(shape)
+        _NVFP4_CUDA_KERNEL[((count + 255) // 256,)](
+            weight, blocks, global_scale, output, count, 256,
+            enable_fp_fusion=False,
+        )
+        return output
+    scales = blocks.float() * global_scale.float().reshape(())
+    codes = torch.stack((weight & 15, weight >> 4), dim=-1).reshape(shape)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=weight.device)
+    decoded = lut[codes.long()]
+    decoded.reshape(shape[0], -1, 16).mul_(scales.unsqueeze(-1))
+    return decoded.to(dtype=dtype)
+
+
 class IndexedCheckpoint:
     """Strict index/header validation with lazy read-only shard mappings.
 
     ``read`` copies only the requested byte range to independent CPU storage.
-    Metadata and mappings are cached, never decoded tensors. ``close`` releases
-    all mappings; tensors returned by ``read`` remain valid after closing.
+    CUDA decoding uses one checkpoint-wide packed-only LRU (256 MiB by default),
+    shared by all layers. Decoded matrices are never cached. Scale contracts are
+    validated once per immutable projection, optionally ahead of training via
+    ``validate_linear``. Closing or changing the CUDA device clears the LRU.
     """
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, packed_cache_bytes: int = 256 * 1024**2):
         if sys.byteorder != "little":
             raise ValueError("Safetensors reference requires a little-endian host")
+        if type(packed_cache_bytes) is not int or packed_cache_bytes < 0:
+            raise ValueError("Packed device cache bytes must be a nonnegative integer")
+        self.packed_cache_bytes = packed_cache_bytes
+        self._packed_cache = OrderedDict()
+        self._packed_bytes = 0
+        self._packed_device = None
+        self._validated_linears = {}
         self.root = Path(root).resolve(strict=True)
         index_path = self.root / "model.safetensors.index.json"
         if not index_path.resolve(strict=True).is_relative_to(self.root):
@@ -204,8 +259,8 @@ class IndexedCheckpoint:
             shape[1] *= 2
         return tuple(shape)
 
-    def decode_linear(self, prefix, device, dtype):
-        """Decode one ephemeral frozen matrix, never activation-quantizing."""
+    def _decode_linear_cpu(self, prefix, device, dtype):
+        """Independent original CPU reference for codec and activation parity."""
         if dtype not in _FLOAT_DTYPES:
             raise ValueError("Decoded linear weights require a floating activation dtype")
         shape = self.linear_shape(prefix)
@@ -257,7 +312,142 @@ class IndexedCheckpoint:
             raise ValueError(f"{prefix}: nonfinite decoded linear weights")
         return decoded.to(device=device, dtype=dtype).detach()
 
+    def validate_linear(self, prefix):
+        """Validate immutable scale contracts once, without decoding normal NVFP4."""
+        self._entry(prefix + ".weight")
+        if prefix in self._validated_linears:
+            contract = self._validated_linears[prefix]
+            self._check_linear_shards(contract)
+            return contract[0]
+        shape = self.linear_shape(prefix)
+        names = self._entries
+        weight_name = prefix + ".weight"
+        kind = _DTYPES[names[weight_name][1]["dtype"]]
+        block_name, global_name = prefix + ".weight_scale", prefix + ".weight_scale_2"
+        inverse_name, input_name = prefix + ".weight_scale_inv", prefix + ".input_scale"
+        tensor_names = [weight_name]
+        checked_names = [weight_name]
+        if input_name in names:
+            input_scale = self.read(input_name)
+            if input_scale.numel() != 1:
+                raise ValueError(f"{prefix}: input scale must be scalar")
+            _positive_scale(input_scale, input_name)
+            checked_names.append(input_name)
+        if kind == torch.uint8:
+            if shape[1] % 16 or inverse_name in names:
+                raise ValueError(f"{prefix}: invalid NVFP4 block geometry or ambiguous scales")
+            blocks, global_scale = self.read(block_name), self.read(global_name)
+            if blocks.dtype != torch.float8_e4m3fn or tuple(blocks.shape) != (shape[0], shape[1] // 16):
+                raise ValueError(f"{prefix}: NVFP4 requires E4M3 scales per 16 columns")
+            if global_scale.dtype != torch.float32 or global_scale.numel() != 1:
+                raise ValueError(f"{prefix}: NVFP4 global scale must be scalar FP32")
+            scales = _positive_scale(blocks, block_name)
+            scales.mul_(_positive_scale(global_scale, global_name).reshape(()))
+            # An analytic bound avoids an expensive CPU nibble decode at startup.
+            # Unusual near-overflow checkpoints still get the exact old check.
+            if float(scales.max()) > torch.finfo(torch.float32).max / 6:
+                self._decode_linear_cpu(prefix, "cpu", torch.float32)
+            tensor_names.extend((block_name, global_name))
+        elif kind in _FP8_DTYPES:
+            if block_name in names or global_name in names:
+                raise ValueError(f"{prefix}: ambiguous FP8 scale convention")
+            scales = self.read(inverse_name)
+            expected = ((shape[0] + 127) // 128, (shape[1] + 127) // 128)
+            if tuple(scales.shape) != expected:
+                raise ValueError(f"{prefix}: FP8 scales require ceil(N/128) by ceil(K/128)")
+            scales = _positive_scale(scales, inverse_name)
+            weight = self.read(weight_name).float()
+            if not bool(torch.isfinite(weight).all()):
+                raise ValueError(f"{prefix}: nonfinite decoded linear weights")
+            if float(weight.abs().max()) * float(scales.max()) > torch.finfo(torch.float32).max:
+                self._decode_linear_cpu(prefix, "cpu", torch.float32)
+            tensor_names.append(inverse_name)
+        elif kind in _FLOAT_DTYPES:
+            if any(name in names for name in (block_name, global_name, inverse_name)):
+                raise ValueError(f"{prefix}: unquantized matrix has unexpected weight scales")
+            if not bool(torch.isfinite(self.read(weight_name)).all()):
+                raise ValueError(f"{prefix}: nonfinite decoded linear weights")
+        else:
+            raise ValueError(f"{prefix}: unsupported linear weight dtype {kind}")
+        checked_names.extend(tensor_names[1:])
+        shards = tuple({names[name][0]: names[name][3] for name in checked_names}.items())
+        contract = (shape, kind, tuple(tensor_names), shards)
+        self._check_linear_shards(contract)
+        self._validated_linears[prefix] = contract
+        return shape
+
+    @staticmethod
+    def _check_linear_shards(contract):
+        for path, signature in contract[3]:
+            if _signature(path.stat()) != signature:
+                raise ValueError(f"Checkpoint shard changed after validation: {path.name}")
+
+    def clear_device_cache(self):
+        """Release packed references; record_stream keeps in-flight users safe."""
+        self._packed_cache.clear()
+        self._packed_bytes = 0
+        self._packed_device = None
+
+    def device_cache_info(self):
+        return {"bytes": self._packed_bytes, "limit_bytes": self.packed_cache_bytes,
+                "entries": len(self._packed_cache), "device": str(self._packed_device)}
+
+    def _cuda_tensors(self, prefix, device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Frozen checkpoint decoding does not support CUDA graph capture")
+        if device != self._packed_device:
+            self.clear_device_cache()
+            self._packed_device = device
+        stream = torch.cuda.current_stream(device)
+        if prefix in self._packed_cache:
+            tensors, ready, _ = self._packed_cache[prefix]
+            self._packed_cache.move_to_end(prefix)
+            stream.wait_event(ready)
+        else:
+            contract = self._validated_linears[prefix]
+            names = contract[2]
+            nbytes = sum(self._entries[name][1]["data_offsets"][1]
+                         - self._entries[name][1]["data_offsets"][0] for name in names)
+            while self._packed_cache and self._packed_bytes + nbytes > self.packed_cache_bytes:
+                self._packed_bytes -= self._packed_cache.popitem(last=False)[1][2]
+            tensors = tuple(self.read(name).to(device=device).contiguous() for name in names)
+            if contract[1] not in _FLOAT_DTYPES and nbytes <= self.packed_cache_bytes:
+                ready = torch.cuda.Event()
+                ready.record(stream)
+                self._packed_cache[prefix] = (tensors, ready, nbytes)
+                self._packed_bytes += nbytes
+        for tensor in tensors:
+            tensor.record_stream(stream)
+        return tensors
+
+    def decode_linear(self, prefix, device, dtype):
+        """Decode ephemeral W4A16 weights on the requested execution device."""
+        if dtype not in _FLOAT_DTYPES:
+            raise ValueError("Decoded linear weights require a floating activation dtype")
+        device = torch.device(device)
+        if device.type != "cuda":
+            return self._decode_linear_cpu(prefix, device, dtype)
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.validate_linear(prefix)
+        shape, kind, _, _ = self._validated_linears[prefix]
+        with torch.cuda.device(device), torch.no_grad():
+            tensors = self._cuda_tensors(prefix, device)
+            if kind == torch.uint8:
+                return _nvfp4_cuda(*tensors, shape, dtype).detach()
+            if kind in _FP8_DTYPES:
+                weight, scales = tensors
+                rows = torch.arange(shape[0], device=device) // 128
+                cols = torch.arange(shape[1], device=device) // 128
+                # Advanced indexing works for noncontiguous/ragged 128x128 grids.
+                decoded = weight.float() * scales.float()[rows[:, None], cols[None, :]]
+                return decoded.to(dtype=dtype).detach()
+            # Never retain a decoded floating matrix in the packed-only LRU.
+            return tensors[0].to(dtype=dtype).detach()
+
     def close(self):
+        self.clear_device_cache()
+        self._validated_linears.clear()
         for mapping in self._maps.values():
             mapping.close()
         self._maps.clear()
@@ -296,6 +486,42 @@ def frozen_linear(inputs, checkpoint: IndexedCheckpoint, prefix: str):
     return F.linear(inputs, weight)
 
 
+def validate_cuda_linear_parity(checkpoint, prefix, *, device="cuda", dtype=torch.bfloat16):
+    """Opt-in, content-blind real-projection smoke; returns only numeric metrics.
+
+    The oracle is original CPU dequantization followed by the same CUDA linear
+    arithmetic. This checks W4A16 codec/fwd/dx, not W4A4 serving equivalence.
+    It allocates two ephemeral decoded projections and four synthetic inputs.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("CUDA parity requires a CUDA device")
+    reference = checkpoint.decode_linear(prefix, "cpu", dtype).to(device)
+    actual = checkpoint.decode_linear(prefix, device, dtype)
+    assert actual.dtype == dtype and not actual.requires_grad
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    assert torch.equal(actual.signbit(), reference.signbit())
+    generator = torch.Generator(device="cpu").manual_seed(1729)
+    inputs = torch.randn(4, reference.shape[1], generator=generator).to(device=device, dtype=dtype).requires_grad_()
+    upstream = torch.randn(4, reference.shape[0], generator=generator).to(device=device, dtype=dtype)
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
+        output = frozen_linear(inputs, checkpoint, prefix)
+    assert saved == [], "Frozen linear retained a dense activation/weight tensor"
+    expected = F.linear(inputs.detach(), reference)
+    output.backward(upstream)
+    expected_grad = upstream @ reference
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(inputs.grad, expected_grad, rtol=0, atol=0)
+    cache = checkpoint.device_cache_info()
+    assert cache["bytes"] <= cache["limit_bytes"]
+    return {"shape": list(reference.shape), "dtype": str(dtype),
+            "decode_max_abs_error": float((actual - reference).abs().max()),
+            "forward_max_abs_error": float((output - expected).abs().max()),
+            "dx_max_abs_error": float((inputs.grad - expected_grad).abs().max()),
+            "packed_cache": cache}
+
+
 class FrozenCheckpointExperts(nn.Module):
     """HF eager experts API, preserving every top-K route and router derivative."""
 
@@ -332,8 +558,19 @@ class FrozenCheckpointExperts(nn.Module):
             raise ValueError("Expert route is outside checkpoint expert range")
         # This zero-valued path also keeps empty batches connected to autograd.
         output = hidden_states * 0 + top_k_weights.sum().to(hidden_states.dtype) * 0
-        for expert in torch.unique(top_k_index).tolist():
-            tokens, slots = torch.where(top_k_index == expert)
+        # One route sort and one small count transfer replace per-expert where()
+        # synchronization. Stable order preserves repeated routes and accumulation.
+        routes = top_k_index.reshape(-1).long()
+        order = torch.argsort(routes, stable=True)
+        counts = torch.bincount(routes, minlength=self.num_experts).tolist()
+        offset = 0
+        for expert, count in enumerate(counts):
+            if not count:
+                continue
+            selected = order[offset : offset + count]
+            offset += count
+            tokens = selected // top_k_index.shape[1]
+            slots = selected % top_k_index.shape[1]
             inputs = hidden_states.index_select(0, tokens)
             root = f"{self.prefix}.{expert}"
             gate = frozen_linear(inputs, self.checkpoint, root + ".gate_proj")

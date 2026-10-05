@@ -203,6 +203,10 @@ Responses 请求可设置 `qwen_exo_engram=false` 关闭全部 Engram，或仅�
 
 `scripts/qwen_exo/train_native_ple_delta.py` 仅在显式 `--start-training` 时执行 GPU 训练：原生模型／基表／reader 冻结，零初始化稀疏 delta，batch 1、一个完整 epoch、lr `1e-4`。训练行来自 source `t` 预测监督 label `t+1`，按最小出现次数 2 选择；分块 frozen-head CE 在 backward 重算，避免保存完整 `32768 × vocab` logits。CUDA 使用原生 SDPA 并禁止二次方 math fallback，实际完整窗口仍须通过资源门禁。保存进度用文件句柄写入同目录临时文件并原子替换，避免 PyTorch 隐藏临时文件名拒绝；进度、失败和未完成 epoch 不包装成成功。训练后 off／real／shuffled 用相同 source-task 标签和 BF16 导出值计 NLL，这是记忆重叠实验，不是泛化或 CTF 成功率证明。先暂停推理释放 GPU，结束后恢复推理由操作者／私有启动器负责，不由训练器强制停服务。
 
+CUDA 训练现使用三个独立快速路径：QSA 的压缩 key／RoPE 只算一次，按 query chunk 批量评分和因果 Top-K；NVFP4 packed 权重直接传入 GPU 用 Triton 解码，256MiB 有界 packed LRU 不缓存整套 BF16 权重，路由排序避免逐专家同步；GDN 与短卷积绑定既有 FLA 的可反向 chunk／Triton 内核。只在独立训练进程绑定，不修改已安装 HF 或在线服务。FLA 必须可从训练解释器导入，缺失时拒绝悄悄回退慢路径；复用包时仅暴露 FLA 包路径，不能把另一环境整套 site-packages 放在训练环境之前。
+
+QSA 仅接收无 padding、无缓存的完整因果窗口；非因果／非连续 mask 明确拒绝。原始 block budget 与不完整尾块保留；完全等分的 Top-K 可选择不同但等分的块，因此不宣称 tie 情况逐位一致。验证覆盖 109 项 CPU 检查、41 项 GPU codec 检查，真实专家的解码／前向／输入梯度最大误差均为 0；FLA GDN 与卷积前后向通过 BF16 容差检查。SM120 上单个热专家投影 GPU 解码约 0.036ms，32K QSA 单层索引约 0.081s；这些是组件数据，不是整轮训练时间。训练进度另记录完整窗口耗时、GPU 峰值与实际 optimizer steps，不能用短检查代替完整窗口验收。
+
 ### Qwen3.8-Flash-Next NVFP4：隔离单卡路径
 
 `Qwen4ExpForConditionalGeneration` 使用 GDN + QSA、四分支 Gated Residual 和原生 PLE，不能按旧 Qwen3.5 模型直接换目录。官方 NVIDIA checkpoint 是混合精度：主模型 routed experts 为 NVFP4，PLE 为 FP8，MTP experts 为 FP8 分块权重；运行量化名称是 `modelopt_mixed`。
