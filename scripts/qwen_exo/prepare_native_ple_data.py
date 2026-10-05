@@ -3,6 +3,8 @@
 Inventory: --inventory --src SOURCE --output PRIVATE_DIR
 Prepare: --prepare --src SOURCE --model NATIVE_PROFILE --output PRIVATE_DIR
          [--split-map PRIVATE.json | --prior-records OLD_RECORDS.jsonl]
+Memorize: --prepare --memorization-cases --src PRIVATE_CASES.jsonl --model PROFILE --output PRIVATE_DIR
+          All records from exactly two explicitly associated groups train; no heldout claim.
 Check: --check --output PRIVATE_DIR
 Smoke: --synthetic-smoke --model NATIVE_PROFILE (temporary synthetic data only)
 
@@ -121,7 +123,7 @@ def write_json(path, value):
         handle.write("\n")
 
 
-def validate_splits(inventory, split_map):
+def validate_splits(inventory, split_map, memorization_cases=False):
     require(split_map.get("schema_version") == SCHEMA_VERSION, "split_map_schema_mismatch")
     require(split_map.get("source_sha256") == inventory["source_sha256"], "split_map_source_mismatch")
     entries = split_map.get("records")
@@ -146,7 +148,8 @@ def validate_splits(inventory, split_map):
         require(item["source_line"] in mapped, "split_map_record_missing")
         require(mapped[item["source_line"]]["message_sha256"] == item["message_sha256"],
                 "split_map_message_hash_mismatch")
-    require({m["split"] for m in mapped.values()} == {"train", "heldout"}, "both_splits_required")
+    expected = {"train"} if memorization_cases else {"train", "heldout"}
+    require({m["split"] for m in mapped.values()} == expected, "required_splits_missing")
     return mapped
 
 
@@ -186,6 +189,25 @@ def derived_splits(inventory, heldout_groups=15, prior_records=None):
                          "session_id": r["first_user_prompt_sha256"], "task_id": r["first_user_prompt_sha256"],
                          "split": "heldout" if r["first_user_prompt_sha256"] in heldout else "train"}
                         for r in inventory["records"]]}
+
+def memorization_splits(path, inventory):
+    entries = list(records(path))
+    groups = {record.get("group") for _, record in entries}
+    require(groups == {"case_1", "case_2"}, "memorization_exactly_two_declared_groups_required")
+    require(all(record.get("knowledge_case") is True for _, record in entries),
+            "memorization_explicit_case_declaration_required")
+    require(collections.Counter(record.get("kind") for _, record in entries)
+            == {"original_rl": 1, "original_events": 1, "source_artifact": 1},
+            "memorization_source_record_coverage_invalid")
+    require(all(record["group"] == ("case_1" if record["kind"] == "original_rl" else "case_2")
+                for _, record in entries), "memorization_artifact_association_invalid")
+    summary = {r["source_line"]: r for r in inventory["records"]}
+    return {"schema_version": SCHEMA_VERSION, "source_sha256": inventory["source_sha256"],
+            "provenance": {"mode": "explicit_two_case_memorization", "heldout_groups": 0,
+                           "train_evaluation_overlap": True, "generalization_evaluation": False},
+            "records": [{"source_line": line, "message_sha256": summary[line]["message_sha256"],
+                         "session_id": record["group"], "task_id": record["group"], "split": "train"}
+                        for line, record in entries]}
 
 
 def normalize(record):
@@ -328,9 +350,13 @@ def prepare(args):
     output = private_output(args.output)
     require(args.src and args.model, "source_and_native_model_required")
     inventory = inventory_source(args.src)
-    split_document = (json.loads(args.split_map.read_text(encoding="utf-8")) if args.split_map else
+    memorization = getattr(args, "memorization_cases", False)
+    require(not memorization or (args.split_map is None and args.prior_records is None),
+            "memorization_cannot_combine_split_or_prior_map")
+    split_document = (memorization_splits(args.src, inventory) if memorization else
+                      json.loads(args.split_map.read_text(encoding="utf-8")) if args.split_map else
                       derived_splits(inventory, args.heldout_groups, args.prior_records))
-    mapping = validate_splits(inventory, split_document)
+    mapping = validate_splits(inventory, split_document, memorization)
     identity, tokenizer, tokenizer_info = load_native(args.model)
     output.mkdir(parents=True)
     write_json(output / "split-map.json", split_document)
@@ -382,6 +408,8 @@ def prepare(args):
                      "start": start, "end": end, "tokens": end - start, "assistant_targets": targets,
                      "row_keys_sha256": hashlib.sha256(payload["row_keys"].numpy().tobytes()).hexdigest()}
             window_index.append(entry)
+            if memorization:
+                entry["case_group"] = record["group"]
         require(covered == int(mask.sum()), "causal_target_coverage_mismatch")
         state["zero_target_records"] += int(covered == 0)
         state["records"] += 1
@@ -391,12 +419,17 @@ def prepare(args):
         record_index.append({**summary[line], **mapping[line], "render_sha256": render_hash,
                              "tokens_with_boundary_eos": ids.numel(), "assistant_targets": covered,
                              "windows": count, "row_keys_sha256": row_digest.hexdigest()})
+        if memorization:
+            record_index[-1]["case_group"] = record["group"]
     require(file_sha256(args.src) == inventory["source_sha256"], "source_changed_during_preparation")
-    require(all(stats[s]["assistant_targets"] > 0 for s in stats), "empty_supervised_split")
+    required_splits = ("train",) if memorization else ("train", "heldout")
+    require(all(stats[s]["assistant_targets"] > 0 for s in required_splits), "empty_supervised_split")
     report = {"schema_version": SCHEMA_VERSION, "status": "prepared_not_started", "training_started": False,
               "generation_started": False, "source_path": str(args.src.resolve()),
               "model_path": str(args.model.resolve()), "source_sha256": inventory["source_sha256"],
               "source_records": inventory["source_records"], "source_roles": inventory["source_roles"],
+              "memorization_cases": memorization,
+              "selected_case_groups": ["case_1", "case_2"] if memorization else [],
               "split_map_sha256": file_sha256(output / "split-map.json"), "split_map_semantic_sha256": digest(split_document),
               "split_provenance": split_document.get("provenance"), "split_assignments_sha256": digest(mapping),
               "causal_prompt_groups": inventory["causal_prompt_groups"],
@@ -418,7 +451,10 @@ def prepare(args):
               "splits": {s: dict(v) for s, v in stats.items()}, "records": record_index,
               "windows": window_index, "files": files, "output_bytes": written_bytes,
               "evaluation": {"modes": ["off", "real", "shuffled"], "shuffle_seed": args.shuffle_seed,
-                             "matched_inputs_labels_files": [w["file"] for w in window_index if w["split"] == "heldout"],
+                             "claim": "source_task_memorization_not_generalization" if memorization else "heldout_causal_group_evaluation",
+                             "train_evaluation_overlap": memorization,
+                             "matched_inputs_labels_files": [w["file"] for w in window_index
+                                 if w["split"] == ("train" if memorization else "heldout")],
                              "native_backbone_base_ple_reader": "frozen_identical_all_modes",
                              "off": "disable_sparse_delta_only",
                              "real": "delta_lookup_uses_row_keys",
@@ -443,13 +479,22 @@ def check(output, cpu_threads=2):
     require(file_sha256(output / "split-map.json") == report["split_map_sha256"]
             and digest(split_document) == report["split_map_semantic_sha256"], "prepared_split_map_changed")
     current_inventory = inventory_source(report["source_path"])
-    require(digest(validate_splits(current_inventory, split_document)) == report["split_assignments_sha256"],
+    require(digest(validate_splits(current_inventory, split_document, report.get("memorization_cases", False))) == report["split_assignments_sha256"],
             "prepared_split_assignments_changed")
+    if report.get("memorization_cases", False):
+        require(memorization_splits(report["source_path"], current_inventory) == split_document,
+                "memorization_case_declarations_changed")
+        require(report.get("selected_case_groups") == ["case_1", "case_2"]
+                and all(w["split"] == "train" for w in report["windows"]), "memorization_split_invalid")
     identity, _, tokenizer_info = load_native(Path(report["model_path"]))
     require(identity.fingerprint() == report["native_identity_sha256"], "native_identity_changed")
     require(tokenizer_info == report["tokenizer"], "tokenizer_identity_changed")
     require(file_sha256(__file__) == report["code_sha256"], "preparation_code_changed")
     counts = collections.Counter()
+    record_counts = collections.Counter()
+    record_windows = collections.Counter()
+    record_by_line = {r["source_line"]: r for r in report["records"]}
+    require(len(record_by_line) == current_inventory["source_records"], "prepared_record_coverage_changed")
     for window in report["windows"]:
         name = window["file"]
         require(not Path(name).is_absolute() and ".." not in Path(name).parts, "manifest_path_invalid")
@@ -467,8 +512,21 @@ def check(output, cpu_threads=2):
                 "native_row_keys_changed")
         require(int(mask.sum()) == window["assistant_targets"], "window_target_count_changed")
         counts[window["split"]] += int(mask.sum())
-    require(all(counts[s] == report["splits"][s]["assistant_targets"] for s in ("train", "heldout")),
+        require(window["source_line"] in record_by_line, "window_source_record_missing")
+        record_counts[window["source_line"]] += int(mask.sum())
+        record_windows[window["source_line"]] += 1
+        if report.get("memorization_cases", False):
+            require(window.get("case_group") == record_by_line[window["source_line"]].get("case_group")
+                    and window.get("case_group") in report["selected_case_groups"],
+                    "window_case_group_changed")
+    required_splits = ("train",) if report.get("memorization_cases", False) else ("train", "heldout")
+    if report.get("memorization_cases", False):
+        require(not report["splits"]["heldout"], "memorization_heldout_must_be_empty")
+    require(all(counts[s] == report["splits"][s]["assistant_targets"] for s in required_splits),
             "split_target_coverage_changed")
+    require(all(record_counts[line] == record["assistant_targets"]
+                and record_windows[line] == record["windows"] for line, record in record_by_line.items()),
+            "per_record_target_coverage_changed")
     return report
 
 
@@ -541,6 +599,8 @@ def main():
     parser.add_argument("--split-map", type=Path)
     parser.add_argument("--prior-records", type=Path, help="Freeze old heldout records and their causal prompt groups")
     parser.add_argument("--heldout-groups", type=int, default=15)
+    parser.add_argument("--memorization-cases", action="store_true",
+                        help="Explicit two-case ingestion: all targets train, evaluation is memorization only")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--max-sequence", type=int, default=32768)
     parser.add_argument("--max-output-bytes", type=int, default=64 * 1024 ** 3)

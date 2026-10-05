@@ -207,6 +207,61 @@ def _install_seeded_ngram(ngram, native):
     ngram.__class__ = SeededNativeNGram
 
 
+class _ChunkedFrozenHeadCE(torch.autograd.Function):
+    """Retain hidden states, never a sequence-by-vocabulary activation graph."""
+    @staticmethod
+    def forward(ctx, hidden, weight, labels, chunk_size):
+        if (hidden.ndim != 3 or labels.shape != hidden.shape[:2] or labels.dtype != torch.int64
+                or weight.ndim != 2 or weight.shape[1] != hidden.shape[2]
+                or weight.requires_grad or hidden.dtype != weight.dtype
+                or hidden.device != weight.device or labels.device != hidden.device
+                or hidden.dtype not in (torch.float32, torch.float64, torch.bfloat16)
+                or not isinstance(chunk_size, int) or chunk_size < 1):
+            raise ValueError("chunked_ce_contract_invalid")
+        shifted = labels[:, 1:]
+        if bool(((shifted != -100) & ((shifted < 0) | (shifted >= weight.shape[0]))).any()):
+            raise ValueError("chunked_ce_label_invalid")
+        positions = (shifted.reshape(-1) != -100).nonzero().flatten()
+        if not positions.numel():
+            raise ValueError("chunked_ce_no_targets")
+        # Mapping flattened causal positions into the original unshifted hidden tensor.
+        length = hidden.shape[1]
+        source = positions // (length - 1) * length + positions % (length - 1)
+        target = shifted.reshape(-1)[positions]
+        flat = hidden.reshape(-1, hidden.shape[-1])
+        accumulation = torch.float64 if hidden.dtype == torch.float64 else torch.float32
+        total = torch.zeros((), device=hidden.device, dtype=accumulation)
+        for begin in range(0, source.numel(), chunk_size):
+            index = source[begin:begin + chunk_size]
+            logits = torch.nn.functional.linear(flat[index], weight).to(accumulation)
+            total += torch.nn.functional.cross_entropy(logits, target[begin:begin + chunk_size], reduction="sum")
+        ctx.save_for_backward(hidden, weight, source, target)
+        ctx.chunk_size = chunk_size
+        ctx.accumulation = accumulation
+        return total / source.numel()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden, weight, source, target = ctx.saved_tensors
+        flat = hidden.reshape(-1, hidden.shape[-1])
+        grad_hidden = torch.zeros_like(flat)
+        for begin in range(0, source.numel(), ctx.chunk_size):
+            index = source[begin:begin + ctx.chunk_size]
+            logits = torch.nn.functional.linear(flat[index], weight).to(ctx.accumulation)
+            derivative = logits.softmax(dim=-1)
+            derivative[torch.arange(index.numel(), device=index.device), target[begin:begin + ctx.chunk_size]] -= 1
+            derivative *= grad_output.to(ctx.accumulation) / source.numel()
+            # Match native linear backward: CE's F32 derivative casts to the
+            # activation dtype before multiplying the frozen head.
+            grad_hidden[index] = derivative.to(hidden.dtype) @ weight
+        return grad_hidden.reshape_as(hidden), None, None, None
+
+
+def chunked_causal_cross_entropy(hidden, frozen_head_weight, labels, chunk_size=128):
+    """Mean teacher-forced causal CE, ignoring -100, with bounded head workspace."""
+    return _ChunkedFrozenHeadCE.apply(hidden, frozen_head_weight, labels, chunk_size)
+
+
 def _reference_class(native):
     class NativePLETrainingModel(native.Qwen4ExpForCausalLM):
         def set_ple_window(self, history=None, *, mode="real", shuffle_seed=0):
@@ -232,6 +287,18 @@ def _reference_class(native):
             permutation = self.ple_delta.shuffle_indices.detach().clone() if mode == "shuffled" else None
             with _window_context((history, mode, permutation)):
                 return super().forward(*args, **kwargs)
+
+        def forward_hidden(self, input_ids, *, ple_history=None, ple_mode=None):
+            """Exact native final HC mixer output, without materializing logits."""
+            default_history, default_mode = self._ple_window
+            history = default_history if ple_history is None else ple_history.detach().clone()
+            mode = default_mode if ple_mode is None else ple_mode
+            if mode not in {"off", "real", "shuffled"}:
+                raise ValueError("PLE mode must be off, real or shuffled")
+            permutation = self.ple_delta.shuffle_indices.detach().clone() if mode == "shuffled" else None
+            with _window_context((history, mode, permutation)):
+                return self.model(input_ids=input_ids, use_cache=False,
+                                  output_router_logits=False).last_hidden_state
 
         def close(self):
             if hasattr(self, "native_checkpoint"):
@@ -274,7 +341,7 @@ def load_native_ple_training_model(profile, delta, device="cpu", dtype=torch.bfl
         raise ValueError("Place sparse delta on the requested reference device first")
     raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
     config = config_type(**raw["text_config"])
-    config._attn_implementation = "eager"
+    config._attn_implementation = "sdpa" if torch.device(device).type == "cuda" else "eager"
     config.use_cache = False
     checkpoint = IndexedCheckpoint(root)
     try:
@@ -527,6 +594,16 @@ def verify_tiny_native_ple_backward():
             values = grad.coalesce().values()
             if not bool(torch.isfinite(result.loss)) or not bool(torch.isfinite(values).all()) or not bool((values != 0).any()):
                 raise AssertionError("Packed native causal loss->delta gradient is zero/nonfinite")
+            expected_gradient = grad.coalesce().to_dense()
+            delta.weight.grad = None
+            hidden = model.forward_hidden(ids, ple_history=history, ple_mode="real")
+            chunked = chunked_causal_cross_entropy(hidden, model.lm_head.weight, ids.clone(), chunk_size=3)
+            model.set_ple_window(torch.tensor([[30, 31]]), mode="off")
+            chunked.backward()
+            actual_gradient = delta.weight.grad.coalesce().to_dense()
+            torch.testing.assert_close(chunked.detach(), result.loss.detach(), rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(actual_gradient, expected_gradient, rtol=2e-5, atol=1e-7)
+            chunked_gradient_error = float((actual_gradient - expected_gradient).abs().max())
             if any(p.grad is not None for p in model.parameters() if p is not delta.weight):
                 raise AssertionError("Original packed-reference weight acquired a gradient")
             if frozen_digest() != original_tensors or artifact_digest() != original_artifacts:
@@ -535,6 +612,8 @@ def verify_tiny_native_ple_backward():
                 raise AssertionError("Backward-only gate mutated the independent delta")
             return {"loss": float(result.loss.detach()), "delta_gradient_abs_max": float(values.abs().max()),
                     "gradient_rows": int(grad.coalesce().indices().shape[1]), "off_parity_exact": True,
+                    "chunked_ce_loss_difference": float((chunked.detach() - result.loss.detach()).abs()),
+                    "chunked_ce_delta_gradient_max_difference": chunked_gradient_error,
                     "nonzero_delta_control_max_difference": active_difference,
                     "original_gradients": 0, "original_weights_unchanged": True,
                     "original_artifact_bytes_unchanged": True,

@@ -199,6 +199,10 @@ Responses 请求可设置 `qwen_exo_engram=false` 关闭全部 Engram，或仅�
 
 训练参考采用 **W4A16：原始量化权重＋BF16／FP32 激活**，不是在线 W4A4 激活量化的逐位复现；没有偷偷改路由或声称 serving 数值一致。`scripts/qwen_exo/check_native_ple_backend.py --verify-code --profile PROFILE --output PRIVATE_RECEIPT` 仅用 CPU，检查真实 checkpoint 全部文本张量映射、真实专家权重切片解码／输入梯度，以及实际混合加载器上的小型原生模型 causal loss → PLE 梯度。实测 delta 最大梯度 `0.006175774`，关闭增量与相同冻结参考完全一致，原始权重和 artifact 字节不变、原始梯度为零、optimizer steps 为零。准备计划可通过 `--backend-receipt PRIVATE_RECEIPT` 转为 `code_prepared_gpu_validation_pending`；完整模型 GPU backward、32K 显存容量及知识任务收益仍未验证，命令不会自动训练或修改在线服务。
 
+私有两例实验可用 `scripts/qwen_exo/normalize_knowledge_cases.py` 统一 `session.messages` RL JSON 与 `steps.items` 事件 JSON；工具调用／结果和 Think 由程序保真处理，只输出结构计数和哈希，不展示正文，不执行轨迹命令或 HTML。分页缺失和未结算工具调用明确记录，不补造内容；用户提供的 HTML 可以作为第二例额外目标，但标记为用户授权的 artifact 配对，不伪称原轨迹消息。数据准备的 `--memorization-cases` 将恰好两个 case group 全部作为训练来源，没有虚假 heldout。
+
+`scripts/qwen_exo/train_native_ple_delta.py` 仅在显式 `--start-training` 时执行 GPU 训练：原生模型／基表／reader 冻结，零初始化稀疏 delta，batch 1、一个完整 epoch、lr `1e-4`。训练行来自 source `t` 预测监督 label `t+1`，按最小出现次数 2 选择；分块 frozen-head CE 在 backward 重算，避免保存完整 `32768 × vocab` logits。CUDA 使用原生 SDPA 并禁止二次方 math fallback，实际完整窗口仍须通过资源门禁。保存进度用文件句柄写入同目录临时文件并原子替换，避免 PyTorch 隐藏临时文件名拒绝；进度、失败和未完成 epoch 不包装成成功。训练后 off／real／shuffled 用相同 source-task 标签和 BF16 导出值计 NLL，这是记忆重叠实验，不是泛化或 CTF 成功率证明。先暂停推理释放 GPU，结束后恢复推理由操作者／私有启动器负责，不由训练器强制停服务。
+
 ### Qwen3.8-Flash-Next NVFP4：隔离单卡路径
 
 `Qwen4ExpForConditionalGeneration` 使用 GDN + QSA、四分支 Gated Residual 和原生 PLE，不能按旧 Qwen3.5 模型直接换目录。官方 NVIDIA checkpoint 是混合精度：主模型 routed experts 为 NVFP4，PLE 为 FP8，MTP experts 为 FP8 分块权重；运行量化名称是 `modelopt_mixed`。
