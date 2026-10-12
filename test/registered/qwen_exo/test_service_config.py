@@ -16,6 +16,55 @@ from qwen_exo_booster.service_config import (
 )
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "qwen_exo_reasoning_budget_min",
+        "qwen_exo_reasoning_budget_low",
+        "qwen_exo_reasoning_budget_medium",
+        "qwen_exo_reasoning_budget_high",
+        "qwen_exo_reasoning_budget_xhigh",
+    ],
+)
+@pytest.mark.parametrize("invalid", [0, -1, 1.5, True, "2048", 32769])
+def test_managed_reasoning_budgets_reject_invalid_values(key, invalid):
+    values = default_values()
+    values[key] = invalid
+    with pytest.raises(ServiceConfigError) as error:
+        validate_values(values)
+    assert error.value.field == key
+
+
+@pytest.mark.parametrize("invalid", [0, 255, True, 1.5, "2048"])
+def test_managed_dynamic_context_rejects_invalid_values(invalid):
+    values = default_values()
+    values["qwen_exo_reasoning_dynamic_context_tokens"] = invalid
+    with pytest.raises(ServiceConfigError) as error:
+        validate_values(values)
+    assert error.value.field == "qwen_exo_reasoning_dynamic_context_tokens"
+
+
+def test_managed_reasoning_mode_rejects_unknown_mode():
+    values = default_values()
+    values["qwen_exo_reasoning_mode"] = "auto"
+    with pytest.raises(ServiceConfigError) as error:
+        validate_values(values)
+    assert error.value.field == "qwen_exo_reasoning_mode"
+
+
+@pytest.mark.parametrize(
+    "key", ["qwen_exo_force_auto_reasoning", "qwen_exo_reasoning_session_once"]
+)
+@pytest.mark.parametrize("invalid", [0, 1, "false", "true", None, []])
+def test_managed_reasoning_switches_reject_nonbooleans(key, invalid):
+    values = default_values()
+    values[key] = invalid
+    with pytest.raises(ServiceConfigError) as error:
+        validate_values(values)
+    assert error.value.field == key
+    assert error.value.code == "invalid_type"
+
+
 def test_tensor_bank_defaults_reserve_context_and_full_attention_capacity():
     values = default_values()
 
@@ -132,6 +181,29 @@ def test_store_persists_revision_and_marks_exact_config_applied(tmp_path: Path):
     assert values_from_args(effective_args)["qwen_exo_max_candidates"] == 12
     persisted = json.loads(store.path.read_text(encoding="utf-8"))
     assert persisted["applied_revision"] == persisted["revision"]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_store_applies_task_chain_reuse_toggle(tmp_path: Path, enabled):
+    store = ServiceConfigStore(tmp_path / "service-config.json")
+    positive = "--qwen-exo-reasoning-session-once"
+    negative = "--no-qwen-exo-reasoning-session-once"
+    old_args = [negative if enabled else positive]
+    initial = store.ensure(old_args)
+    updated = store.update(
+        {"qwen_exo_reasoning_session_once": enabled},
+        expected_revision=initial["revision"],
+    )
+    assert updated["pending_restart"] is True
+    assert updated["revision"] != initial["revision"]
+
+    applied, argv = store.mark_applied(old_args)
+    assert argv.count(positive if enabled else negative) == 1
+    assert (negative if enabled else positive) not in argv
+    assert values_from_args(argv)["qwen_exo_reasoning_session_once"] is enabled
+    assert applied["applied_revision"] == updated["revision"]
+    persisted = ServiceConfigStore(store.path).public_document()
+    assert persisted["values"]["qwen_exo_reasoning_session_once"] is enabled
 
 
 def test_store_rejects_stale_revision_without_overwriting(tmp_path: Path):

@@ -278,6 +278,7 @@ class TestDFlashPriorityYield(CustomTestCase):
 
         def init_batch(reqs, *args, **kwargs):
             batch = self._batch(reqs, target_only=args[-1].is_none())
+            batch.spec_algorithm = args[-1]
             batch.chunked_req = kwargs.get("chunked_req")
             return batch
 
@@ -516,12 +517,58 @@ class TestDFlashPriorityYield(CustomTestCase):
                     )
                 )
 
+    def test_qwen4_mtp_native_exports_isolate_then_resume_speculation(self):
+        for export_key in ("qwen_exo_native_bank_export", "qwen_exo_session_initial_gdn_export"):
+            with self.subTest(export_key=export_key):
+                export = self._request("export", 0, target_only=True)
+                export.sampling_params.custom_params[export_key] = {"source_digest": "a" * 64}
+                ordinary = self._request("generation", 0)
+                scheduler = self._scheduler([ordinary, export])
+                scheduler.spec_algorithm = SpeculativeAlgorithm.EAGLE
+                scheduler.server_args.enable_qwen_exo = True
+                scheduler.model_config.hf_text_config = SimpleNamespace(model_type="qwen4_exp_text")
+                empty = self._batch([])
+                empty.spec_algorithm = SpeculativeAlgorithm.EAGLE
+                batch, retained = self._prefill(scheduler, empty)
+                self.assertEqual(batch.reqs, [export])
+                self.assertEqual(batch.spec_algorithm, SpeculativeAlgorithm.NONE)
+                self.assertEqual(retained.reqs, [])
+                self.assertEqual(scheduler.waiting_queue, [ordinary])
+                export.finished.return_value = True
+                batch.filter_batch()
+                resumed, _ = self._prefill(scheduler, batch)
+                self.assertEqual(resumed.reqs, [ordinary])
+                self.assertEqual(resumed.spec_algorithm, SpeculativeAlgorithm.EAGLE)
+                self.assertEqual(scheduler.waiting_queue, [])
+
+    def test_target_only_lane_does_not_change_other_eagle_models(self):
+        for model_type, exo in (("qwen3_5_text", True), ("qwen4_exp_text", False)):
+            with self.subTest(model_type=model_type, exo=exo):
+                export = self._request("export", 0, target_only=True)
+                scheduler = self._scheduler([export])
+                scheduler.spec_algorithm = SpeculativeAlgorithm.EAGLE
+                scheduler.server_args.enable_qwen_exo = exo
+                scheduler.model_config.hf_text_config = SimpleNamespace(model_type=model_type)
+                batch, _ = self._prefill(scheduler, self._batch([]))
+                self.assertEqual(batch.reqs, [export])
+                self.assertEqual(batch.spec_algorithm, SpeculativeAlgorithm.EAGLE)
+
     def test_overlap_commits_output_before_retraction_and_processes_once(self):
+        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.EAGLE):
+            with self.subTest(algorithm=algorithm):
+                self._check_overlap_commits_before_retraction(algorithm)
+
+    def _check_overlap_commits_before_retraction(self, algorithm):
         victim = self._request("reflection", -25)
         foreground = self._request("probe", -10, target_only=True)
         scheduler = self._scheduler([foreground])
+        scheduler.spec_algorithm = algorithm
+        if algorithm == SpeculativeAlgorithm.EAGLE:
+            scheduler.server_args.enable_qwen_exo = True
+            scheduler.model_config.hf_text_config = SimpleNamespace(model_type="qwen4_exp_text")
         scheduler.enable_overlap = True
         scheduler.running_batch = self._batch([victim])
+        scheduler.running_batch.spec_algorithm = algorithm
         scheduler.last_batch = scheduler.running_batch
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False

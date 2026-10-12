@@ -57,17 +57,113 @@ def test_config_has_no_external_learning_surface(tmp_path):
     assert all("learning" not in key.lower() for key in public)
 
 
-def test_reasoning_budget_is_public_and_positive(tmp_path):
+@pytest.mark.parametrize(
+    ("effort", "expected"),
+    [
+        ("min", 512), ("minimal", 512), ("low", 1024), ("medium", 2048),
+        ("high", 4090), ("xhigh", 8192), ("max", 8192), ("none", 0),
+        (None, 3072), (0, 3072), (0.5, 3072),
+    ],
+)
+def test_reasoning_budget_resolves_requested_tier(tmp_path, effort, expected):
+    config = QwenExoConfig.from_server_args(server_args(tmp_path))
+    assert config.reasoning_budget_for_effort(effort) == expected
+
+
+@pytest.mark.parametrize("tier", ["min", "low", "medium", "high", "xhigh"])
+def test_reasoning_budget_override_is_independent_of_fallback(tmp_path, tier):
     config = QwenExoConfig.from_server_args(
-        server_args(tmp_path, qwen_exo_max_reasoning_tokens=6144)
+        server_args(
+            tmp_path,
+            qwen_exo_max_reasoning_tokens=128,
+            **{f"qwen_exo_reasoning_budget_{tier}": 9011},
+        )
+    )
+    assert config.reasoning_budget_for_effort(tier) == 9011
+    assert config.reasoning_budget_for_effort(None) == 128
+    assert config.public_dict()[f"reasoning_budget_{tier}"] == 9011
+
+
+@pytest.mark.parametrize("tier", ["min", "low", "medium", "high", "xhigh"])
+@pytest.mark.parametrize("invalid", [0, -1, 1.5, True, "512"])
+def test_reasoning_budget_rejects_nonpositive_or_noninteger(tmp_path, tier, invalid):
+    with pytest.raises(ValueError, match=f"reasoning_budget_{tier}"):
+        QwenExoConfig.from_server_args(
+            server_args(tmp_path, **{f"qwen_exo_reasoning_budget_{tier}": invalid})
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "invalid"),
+    [
+        ("qwen_exo_max_reasoning_tokens", 0),
+        ("qwen_exo_reasoning_mode", "auto"),
+        ("qwen_exo_force_auto_reasoning", 1),
+        ("qwen_exo_force_auto_reasoning", "false"),
+        ("qwen_exo_reasoning_session_once", 0),
+        ("qwen_exo_reasoning_session_once", 1),
+        ("qwen_exo_reasoning_session_once", "false"),
+        ("qwen_exo_reasoning_session_once", None),
+        ("qwen_exo_reasoning_dynamic_context_tokens", 0),
+        ("qwen_exo_reasoning_dynamic_context_tokens", 255),
+        ("qwen_exo_reasoning_dynamic_context_tokens", True),
+        ("qwen_exo_reasoning_dynamic_context_tokens", 1.5),
+    ],
+)
+def test_reasoning_configuration_rejects_invalid_controls(tmp_path, key, invalid):
+    with pytest.raises(ValueError, match=key):
+        QwenExoConfig.from_server_args(server_args(tmp_path, **{key: invalid}))
+
+
+@pytest.mark.parametrize("session_once", [True, False])
+def test_managed_reasoning_configuration_preserves_tier_resolution(
+    tmp_path, session_once
+):
+    from qwen_exo_booster.service_config import (
+        apply_values_to_args,
+        default_values,
+        values_from_args,
     )
 
-    assert config.max_reasoning_tokens == 6144
-    assert config.public_dict()["max_reasoning_tokens"] == 6144
-    with pytest.raises(ValueError, match="max_reasoning_tokens"):
-        QwenExoConfig.from_server_args(
-            server_args(tmp_path, qwen_exo_max_reasoning_tokens=0)
-        )
+    values = default_values()
+    values.update(
+        qwen_exo_max_reasoning_tokens=128,
+        qwen_exo_reasoning_budget_min=111,
+        qwen_exo_reasoning_budget_low=222,
+        qwen_exo_reasoning_budget_medium=333,
+        qwen_exo_reasoning_budget_high=444,
+        qwen_exo_reasoning_budget_xhigh=9999,
+        qwen_exo_reasoning_mode="dynamic",
+        qwen_exo_force_auto_reasoning=False,
+        qwen_exo_reasoning_session_once=session_once,
+        qwen_exo_reasoning_dynamic_context_tokens=1024,
+    )
+    argv = apply_values_to_args(
+        [
+            "--qwen-exo-reasoning-budget-xhigh", "512",
+            "--qwen-exo-reasoning-session-once",
+            "--no-qwen-exo-reasoning-session-once",
+        ],
+        values,
+    )
+    config = QwenExoConfig.from_server_args(
+        server_args(tmp_path, **values_from_args(argv))
+    )
+    if sys.platform != "win32":
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(["--model", "dummy", *argv])
+        config = QwenExoConfig.from_server_args(parsed)
+    assert [config.reasoning_budget_for_effort(tier) for tier in (
+        "min", "low", "medium", "high", "xhigh", "none", None
+    )] == [111, 222, 333, 444, 9999, 0, 128]
+    assert config.reasoning_mode == "dynamic"
+    assert config.force_auto_reasoning is False
+    assert config.reasoning_session_once is session_once
+    assert config.public_dict()["reasoning_session_once"] is session_once
+    assert config.reasoning_dynamic_context_tokens == 1024
 
 
 def test_experimental_activation_training_defaults_off_and_is_public(tmp_path):
@@ -636,6 +732,48 @@ def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):
 
     asyncio.run(runtime.close())
     assert runtime.state is QwenExoRuntimeState.STOPPED
+
+
+def test_first_knowledge_reindex_enables_geometry_bound_flash_next_recall():
+    runtime = object.__new__(QwenExoRuntime)
+    runtime.query_probe = None
+    runtime.tokenizer_manager = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda text, **kwargs: [1]),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="qwen4_exp_text",
+                num_attention_heads=16,
+                hidden_size=2560,
+                head_dim=256,
+            )
+        ),
+    )
+    runtime.internal_jobs = SimpleNamespace()
+    runtime.telemetry = SimpleNamespace(emit=lambda *args: None)
+    runtime.config = SimpleNamespace(max_internal_tokens=4096, qk_query_pooling="windows")
+    runtime.refresh_service = SimpleNamespace(query_probe=None)
+
+    async def ensure_ready():
+        return SimpleNamespace(ready=True, public_dict=lambda: {"ready": True})
+
+    runtime.tensor_bank = SimpleNamespace(
+        ensure_ready=ensure_ready, cognition_token_ids=lambda: ()
+    )
+    asyncio.run(runtime._reindex_tensor_bank_unlocked())
+    # Scheduler transport flattens customized_info; Flash-Next's explicit
+    # head_dim is not hidden_size // num_attention_heads (160).
+    raw = [float(index % 31) for index in range(2 * 16 * 256)]
+    heads = runtime.query_probe._query_heads(
+        {"qwen_exo_user_query_full_heads": raw}, expected_states=2
+    )
+    assert heads == tuple(
+        tuple(
+            tuple(raw[(state * 16 + head) * 256:(state * 16 + head + 1) * 256])
+            for head in range(16)
+        )
+        for state in range(2)
+    )
+    assert runtime.refresh_service.query_probe is runtime.query_probe
 
 
 def test_runtime_startup_warmup_records_native_probe_result():

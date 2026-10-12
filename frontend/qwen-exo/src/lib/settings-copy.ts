@@ -39,8 +39,44 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
     "限制每个请求的内部任务生成预算；过小会截断审计，过大会增加主请求延迟。开启 Responses 上下文压缩时必须覆盖摘要预算，推荐 2048。",
   ],
   qwen_exo_max_reasoning_tokens: [
-    "推理思考上限",
-    "限制隐藏推理阶段的最大 token 数；复杂编码任务可提高，延迟敏感任务可降低，推荐 3072。",
+    "默认 / 内部思考预算",
+    "未指定 effort、数值 effort 和内部任务的思考 token 预算；不限制显式档位的独立预算，默认 3072。",
+  ],
+  qwen_exo_reasoning_budget_min: [
+    "min 思考预算",
+    "显式 min（或 minimal）档位的最大思考 token 数，仍受请求总输出与上下文限制；默认 512。",
+  ],
+  qwen_exo_reasoning_budget_low: [
+    "low 思考预算",
+    "显式 low 档位的最大思考 token 数，仍受请求总输出与上下文限制；默认 1024。",
+  ],
+  qwen_exo_reasoning_budget_medium: [
+    "medium 思考预算",
+    "显式 medium 档位的最大思考 token 数，仍受请求总输出与上下文限制；默认 2048。",
+  ],
+  qwen_exo_reasoning_budget_high: [
+    "high 思考预算",
+    "显式 high 档位使用此预算，即使模型模板映射到 xhigh；默认 4090。",
+  ],
+  qwen_exo_reasoning_budget_xhigh: [
+    "xhigh 思考预算",
+    "显式 xhigh（或 max）档位不受默认思考预算限制，仍受请求总输出与上下文限制；默认 8192。",
+  ],
+  qwen_exo_reasoning_mode: [
+    "思考预算模式",
+    "仅在关闭强制自动后生效：固定模式使用默认预算；动态模式为未指定 effort 的请求选档，并遵循任务链预算复用设置。此时显式 effort（包括 none）优先。",
+  ],
+  qwen_exo_force_auto_reasoning: [
+    "强制自动思考预算",
+    "默认开启：所有 Responses 请求使用自动档位，覆盖客户端档位（包括 none）和固定模式；是否重新调用 JEV 由任务链预算复用设置决定。关闭后恢复显式档位优先。",
+  ],
+  qwen_exo_reasoning_session_once: [
+    "任务链思考预算复用",
+    "默认开启：需要自动选档时，仅根据首次用户任务调用一次 JEV，后续工具轮复用该档位；新的真实用户任务或新会话重新评估。关闭后每个自动选档请求均调用 JEV；不改变显式 effort 的优先级。",
+  ],
+  qwen_exo_reasoning_dynamic_context_tokens: [
+    "动态思考评估上下文",
+    "内部动态档位评估最多读取的上下文 token 数，不改变主请求上下文；默认 2048。",
   ],
   qwen_exo_enable_hybrid_prefix: [
     "混合前缀状态",

@@ -38,6 +38,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     field_validator,
     model_serializer,
     model_validator,
@@ -706,9 +707,9 @@ class ToolChoice(BaseModel):
 
 
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
-# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+# none/min/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
 ReasoningEffortTier = Literal[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    "none", "min", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
 # Chat Completions and /v1/tokenize additionally accept a fine-grained float in
 # [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
@@ -768,7 +769,7 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "Accepts string levels ('none', 'min', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
         "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
@@ -888,6 +889,7 @@ class ChatCompletionRequest(BaseModel):
                 effort = r.get("reasoning_effort")
             if isinstance(effort, str) and effort in {
                 "none",
+                "min",
                 "minimal",
                 "low",
                 "medium",
@@ -1402,7 +1404,7 @@ class ResponseReasoningParam(BaseModel):
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
         "Accepts the OpenAI string tiers "
-        "('none','minimal','low','medium','high','xhigh','max').",
+        "('none','min','minimal','low','medium','high','xhigh','max').",
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
@@ -1519,6 +1521,9 @@ class ResponsesRequest(BaseModel):
     # entire conversation, while a trailing block only invalidates the last turn.
     # Server-internal — the HTTP boundary clears whatever a client sends.
     qwen_exo_memory_attachment: Optional[str] = Field(default=None, exclude=True)
+    # Server-only: survives model_copy, never accepts a client override or
+    # enters serialized Responses history. Budget selection stays in reasoning.
+    _qwen_exo_auto_reasoning: bool = PrivateAttr(default=False)
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
@@ -1802,20 +1807,16 @@ class ResponsesResponse(BaseModel):
             instructions=request.instructions,
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
-            # The external OpenAI Responses event schema accepts ``high`` but
-            # not Qwen's native ``xhigh``/``max`` aliases. Keep the request's
-            # native effort for template rendering and serialize a compatible
-            # ceiling in response metadata.
+            # Installed OpenAI SSE schemas use minimal/low/medium/high.
+            # Normalize response metadata only; the request retains its exact
+            # effort for template mapping and the independent token budget.
             reasoning={
                 "effort": (
-                    "high"
-                    if request.reasoning
-                    and request.reasoning.effort in {"xhigh", "max"}
-                    else (
-                        request.reasoning.effort
-                        if request.reasoning and request.reasoning.effort != "none"
-                        else None
+                    {"min": "minimal", "xhigh": "high", "max": "high", "none": None}.get(
+                        request.reasoning.effort, request.reasoning.effort
                     )
+                    if request.reasoning is not None
+                    else None
                 ),
                 "summary": None,  # unused
             },

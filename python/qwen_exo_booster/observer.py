@@ -321,6 +321,9 @@ class ObserverResult:
     trigger_reasons: tuple[str, ...]
     events: tuple[MidThinkEvent, ...]
     finished: bool
+    # One (current, local mean, history mean) sample per newly observed token.
+    # Retaining only this chunk makes downstream gates independent of SSE batching.
+    refresh_signals: tuple[tuple[float, float, float], ...] = ()
 
 
 class InFlightObserver:
@@ -423,6 +426,7 @@ class InFlightObserver:
         triggered = False
         reasons: list[str] = []
         completed_events: list[MidThinkEvent] = []
+        refresh_signals: list[tuple[float, float, float]] = []
         for offset, item in enumerate(new_logprobs):
             logprob = self._logprob_value(item)
             if logprob is None or not math.isfinite(logprob):
@@ -468,6 +472,9 @@ class InFlightObserver:
             state.local_window_mean = sum(recent) / len(recent)
             state.history_mean = (
                 sum(history) / len(history) if history else state.local_window_mean
+            )
+            refresh_signals.append(
+                (surprisal, state.local_window_mean, state.history_mean)
             )
 
             token_id = (
@@ -661,6 +668,7 @@ class InFlightObserver:
             trigger_reasons=tuple(reasons),
             events=tuple(completed_events),
             finished=finished,
+            refresh_signals=tuple(refresh_signals),
         )
 
     def _advance_pending_event(

@@ -1640,7 +1640,7 @@ class Scheduler(
             # Keep last_batch for the normal prefill-to-decode merge below.
             last_result_processed = False
             if (
-                self.spec_algorithm.is_dflash()
+                self._supports_target_only_lane()
                 and self.enable_priority_preemption
                 and self.result_queue
                 and any(
@@ -3689,6 +3689,18 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _supports_target_only_lane(self) -> bool:
+        if self.spec_algorithm.is_dflash():
+            return True
+        # Native Flash-Next MTP shares the target-only EXO jobs with DFLASH.
+        # Other EAGLE models retain their existing speculative admission.
+        return (
+            self.spec_algorithm == SpeculativeAlgorithm.EAGLE
+            and getattr(self.server_args, "enable_qwen_exo", False)
+            and getattr(self.model_config.hf_text_config, "model_type", "")
+            in {"qwen4_exp", "qwen4_exp_text"}
+        )
+
     @staticmethod
     def _dflash_active_request_flags(
         running_batch: ScheduleBatch,
@@ -3745,7 +3757,7 @@ class Scheduler(
     ) -> bool:
         """Allow a lane switch only when every owner can yield by priority."""
         if (
-            not self.spec_algorithm.is_dflash()
+            not self._supports_target_only_lane()
             or not self.enable_priority_preemption
             or self.chunked_req is not None
             or preselected_requests
@@ -3990,7 +4002,7 @@ class Scheduler(
             )
         )
         target_only_waiting = (
-            self.spec_algorithm.is_dflash()
+            self._supports_target_only_lane()
             and not active_has_target_only
             and any(is_dflash_target_only_request(item) for item in self.waiting_queue)
         )
@@ -4007,10 +4019,10 @@ class Scheduler(
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
             target_only_req = (
-                self.spec_algorithm.is_dflash() and is_dflash_target_only_request(req)
+                self._supports_target_only_lane() and is_dflash_target_only_request(req)
             )
 
-            if self.spec_algorithm.is_dflash() and (
+            if self._supports_target_only_lane() and (
                 (target_only_req and active_has_non_target_only)
                 or (not target_only_req and active_has_target_only)
             ):
@@ -4116,7 +4128,7 @@ class Scheduler(
             )
             if work_admission is not None and req in adder.can_run_list:
                 work_admission.add(req)
-            if self.spec_algorithm.is_dflash() and adder.can_run_list:
+            if self._supports_target_only_lane() and adder.can_run_list:
                 active_has_target_only, active_has_non_target_only = (
                     self._dflash_active_request_flags(
                         running_batch, last_batch, adder.can_run_list
@@ -4184,7 +4196,7 @@ class Scheduler(
 
         # Create a new batch
         target_only_batch = (
-            self.spec_algorithm.is_dflash()
+            self._supports_target_only_lane()
             and can_run_list
             and all(is_dflash_target_only_request(req) for req in can_run_list)
         )

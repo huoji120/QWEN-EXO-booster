@@ -205,6 +205,9 @@ class BaseMultimodalProcessor(ABC):
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
+        image_device = self.image_config.get("device")
+        if image_device is not None and torch.device(image_device).type == "cpu":
+            self.gpu_image_decode = False
 
         # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
         # directly as _processor rather than a processor that wraps a tokenizer.
@@ -458,6 +461,9 @@ class BaseMultimodalProcessor(ABC):
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.disable_fast_image_processor
+            and "device" not in kwargs
+            and "device" not in kwargs.get("images_kwargs", {})
+            and "device" not in kwargs.get("videos_kwargs", {})
         ):
             if _is_cpu or get_server_args().rl_on_policy_target is not None:
                 kwargs["device"] = "cpu"
@@ -551,6 +557,8 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        *,
+        gpu_image_decode: bool,
     ):
         """
         Load a single multimodal data.
@@ -563,7 +571,7 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                img, _ = load_image(data, gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
@@ -668,6 +676,7 @@ class BaseMultimodalProcessor(ABC):
                 None,  # frame_count_limit: no consider for fast path
                 audio_sample_rate,
                 discard_alpha_channel,
+                gpu_image_decode=self.gpu_image_decode,
             )
             futures.append((modality, idx, future))
 
@@ -728,6 +737,7 @@ class BaseMultimodalProcessor(ABC):
                         frame_count_limit,
                         audio_sample_rate,
                         discard_alpha_channel,
+                        gpu_image_decode=self.gpu_image_decode,
                     )
                 )
                 task_info.append((modality, data, frame_count_limit))

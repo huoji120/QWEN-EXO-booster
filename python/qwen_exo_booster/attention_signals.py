@@ -1244,8 +1244,8 @@ class AttentionSignalTracker:
     ) -> dict[str, torch.Tensor] | None:
         """Probe-only entry: mean-pooled full Q heads per query span.
 
-        Used by a tracker placed on the configured Q/K recall layer when that
-        layer is not the final full-attention layer. It performs none of the
+        Used by a tracker on the configured Q/K recall layer, including the
+        final layer when observation is disabled. It performs none of the
         observer or score-bias work of :meth:`observe`.
         """
         if not metadata.is_extend or not metadata.rids or not metadata.extend_lens:

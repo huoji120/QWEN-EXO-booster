@@ -74,6 +74,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ResponseReasoningParam,
     ResponsesRequest,
     ResponsesResponse,
     Tool,
@@ -84,6 +85,7 @@ from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.sampling.sampling_params import QWEN_EXO_REASONING_BUDGET_KEY
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -104,6 +106,36 @@ _DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 _CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
 # Identifies the synthetic tool message that carries retrieved QWEN-EXO memory.
 _MEMORY_ATTACHMENT_TOOL_CALL_ID = "qwen_exo_memory"
+
+
+class _ResponsePromptEncoding:
+    """Reuse exact encodings within one response, retaining only its latest text."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        self._tokenizer = tokenizer
+        self._prompt: str | None = None
+        self._encodings: dict[bool | None, list[int]] = {}
+
+    def encode(
+        self, prompt: str, *, add_special_tokens: bool | None = None
+    ) -> list[int]:
+        if prompt != self._prompt:
+            self._prompt = prompt
+            self._encodings.clear()
+        if add_special_tokens not in self._encodings:
+            # Omitted tokenizer options must remain distinct from explicit False.
+            self._encodings[add_special_tokens] = (
+                self._tokenizer.encode(prompt)
+                if add_special_tokens is None
+                else self._tokenizer.encode(
+                    prompt, add_special_tokens=add_special_tokens
+                )
+            )
+        return self._encodings[add_special_tokens]
+
+
+class _ResponsesInputError(ValueError):
+    """Invalid client history, distinct from internal reasoning scoring failures."""
 
 
 def _log_response_shape(*, request_id, stream, status, items, finish_reason, usage):
@@ -473,6 +505,50 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _request_id_prefix(self) -> str:
         return "resp_"
 
+    @staticmethod
+    def _requested_reasoning_effort(request: ResponsesRequest | None) -> str | None:
+        if (
+            request is None
+            or request.reasoning is None
+            or "effort" not in request.reasoning.model_fields_set
+        ):
+            return None
+        return request.reasoning.effort
+
+    async def _resolve_reasoning_effort(self, request, prev_response, runtime):
+        if runtime is None:
+            return request
+        config = getattr(runtime, "config", None)
+        force_auto = getattr(config, "force_auto_reasoning", False)
+        effort = self._requested_reasoning_effort(request)
+        if not force_auto and (
+            getattr(config, "reasoning_mode", "fixed") != "dynamic"
+            or effort is not None
+        ):
+            return request
+        try:
+            messages = self._construct_input_messages(
+                request, prev_response, memory_attachment=None
+            )
+        except (ValueError, TypeError) as exc:
+            raise _ResponsesInputError(str(exc)) from exc
+        selected = await runtime.plan_reasoning_effort(
+            request.request_id,
+            messages,
+            request=request,
+            previous_response_id=(
+                prev_response.id if prev_response is not None else request.previous_response_id
+            ),
+        )
+        reasoning = (
+            request.reasoning.model_copy(update={"effort": selected})
+            if request.reasoning is not None
+            else ResponseReasoningParam(effort=selected)
+        )
+        resolved = request.model_copy(update={"reasoning": reasoning})
+        resolved._qwen_exo_auto_reasoning = True
+        return resolved
+
     async def create_responses(
         self,
         request: ResponsesRequest,
@@ -517,10 +593,33 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return self._make_not_found_error(prev_response_id)
         else:
             prev_response = None
+        qwen_exo_runtime = (
+            getattr(raw_request.app.state, "qwen_exo_runtime", None)
+            if raw_request is not None
+            else None
+        )
+        try:
+            request = await self._resolve_reasoning_effort(
+                request, prev_response, qwen_exo_runtime
+            )
+        except asyncio.CancelledError:
+            raise
+        except _ResponsesInputError as exc:
+            return self.create_error_response(
+                str(exc), err_type="invalid_request_error", status_code=400
+            )
+        except Exception:
+            logger.exception("QWEN-EXO dynamic reasoning selection failed")
+            return self.create_error_response(
+                "Dynamic reasoning selection failed; no generation was started",
+                err_type="reasoning_planning_error",
+                status_code=503,
+            )
 
         try:
             model_name = request.model
             tokenizer = self.tokenizer_manager.tokenizer
+            prompt_encoding = _ResponsePromptEncoding(tokenizer)
             processed_messages: Optional[MessageProcessingResult] = None
 
             if self.use_harmony:
@@ -542,13 +641,16 @@ class OpenAIServingResponses(OpenAIServingChat):
         request_metadata = RequestResponseMetadata(request_id=request.request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
-        qwen_exo_runtime = (
-            getattr(raw_request.app.state, "qwen_exo_runtime", None)
-            if raw_request is not None
-            else None
-        )
         qwen_exo_observe = (
-            qwen_exo_runtime is not None and qwen_exo_runtime.observer.mode != "off"
+            qwen_exo_runtime is not None
+            and (
+                qwen_exo_runtime.observer.mode != "off"
+                or bool(getattr(
+                    getattr(qwen_exo_runtime, "config", None),
+                    "feature_flags",
+                    None,
+                ) and qwen_exo_runtime.config.feature_flags.external_memory)
+            )
         )
         qwen_exo_score_bias = bool(
             qwen_exo_runtime is not None
@@ -573,7 +675,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         len(prompt)
                         if isinstance(prompt, list)
                         else (
-                            len(tokenizer.encode(prompt))
+                            len(prompt_encoding.encode(prompt))
                             if isinstance(prompt, str)
                             else 0
                         )
@@ -887,7 +989,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
                     elif isinstance(engine_prompt, str):
-                        prompt_length = len(tokenizer.encode(engine_prompt))
+                        prompt_length = len(prompt_encoding.encode(engine_prompt))
                     else:
                         prompt_length = 0
 
@@ -944,10 +1046,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             previous_response_id=request.previous_response_id,
                             response_id=request.request_id,
                         )
-                        session_namespace = qwen_exo_runtime.response_cache_namespace(
-                            request.request_id
-                        )
-                        bound_extra_key = f"{bound_extra_key}|{session_namespace}"
+                        # Radix matching is exact-token, so shared heads (system
+                        # prompt, tools, a forked subagent's inherited context)
+                        # are reused across conversations, as in chat/completions.
                         custom_params["qwen_exo_kind"] = "user"
                         if memory_state is not None:
                             memory_span = locate_memory_span(
@@ -982,9 +1083,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             score_bias_prompt_ids = (
                                 list(engine_prompt)
                                 if isinstance(engine_prompt, list)
-                                else tokenizer.encode(
+                                else prompt_encoding.encode(
                                     engine_prompt, add_special_tokens=False
-                                )
+                                ).copy()
                             )
                             score_bias_blocks = score_bias_builder(
                                 request.request_id, score_bias_prompt_ids
@@ -1104,6 +1205,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         raw_request=raw_request,
                         response_request=request,
                         priority=request.priority,
+                        prompt_encoding=prompt_encoding,
                     )
                     if qwen_exo_runtime is not None:
                         generator = qwen_exo_runtime.track_generation(
@@ -1247,6 +1349,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        # Automatic selection controls the hard token budget, not the leading
+        # system tokens. Changing native effort here destroys long-prefix reuse.
+        # The shared "high" spelling maps to Qwen3.8's native default "xhigh".
+        template_effort = (
+            "high" if request._qwen_exo_auto_reasoning
+            else (request.reasoning.effort if request.reasoning else None)
+        )
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -1259,7 +1368,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
-            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
+            reasoning_effort=template_effort,
+            chat_template_kwargs=(
+                {"reasoning_effort": template_effort}
+                if request._qwen_exo_auto_reasoning else None
+            ),
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
@@ -3474,6 +3587,43 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         return phase_sampling, cap_applied
 
+    @classmethod
+    def _single_phase_reasoning_sampling_params(
+        cls,
+        sampling_params: Any,
+        reasoning_end_token_id: int,
+        max_reasoning_tokens: int,
+    ) -> tuple[Any, bool]:
+        """Budget the reasoning phase in the scheduler instead of stopping at
+        </think>, so a natural reasoning end continues into the answer within
+        the same request (no second scheduling round trip)."""
+        configured_max = (
+            sampling_params.get("max_new_tokens")
+            if isinstance(sampling_params, dict)
+            else getattr(sampling_params, "max_new_tokens", None)
+        )
+        cap_applied = configured_max is None or int(configured_max) > int(
+            max_reasoning_tokens
+        )
+        if not cap_applied:
+            return sampling_params, False
+        custom_params = dict(
+            (
+                sampling_params.get("custom_params")
+                if isinstance(sampling_params, dict)
+                else getattr(sampling_params, "custom_params", None)
+            )
+            or {}
+        )
+        custom_params[QWEN_EXO_REASONING_BUDGET_KEY] = {
+            "end_token_id": int(reasoning_end_token_id),
+            "max_tokens": int(max_reasoning_tokens),
+        }
+        return (
+            cls._copy_sampling_params(sampling_params, custom_params=custom_params),
+            True,
+        )
+
     @staticmethod
     def _forced_reasoning_boundary(
         finish_reason: dict[str, Any],
@@ -3502,13 +3652,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
     def _request_prompt_token_ids(
-        self, adapted_request: GenerateReqInput
+        self,
+        adapted_request: GenerateReqInput,
+        prompt_encoding: _ResponsePromptEncoding | None = None,
     ) -> list[int] | None:
         if adapted_request.input_ids is not None:
             return list(adapted_request.input_ids)
         if adapted_request.text is not None:
+            if prompt_encoding is None:
+                prompt_encoding = _ResponsePromptEncoding(
+                    self.tokenizer_manager.tokenizer
+                )
             return list(
-                self.tokenizer_manager.tokenizer.encode(
+                prompt_encoding.encode(
                     adapted_request.text, add_special_tokens=False
                 )
             )
@@ -3621,9 +3777,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         raw_request: Optional[Request] = None,
         response_request: ResponsesRequest | None = None,
         priority: Optional[int] = None,
+        prompt_encoding: _ResponsePromptEncoding | None = None,
         **kwargs,
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
+        if prompt_encoding is None:
+            prompt_encoding = _ResponsePromptEncoding(self.tokenizer_manager.tokenizer)
         orig_priority = priority or 0
         generation_index = 0
         incremental_logprobs = bool(
@@ -3664,7 +3823,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     generation_index=generation_index,
                 )
 
-            prompt_token_ids = self._request_prompt_token_ids(adapted_request)
+            prompt_token_ids = self._request_prompt_token_ids(
+                adapted_request, prompt_encoding
+            )
             trajectory_spans = ()
             if qwen_exo_runtime is not None and prompt_token_ids is not None:
                 score_bias_builder = getattr(
@@ -3735,14 +3896,45 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if score_bias_logprob_start_len is not None
                 else adapted_request
             )
+            if (
+                qwen_exo_runtime is not None
+                and not self.use_harmony
+                and isinstance(generation_request.text, str)
+                and generation_request.text
+                and generation_request.input_ids is None
+                and not any(
+                    getattr(generation_request, field, None)
+                    for field in (
+                        "image_data", "video_data", "audio_data", "modalities"
+                    )
+                )
+            ):
+                # Keep the original text for recording, and leave internal
+                # scoring/THINK IDs in their original no-special-token form.
+                # The native tokenizer path uses default special-token options.
+                generation_request = replace(
+                    generation_request,
+                    input_ids=list(prompt_encoding.encode(generation_request.text)),
+                )
             max_reasoning_tokens = 0
             reasoning_cap_applied = False
+            # Without a think-context injection there is nothing to insert at a
+            # natural </think>, so the answer continues in the same request.
+            single_phase_reasoning = reasoning_end_token_id is not None and not (
+                getattr(qwen_exo_runtime, "think_context_enabled", False)
+            )
             if reasoning_end_token_id is not None:
-                max_reasoning_tokens = int(
-                    getattr(qwen_exo_runtime, "max_reasoning_tokens", 3072)
+                max_reasoning_tokens = qwen_exo_runtime.reasoning_budget_for_effort(
+                    self._requested_reasoning_effort(response_request)
                 )
                 phase_sampling_params, reasoning_cap_applied = (
-                    self._reasoning_phase_sampling_params(
+                    self._single_phase_reasoning_sampling_params(
+                        sampling_params,
+                        reasoning_end_token_id,
+                        max_reasoning_tokens,
+                    )
+                    if single_phase_reasoning
+                    else self._reasoning_phase_sampling_params(
                         sampling_params,
                         reasoning_end_token_id,
                         max_reasoning_tokens,
@@ -3819,11 +4011,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self._matched_reasoning_boundary(
                         finish_reason, reasoning_end_token_id
                     )
-                    or self._forced_reasoning_boundary(
-                        finish_reason,
-                        output_tokens=len(phase_output_ids),
-                        max_reasoning_tokens=max_reasoning_tokens,
-                        cap_applied=reasoning_cap_applied,
+                    or (
+                        self._forced_reasoning_boundary(
+                            finish_reason,
+                            output_tokens=len(phase_output_ids),
+                            max_reasoning_tokens=max_reasoning_tokens,
+                            cap_applied=reasoning_cap_applied,
+                        )
+                        and reasoning_end_token_id not in phase_output_ids
                     )
                 ):
                     public_result = dict(res)
@@ -3846,7 +4041,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                     max_reasoning_tokens=max_reasoning_tokens,
                     cap_applied=reasoning_cap_applied,
                 )
+                # A length finish after a natural </think> is the answer's own
+                # max_new_tokens, not the reasoning budget.
+                and reasoning_end_token_id not in phase_output_ids
             )
+            if (
+                single_phase_reasoning
+                and not forced_reasoning_boundary
+                and reasoning_end_token_id in phase_output_ids
+            ):
+                reasoning_end = phase_output_ids.index(reasoning_end_token_id) + 1
+                context.num_reasoning_tokens = reasoning_tokens_before + reasoning_end
+                qwen_exo_runtime.record_reasoning_boundary(
+                    request_id,
+                    injection=None,
+                    committed_text="",
+                    token_ids=(),
+                    generation_index=generation_index,
+                )
             if matched_reasoning_boundary or forced_reasoning_boundary:
                 assert reasoning_end_token_id is not None
                 assert qwen_exo_runtime is not None
@@ -3855,6 +4067,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         request_id,
                         observed_tokens=len(phase_output_ids),
                         generation_index=generation_index,
+                        max_reasoning_tokens=max_reasoning_tokens,
                     )
                 else:
                     injection = await qwen_exo_runtime.await_think_context(request_id)

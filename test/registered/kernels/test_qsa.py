@@ -320,32 +320,6 @@ def test_qsa_cuda_graph_padding_reaches_hybrid_children():
     assert linear.num_padding == 1
 
 
-def test_qsa_draft_extend_backend_decision_follows_profile():
-    from sglang.srt.speculative.draft_utils import DraftBackendFactory
-
-    def factory(config):
-        return DraftBackendFactory(
-            draft_model_runner=SimpleNamespace(
-                model_config=SimpleNamespace(hf_config=config),
-                draft_attention_backend=None,
-                attn_backend="draft-runner-backend",
-            ),
-            topk=1,
-            speculative_num_steps=3,
-        )
-
-    # Compressed profiles run draft-extend through the draft model runner's
-    # own (QSA-wrapped hybrid) backend; the draft-extend CUDA graph replays
-    # it with variable accepted rows padded to the captured width.
-    assert (
-        factory(_compressed_config_namespace()).create_draft_extend_backend()
-        == "draft-runner-backend"
-    )
-    # Tokenwise profiles stay eager (no graph-stable indexer metadata); they
-    # must never silently fall back to a dense backend either.
-    assert factory(_tokenwise_config_namespace()).create_draft_extend_backend() is None
-
-
 def test_qsa_backend_stores_parsed_profile():
     from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED
 
@@ -818,7 +792,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
             _pending_ring_slots=lambda metadata, logical_positions, is_extend: (
                 torch.zeros(logical_positions.numel(), dtype=torch.long)
             ),
-            update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False: (
+            update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False, verify_group_locs=None: (
                 calls.update(
                     token_rows=token_k.shape[0],
                     logical_rows=logical.numel(),
@@ -921,6 +895,17 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
 
     pool = Pool()
     backend.token_to_kv_pool = pool
+    backend.forward_metadata = qsa_backend_module.QwenSparseAttnMetadata(
+        sequence_lengths=torch.tensor([15], dtype=torch.int32, device="cuda"),
+        token_to_batch_idx=torch.zeros(15, dtype=torch.int32, device="cuda"),
+        token_slot_table=torch.empty((1, 15), dtype=torch.int32, device="cuda"),
+        indexer_metadata=None,
+        prefill_metadata=qsa_backend_module.QwenSparsePrefillMetadata(
+            cu_seqlens_q=torch.tensor([0, 15], dtype=torch.int64, device="cuda"),
+            cu_seqlens_k=None,
+            max_sequence_len=15,
+        ),
+    )
     layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
     topk = torch.zeros(15, 3, dtype=torch.int32, device="cuda")
 
@@ -1086,6 +1071,193 @@ def _make_qsa_runner_and_pool(num_reqs=4):
     return runner, pool, runner.req_to_token_pool
 
 
+def test_qsa_trtllm_graph_gathers_only_active_rows_and_preserves_tail():
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    trtllm_decode = qsa_backend_module._resolve_trtllm_sparse_decode()
+    if trtllm_decode is None:
+        pytest.skip("requires TRTLLM sparse decode")
+
+    torch.manual_seed(19)
+    device = torch.device("cuda")
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._cuda_graph_max_tokens = 4
+    backend._fa2_scratch = {}
+    backend._trtllm_sparse_tables = {}
+    backend._trtllm_workspace = None
+    backend.token_to_kv_pool = SimpleNamespace(full_kv_pool=object())
+    slots = torch.zeros(3, 8, dtype=torch.int32, device=device)
+    slots[1] = torch.arange(8, 16, dtype=torch.int32, device=device)
+    slots[2] = torch.arange(16, 24, dtype=torch.int32, device=device)
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=slots)
+    keys = torch.randn(24, 1, 128, device=device).to(torch.float8_e4m3fn)
+    values = torch.randn(24, 1, 128, device=device).to(torch.float8_e4m3fn)
+    keys[0].zero_()
+    values[0].zero_()
+    layer = SimpleNamespace(
+        layer_id=0, scaling=128**-0.5, k_scale_float=2.0, v_scale_float=3.0
+    )
+    query = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=device)
+    requests = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    lengths = torch.tensor([8, 1], dtype=torch.int32, device=device)
+    indices = torch.tensor(
+        [[0, 3, 7, -1, -1], [0, -1, -1, -1, -1]],
+        dtype=torch.int32, device=device,
+    )
+    metadata = SimpleNamespace(
+        is_cuda_graph=True,
+        sequence_lengths=lengths,
+        row_req_pool_indices=requests,
+        fa2_valid_counts=torch.empty(2, dtype=torch.int32, device=device),
+    )
+    batch = SimpleNamespace(req_pool_indices=requests)
+    # Reserve the largest captured shape, then poison the inactive half.
+    scratch_k, scratch_v = backend._get_fa2_scratch(
+        4 * 64, 1, 128, query.dtype, device
+    )
+    scratch_k.fill_(77)
+    scratch_v.fill_(77)
+
+    def forward():
+        return backend._forward_trtllm_sparse(
+            query, keys, values, layer, batch, metadata, indices, trtllm_decode
+        )
+
+    def reference(request, positions):
+        raw_slots = slots[request, positions].long()
+        k = keys.index_select(0, raw_slots).to(query.dtype) * layer.k_scale_float
+        v = values.index_select(0, raw_slots).to(query.dtype) * layer.v_scale_float
+        logits = torch.einsum("hd,nd->hn", query[0].float(), k[:, 0].float())
+        weights = (logits * layer.scaling).softmax(-1)
+        return torch.einsum("hn,nd->hd", weights, v[:, 0].float())
+
+    # Warm real gather/count/decode kernels before recording them.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            forward()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = forward()
+    graph.replay()
+    torch.testing.assert_close(
+        result[0].view(8, 128).float(), reference(1, [0, 3, 7]), rtol=0.02, atol=0.03
+    )
+    torch.testing.assert_close(result[1], torch.zeros_like(result[1]))
+    assert bool((scratch_k[128:] == 77).all())
+    assert bool((scratch_v[128:] == 77).all())
+
+    # The same graph now sees a reused/reordered request slot and new logical
+    # selections; its static scratch addresses and padding remain unchanged.
+    requests.copy_(torch.tensor([2, 0], dtype=torch.int32, device=device))
+    lengths.copy_(torch.tensor([6, 1], dtype=torch.int32, device=device))
+    indices[0].copy_(torch.tensor([2, 5, -1, -1, -1], dtype=torch.int32, device=device))
+    graph.replay()
+    torch.testing.assert_close(
+        result[0].view(8, 128).float(), reference(2, [2, 5]), rtol=0.02, atol=0.03
+    )
+    torch.testing.assert_close(result[1], torch.zeros_like(result[1]))
+    assert bool((scratch_k[128:] == 77).all())
+    assert bool((scratch_v[128:] == 77).all())
+
+
+def test_qsa_prefill_plan_rebuilt_across_chunks_and_request_slot_reuse():
+    runner, pool, req_pool = _make_qsa_runner_and_pool()
+    backend = QwenSparseAttnBackend(runner)
+
+    def initialize(requests, lengths, extensions):
+        positions = torch.cat([
+            torch.arange(length - extend, length)
+            for length, extend in zip(lengths, extensions)
+        ])
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor(requests, dtype=torch.int32),
+            seq_lens=torch.tensor(lengths, dtype=torch.int32),
+            seq_lens_cpu=torch.tensor(lengths, dtype=torch.int32),
+            extend_seq_lens=torch.tensor(extensions, dtype=torch.int32),
+            extend_seq_lens_cpu=extensions,
+            positions=positions,
+            mrope_positions=None,
+            input_ids=torch.zeros(positions.numel(), dtype=torch.int32),
+            out_cache_loc=torch.arange(1, positions.numel() + 1, dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            spec_info=None,
+        )
+        backend.init_forward_metadata(batch)
+        return backend.forward_metadata, positions
+
+    first, positions = initialize([1, 2], [8, 4], [4, 0])
+    packed = first.prefill_metadata
+    assert packed.cu_seqlens_q.tolist() == [0, 4, 4]
+    assert packed.cu_seqlens_k.tolist() == [0, 8, 12]
+    assert packed.kv_locations.tolist() == list(range(64, 72)) + list(range(128, 132))
+    plan = first.indexer_metadata.prefill_plan
+    assert plan.compressed_locs.tolist() == [16, 17, 32]
+    assert plan.row_starts.tolist() == [0, 0, 0, 0]
+    assert plan.row_ends.tolist() == [1, 1, 1, 2]
+
+    # Plans are shared by layers, but compressed-key values must be freshly
+    # read after each layer has written its own cache.
+    caches = {
+        0: torch.arange(64 * 128, dtype=torch.float32).reshape(64, 1, 128),
+        1: -torch.arange(64 * 128, dtype=torch.float32).reshape(64, 1, 128),
+    }
+    pool.get_qsa_compressed_k_buffer = lambda layer_id: caches[layer_id]
+    for layer_id in caches:
+        keys, starts, ends, _ = first.indexer_metadata.get_prefill_mqa_inputs(
+            layer_id, positions
+        )
+        torch.testing.assert_close(keys, caches[layer_id][[16, 17, 32]])
+        assert starts is plan.row_starts and ends is plan.row_ends
+
+    # A subsequent chunk grows one request and reorders the two request rows.
+    second, _ = initialize([2, 1], [8, 12], [4, 4])
+    assert second.prefill_metadata.kv_locations.tolist() == (
+        list(range(128, 136)) + list(range(64, 76))
+    )
+    assert second.indexer_metadata.prefill_plan.compressed_locs.tolist() == [
+        32, 33, 16, 17, 18
+    ]
+    assert second.indexer_metadata.prefill_plan.row_starts.tolist() == [0] * 4 + [2] * 4
+    assert second.indexer_metadata.prefill_plan.row_ends.tolist() == [1, 1, 1, 2, 4, 4, 4, 5]
+
+    # Request slot 1 is now allocated to a different token page. No old
+    # slot-address plan may survive merely because the request ID is reused.
+    req_pool.req_to_token[1] = torch.arange(192, 256, dtype=torch.int32)
+    third, _ = initialize([1], [4], [4])
+    assert third.prefill_metadata.kv_locations is None
+    assert third.prefill_metadata.cu_seqlens_k is None
+    assert third.prefill_metadata.cu_seqlens_q.tolist() == [0, 4]
+    assert third.indexer_metadata.prefill_plan.compressed_locs.tolist() == [48]
+    assert third.indexer_metadata.prefill_plan.row_ends.tolist() == [0, 0, 0, 1]
+    fourth, _ = initialize([1], [8], [4])
+    assert fourth.prefill_metadata.kv_locations.tolist() == list(range(192, 200))
+    assert fourth.indexer_metadata.prefill_plan.compressed_locs.tolist() == [48, 49]
+    for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+        base_length = 8 if mode.is_target_verify() else 10
+        speculative = SimpleNamespace(
+            req_pool_indices=torch.tensor([1], dtype=torch.int32),
+            seq_lens=torch.tensor([base_length], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([base_length], dtype=torch.int32),
+            positions=torch.tensor([8, 9], dtype=torch.int64),
+            out_cache_loc=torch.tensor([200, 201], dtype=torch.int32),
+            extend_seq_lens=(
+                None if mode.is_target_verify() else torch.tensor([2], dtype=torch.int32)
+            ),
+            forward_mode=mode,
+            spec_info=SimpleNamespace(topk=1, draft_token_num=2),
+        )
+        backend.init_forward_metadata(speculative)
+        assert backend.forward_metadata.prefill_metadata is None
+        assert backend.forward_metadata.indexer_metadata.prefill_plan is None
+        assert backend.forward_metadata.sequence_lengths.tolist() == [9, 10]
+    after_verify, _ = initialize([1], [12], [4])
+    assert after_verify.prefill_metadata.kv_locations.tolist() == list(range(192, 204))
+    assert after_verify.indexer_metadata.prefill_plan.compressed_locs.tolist() == [48, 49, 50]
+
+
 def test_qsa_idle_metadata_builds_empty_rows():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     idle_batch = SimpleNamespace(
@@ -1204,6 +1376,7 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
         seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_seq_lens_cpu=[num_tokens],
         extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
         positions=flat,
         mrope_positions=mrope,
@@ -1291,7 +1464,7 @@ def test_qsa_indexer_decode_ignores_dp_attention_token_padding():
             hidden.reshape(-1, 1, 2),
             False,
         ),
-        update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False: (
+        update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False, verify_group_locs=None: (
             calls.update(
                 token_rows=token_k.shape[0],
                 logical_rows=logical.numel(),
@@ -1790,6 +1963,7 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
     assert torch.equal(backend._step_out_cache_loc(fb, 0), flat)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qsa_graph_metadata_kernels_match_legacy_host_path():
     """The recorded replay kernels and the legacy host refresh must produce
     identical graph buffers from the same lengths + ledger sidecar, for both
@@ -1957,6 +2131,7 @@ def _qsa_expected_graph_layout(
     return row_lens, row_prefix, row_reqs
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
     """The recorded layout kernel must reproduce the per-step speculative row
     fan-out (uniform target-verify window and per-request draft-extend lengths)

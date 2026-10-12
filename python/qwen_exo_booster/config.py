@@ -146,7 +146,17 @@ class QwenExoConfig:
     activation_editor_enabled: bool = False
     activation_editor_strength: float = 2.0
     max_output_tokens: int = 8192
+    # Fallback for omitted/numeric effort and internal generation, not a tier ceiling.
     max_reasoning_tokens: int = 3072
+    reasoning_budget_min: int = 512
+    reasoning_budget_low: int = 1024
+    reasoning_budget_medium: int = 2048
+    reasoning_budget_high: int = 4090
+    reasoning_budget_xhigh: int = 8192
+    reasoning_mode: str = "fixed"
+    force_auto_reasoning: bool = True
+    reasoning_session_once: bool = True
+    reasoning_dynamic_context_tokens: int = 2048
     observer_surprisal_threshold: float = 0.8
     observer_surprisal_window: int = 8
     observer_surprisal_margin: float = 0.2
@@ -158,7 +168,7 @@ class QwenExoConfig:
     observer_q_post_tokens: int = 4
     observer_recovery_tokens: int = 8
     immediate_uncertainty_retrieval: bool = False
-    # When think generation hits ``max_reasoning_tokens`` and is truncated, inject
+    # When think generation hits its resolved reasoning budget and is truncated, inject
     # this many short, concrete self-check questions before the stop-and-go line
     # so the model reconsiders before committing. ``0`` disables the questions and
     # keeps the plain reasoning-budget cutoff.
@@ -257,6 +267,25 @@ class QwenExoConfig:
             raise ValueError("qwen_exo_max_output_tokens must be positive")
         if self.max_reasoning_tokens < 1:
             raise ValueError("qwen_exo_max_reasoning_tokens must be positive")
+        if self.reasoning_mode not in ("fixed", "dynamic"):
+            raise ValueError("qwen_exo_reasoning_mode must be fixed or dynamic")
+        if type(self.force_auto_reasoning) is not bool:
+            raise ValueError("qwen_exo_force_auto_reasoning must be a boolean")
+        if type(self.reasoning_session_once) is not bool:
+            raise ValueError("qwen_exo_reasoning_session_once must be a boolean")
+        if (
+            type(self.reasoning_dynamic_context_tokens) is not int
+            or self.reasoning_dynamic_context_tokens < 256
+        ):
+            raise ValueError(
+                "qwen_exo_reasoning_dynamic_context_tokens must be an integer >= 256"
+            )
+        for effort in ("min", "low", "medium", "high", "xhigh"):
+            budget = getattr(self, f"reasoning_budget_{effort}")
+            if type(budget) is not int or budget < 1:
+                raise ValueError(
+                    f"qwen_exo_reasoning_budget_{effort} must be a positive integer"
+                )
         if self.observer_mode not in _OBSERVER_MODES:
             raise ValueError(
                 f"qwen_exo_observer_mode must be one of {sorted(_OBSERVER_MODES)}"
@@ -566,6 +595,23 @@ class QwenExoConfig:
             max_reasoning_tokens=int(
                 getattr(server_args, "qwen_exo_max_reasoning_tokens", 3072)
             ),
+            reasoning_budget_min=getattr(server_args, "qwen_exo_reasoning_budget_min", 512),
+            reasoning_budget_low=getattr(server_args, "qwen_exo_reasoning_budget_low", 1024),
+            reasoning_budget_medium=getattr(
+                server_args, "qwen_exo_reasoning_budget_medium", 2048
+            ),
+            reasoning_budget_high=getattr(server_args, "qwen_exo_reasoning_budget_high", 4090),
+            reasoning_budget_xhigh=getattr(
+                server_args, "qwen_exo_reasoning_budget_xhigh", 8192
+            ),
+            reasoning_mode=getattr(server_args, "qwen_exo_reasoning_mode", "fixed"),
+            force_auto_reasoning=getattr(server_args, "qwen_exo_force_auto_reasoning", True),
+            reasoning_session_once=getattr(
+                server_args, "qwen_exo_reasoning_session_once", True
+            ),
+            reasoning_dynamic_context_tokens=getattr(
+                server_args, "qwen_exo_reasoning_dynamic_context_tokens", 2048
+            ),
             observer_mode=observer_mode,
             feature_flags=QwenExoFeatureFlags(
                 hybrid_prefix=bool(server_args.qwen_exo_enable_hybrid_prefix),
@@ -831,6 +877,17 @@ class QwenExoConfig:
     def model_state_directory(self) -> Path:
         return self.state_directory / "model-native" / self.topology_key
 
+    def reasoning_budget_for_effort(self, effort: str | int | float | None) -> int:
+        """Resolve the API tier before any model-template effort normalization."""
+        if effort is None or isinstance(effort, (int, float)):
+            return self.max_reasoning_tokens
+        effort = {"minimal": "min", "max": "xhigh"}.get(effort, effort)
+        if effort == "none":
+            return 0
+        if effort not in ("min", "low", "medium", "high", "xhigh"):
+            raise ValueError(f"Unsupported reasoning effort: {effort}")
+        return getattr(self, f"reasoning_budget_{effort}")
+
     def public_dict(self) -> dict[str, Any]:
         flags = asdict(self.feature_flags)
         return {
@@ -853,6 +910,15 @@ class QwenExoConfig:
             "tensor_bank_span_tokens": self.tensor_bank_span_tokens,
             "max_output_tokens": self.max_output_tokens,
             "max_reasoning_tokens": self.max_reasoning_tokens,
+            "reasoning_budget_min": self.reasoning_budget_min,
+            "reasoning_budget_low": self.reasoning_budget_low,
+            "reasoning_budget_medium": self.reasoning_budget_medium,
+            "reasoning_budget_high": self.reasoning_budget_high,
+            "reasoning_budget_xhigh": self.reasoning_budget_xhigh,
+            "reasoning_mode": self.reasoning_mode,
+            "force_auto_reasoning": self.force_auto_reasoning,
+            "reasoning_session_once": self.reasoning_session_once,
+            "reasoning_dynamic_context_tokens": self.reasoning_dynamic_context_tokens,
             "max_running_requests": self.max_running_requests,
             "context_length": self.context_length,
             "qk_expansion_margin": self.qk_expansion_margin,

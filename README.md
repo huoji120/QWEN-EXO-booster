@@ -86,6 +86,8 @@ QK 只负责提出候选，语义 Judge 负责最后裁决。分数不足、marg
 
 普通 RAG 的代价是把命中文档重新塞进 prompt。QWEN-EXO 的模型原生 K/V、GDN/DeltaNet 状态与文本指令可以分层协作：能用原生状态表达的记忆不必完整复制成自然语言，文本指令只承载需要显式可读的部分。这不是"上下文无限"的宣传，而是把有限上下文留给当前任务、最新工具结果和真正需要模型阅读的证据。
 
+当前 Knowledge 文本投递使用 `<memory>` 包裹，提示内容可能错误、过时或不适用，并要求核对当前任务与工具证据；正文和来源 ID 转义，标签及提示计入总 token 预算。显式 `document_group` 表示通用逻辑来源，Q/K 按组排序并返回代表分片；Judge 接收组 ID、分片路径、摘要和组成员数。通过准入的显式组只保留最高 Q/K 分数组，未分组文档维持既有行为。此规则不保证来源就是同一个任务，group 标签本身不是适用性证据。
+
 ### Attention Bias：有限、可审计，而不是无脑放大记忆
 
 Score Bias 可以把相关的系统规约、工具轨迹和历史证据提供给注意力路径，但它不是永久放大的"记忆开关"。QWEN-EXO 支持 shadow 观察、相关性阈值、最大权重、任务范围和回退策略：先观察模型会选择什么，再决定是否启用偏置；每次候选、权重、拒绝和实际选择都能通过 telemetry 检查。
@@ -94,9 +96,35 @@ Score Bias 可以把相关的系统规约、工具轨迹和历史证据提供给
 
 长思考和多轮工具调用最容易出现截断、半个 tool call 或 reasoning 泄漏。QWEN-EXO 将 reasoning、tool call、tool output 和最终 output 分开处理，并对不完整响应提供受控恢复路径。即使模型在预算边界停止，也不会把半截内部思考直接冒充最终答案。
 
-Responses 的 `max_reasoning_tokens` 截断独立于 Observer、Adaptive Refresh 和外部知识检索；它限制目标模型实际生成的思考 tokens，因此保留 EAGLE/MTP 也可执行预算截断。显式关闭 THINK 时不进入两阶段路径；截断后用剩余总输出预算继续回答，耗尽总预算仍标记 `incomplete`。Self-Ask 截断问题注入仍要求原有 Observer／刷新上下文通道启用，不会因独立限额而额外启动内部生成。`reasoning.budget_forced.observed_tokens` 是实际截断位置；API `reasoning_tokens` 还会计入合成边界／截断控制文本，不应直接等同于该生成限额。
+Responses 的思考预算截断独立于 Observer、Adaptive Refresh 和外部知识检索；它限制目标模型实际生成的思考 tokens，因此保留 EAGLE/MTP 也可执行预算截断。未强制自动且显式关闭 THINK 时不进入两阶段路径；截断后用剩余总输出预算继续回答，耗尽总预算仍标记 `incomplete`。Self-Ask 截断问题注入仍要求原有 Observer／刷新上下文通道启用，不会因独立限额而额外启动内部生成。`reasoning.budget_forced.observed_tokens` 是实际截断位置；API `reasoning_tokens` 还会计入合成边界／截断控制文本，不应直接等同于该生成限额。
 
-托管设置 `default_enable_thinking` 控制未显式指定时是否思考；`default_preserve_thinking` 控制模板是否保留历史 assistant 思考。保留历史不会恢复客户端未发送的 THINK，客户端仍须提供历史推理；显式请求设置优先。
+未开启强制自动预算时，托管设置 `default_enable_thinking` 控制未显式指定时是否思考，显式请求设置优先；`default_preserve_thinking` 控制模板是否保留历史 assistant 思考。保留历史不会恢复客户端未发送的 THINK，客户端仍须提供历史推理。
+
+#### 五档思考预算与动态模式
+
+`POST /v1/responses` 可用 `reasoning: {"effort": "high"}` 指定档位；默认开启的强制自动开关会覆盖该值，由内部 JEV 选择实际预算档位。默认最大**生成思考 token**：
+
+| 预算档位 | 预算 | 非自动选档时的 Flash-Next 模板档位 |
+|---|---:|---|
+| `min`（兼容 `minimal`） | 512 | `low` |
+| `low` | 1024 | `low` |
+| `medium` | 2048 | `medium` |
+| `high` | 4090 | `xhigh` |
+| `xhigh`（兼容 `max`） | 8192 | `xhigh` |
+
+实际 Qwen3.8-Flash-Next 模板仅支持 `low / medium / xhigh`；模板兼容映射不改变选中档位的预算。关闭强制自动后，`none` 才会关闭思考。五档可在服务端设置 `qwen_exo_reasoning_budget_min/low/medium/high/xhigh`，对应启动环境变量 `QWEN_EXO_REASONING_BUDGET_MIN/LOW/MEDIUM/HIGH/XHIGH`。非强制的固定模式下，未显式指定 effort 及内部任务继续使用 `qwen_exo_max_reasoning_tokens`；该默认预算不钳制显式档位。请求总输出上限和模型上下文限制仍然生效，预算不是必须消耗的 token 数。
+
+自动选档与模板 effort 分离：所有 JEV 自动选择的请求固定使用共享接口 `high`（Flash-Next 渲染为原生默认 `xhigh`），只有硬思考预算随 `min/low/medium/high/xhigh` 改变。这样不会因为预算切换而改写开头的 system 指令，保留相同历史的前缀缓存；不代表历史内容变化、缓存淘汰或重启后也能命中。代价是自动模式不再逐轮切换原生 effort 指令。未经过自动选档的请求保留原有模板映射。服务端私有标记区分自动请求，不接受客户端伪造，也不写入公开 Responses 历史。
+
+为兼容当前安装的 OpenAI SSE 事件模型，响应元数据会把 `min` 写为 `minimal`，`xhigh/max` 写为 `high`，`none` 写为空；该序列化兼容不改变实际预算。服务端自动补齐的默认 effort 不视为客户端显式选择，因此不会阻止动态选档。
+
+Responses 的动态选档与记忆 Judge 分开处理：动态选档只把当前最后一条真实 user 消息原文交给内部 JEV，不再构造 canonical JSON/序列化包装，也不读取旧任务、assistant 推理或工具结果。主模型仍接收完整有效历史；启用记忆时的适用性 Judge 继续使用其完整上下文，两者不再强求共享同一长历史前缀。知识库关闭时不为选档构造完整工作流快照。
+
+默认 `qwen_exo_reasoning_session_once=true`：新 user 任务选一次档位，同一任务后续工具轮复用。重发完整历史不会仅因出现旧 user 消息而重新选档；相同文字在后面新增的一次 user 消息仍视为新任务。显式关闭此设置时每轮重评，但输入仍只含最后一条 user 消息。新会话、缓存淘汰或服务重启后需要重新选择；无可恢复用户任务时明确失败，不凭工具结果编造任务。
+
+“强制自动思考预算” `qwen_exo_force_auto_reasoning` 默认开启；关闭后显式 effort 优先。自动选档仍只改变硬预算，模板 effort 保持稳定。`reasoning.effort_selected` 记录实际评估 token 数，`reasoning.effort_reused` 记录工具轮复用。选档不在同一流式生成中途重复，且不改变主生成 KV/GDN 缓存策略。
+
+Responses 在单次请求内复用同一份已渲染文本、相同编码选项的 token IDs；prompt 重建后不复用旧结果，缓存不跨请求。默认特殊 token 编码与内部无特殊 token 编码分别保留。纯文本 QWEN-EXO 生成将已编码 IDs 与原文一并交给原生引擎，避免重复编码；Harmony 和多模态仍走原处理路径。该优化减少工具结果回传后的 CPU 前处理，不改变 THINK、上下文上限、工具语义或 KV/GDN 状态。
 
 ### 可观测性：不是黑盒魔法
 
@@ -233,6 +261,12 @@ bash scripts/qwen_exo/launch_native_js4090.sh
 
 PLE 从原始 safetensors 按需读行，不把约 51GB 表常驻 CPU/GPU；`pread` 用于 POSIX，`mmap` 是可选后端，不包含未安装的 io_uring 扩展。CPU expert paging 保留模型原生 Top-10 路由和权重，每层仅保留当前专家集；prefill 按实际路由集合分组执行，不能把整批 token 当成只会选同十个专家。启动器选择 `flashinfer_cutlass`、独立 shared experts，并禁用两个阶段的 CUDA graphs。
 
+选择 `QWEN_EXO_NATIVE_PLE_BACKEND=mmap` 时，reader 按 shard 批量收集行与 scale，保持原始顺序和重复行；映射不等于整表常驻。大批量 CUDA 原生逐行 FP8 查询传输原始 FP8 与 FP32 scale，由融合内核执行 FP32 乘法后转 BF16，直接填入已有输出 buffer；小批次、CPU、非连续输出及其他存储格式保留 CPU 解码。回归覆盖有限值逐位一致、带符号零和 NaN 类别。pinned／CUDA staging 在前次异步复制及解码完成后才复用，磁盘读取和准备不进入 graph capture。
+
+QSA 普通 prefill 的地址与累计长度计划只在当前 forward 内共享，各层仍读取自己的 KV；decode graph 保留固定容量 buffer，但仅提取和缩放当前捕获形状（含 dummy rows）。这些优化不改变原生路由、稀疏选择、接受状态或 prefill/decode 调度策略；组件提速不能直接当作端到端加速倍数。
+
+Host-capable QSA 的选中 KV 路径将槽位清空、逻辑位置映射及 K/V 两次读取合为一个 Triton kernel；不分配选中槽位 scratch，保留原有 BF16 舍入和独立 scale 操作。CUDA 验证覆盖两种 FP8、GPU/主机混合驻留、图重放、因果行与 padding。SM120 上 `2×256` KV 几何、verify width 4、Top-K 2051 的隔离微基准中，batch 1/2 全 GPU 冷读约快 10%，热读耗时约降 40%；50% 主机读取基本持平。这不是端到端吞吐承诺，混入其他请求的测量不计入结论。
+
 已有 PLE 可绑定到独立模型 profile，不必重新下载 NVIDIA 的整张表。磁盘读取支持原始 checkpoint 的 BF16/FP8，以及 `native-ple.json` 声明的 BF16/F16 或逐行 FP8 + FP32 scale。原始 checkpoint FP8 保留 checkpoint 的全表 scale；外部逐行 FP8 先按行 scale 解码为 BF16，原生 PLE 的后续 scale 固定为 1，不能再次乘 NVIDIA 的全表 scale。仅复用表数据，仍加载新模型的原生 PLE key/value 投影，不复用 27B Engram reader。
 
 ```bash
@@ -251,6 +285,14 @@ js4090 已实测既有 128 分片、320001536 × 160 的逐行 FP8 表：22 个�
 
 原生 Bank 同时保存 KV/GDN、QSA 压缩索引键/坐标，以及 PLE short-conv/ngram 状态；稀疏选择保留完整压缩组和 64-token 对齐。验证阶段只提交接受的 QSA/PLE 状态，普通 GDN 与 ReplaySSM 使用同一接受边界；会话快照显式声明状态组件并拒绝缺项。新模型使用独立指纹和状态目录，不复用旧编译产物或 27B Engram reader。当前路径限制 TP/EP/PP/MoE-DP=1，KV 需 BF16/FP8，不支持旧 NVFP4 KV、dense Score Bias、unified-memory/disaggregation 或通用权重 offload 混用。HiCache、LMCache 与 FlexKV 的 QSA/PLE 主机传输尚未适配，因此明确拒绝启用，不会静默丢失上下文；普通 radix cache 和原生 Bank 不受此限制。
 
+Flash-Next 的 Knowledge 与反思记忆沿用同一条原生链路：文档编译、模型 Q×K 检索、语义准入、完整混合状态恢复；反思发布后热重建 Bank，不把文档改为普通 prompt 拼接。空库首次导入也会建立带真实 attention head 几何的 Query Probe，并交给 Self-Ask；关闭 Observer 不再同时关闭检索 Q 捕获。PolicyData、Cognition、会话压缩及反思来源管理继续使用现有控制面和各自开关，原生 PLE 训练不是启用这些功能的前提。
+
+启用原生 MTP（EAGLE）时，EXO 的 target-only 内部请求使用独立调度，不运行草稿 prefill/verify；外部请求仍保留原生推测解码。Bank 发布和恢复会拒绝缺失、非有限或形状不匹配的 KV/GDN/QSA/PLE 状态，以及重复、乱序或被拆开的压缩组。CPU 回归覆盖完整页导出到稀疏前缀恢复、ReplaySSM、首次热导入和调度切换；这些回归不替代真实 GPU 上的端到端生成验收。
+
+启用反思可设置 `QWEN_EXO_REFLECTION_MEMORY_MODE=active`，会话压缩设置 `QWEN_EXO_RESPONSE_COMPACTION_MODE=active`；推理中自问检索需要 `QWEN_EXO_OBSERVER_MODE=active` 与 `QWEN_EXO_ENABLE_ADAPTIVE_REFRESH=1`。保留 `QWEN_EXO_SCORE_BIAS_MODE=off`：QSA 尚不支持 dense Score Bias，该限制不等于关闭知识库或反思。已有托管配置可能覆盖启动环境变量，必须核对实际配置；代码更新不会自动改动运行中的服务。
+
+QSA 注意力诊断按真实 top-k 逻辑位置重建概率，未选 token 的概率质量为零，不再用 dense softmax 冒充稀疏注意力。无缓存 prefill 读取本次原始 K；带前缀 prefill 读取缓存 K 并应用实际 scale。它仍是概率重建，不是因果解释；CUDA 端到端诊断及完整 checkpoint 的记忆生成/召回需要在空闲 GPU 上另行验收。
+
 这不是吞吐提升承诺：冷专家换入和高多样性 prefill 会增加 PCIe 传输与布局转换。CPU bank 会校验真实 cgroup 内存限额，不能与占用大量主存的生产模型强行同载。组件回归、按行读表和小型内核验证不等于全量 checkpoint 已生成成功；切换前仍须完成全部权重校验及独立端到端生成验收。
 
 CPU 专家库准入按 `memory.stat` 扣除可回收的干净文件缓存，而非将 `memory.current` 全部视为必须常驻；共享、脏页、写回和锁页不计作可用容量，未触页的专家预留仍累计，并保留 8GiB 余量。PLE 仍使用硬盘 `pread`，不整表加载或锁页。BF16 GEMM 默认分支也须检查实际 GPU：SM120 不启用仅供 SM100/103 的 split-K 内核，不能因分支内导入造成初始化异常。
@@ -265,13 +307,15 @@ CPU 专家库准入按 `memory.stat` 扣除可回收的干净文件缓存，而�
 
 js4090 的真实组合验收：固定空闲单请求、相同原生 prompt、温度 0、强制 128 token，原 eager 总耗时 `10.412s`（TTFT `0.237s`，decode `12.48 token/s`）；full Graph + 原生 MTP 两次为 `1.397s`/`1.209s`（decode `105.52`/`121.86 token/s`）。MTP 草稿接受率 `0.644`/`0.699`，每次验证输出长度 `2.909`/`3.122`；真实日志有 `cuda graph: True`。这是固定短请求的组合收益，不是 Graph/MTP 独立归因，也不是所有任务或 200K 长窗吞吐承诺；混合精度下前后及重复生成非逐 token 一致，不宣称 bit-exact。
 
-真实网关 SSE 中文问答在 `0.82s` 返回正确结果并以 `response.completed` 结束；三个并发请求的算术、排序、12648-token 上下文记号检查均通过。运行配置保持 `context_length=200000`，实分配 KV 容量 `250560`，`mem_fraction_static=0.93`、Mamba 槽 `64`，decode Graph 捕获 batch 1–5，超过捕获范围走 eager。会话摘要胶囊也已关闭，避免每轮回答后再生成 256-token 隐藏摘要；知识、PolicyData、反思和压缩继续关闭。
+此前网关 SSE 中文问答在 `0.82s` 返回正确结果并以 `response.completed` 结束；三个并发请求的算术、排序、12648-token 上下文记号检查均通过。当时运行配置为 `context_length=200000`，实分配 KV 容量 `250560`，`mem_fraction_static=0.93`、Mamba 槽 `64`，decode Graph 捕获 batch 1–5，超过捕获范围走 eager。会话摘要胶囊也已关闭，避免每轮回答后再生成 256-token 隐藏摘要；知识、PolicyData、反思和压缩继续关闭。
+
+带图请求显存紧张时，可设置 `QWEN_EXO_MM_PROCESS_CONFIG='{"image":{"device":"cpu"}}'`：启动器传入原生 `--mm-process-config`，显式图片／视频设备不再被自动 CUDA 选择覆盖。CPU 图片配置同时关闭 nvJPEG GPU 解码；保留同一处理器、原始图片顺序和分辨率策略，不去重、删图或降低清晰度。视觉编码仍在 GPU，需独立留出工作区；js4090 已将托管和启动显存比例从 `0.93` 调为 `0.90`，保留 4K THINK、历史 THINK 和 EAGLE/MTP。完整 1080p PNG／JPEG、四张重复图及两张不同图的真实 SSE 均完成正确颜色回答，验收窗口无新增 CUDA OOM；CPU 单图、重复图和不同尺寸图的像素／网格／token 与参考完全一致。该门禁不代表任意图片数量、尺寸或并发均已验收。
 
 Qwen4 长历史 FP8 K/V 可通过 `QWEN_EXO_HOST_KV_CACHE=1` 使用显存优先、pinned 主存溢出的混合布局。启动时从现有显存预算扣除完整逻辑跨度的 QSA 索引，再按页分配主模型＋MTP 共用的 GPU 槽位前缀；只为剩余槽位分配主存，不保留完整双份镜像。新分配和已释放的槽位优先复用显存；已有主存行不做后台 LRU 迁回。GPU 同时保留 QSA 索引、GDN／PLE 状态和选中工作集，CUDA kernel 根据逻辑槽位直接访问对应银行。预算足够时整个原始 KV 银行均可驻留显存。前缀预填充、目标验证和草稿 decode 保留原有语义及 Graph 路径；接受行搬运必须保留快照式并行赋值，避免跨层级或重叠搬运破坏历史。该路径限制 CUDA TP/EP/PP/DP=1、FP8 E4M3、NHD、原生 topk=1 MTP 和 FlashInfer TRTLLM 稀疏注意力；不与通用 HiCache、unified-memory、disaggregation 或 FP4 混用。
 
 Host KV 同时要求 `DCP=1`，未实现的解码上下文并行直接拒绝。原生 Bank 导出在 inverse RoPE 前恢复全局 FP8 K/V scale，还原时把 BF16 激活放到逻辑槽位所在 CUDA 设备后经池 API 写入；缩放各应用一次，不把 pinned CPU 缓冲误当执行设备。Bank 快照协议已升为 `qwen-exo-native-state-bank-v2`，旧版本需重建，不复用旧缩放语义的产物。该源码修复不代表在线服务已部署此版本。
 
-六路 200K profile 保持 `QWEN_EXO_MAX_RUNNING_REQUESTS=6`、`QWEN_EXO_MAX_TOTAL_TOKENS=1300032`、`QWEN_EXO_CUDA_GRAPH_MAX_BS=6`、上下文 `200000`、原生 MTP 和磁盘 PLE。当前在线启动预算自动得到 255616 个 GPU 有效槽位及 1044416 个主存溢出槽位，主模型＋MTP 原始 K/V 分别约 3.17GiB 显存、12.95GiB pinned 主存；dummy page 计入 GPU 字节，QSA 索引、GDN 和工作区另计。这是启动预算下的固定分段，不是每次请求按 `nvidia-smi` 空闲量搬运整个会话。
+六路 200K profile 保持 `QWEN_EXO_MAX_RUNNING_REQUESTS=6`、`QWEN_EXO_MAX_TOTAL_TOKENS=1300032`、`QWEN_EXO_CUDA_GRAPH_MAX_BS=6`、上下文 `200000`、原生 MTP 和磁盘 PLE。此前 `0.93` 启动预算得到 255616 个 GPU 有效槽位及 1044416 个主存溢出槽位，主模型＋MTP 原始 K/V 分别约 3.17GiB 显存、12.95GiB pinned 主存；dummy page 计入 GPU 字节，QSA 索引、GDN 和工作区另计。此槽位记录不作为当前 `0.90` 配置的容量验收。布局仍是启动预算下的固定分段，不是每次请求按 `nvidia-smi` 空闲量搬运整个会话。
 
 混合方案完成 88 项回归及 11 项 subtests；两轮六路长请求各输入 199744 tokens、生成 128 tokens，并返回各自正确记号。在线混合负载采样到 6 路运行，驻留峰值分别为 845120／904640，未重现此前 1199232 的满驻留峰值，因此不能沿用旧结果宣称混合模式已通过该峰值验收。后续测试按用户要求停止，模型服务继续运行。证据位于 `bench/mixed-kv-20261005/{acceptance,replay-acceptance}.json`。
 

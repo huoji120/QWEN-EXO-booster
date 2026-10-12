@@ -43,6 +43,7 @@ class InternalJobType(str, Enum):
     RESPONSE_COMPACTION = "response_compaction"
     QUERY_PROBE = "query_probe"
     ATTENTION_DIAGNOSTIC = "attention_diagnostic"
+    SYSTEM_ONE = "system_one"
 
 
 class EligibilityStatus(str, Enum):

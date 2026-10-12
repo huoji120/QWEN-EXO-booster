@@ -109,7 +109,9 @@ def _diagnostic_backend():
         else:
             break
     if (
-        type(backend).__name__ not in ("TritonAttnBackend", "FlashInferAttnBackend")
+        type(backend).__name__ not in (
+            "TritonAttnBackend", "FlashInferAttnBackend", "QwenSparseAttnBackend"
+        )
         or getattr(backend, "dcp_size", 1) != 1
         or getattr(backend, "use_mla", False)
         or getattr(backend, "enable_mis", False)
@@ -121,7 +123,7 @@ def _diagnostic_backend():
             return None
         pool = pool.full_kv_pool
     if (
-        type(pool).__name__ != "MHATokenToKVPool"
+        type(pool).__name__ not in ("MHATokenToKVPool", "QwenHostFP8KVPool")
         or getattr(pool, "use_hnd", False)
         or getattr(pool, "kv_cache_layout", None) == "vectorized_5d"
     ):
@@ -189,6 +191,33 @@ def mean_cached_attention(query, keys, *, scaling: float, key_descale: float):
     return result.div_(num_heads)
 
 
+def mean_sparse_cached_attention(
+    query, selected_keys, selected_positions, *, token_count: int,
+    scaling: float, key_descale: float,
+):
+    """Reconstruct QSA's selected-key distribution in logical token coordinates.
+
+    The caller gathers only the indexer's valid rows, in exactly its order.
+    Cache descales are applied in the attention input dtype, as in native QSA;
+    uncached prefill passes the original keys with a descale of one.
+    """
+    if (
+        selected_positions.ndim != 1
+        or selected_positions.numel() != selected_keys.shape[0]
+        or not 1 <= token_count <= ATTENTION_DIAGNOSTIC_MAX_TOKENS
+        or bool(((selected_positions < 0) | (selected_positions >= token_count)).any().item())
+    ):
+        raise ValueError("Invalid diagnostic sparse token coordinates")
+    keys = selected_keys if key_descale == 1.0 else selected_keys * key_descale
+    probabilities = mean_cached_attention(
+        query, keys, scaling=scaling, key_descale=1.0
+    )
+    output = probabilities.new_zeros(token_count)
+    # Unselected tokens have zero probability, including very high dense scores.
+    # Repeated selected rows carry repeated softmax mass in the native operator.
+    return output.scatter_add_(0, selected_positions.long(), probabilities)
+
+
 def _unsupported_attention(layer, metadata, forward_batch) -> bool:
     """Attention variants that a plain causal cached-key softmax cannot reproduce."""
     # FlashInfer extend metadata always carries a (normally disabled)
@@ -222,7 +251,9 @@ def diagnostic_position_matches(positions, end: int, count: int) -> bool:
     return False
 
 
-def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> None:
+def capture_attention_diagnostic(
+    decoder, query, positions, forward_batch, *, sparse_topk=None, current_keys=None
+) -> None:
     """Called strictly after the actual attention backend has written K/V.
 
     Error codes: 1 unsupported backend/cache/topology; 2 invalid specification;
@@ -267,7 +298,9 @@ def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> No
     full_layers = {
         index
         for index, kind in enumerate(decoder.config.layers_block_type)
-        if kind == "attention"
+        if kind in {
+            "attention", "full_attention", "qwen_sparse_attention", "sparse_attention"
+        }
     }
     valid_rows = []
     has_error = False
@@ -285,7 +318,11 @@ def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> No
         return
     weights = None
     if valid_rows:
-        if _unsupported_attention(layer, backend.forward_metadata, forward_batch):
+        sparse = type(backend).__name__ == "QwenSparseAttnBackend"
+        if (
+            _unsupported_attention(layer, backend.forward_metadata, forward_batch)
+            or (sparse and sparse_topk is None)
+        ):
             errors[valid_rows] = 1
         else:
             descale = _cached_key_descale(layer, full_pool)
@@ -340,15 +377,45 @@ def capture_attention_diagnostic(decoder, query, positions, forward_batch) -> No
                     ):
                         errors[row] = 3
                         continue
-                    keys, _ = backend.token_to_kv_pool.get_kv_tokens(
-                        layer.layer_id, mapping, read_dtype
-                    )
-                    weights[row, :count] = mean_cached_attention(
-                        q[end - 1],
-                        keys,
-                        scaling=layer.scaling,
-                        key_descale=descale,
-                    )
+                    if sparse:
+                        if end > sparse_topk.shape[0]:
+                            errors[row] = 3
+                            continue
+                        selected = sparse_topk[end - 1].long()
+                        selected = selected[selected >= 0]
+                        if selected.numel() == 0 or bool((selected >= count).any().item()):
+                            errors[row] = 3
+                            continue
+                        # Uncached QSA prefill attends to the original BF16 K,
+                        # not the quantized copy written to an FP8 cache.
+                        prefill = backend.forward_metadata.prefill_metadata
+                        if prefill is not None and prefill.kv_locations is None:
+                            if current_keys is None or int(prefixes[row]) != 0:
+                                errors[row] = 3
+                                continue
+                            keys = current_keys.reshape(
+                                -1, decoder.num_kv_heads, decoder.head_dim
+                            )[offsets[row] : end].index_select(0, selected)
+                            selected_descale = 1.0
+                        else:
+                            keys, _ = backend.token_to_kv_pool.get_kv_tokens(
+                                layer.layer_id, mapping.index_select(0, selected), query.dtype
+                            )
+                            selected_descale = descale
+                        weights[row, :count] = mean_sparse_cached_attention(
+                            q[end - 1], keys, selected, token_count=count,
+                            scaling=layer.scaling, key_descale=selected_descale,
+                        )
+                    else:
+                        keys, _ = backend.token_to_kv_pool.get_kv_tokens(
+                            layer.layer_id, mapping, read_dtype
+                        )
+                        weights[row, :count] = mean_cached_attention(
+                            q[end - 1],
+                            keys,
+                            scaling=layer.scaling,
+                            key_descale=descale,
+                        )
                 if parallel.attn_tp_size > 1:
                     weights = parallel.attn_tp_group.all_reduce(weights)
                     weights.div_(parallel.attn_tp_size)

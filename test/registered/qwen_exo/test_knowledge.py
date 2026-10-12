@@ -247,6 +247,7 @@ async def test_selected_document_compile_retains_unchanged_compiled_documents(tm
                 for index, _key in enumerate(sorted(included_documents))
             )
             return SimpleNamespace(
+                ready=bool(pages),
                 pages=pages,
                 public_dict=lambda: {"document_state_count": len(pages)},
             )
@@ -255,6 +256,7 @@ async def test_selected_document_compile_retains_unchanged_compiled_documents(tm
             self.resident = tuple(page_ids)
 
     runtime.tensor_bank = SelectiveTensorBank()
+    runtime.query_probe = _ReflectionQueryProbe()
     runtime._tensor_bank_admin_lock = asyncio.Lock()
     runtime.telemetry = SimpleNamespace(emit=lambda *_args, **_kwargs: None)
 
@@ -606,6 +608,7 @@ class _RuntimeTensorBank:
             for document in self.runtime.knowledge.snapshot.documents
         )
         return SimpleNamespace(
+            ready=bool(pages),
             pages=pages,
             public_dict=lambda: {"document_state_count": len(pages)},
         )
@@ -620,8 +623,18 @@ async def test_runtime_hot_ingest_replaces_groups_and_rolls_back_compile_failure
 ):
     runtime = object.__new__(QwenExoRuntime)
     runtime.knowledge = KnowledgeRepository(tmp_path / "knowledge")
-    runtime.config = SimpleNamespace(tensor_bank_max_document_tokens=256)
-    runtime.tokenizer_manager = SimpleNamespace(tokenizer=_CharacterTokenizer())
+    runtime.config = SimpleNamespace(
+        tensor_bank_max_document_tokens=256,
+        max_internal_tokens=4096,
+        qk_query_pooling="windows",
+    )
+    runtime.tokenizer_manager = SimpleNamespace(
+        tokenizer=_CharacterTokenizer(),
+        model_config=SimpleNamespace(num_attention_heads=16, head_dim=256),
+    )
+    runtime.query_probe = None
+    runtime.refresh_service = None
+    runtime.internal_jobs = SimpleNamespace()
     runtime.telemetry = SimpleNamespace(emit=lambda *_args, **_kwargs: None)
     runtime._tensor_bank_admin_lock = asyncio.Lock()
     runtime.tensor_bank = _RuntimeTensorBank(runtime)
@@ -635,6 +648,8 @@ async def test_runtime_hot_ingest_replaces_groups_and_rolls_back_compile_failure
     assert first["restart_required"] is False
     assert first["document_count"] == 1
     assert runtime.knowledge.snapshot.documents[0].relative_path == ("uploads/guide.md")
+    assert runtime.query_probe.query_head_count == 16
+    assert runtime.query_probe.head_dim == 256
 
     second = await runtime.ingest_knowledge_files(
         [{"filename": "guide.txt", "content_base64": _encoded("second version")}]

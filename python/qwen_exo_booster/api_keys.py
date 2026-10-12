@@ -18,6 +18,7 @@ _PROTECTED_ENDPOINTS = frozenset(
         "/v1/models",
         "/v1/responses",
         "/v1/responses/compact",
+        "/v1/systemone",
     }
 )
 

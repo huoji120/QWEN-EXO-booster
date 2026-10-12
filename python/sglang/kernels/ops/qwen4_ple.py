@@ -1,4 +1,4 @@
-"""Bitwise-exact fused kernels for decode-sized Qwen4 PLE paths."""
+"""Fused kernels for Qwen4 PLE hashing, state movement and row decoding."""
 
 from __future__ import annotations
 
@@ -312,3 +312,94 @@ def fused_qwen4_short_conv_state(
             num_warps=8,
         )
     return conv_input
+
+
+@triton.jit
+def _qwen4_fp8_e4m3_rowscale_kernel(
+    rows_ptr,
+    scales_ptr,
+    output_ptr,
+    num_rows,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Decode E4M3FN bytes and apply one FP32 scale per row."""
+
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = (row < num_rows) & (cols < hidden_size)
+    bits = tl.load(
+        rows_ptr + row * hidden_size + cols, mask=mask, other=0
+    ).to(tl.int32)
+    exponent = (bits >> 3) & 0xF
+    mantissa = bits & 0x7
+    subnormal = mantissa.to(tl.float32) * (2.0 ** -9)
+    # Normal E4M3FN values map exactly to FP32 exponent/mantissa bits.
+    normal_bits = ((exponent + 120) << 23) | (mantissa << 20)
+    normal = normal_bits.to(tl.float32, bitcast=True)
+    value = tl.where(exponent == 0, subnormal, normal)
+    # Exponent=15/mantissa=7 is NaN; retain sign bits, including negative zero.
+    value_bits = value.to(tl.int32, bitcast=True)
+    value_bits = tl.where(
+        (exponent == 15) & (mantissa == 7), 0x7FC00000, value_bits
+    )
+    value_bits = value_bits | ((bits & 0x80) << 24)
+    value = value_bits.to(tl.float32, bitcast=True)
+    scale = tl.load(scales_ptr + row).to(tl.float32)
+    # Triton emits the default IEEE FP32 round-to-nearest multiply (without
+    # fast-math/FTZ), matching the CPU decoder's FP32 product.
+    scaled = value * scale
+    # CUDA multiplication may canonicalize NaN to an all-ones payload; the
+    # integer RNE bias would overflow that payload into signed zero.
+    rounded = tl.where(scaled != scaled, scaled, _round_bf16_to_fp32(scaled))
+    tl.store(
+        output_ptr + row * hidden_size + cols,
+        rounded,
+        mask=mask,
+    )
+
+
+def can_fuse_qwen4_fp8_rowscale(
+    rows: torch.Tensor, scales: torch.Tensor, output: torch.Tensor
+) -> bool:
+    """Return whether the native FP8 rowscale decode contract is supported."""
+
+    return (
+        rows.is_cuda
+        and rows.dtype == torch.uint8
+        and rows.dim() == 2
+        and rows.is_contiguous()
+        and scales.is_cuda
+        and scales.dtype == torch.float32
+        and scales.dim() == 1
+        and scales.is_contiguous()
+        and output.is_cuda
+        and output.dtype == torch.bfloat16
+        and output.dim() == 2
+        and output.is_contiguous()
+        and rows.shape == output.shape
+        and scales.shape[0] == rows.shape[0]
+        and rows.device == scales.device == output.device
+    )
+
+
+def fused_qwen4_fp8_rowscale(
+    rows: torch.Tensor, scales: torch.Tensor, output: torch.Tensor
+) -> torch.Tensor:
+    """Decode native FP8 rows directly into an existing contiguous BF16 buffer."""
+
+    if not can_fuse_qwen4_fp8_rowscale(rows, scales, output):
+        raise ValueError("unsupported input for fused Qwen4 FP8 rowscale decode")
+    num_rows, hidden_size = rows.shape
+    if num_rows:
+        block_size = triton.next_power_of_2(hidden_size)
+        _qwen4_fp8_e4m3_rowscale_kernel[(num_rows,)](
+            rows,
+            scales,
+            output,
+            num_rows,
+            hidden_size,
+            BLOCK_SIZE=block_size,
+            num_warps=4 if block_size <= 256 else 8,
+        )
+    return output

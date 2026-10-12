@@ -126,9 +126,11 @@ class ResolvedConfidence(msgspec.Struct):
 
 @dataclass
 class RelayPayload:
-    """Per-iteration stash payload for the FutureMap bufs. Non-spec fills only
-    `bonus_tokens`; which spec extras get relayed is decided by
-    `FutureMap.spec_algo`, not by this payload's shape."""
+    """Per-iteration relay state, distinct from the server's speculation mode.
+
+    Target-only batches carry tokens only, even in an EAGLE service. Draft
+    producers explicitly mark payloads that own speculative side state.
+    """
 
     bonus_tokens: torch.Tensor
     topk_p: Optional[torch.Tensor] = None
@@ -136,6 +138,7 @@ class RelayPayload:
     hidden_states: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
     dsa_topk_indices: Optional[torch.Tensor] = None
+    speculative: bool = False
 
     @classmethod
     def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
@@ -146,6 +149,7 @@ class RelayPayload:
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
             dsa_topk_indices=draft_input.dsa_topk_indices,
+            speculative=True,
         )
 
 
@@ -298,8 +302,8 @@ class FutureMap:
 
         self._forward_buf_initialized = True
 
-        # Spec extras are gated by spec_algo, not by the payload's shape, so a
-        # non-spec stash allocates no extra bufs (only output_tokens_buf).
+        # Called only for a speculative payload. A preceding target-only batch
+        # must not initialize or freeze the shapes of these draft buffers.
         self.need_topk = self.spec_algo.is_some() and self.spec_algo.need_topk()
         self.need_hidden_states = (
             self.spec_algo.is_some()
@@ -504,12 +508,14 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        if not self._forward_buf_initialized:
-            self._lazy_init_forward_buf(payload)
-        self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf
         )
+        if not payload.speculative:
+            return
+        if not self._forward_buf_initialized:
+            self._lazy_init_forward_buf(payload)
+        self._maybe_init_dsa_topk_indices_buf(payload)
 
         if self.need_topk:
             self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)

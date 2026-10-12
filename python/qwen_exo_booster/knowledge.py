@@ -396,6 +396,10 @@ class KnowledgeCandidate:
     reference_content: str = field(repr=False)
     normalized_reference_content: str = field(repr=False)
     lane: str = "knowledge"
+    # Explicit logical-source identity; empty means legacy ungrouped document.
+    document_group: str | None = None
+    group_sources: tuple[tuple[str, str, str], ...] = ()
+    group_member_count: int = 1
     tensor_score: float | None = None
     relative_tensor_score: float | None = None
     score_percentile: float | None = None
@@ -423,8 +427,14 @@ class KnowledgeCandidate:
             "lexical_score": self.lexical_score,
             "quality_prior": self.quality_prior,
             "canonical": self.canonical,
-            "reference_digest": self.reference_digest,
             "lane": self.lane,
+            "document_group": self.document_group,
+            "group_member_count": self.group_member_count,
+            "group_sources": [
+                {"document_id": document_id, "relative_path": path, "sha256": digest}
+                for document_id, path, digest in self.group_sources
+            ],
+            "reference_digest": self.reference_digest,
             "policy": self.lane == "policydata",
             "tensor_score": self.tensor_score,
             "relative_tensor_score": self.relative_tensor_score,
@@ -590,6 +600,7 @@ class KnowledgeRepository:
             reference_digest=document.sha256,
             reference_content=document.content,
             normalized_reference_content=document.normalized_content,
+            document_group=document.document_group,
         )
 
     def lexical_document_scores(self, query: str) -> dict[str, float]:
@@ -670,6 +681,7 @@ class KnowledgeRepository:
                     reference_digest=document.sha256,
                     reference_content=document.content,
                     normalized_reference_content=document.normalized_content,
+                    document_group=document.document_group,
                 )
             )
         candidates.sort(key=lambda candidate: (-candidate.score, candidate.document_id))

@@ -15,20 +15,23 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import io
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import (
+    PreTrainedTokenizerFast,
+    Qwen2VLImageProcessor,
+    Qwen2VLProcessor,
+    Qwen2VLVideoProcessor,
+)
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.test.test_utils import CustomTestCase
-
-
-class _StubProcessor(BaseMultimodalProcessor):
-    # gpu_image_decode=False forces the PIL (CPU) path so the test needs no GPU and
-    # exercises exactly the lazy-decode branch the fix targets. The abstract methods
-    # are never called: we only invoke the _load_single_item classmethod.
-    gpu_image_decode = False
 
 
 def _png_bytes(mode: str = "RGB", size=(8, 8)) -> bytes:
@@ -56,14 +59,18 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         self.assertFalse(_is_decoded(lazy))
 
     def test_load_single_item_forces_decode(self):
-        img = _StubProcessor._load_single_item(_png_bytes("RGB"), Modality.IMAGE)
+        img = BaseMultimodalProcessor._load_single_item(
+            _png_bytes("RGB"), Modality.IMAGE, gpu_image_decode=False
+        )
         self.assertIsInstance(img, Image.Image)
         self.assertEqual(img.mode, "RGB")
         # The fix: decode is forced inside _load_single_item, not lazily later.
         self.assertTrue(_is_decoded(img))
 
     def test_rgba_converted_to_rgb_and_decoded(self):
-        img = _StubProcessor._load_single_item(_png_bytes("RGBA"), Modality.IMAGE)
+        img = BaseMultimodalProcessor._load_single_item(
+            _png_bytes("RGBA"), Modality.IMAGE, gpu_image_decode=False
+        )
         # Existing alpha-discard behavior preserved.
         self.assertEqual(img.mode, "RGB")
         self.assertTrue(_is_decoded(img))
@@ -71,9 +78,96 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
     def test_pixels_match_reference(self):
         # Output must be bit-identical to the pre-fix path (open -> [convert]).
         data = _png_bytes("RGB")
-        img = _StubProcessor._load_single_item(data, Modality.IMAGE)
+        img = BaseMultimodalProcessor._load_single_item(
+            data, Modality.IMAGE, gpu_image_decode=False
+        )
         ref = Image.open(io.BytesIO(data)).convert("RGB")
         np.testing.assert_array_equal(np.asarray(img), np.asarray(ref))
+
+
+class _ConfiguredProcessor(BaseMultimodalProcessor):
+    async def process_mm_data_async(self, *args, **kwargs):
+        raise NotImplementedError("These tests exercise decoding and preprocessing directly")
+
+
+class TestCPUImageProcessing(CustomTestCase):
+    def setUp(self):
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            pad_token="[UNK]",
+            additional_special_tokens=[
+                "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"
+            ],
+        )
+        self.hf = Qwen2VLProcessor(
+            image_processor=Qwen2VLImageProcessor(
+                min_pixels=56 * 56, max_pixels=112 * 112
+            ),
+            tokenizer=tokenizer,
+            video_processor=Qwen2VLVideoProcessor(),
+        )
+        self.processor = _ConfiguredProcessor(
+            SimpleNamespace(),
+            SimpleNamespace(
+                keep_mm_feature_on_device=False,
+                mm_feature_transport="cpu",
+                disable_fast_image_processor=False,
+                skip_tokenizer_init=False,
+                mm_process_config={"image": {"device": "cpu"}},
+            ),
+            self.hf,
+            transport_mode="cpu",
+        )
+        self.addCleanup(self.processor.io_executor.shutdown)
+        self.addCleanup(self.processor.cpu_executor.shutdown)
+
+    def test_cpu_device_preserves_repeated_image_pixels_grids_and_tokens(self):
+        from sglang.srt.multimodal.processors import base_processor as module
+
+        image = Image.open(io.BytesIO(_png_bytes(size=(56, 56))))
+        images = [image, image, image]
+        text = "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
+        with (
+            patch.multiple(module, _is_cpu=False, _is_xpu=False, _is_npu=False),
+            patch.object(
+                module,
+                "get_server_args",
+                return_value=SimpleNamespace(rl_on_policy_target=None, base_gpu_id=0),
+            ),
+        ):
+            actual = self.processor.process_mm_data(text, images=images)
+        expected = self.hf(
+            text=[text],
+            images=images,
+            images_kwargs={"device": "cpu"},
+            padding=True,
+            return_tensors="pt",
+        )
+        for key in ("pixel_values", "image_grid_thw", "input_ids"):
+            np.testing.assert_array_equal(actual[key].numpy(), expected[key].numpy())
+        self.assertEqual(actual["image_grid_thw"].shape[0], len(images))
+        self.assertEqual(actual["pixel_values"].device.type, "cpu")
+
+    def test_cpu_device_decodes_jpeg_without_nvjpeg(self):
+        from sglang.srt.utils import common
+
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(_png_bytes(size=(56, 56)))).save(buf, format="JPEG")
+        data = buf.getvalue()
+        with patch.object(common, "is_cuda", return_value=True), patch.object(
+            common,
+            "decode_jpeg",
+            side_effect=AssertionError("CPU images must not allocate nvJPEG GPU memory"),
+        ) as gpu_decoder:
+            jobs = self.processor._submit_mm_data_loading_tasks_simple(
+                [data], Modality.IMAGE, None, True
+            )
+            actual = jobs[0][2].result(timeout=5)
+        gpu_decoder.assert_not_called()
+        np.testing.assert_array_equal(
+            np.asarray(actual), np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+        )
 
 
 if __name__ == "__main__":

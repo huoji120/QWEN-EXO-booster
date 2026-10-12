@@ -42,6 +42,7 @@ from typing import (
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -1878,6 +1879,41 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
     )
 
 
+@app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
+async def v1_systemone_request(raw_request: Request):
+    """TypeSafe System One (jev-latest) compatible noul/choice/score evaluation."""
+    from qwen_exo_booster.system_one import SystemOneError, SystemOneEvaluator
+
+    qwen_exo_runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
+    if qwen_exo_runtime is None:
+        error = SystemOneError(
+            404, "not_supported", "System One requires the QWEN-EXO runtime"
+        )
+        return ORJSONResponse(error.public_dict(), status_code=error.status_code)
+    evaluator = getattr(raw_request.app.state, "qwen_exo_system_one", None)
+    if evaluator is None:
+        tokenizer_manager = _global_state.tokenizer_manager
+        evaluator = SystemOneEvaluator(
+            qwen_exo_runtime.internal_jobs,
+            tokenizer_manager.tokenizer,
+            max_prompt_tokens=min(32768, tokenizer_manager.context_len - 1),
+        )
+        raw_request.app.state.qwen_exo_system_one = evaluator
+    try:
+        payload = orjson.loads(await raw_request.body())
+    except orjson.JSONDecodeError:
+        error = SystemOneError(400, "invalid_json", "request body is not valid JSON")
+        return ORJSONResponse(error.public_dict(), status_code=error.status_code)
+    try:
+        return ORJSONResponse(await evaluator.evaluate(payload))
+    except SystemOneError as error:
+        return ORJSONResponse(error.public_dict(), status_code=error.status_code)
+    except Exception:
+        logger.exception("System One evaluation failed")
+        error = SystemOneError(500, "internal_error", "System One evaluation failed")
+        return ORJSONResponse(error.public_dict(), status_code=error.status_code)
+
+
 @app.post(
     "/qwen-exo/console/v1/responses",
     dependencies=[Depends(validate_json_request)],
@@ -1897,9 +1933,28 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
         # Server-internal channel for the retrieved-memory block: never trust a
         # client-supplied value.
         request.qwen_exo_memory_attachment = None
+        async def decision_history(prepared_request):
+            previous = None
+            if prepared_request.previous_response_id:
+                async with serving.response_store_lock:
+                    previous = serving.response_store.get(prepared_request.previous_response_id)
+                if previous is None:
+                    raise ValueError("Decision context previous response is unavailable")
+            return serving._construct_input_messages(
+                prepared_request, previous, memory_attachment=None
+            )
+        # Authentication has already run; isolate private KV by credential as
+        # well as resolved conversation, never by a client label alone.
+        from hashlib import sha256
+        decision_credential = raw_request.headers.get("authorization", "")
+        decision_scope = (
+            sha256(decision_credential.encode()).hexdigest()
+            if decision_credential else None
+        )
         try:
             request, memory_state = await qwen_exo_runtime.prepare_responses_request(
-                request
+                request, history_resolver=decision_history,
+                decision_cache_scope=decision_scope,
             )
             raw_request.state.qwen_exo_memory = (
                 memory_state.public_dict() if memory_state is not None else None

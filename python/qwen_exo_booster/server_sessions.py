@@ -285,6 +285,9 @@ class ServerSessionStore:
             if timers:
                 await asyncio.gather(*timers, return_exceptions=True)
             if targets:
+                clear_reasoning = getattr(self.runtime, "clear_reasoning_sessions", None)
+                if clear_reasoning is not None:
+                    await clear_reasoning(targets)
                 for name in (
                     "_reflection_memory_trajectories",
                     "_reflection_memory_sources",

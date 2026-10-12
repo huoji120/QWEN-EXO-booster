@@ -17,6 +17,7 @@ from qwen_exo_booster.native_state_bank import (
     _quantize_fp8,
     _session_initial_gdn_path,
     validate_session_initial_gdn_artifacts,
+    validate_page_artifacts,
 )
 from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.tensor_bank import TensorBank, TensorBankCompileError
@@ -1392,7 +1393,7 @@ def test_load_page_key_heads_selects_the_configured_full_attention_layer(tmp_pat
         )
 
 
-def test_qwen4_bank_restores_sparse_groups_with_index_rope_and_ple(tmp_path):
+def _qwen4_bank_fixture(tmp_path, *, replay=False):
     torch.manual_seed(41)
     rotary = _rotary(rows=256)
     ratio = 4
@@ -1404,14 +1405,23 @@ def test_qwen4_bank_restores_sparse_groups_with_index_rope_and_ple(tmp_path):
     )
     pending = torch.randn(8, 1, 8, dtype=torch.bfloat16)
     pending_rope = torch.arange(24).reshape(8, 3)
-    kv_pool = SimpleNamespace(
-        qsa_compress_ratio=ratio, qsa_index_kv_heads=1, qsa_index_head_dim=8,
-        qsa_token_topk=2048,
-        get_qsa_compressed_k_buffer=lambda layer_id: compressed,
-        get_qsa_key_state_buffer=lambda layer_id: pending,
-        get_qsa_rope_position_buffer=lambda indices: pending_rope[indices],
-        set_qsa_compressed_k_buffer=lambda layer_id, indices, data: compressed.index_copy_(0, indices, data.to(compressed.dtype)),
+    raw_key = torch.randn(96, 1, 8, dtype=torch.bfloat16)
+    values = torch.randn_like(raw_key)
+    key_buffer = torch.zeros(320, 1, 8, dtype=torch.bfloat16)
+    value_buffer = torch.zeros_like(key_buffer)
+    key_buffer[64:160] = _apply_rotary_key(
+        raw_key, positions=torch.arange(8, 104), rotary=rotary,
     )
+    value_buffer[64:160] = values
+    kv_pool = _KVPool(key_buffer, value_buffer)
+    kv_pool.qsa_compress_ratio = ratio
+    kv_pool.qsa_index_kv_heads = 1
+    kv_pool.qsa_index_head_dim = 8
+    kv_pool.qsa_token_topk = 2048
+    kv_pool.get_qsa_compressed_k_buffer = lambda layer_id: compressed
+    kv_pool.get_qsa_key_state_buffer = lambda layer_id: pending
+    kv_pool.get_qsa_rope_position_buffer = lambda indices: pending_rope[indices]
+    kv_pool.set_qsa_compressed_k_buffer = lambda layer_id, indices, data: compressed.index_copy_(0, indices, data.to(compressed.dtype))
     short_state = torch.randn(1, 8, 2, 3, dtype=torch.bfloat16)
     ngram_state = torch.arange(16).reshape(8, 2)
     short = SimpleNamespace(
@@ -1422,31 +1432,76 @@ def test_qwen4_bank_restores_sparse_groups_with_index_rope_and_ple(tmp_path):
         enabled=True, context=ngram_state, eos_token_id=7,
         load_cpu_slots=lambda data, indices: ngram_state.index_copy_(0, indices, data),
     )
+    mamba_pool = _SessionMambaPool(replay=replay, ple=True)
+    mamba_pool._slot_siblings = (short, ngram)
+    mamba_pool.mamba_cache.conv[0][:, 2].normal_()
+    mamba_pool.mamba_cache.temporal[:, 2].normal_()
+    req_to_token = torch.zeros(2, 104, dtype=torch.long)
+    req_to_token[1, 8:] = torch.arange(64, 160)
     manager = NativeStateBankManager(
         root=tmp_path,
         model_config=SimpleNamespace(model_path="", hf_text_config=SimpleNamespace(
             model_type="qwen4_exp_text", layers_block_type=["attention"],
         )),
-        model=SimpleNamespace(layers=[SimpleNamespace(rotary_emb=rotary)]),
-        kv_pool=kv_pool, kv_allocator=object(),
-        req_pool=SimpleNamespace(short_conv_pool=short, ngram_pool=ngram, mamba_pool=SimpleNamespace()),
-        tree_cache=object(), rank=0, world_size=1, page_size=64, consensus=lambda value: value,
+        model=SimpleNamespace(layers=[SimpleNamespace(
+            rotary_emb=rotary, attn=SimpleNamespace(layer_id=0),
+        )]),
+        kv_pool=kv_pool, kv_allocator=_SequentialAllocator(192),
+        req_pool=SimpleNamespace(
+            short_conv_pool=short, ngram_pool=ngram, mamba_pool=mamba_pool,
+            mamba_allocator=_SequentialAllocator(3), req_to_token=req_to_token,
+            translate_mamba_indices=lambda indices: indices,
+        ),
+        tree_cache=_InsertCache(), rank=0, world_size=1, page_size=64,
+        consensus=lambda value: value,
+        insert_params_factory=SimpleNamespace,
     )
-    request = SimpleNamespace(req_pool_idx=1, origin_input_ids=list(range(104)))
-    state = manager._export_qwen4_state(
-        request, torch.arange(64, 160), 8, 96, torch.tensor([2]),
+    request = SimpleNamespace(
+        req_pool_idx=1, origin_input_ids=list(range(104)),
+        mamba_pool_idx=torch.tensor(2),
     )
-    payload = {"capture_count": 96, "qwen4_state": state}
+    export = {
+        "source_digest": "a" * 64, "page_id": 0,
+        "capture_start": 8, "capture_count": 96, "prefix_identity": "qwen4-page",
+    }
+    manager._export(request, export)
+    payload = _load_page_payload(tmp_path, source_digest="a" * 64, page_id=0, rank=0)
+    return manager, request, export, payload, raw_index_keys, raw_key, values
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_qwen4_bank_restores_sparse_groups_with_index_rope_and_ple(tmp_path, replay):
+    manager, request, export, payload, raw_index_keys, raw_key, values = _qwen4_bank_fixture(
+        tmp_path, replay=replay,
+    )
+    state = payload["qwen4_state"]
+    compressed = manager.kv_pool.get_qsa_compressed_k_buffer(0)
+    short_state = manager.req_pool.short_conv_pool.conv_state
+    ngram_state = manager.req_pool.ngram_pool.context
+    mamba_pool = manager.req_pool.mamba_pool
+    rotary = manager.layers[0].rotary_emb
+    ratio = state["compress_ratio"]
+    validate_page_artifacts(
+        tmp_path, source_digest="a" * 64, page_id=0, world_size=1,
+        model_fingerprint=manager.model_fingerprint, prefix_identity="qwen4-page",
+        token_count=96,
+    )
     selected = tuple(range(32)) + tuple(range(64, 96))
     manager._validate_qwen4_state(payload, selected)
     stored_short = state["short_conv"].clone()
     stored_ngram = state["ngram"].clone()
     assert torch.equal(state["layers"]["0"]["compressed_key"], compressed[16:40])
-    assert torch.equal(state["layers"]["0"]["pending_key"], pending[4:8])
-    assert torch.equal(state["pending_rope"], pending_rope[4:8])
+    assert torch.equal(state["layers"]["0"]["pending_key"], manager.kv_pool.get_qsa_key_state_buffer(0)[4:8])
+    assert torch.equal(state["pending_rope"], manager.kv_pool.get_qsa_rope_position_buffer(torch.arange(4, 8)))
     short_state[:, 3].zero_()
     ngram_state[3].fill_(-1)
-    manager._restore_qwen4_state(payload, selected, torch.arange(192, 256), torch.tensor([3]))
+    manager._validate_restore_payload(
+        payload, local_positions=selected,
+        prefix_token_ids=tuple(payload["token_ids"][index] for index in selected),
+    )
+    manager._restore_prefix(
+        request, payload=payload, key="qwen4-native-key", local_positions=selected,
+    )
     selected_groups = torch.tensor(selected[::ratio]) // ratio
     expected = _apply_rotary_key(
         raw_index_keys[selected_groups], positions=torch.arange(0, 64, ratio), rotary=rotary,
@@ -1454,10 +1509,132 @@ def test_qwen4_bank_restores_sparse_groups_with_index_rope_and_ple(tmp_path):
     assert torch.allclose(compressed[48:64].float(), expected.float(), atol=0.025, rtol=0.025)
     assert torch.equal(short_state[:, 3:4], stored_short)
     assert torch.equal(ngram_state[3:4], stored_ngram)
+    expected_keys = _apply_rotary_key(
+        raw_key[list(selected)], positions=torch.arange(64), rotary=rotary,
+    )
+    assert torch.allclose(
+        manager.kv_pool.key[192:256].float(), expected_keys.float(), atol=0.14, rtol=0.08,
+    )
+    assert torch.allclose(
+        manager.kv_pool.value[192:256].float(), values[list(selected)].float(),
+        atol=0.14, rtol=0.08,
+    )
+    for restored, encoded in zip(mamba_pool.mamba_cache.conv, payload["section_delta"]["conv"]):
+        assert torch.equal(restored[:, 3:4], _dequantize_fp8(encoded))
+    assert torch.equal(
+        mamba_pool.mamba_cache.temporal[:, 3:4],
+        _dequantize_fp8(payload["section_delta"]["temporal"]),
+    )
+    if replay:
+        assert mamba_pool.replayssm_write_pos[3] == 0
+        assert mamba_pool.replayssm_cache_base[3] == 0
+        assert mamba_pool.replayssm_is_flush[3] == 0
+    assert tuple(manager.tree_cache.inserted[1].tolist()) == tuple(range(192, 256))
+    assert tuple(manager.tree_cache.inserted[2].tolist()) == (3,)
     with pytest.raises(NativeStateBankError):
         manager._validate_qwen4_state({"capture_count": 96}, selected)
     with pytest.raises(NativeStateBankError):
         manager._validate_qwen4_state(payload, tuple(range(1, 65)))
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["compressed_nan", "pending_nan", "short_nan", "missing_ngram", "source_coordinates",
+     "pending_group", "missing_layer", "gdn_scale", "gdn_bytes", "kv_bytes"],
+)
+def test_qwen4_corrupt_native_state_rejected_before_publication_and_restore(tmp_path, corruption):
+    manager, _, _, payload, *_ = _qwen4_bank_fixture(tmp_path)
+    state = payload["qwen4_state"]
+    if corruption == "compressed_nan":
+        state["layers"]["0"]["compressed_key"][0, 0, 0] = float("nan")
+    elif corruption == "pending_nan":
+        state["layers"]["0"]["pending_key"][0, 0, 0] = float("nan")
+    elif corruption == "short_nan":
+        state["short_conv"][0, 0, 0, 0] = float("nan")
+    elif corruption == "missing_ngram":
+        del state["ngram"]
+    elif corruption == "source_coordinates":
+        state["source_group_positions"][2] += 4
+    elif corruption == "pending_group":
+        state["pending_count"] = 1
+    elif corruption == "missing_layer":
+        state["layers"].clear()
+    elif corruption == "gdn_scale":
+        payload["section_delta"]["temporal"]["scale"].fill_(float("nan"))
+    elif corruption == "gdn_bytes":
+        payload["section_delta"]["conv"][0]["data"].flatten()[0] = 127
+    else:
+        payload["full_attention"]["0"]["key"]["data"].flatten()[0] = 255
+    _atomic_torch_save(payload, _page_path(tmp_path, "a" * 64, 0, 0))
+    with pytest.raises(NativeStateBankError):
+        validate_page_artifacts(
+            tmp_path, source_digest="a" * 64, page_id=0, world_size=1,
+            model_fingerprint=manager.model_fingerprint,
+            prefix_identity="qwen4-page", token_count=96,
+        )
+    with pytest.raises(NativeStateBankError):
+        manager._validate_restore_payload(
+            payload, local_positions=tuple(range(64)), prefix_token_ids=tuple(range(8, 72)),
+        )
+    assert manager.tree_cache.inserted is None
+
+
+@pytest.mark.parametrize("mapping_kind", ["permuted_members", "aliased_groups"])
+def test_qwen4_bank_rejects_nonbijective_physical_compression_groups(tmp_path, mapping_kind):
+    manager, request, _, payload, *_ = _qwen4_bank_fixture(tmp_path)
+    source = torch.arange(64, 160)
+    target = torch.arange(192, 256)
+    for mapping in (source, target):
+        if mapping_kind == "permuted_members":
+            mapping[:4] = mapping[:4].flip(0)
+        else:
+            mapping[4:8] = mapping[:4]
+    with pytest.raises(NativeStateBankError, match="compression group"):
+        manager._export_qwen4_state(request, source, 8, 96, torch.tensor([2]))
+    with pytest.raises(NativeStateBankError, match="compression group"):
+        manager._restore_qwen4_state(payload, tuple(range(64)), target)
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [tuple(range(-4, 60)), tuple(range(64, 128)),
+     tuple(range(32)) * 2, tuple(range(32, 64)) + tuple(range(32))],
+)
+def test_qwen4_bank_rejects_invalid_source_group_selection(tmp_path, selection):
+    manager, _, _, payload, *_ = _qwen4_bank_fixture(tmp_path)
+    with pytest.raises(NativeStateBankError):
+        manager._validate_qwen4_state(payload, selection)
+
+
+def test_qwen4_bank_rejects_gdn_geometry_and_detached_ple_pool(tmp_path):
+    manager, _, _, payload, *_ = _qwen4_bank_fixture(tmp_path)
+    payload["section_delta"]["temporal"] = _quantize_fp8(
+        torch.zeros(2, 1, 1, 2, 2), reduce_dims=(-2, -1),
+    )
+    with pytest.raises(NativeStateBankError, match="shape/dtype"):
+        manager._validate_qwen4_state(payload, tuple(range(64)))
+    manager.req_pool.mamba_pool._slot_siblings = ()
+    with pytest.raises(NativeStateBankError, match="slot lifecycle"):
+        manager._qwen4_layout()
+
+
+def test_session_initial_gdn_export_rejects_nonfinite_state_before_saving(tmp_path):
+    manager = _session_validator_manager()
+    manager.root = tmp_path
+    manager.rank = 0
+    manager.req_pool.translate_mamba_indices = lambda indices: indices
+    manager.req_pool.mamba_pool.mamba_cache.temporal[:, 1].fill_(float("nan"))
+    with pytest.raises(NativeStateBankError):
+        manager._export_session_initial_gdn(
+            SimpleNamespace(
+                mamba_pool_idx=torch.tensor(1), origin_input_ids=[1, 2],
+                output_ids_through_stop=[3],
+            ),
+            {"source_digest": "a" * 64, "state_identity": "b" * 64},
+        )
+    assert not _session_initial_gdn_path(
+        tmp_path, source_digest="a" * 64, state_identity="b" * 64, rank=0,
+    ).exists()
 
 
 def test_qwen4_query_selection_keeps_compression_groups_within_budget():

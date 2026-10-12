@@ -154,6 +154,7 @@ class FakeRequestJudge:
         question,
         candidates,
         telemetry_correlation_id,
+        decision_context=None,
     ):
         del turn_id, telemetry_correlation_id
         decisions = tuple(

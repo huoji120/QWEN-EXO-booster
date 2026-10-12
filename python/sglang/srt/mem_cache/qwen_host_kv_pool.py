@@ -142,6 +142,62 @@ def _gather_host_rows(
     tl.store(output + row * ROW_DIM + offsets, values, mask=offsets < ROW_DIM)
 
 
+@triton.jit
+def _selected_host_values(address, gpu, slot, offsets, GPU_ROWS: tl.constexpr,
+                          ROW_DIM: tl.constexpr, CAPACITY: tl.constexpr,
+                          STORAGE_TYPE: tl.constexpr):
+    valid = (slot >= 0) & (slot < CAPACITY) & (offsets < ROW_DIM)
+    host = address.to(tl.int64).to(tl.pointer_type(STORAGE_TYPE))
+    device = gpu.to(tl.pointer_type(STORAGE_TYPE))
+    h = tl.load(host + tl.maximum(slot - GPU_ROWS, 0) * ROW_DIM + offsets,
+                mask=valid & (slot >= GPU_ROWS), other=0.0)
+    g = tl.load(device + tl.maximum(slot, 0) * ROW_DIM + offsets,
+                mask=valid & (slot < GPU_ROWS), other=0.0)
+    # Match _gather_host_rows, including FP8 cross-format conversion.
+    return tl.where(slot < GPU_ROWS, g, h).to(tl.float32)
+
+
+@triton.jit
+def _gather_selected_host_kv(
+    host_k, host_v, gpu_k, gpu_v, req_to_token, req_indices, indices,
+    seq_lens, cu_k, output_k, output_v,
+    BATCH: tl.constexpr, TOPK: tl.constexpr,
+    REQ_ROWS: tl.constexpr, REQ_WIDTH: tl.constexpr,
+    R0: tl.constexpr, R1: tl.constexpr, RI: tl.constexpr,
+    I0: tl.constexpr, I1: tl.constexpr, LS: tl.constexpr, CS: tl.constexpr,
+    GPU_ROWS: tl.constexpr, K_DIM: tl.constexpr, V_DIM: tl.constexpr,
+    CAPACITY: tl.constexpr, STORAGE_TYPE: tl.constexpr, BLOCK: tl.constexpr,
+):
+    packed_row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    # Upper-bound search handles empty requests and page-padded cu_k alike.
+    # One program owns each output row, including the unused packed tail.
+    lo, hi = 0, BATCH
+    while lo < hi:
+        mid = (lo + hi) // 2
+        end = tl.load(cu_k + (mid + 1) * CS)
+        before = packed_row < end
+        hi = tl.where(before, mid, hi)
+        lo = tl.where(before, lo, mid + 1)
+    row = lo
+    active = row < BATCH
+    start = tl.load(cu_k + row * CS, mask=active, other=0)
+    col = packed_row - start
+    req = tl.load(req_indices + row * RI, mask=active, other=-1)
+    length = tl.load(seq_lens + row * LS, mask=active, other=0)
+    pos = tl.load(indices + row * I0 + col * I1,
+                  mask=active & (col >= 0) & (col < TOPK), other=-1)
+    valid = active & (req >= 0) & (req < REQ_ROWS)
+    valid = valid & (pos >= 0) & (pos < length) & (pos < REQ_WIDTH)
+    slot = tl.load(req_to_token + req * R0 + pos * R1, mask=valid, other=-1)
+    k = _selected_host_values(host_k, gpu_k, slot, offsets, GPU_ROWS,
+                              K_DIM, CAPACITY, STORAGE_TYPE)
+    v = _selected_host_values(host_v, gpu_v, slot, offsets, GPU_ROWS,
+                              V_DIM, CAPACITY, STORAGE_TYPE)
+    tl.store(output_k + packed_row * K_DIM + offsets, k, mask=offsets < K_DIM)
+    tl.store(output_v + packed_row * V_DIM + offsets, v, mask=offsets < V_DIM)
+
+
 class QwenHostFP8KVPool(MHATokenToKVPool):
     """Disjoint CUDA prefix and allocator-owned pinned overflow bank.
 
@@ -261,8 +317,44 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
             *cache_k.stride(), *cache_v.stride(), self.size + self.page_size, 256,
         )
 
-    def _gather_rows(self, local_layer_id, slots, output_k, output_v, *, raw=False):
-        self._check_slots(slots)
+    def gather_selected_into(self, local_layer_id, req_to_token, req_indices,
+                             indices, seq_lens, cu_k, output_k, output_v):
+        """Map packed QSA selections and gather both banks in one launch.
+
+        Cast only: callers retain their existing dtype-rounded scale operation.
+        cu_k is the same monotonic packed/page-padded prefix plan used by QSA.
+        No scratch allocations or host synchronization occur during replay.
+        """
+        self._check_slots(req_indices)
+        self._check_slots(seq_lens)
+        self._check_slots(cu_k)
+        batch, topk = indices.shape
+        for tensor in (req_to_token, indices):
+            if (tensor.device != self._host_cuda_device or tensor.ndim != 2
+                    or tensor.dtype not in (torch.int32, torch.int64)):
+                raise ValueError("QSA mapping must be two-dimensional CUDA integer tensors.")
+        if (req_indices.numel() != batch or seq_lens.numel() != batch
+                or cu_k.numel() != batch + 1):
+            raise ValueError("QSA mapping batch dimensions must match.")
+        if any(s <= 0 for t in (req_to_token, req_indices, indices, seq_lens, cu_k)
+               for s in t.stride()):
+            raise ValueError("QSA mapping requires positive strides.")
+        self._check_gather_outputs(local_layer_id, output_k, output_v, 0, raw=False)
+        rows = output_k.shape[0]
+        if not rows:
+            return
+        _gather_selected_host_kv[(rows, triton.cdiv(max(self.row_dim, self.head_num * self.v_head_dim), 256))](
+            self.k_buffer[local_layer_id].data_ptr(), self.v_buffer[local_layer_id].data_ptr(),
+            self.gpu_k_buffer[local_layer_id], self.gpu_v_buffer[local_layer_id],
+            req_to_token, req_indices, indices, seq_lens, cu_k, output_k, output_v,
+            batch, topk, *req_to_token.shape, *req_to_token.stride(),
+            req_indices.stride(0), *indices.stride(), seq_lens.stride(0), cu_k.stride(0),
+            self.gpu_rows, self.row_dim, self.head_num * self.v_head_dim,
+            self.size + self.page_size,
+            tl.float8e4nv if self.dtype == torch.float8_e4m3fn else tl.float8e5, 256,
+        )
+
+    def _check_gather_outputs(self, local_layer_id, output_k, output_v, num_slots, *, raw):
         if not 0 <= local_layer_id < self.layer_num:
             raise IndexError("Host KV local layer id is outside the pool.")
         rows = output_k.shape[0]
@@ -271,13 +363,18 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
             torch.float16, torch.float32,
         )
         for output, dim in ((output_k, self.head_dim), (output_v, self.v_head_dim)):
-            if (output.device != slots.device or not output.is_contiguous()
+            if (output.device != self._host_cuda_device or not output.is_contiguous()
                     or output.ndim != 3 or tuple(output.shape[1:]) != (self.head_num, dim)):
                 raise ValueError("Host KV gather output must be contiguous CUDA NHD with pool geometry.")
-            if output.shape[0] != rows or rows < slots.numel():
+            if output.shape[0] != rows or rows < num_slots:
                 raise ValueError("Host KV outputs must hold all selected slots with equal row counts.")
             if output.dtype not in allowed:
                 raise ValueError("Unsupported host KV gather output dtype.")
+
+    def _gather_rows(self, local_layer_id, slots, output_k, output_v, *, raw=False):
+        self._check_slots(slots)
+        self._check_gather_outputs(local_layer_id, output_k, output_v, slots.numel(), raw=raw)
+        rows = output_k.shape[0]
         if not rows:
             return
         storage_type = tl.uint8 if raw else (

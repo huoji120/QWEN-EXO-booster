@@ -207,3 +207,68 @@ def test_large_virtual_bank_has_bounded_resident_allocations(make_pool, dtype, g
     dummy = pool.get_kv_tokens(3, torch.arange(32, device="cuda"), torch.float32)
     assert torch.count_nonzero(dummy[0]) == 0
     assert torch.count_nonzero(dummy[1]) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("output_dtype", [
+    torch.float16, torch.bfloat16, torch.float32,
+    torch.float8_e4m3fn, torch.float8_e5m2,
+])
+@pytest.mark.parametrize("gpu_size", [0, 32, 64])
+def test_selected_mapping_graph_bitwise(make_pool, dtype, output_dtype, gpu_size):
+    pool = make_pool(dtype, gpu_size=gpu_size, k_dim=256, v_dim=127)
+    # Every FP8 encoding: signed zero, subnormals, infinities and NaNs.
+    for banks in (pool.k_buffer, pool.v_buffer, pool.gpu_k_buffer, pool.gpu_v_buffer):
+        bank = banks[0]
+        bank.copy_(torch.arange(bank.numel(), device=bank.device).remainder(256)
+                   .to(torch.uint8).reshape(bank.shape))
+    mapping = torch.empty((6, 32), device="cuda", dtype=torch.int64)[::2, ::2]
+    mapping.copy_(torch.arange(48, device="cuda").reshape(3, 16) * 7 % 68)
+    mapping[0, 1], mapping[1, 2] = -3, 68
+    reqs = torch.empty(6, device="cuda", dtype=torch.int32)[::2]
+    lengths = torch.empty(6, device="cuda", dtype=torch.int32)[::2]
+    indices = torch.empty((6, 14), device="cuda", dtype=torch.int64)[::2, ::2]
+    cu = torch.empty(8, device="cuda", dtype=torch.int32)[::2]
+    indices.copy_(torch.tensor([[0, 1, -1, 15, 16, 2, 4],
+                               [2, 1, 0, 3, 4, 5, 6],
+                               [15, 0, 8, -3, 2, 1, 7]], device="cuda"))
+    reqs.copy_(torch.tensor([0, 1, 2], device="cuda"))
+    lengths.copy_(torch.tensor([16, 4, 9], device="cuda"))
+    cu.copy_(torch.tensor([0, 7, 7, 16], device="cuda"))
+    outputs = (torch.empty((23, 2, 256), device="cuda", dtype=output_dtype),
+               torch.empty((23, 2, 127), device="cuda", dtype=output_dtype))
+    references = tuple(torch.empty_like(t) for t in outputs)
+
+    def run():
+        pool.gather_selected_into(0, mapping, reqs, indices, lengths, cu, *outputs)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    addresses = tuple(t.data_ptr() for t in outputs)
+    for request_order, prefix in (
+        ([0, 1, 2], [0, 7, 7, 16]),  # empty row and page padding
+        ([2, 0, 1], [0, 2, 9, 12]),  # compact uneven counts
+        ([1, 2, 0], [0, 0, 0, 0]),  # all padding
+        ([0, 2, 1], [0, 7, 14, 21]),
+    ):
+        reqs.copy_(torch.tensor(request_order, device="cuda"))
+        cu.copy_(torch.tensor(prefix, device="cuda"))
+        graph.replay()
+        slots = torch.full((23,), -1, device="cuda", dtype=torch.int64)
+        for row in range(3):
+            for col in range(min(7, prefix[row + 1] - prefix[row])):
+                pos = int(indices[row, col])
+                if 0 <= pos < int(lengths[row]):
+                    slots[prefix[row] + col] = mapping[request_order[row], pos]
+        pool.gather_into(0, slots, *references)
+        for actual, expected in zip(outputs, references):
+            # Unlike assert_close, byte equality checks signed zero and NaN payloads.
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        assert tuple(t.data_ptr() for t in outputs) == addresses

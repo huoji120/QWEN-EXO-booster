@@ -1209,6 +1209,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+        if batch.spec_algorithm.is_none():
+            # EXO Bank/probe/session-state jobs must not prefill the draft or
+            # commit speculative QSA/PLE siblings. The scheduler isolates this
+            # lane and resolves ordinary target input IDs before dispatch.
+            return self.target_worker.forward_batch_generation(batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (

@@ -850,7 +850,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attention_layer_ids = [
             index
             for index, layer_type in enumerate(config.layers_block_type)
-            if layer_type in {"attention", "qwen_sparse_attention", "sparse_attention"}
+            if layer_type in {
+                "attention", "full_attention", "qwen_sparse_attention", "sparse_attention"
+            }
         ]
         qwen_exo_observer_enabled = (
             bool(getattr(server_args, "enable_qwen_exo", False))
@@ -858,9 +860,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and bool(attention_layer_ids)
             and layer_id == attention_layer_ids[-1]
         )
-        # Q/K recall may read Q from a non-final full-attention layer. That
-        # layer gets a probe-only tracker; the final-layer tracker then skips
-        # the full Q-head capture so the two never write the same key.
+        # Retrieval query capture is independent of the optional observer. A
+        # dedicated tracker on the selected attention layer owns full Q heads,
+        # including when observation is disabled for this request or globally.
         qwen_exo_qk_layer = getattr(server_args, "qwen_exo_qk_layer", None)
         if qwen_exo_qk_layer is not None and bool(attention_layer_ids):
             qwen_exo_qk_layer = int(qwen_exo_qk_layer)
@@ -871,15 +873,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
         qwen_exo_probe_layer = (
             bool(getattr(server_args, "enable_qwen_exo", False))
-            and qwen_exo_qk_layer is not None
             and bool(attention_layer_ids)
-            and qwen_exo_qk_layer != attention_layer_ids[-1]
-            and layer_id == qwen_exo_qk_layer
-        )
-        final_layer_captures_full_queries = (
-            qwen_exo_qk_layer is None
-            or not attention_layer_ids
-            or qwen_exo_qk_layer == attention_layer_ids[-1]
+            and layer_id == (
+                qwen_exo_qk_layer
+                if qwen_exo_qk_layer is not None
+                else attention_layer_ids[-1]
+            )
         )
         self.qwen_exo_score_bias_enabled = (
             bool(getattr(server_args, "enable_qwen_exo", False))
@@ -932,7 +931,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 score_bias_anchor_drift_threshold=float(
                     getattr(server_args, "qwen_exo_observer_q_drift_threshold", 0.35)
                 ),
-                capture_full_queries=final_layer_captures_full_queries,
+                capture_full_queries=False,
             )
             if qwen_exo_observer_enabled
             else None
@@ -1438,6 +1437,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             contains_last_prefill_chunk=forward_batch.contains_last_prefill_chunk,
             rids=tuple(str(value) for value in (forward_batch.rids or ())),
             observe_mask=tuple(forward_batch.qwen_exo_observe or ()),
+            memory_spans=(),
             final_prefill_mask=(
                 tuple(forward_batch.qwen_exo_final_prefill)
                 if forward_batch.qwen_exo_final_prefill is not None

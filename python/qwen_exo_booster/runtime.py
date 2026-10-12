@@ -75,6 +75,7 @@ from qwen_exo_booster.latent_transplant import (
     validate_artifact_name,
 )
 from qwen_exo_booster.mid_think_questions import MidThinkQuestionService
+from qwen_exo_booster.memory_refresh import AdaptiveMemoryRefreshGate
 from qwen_exo_booster.observer import (
     AdaptiveRetrievalPhase,
     AdaptiveRetrievalStateMachine,
@@ -85,6 +86,9 @@ from qwen_exo_booster.pipeline import MemoryPipeline, MemoryPreparationState
 from qwen_exo_booster.pmi_gate import PmiJudgeGate
 from qwen_exo_booster.policy_data import PolicyDataRepository
 from qwen_exo_booster.query_probe import QueryProbePlan, QueryProbeService
+from qwen_exo_booster.reasoning_planner import DynamicReasoningPlanner
+from qwen_exo_booster.decision_context import build_decision_context
+from qwen_exo_booster.system_one import SystemOneEvaluator
 from qwen_exo_booster.recall_trace import recall_trace_payload
 from qwen_exo_booster.reflection_evidence import (
     ReflectionEvidenceStore,
@@ -132,7 +136,7 @@ _FOREGROUND_POLL_SECONDS = 2.0
 def _query_probe_timeout_seconds(tokenizer_manager: Any) -> float:
     server_args = getattr(tokenizer_manager, "server_args", None)
     algorithm = str(getattr(server_args, "speculative_algorithm", "") or "").upper()
-    return 120.0 if algorithm == "DFLASH" else 30.0
+    return 120.0 if algorithm == "DFLASH" else 8.0
 
 
 _STARTUP_GENERATION_WARMUP_PARENT_ID = "runtime"
@@ -278,12 +282,6 @@ class SelfQuestionAttempt:
 
 
 @dataclass(frozen=True, slots=True)
-class _DefaultResponseReasoning:
-    effort: str = "high"
-    summary: None = None
-
-
-@dataclass(frozen=True, slots=True)
 class CompactionReflectionCheckpoint:
     checkpoint_id: str
     response_id: str
@@ -302,6 +300,12 @@ class ResponseConversationIdentity:
     first_lines_digest: str
     payload_digest: str
     original_task: str
+
+
+@dataclass(slots=True)
+class ReasoningTaskSelection:
+    task: asyncio.Task[str]
+    waiters: int = 0
 
 
 @dataclass(slots=True)
@@ -416,6 +420,7 @@ class QwenExoRuntime:
         self.reflection_memory_service: ReflectionMemoryService | None = None
         self.memory_pipeline: MemoryPipeline | None = None
         self.query_probe: QueryProbeService | None = None
+        self.reasoning_planner: DynamicReasoningPlanner | None = None
         self.compaction_service: ResponseCompactionService | None = None
         self._compaction_summaries: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._max_compaction_summaries = 512
@@ -499,6 +504,7 @@ class QwenExoRuntime:
         }
         self._lifecycle_lock = asyncio.Lock()
         self._request_questions: dict[str, str] = {}
+        self._decision_contexts: dict[str, Any] = {}
         self._refresh_tasks: dict[str, asyncio.Task[Any]] = {}
         self._replay_tasks: dict[str, asyncio.Task[Any]] = {}
         self._capsule_tasks: dict[str, asyncio.Task[Any]] = {}
@@ -547,6 +553,22 @@ class QwenExoRuntime:
         ] = OrderedDict()
         self._memory_parents_by_conversation: OrderedDict[str, str] = OrderedDict()
         self._max_conversation_keys = self.capsule_store.max_records
+        self.memory_refresh_gate = AdaptiveMemoryRefreshGate(
+            max_conversations=self._max_conversation_keys,
+            surprisal_threshold=config.observer_surprisal_threshold,
+            surprisal_margin=config.observer_surprisal_margin,
+            window_tokens=config.observer_surprisal_window,
+        )
+        self._request_memory_gate_keys: dict[str, str] = {}
+        self._reasoning_task_selections: OrderedDict[
+            tuple[str, str, str], ReasoningTaskSelection
+        ] = OrderedDict()
+        self._reasoning_tasks_by_response: OrderedDict[
+            str, tuple[str, str, str]
+        ] = OrderedDict()
+        self._reasoning_latest_tasks: OrderedDict[
+            tuple[str, str], tuple[str, str, str]
+        ] = OrderedDict()
         self._request_conversation_keys: dict[str, str] = {}
         self._recent_self_questions: OrderedDict[
             str, tuple[SelfQuestionAttempt, ...]
@@ -1426,10 +1448,22 @@ class QwenExoRuntime:
                     self.config.feature_flags.reference_judge
                     or self.config.feature_flags.capsule
                     or self.config.feature_flags.policy_data
+                    or self.config.reasoning_mode == "dynamic"
+                    or self.config.force_auto_reasoning
                     or self.cognition.snapshot.documents
                 ):
                     raise RuntimeError(
                         "QWEN-EXO internal jobs require an initialized tokenizer"
+                    )
+                if self.config.force_auto_reasoning or self.config.reasoning_mode == "dynamic":
+                    self.reasoning_planner = DynamicReasoningPlanner(
+                        SystemOneEvaluator(
+                            self.internal_jobs,
+                            tokenizer,
+                            max_prompt_tokens=self.config.context_length - 1,
+                            model_fingerprint=self.model_identity.fingerprint,
+                        ),
+                        context_tokens=self.config.reasoning_dynamic_context_tokens,
                     )
                 convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
                 self._reasoning_end_token_id = (
@@ -1441,6 +1475,8 @@ class QwenExoRuntime:
                         self.knowledge,
                         tokenizer,
                         model_fingerprint=self.model_identity.fingerprint,
+                        max_prompt_tokens=self.config.context_length - 1,
+                        timeout_seconds=120.0,
                     )
                 if self.config.feature_flags.capsule:
                     self.capsules = ExecutionCapsuleService(
@@ -1541,46 +1577,7 @@ class QwenExoRuntime:
                             "runtime", "tensor_bank.ready", bank_snapshot.public_dict()
                         )
                         self._commit_pre_complete_knowledge()
-                        runtime_model_config = getattr(
-                            self.tokenizer_manager, "model_config", None
-                        )
-                        hf_config = getattr(runtime_model_config, "hf_config", None)
-                        query_head_count = int(
-                            getattr(runtime_model_config, "num_attention_heads", 0)
-                            or getattr(hf_config, "num_attention_heads", 0)
-                            or 0
-                        )
-                        hidden_size = int(
-                            getattr(runtime_model_config, "hidden_size", 0)
-                            or getattr(hf_config, "hidden_size", 0)
-                            or 0
-                        )
-                        query_head_dim = int(
-                            getattr(runtime_model_config, "head_dim", 0)
-                            or getattr(hf_config, "head_dim", 0)
-                            or (
-                                hidden_size // query_head_count
-                                if query_head_count
-                                else 0
-                            )
-                        )
-                        if query_head_count < 1 or query_head_dim < 1:
-                            raise RuntimeError(
-                                "QWEN-EXO QueryProbe requires model Attention head geometry"
-                            )
-                        self.query_probe = QueryProbeService(
-                            self.internal_jobs,
-                            tokenizer,
-                            self.telemetry,
-                            max_prompt_tokens=self.config.max_internal_tokens,
-                            timeout_seconds=_query_probe_timeout_seconds(
-                                self.tokenizer_manager
-                            ),
-                            cognition_token_ids=self.tensor_bank.cognition_token_ids(),
-                            query_head_count=query_head_count,
-                            head_dim=query_head_dim,
-                            query_pooling=self.config.qk_query_pooling,
-                        )
+                        self._ensure_query_probe()
                 if (
                     self.config.feature_flags.adaptive_refresh
                     and self.reference_judge is not None
@@ -1696,6 +1693,7 @@ class QwenExoRuntime:
 
     async def close(self) -> None:
         async with self._lifecycle_lock:
+            await self.clear_reasoning_sessions()
             if self.state in {
                 QwenExoRuntimeState.CREATED,
                 QwenExoRuntimeState.STOPPED,
@@ -1750,6 +1748,7 @@ class QwenExoRuntime:
             self._bank_cache_status_emitted.clear()
             self._session_initial_gdn_status_emitted.clear()
             self._request_questions.clear()
+            self._decision_contexts.clear()
             self._pending_background_requests.clear()
             self._cancelled_request_ids.clear()
             self._request_outputs.clear()
@@ -1775,6 +1774,8 @@ class QwenExoRuntime:
             self._conversation_keys_by_call_association.clear()
             self._memory_parents_by_conversation.clear()
             self._request_conversation_keys.clear()
+            self.memory_refresh_gate.clear()
+            self._request_memory_gate_keys.clear()
             self._response_head_crc32.clear()
             self._request_tool_event_marks.clear()
             self._request_score_bias_steps.clear()
@@ -1873,7 +1874,14 @@ class QwenExoRuntime:
     def _enable_default_response_thinking(request: Any) -> Any:
         if not hasattr(request, "reasoning") or request.reasoning is not None:
             return request
-        return request.model_copy(update={"reasoning": _DefaultResponseReasoning()})
+        from sglang.srt.entrypoints.openai.protocol import ResponseReasoningParam
+
+        # This is a server default, not a client-selected tier. Preserve that
+        # distinction for dynamic planning and the fallback reasoning budget.
+        reasoning = ResponseReasoningParam.model_construct(
+            _fields_set=set(), effort="high"
+        )
+        return request.model_copy(update={"reasoning": reasoning})
 
     def _cognition_text(self) -> str | None:
         documents = tuple(self.cognition.snapshot.documents)
@@ -1932,7 +1940,8 @@ class QwenExoRuntime:
 
     @retained_source_producer
     async def prepare_responses_request(
-        self, request: Any
+        self, request: Any, *, history_resolver: Any = None,
+        decision_cache_scope: str | None = None,
     ) -> tuple[Any, MemoryPreparationState | None]:
         request = self._enable_default_response_thinking(request)
         request = self._attach_cognition_text(request)
@@ -2114,6 +2123,21 @@ class QwenExoRuntime:
             original_task=original_task or None,
             compaction_context=compaction_context or None,
         )
+        decision_context = None
+        if self.memory_pipeline is not None:
+            effective_history = (
+                await history_resolver(request) if history_resolver is not None else request.input
+            )
+            decision_context = build_decision_context(
+                request, self.tokenizer_manager.tokenizer,
+                input_items=effective_history,
+                compaction_context=compaction_context or None,
+                lineage_namespace=(
+                    stable_digest(decision_cache_scope, conversation_key)
+                    if decision_cache_scope else None
+                ),
+            )
+            self._decision_contexts[request.request_id] = decision_context
         self._request_questions[request.request_id] = (
             original_task or current_user or retrieval_question
         )
@@ -2163,18 +2187,6 @@ class QwenExoRuntime:
             self._request_score_bias_steps[request.request_id] = score_bias_step
             while len(self._score_bias_step_counts) > self.capsule_store.max_records:
                 self._score_bias_step_counts.popitem(last=False)
-        query_heads: tuple[tuple[tuple[float, ...], ...], ...] = ()
-        query_states = ()
-        query_role_plan_digest = query_plan.identity
-        query_probe_status = "unavailable"
-        query_probe_prompt_tokens = 0
-        if self.memory_pipeline is not None and self.query_probe is not None:
-            query_probe = await self.query_probe.probe(request.request_id, query_plan)
-            query_heads = query_probe.query_heads
-            query_states = query_probe.query_states
-            query_role_plan_digest = query_probe.role_plan_digest
-            query_probe_status = query_probe.status
-            query_probe_prompt_tokens = query_probe.prompt_tokens
         unseen_tool_events = self._unseen_response_tool_events(
             conversation_key, tool_events
         )
@@ -2256,19 +2268,17 @@ class QwenExoRuntime:
         (
             prepared_request,
             memory_state,
-        ) = await self.memory_pipeline.prepare_responses_request(
+        ) = await self._prepare_gated_memory_request(
             request,
+            conversation_key=conversation_key,
+            decision_cache_scope=decision_cache_scope,
+            query_plan=query_plan,
             restoration=restoration,
             retrieval_question=retrieval_question,
             original_task=original_task or None,
-            query_heads=query_heads,
-            query_states=query_states,
-            query_role_plan_digest=query_role_plan_digest,
-            query_probe_status=query_probe_status,
-            query_probe_prompt_tokens=query_probe_prompt_tokens,
             memory_previous_response_id=effective_memory_previous_response_id,
             published_previous_response_id=previous_response_id,
-            judge_reuse_scope=self._judge_reuse_scope(request.request_id, original_task),
+            decision_context=decision_context,
         )
         # The global initial GDN namespace is prefixed onto the radix key by the
         # Responses entrypoint together with the selection itself, so internal
@@ -2309,6 +2319,70 @@ class QwenExoRuntime:
                 decision="semantic_rejudge_passed",
             )
         return prepared_request, memory_state
+
+    async def _prepare_gated_memory_request(
+        self, request: Any, *, conversation_key: str,
+        decision_cache_scope: str | None, query_plan: QueryProbePlan,
+        restoration: Any, retrieval_question: str, original_task: str | None,
+        memory_previous_response_id: str | None,
+        published_previous_response_id: str | None, decision_context: Any,
+    ) -> tuple[Any, MemoryPreparationState]:
+        # Credential scope prevents otherwise identical stateless histories from
+        # sharing an attachment across authenticated clients.
+        gate_key = stable_digest(decision_cache_scope or "local", conversation_key)
+        self._request_memory_gate_keys[request.request_id] = gate_key
+        async with self.memory_refresh_gate.conversation(gate_key) as gate_state:
+            self._raise_if_cancelled(request.request_id)
+            revision = stable_digest(
+                self.knowledge.snapshot.source_digest,
+                self.policy_data.snapshot.source_digest,
+                str(self.config.feature_flags.external_memory),
+                str(self.config.feature_flags.policy_data),
+                str(self.config.max_memory_tokens),
+                str(self.config.max_policy_tokens),
+            )
+            decision = self.memory_refresh_gate.decide(
+                gate_state, request_id=request.request_id, revision=revision,
+            )
+            self.telemetry.emit(request.request_id, "memory.refresh_gate", {
+                "conversation_key": conversation_key,
+                **decision.public_dict(),
+            })
+            if not decision.retrieve:
+                return await self.memory_pipeline.reuse_responses_request(
+                    request, gate_state.memory,
+                    retrieval_question=retrieval_question,
+                    memory_previous_response_id=memory_previous_response_id,
+                    published_previous_response_id=published_previous_response_id,
+                    decision_context=decision_context,
+                )
+            query_heads = ()
+            query_states = ()
+            query_role_plan_digest = query_plan.identity
+            query_probe_status = "unavailable"
+            query_probe_prompt_tokens = 0
+            if self.query_probe is not None:
+                probe = await self.query_probe.probe(request.request_id, query_plan)
+                query_heads = probe.query_heads
+                query_states = probe.query_states
+                query_role_plan_digest = probe.role_plan_digest
+                query_probe_status = probe.status
+                query_probe_prompt_tokens = probe.prompt_tokens
+            prepared, memory = await self.memory_pipeline.prepare_responses_request(
+                request, restoration=restoration,
+                retrieval_question=retrieval_question, original_task=original_task,
+                query_heads=query_heads, query_states=query_states,
+                query_role_plan_digest=query_role_plan_digest,
+                query_probe_status=query_probe_status,
+                query_probe_prompt_tokens=query_probe_prompt_tokens,
+                memory_previous_response_id=memory_previous_response_id,
+                published_previous_response_id=published_previous_response_id,
+                judge_reuse_scope=self._judge_reuse_scope(request.request_id, original_task),
+                decision_context=decision_context,
+            )
+            self._raise_if_cancelled(request.request_id)
+            self.memory_refresh_gate.commit(gate_state, memory, revision=revision)
+            return prepared, memory
 
     def _ensure_compaction_reflection_worker(self) -> None:
         if getattr(self, "reflection_memory_service", None) is None:
@@ -3286,6 +3360,9 @@ class QwenExoRuntime:
             reasoning_end_token_id=observer_reasoning_end_token_id,
             thinking_enabled=thinking_enabled,
         )
+        gate_key = self._request_memory_gate_keys.get(request_id)
+        if gate_key is not None:
+            self.memory_refresh_gate.observe(gate_key, observation)
         for resolved_event in observation.events:
             if resolved_event.uncertainty_state == "resolved_by_continuation":
                 self.telemetry.emit(
@@ -5621,12 +5698,216 @@ class QwenExoRuntime:
     def max_reasoning_tokens(self) -> int:
         return self.config.max_reasoning_tokens
 
+    def reasoning_budget_for_effort(self, effort: str | None) -> int:
+        return self.config.reasoning_budget_for_effort(effort)
+
+    def _forget_reasoning_task(
+        self, key: tuple[str, str, str], entry: ReasoningTaskSelection | None = None
+    ) -> None:
+        if entry is not None and self._reasoning_task_selections.get(key) is not entry:
+            return
+        self._reasoning_task_selections.pop(key, None)
+        for response_id, value in tuple(self._reasoning_tasks_by_response.items()):
+            if value == key:
+                self._reasoning_tasks_by_response.pop(response_id, None)
+        scope = key[:2]
+        if self._reasoning_latest_tasks.get(scope) == key:
+            self._reasoning_latest_tasks.pop(scope, None)
+
+    async def clear_reasoning_sessions(
+        self, conversation_keys: Iterable[str] | None = None
+    ) -> None:
+        """Erase cached choices and drain their internal jobs before session deletion."""
+        targets = None if conversation_keys is None else set(conversation_keys)
+        cancelled = []
+        for key, entry in tuple(
+            getattr(self, "_reasoning_task_selections", {}).items()
+        ):
+            if targets is None or key[0] in targets:
+                self._forget_reasoning_task(key)
+                if not entry.task.done():
+                    entry.task.cancel()
+                cancelled.append(entry.task)
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+
+    async def _choose_reasoning_effort(
+        self,
+        request_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        task_chain: bool = False,
+    ) -> str:
+        user_messages = [message for message in messages if message.get("role") == "user"]
+        if not user_messages:
+            raise RuntimeError("User task is unavailable for reasoning selection")
+        selection = await self.reasoning_planner.choose(
+            [user_messages[-1]],
+            {
+                effort: self.config.reasoning_budget_for_effort(effort)
+                for effort in ("min", "low", "medium", "high", "xhigh")
+            },
+            task_chain=True,
+        )
+        self.telemetry.emit(request_id, "reasoning.effort_selected", selection)
+        return selection["effort"]
+
+    async def plan_reasoning_effort(
+        self,
+        request_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        request: Any | None = None,
+        previous_response_id: str | None = None,
+    ) -> str:
+        if self.reasoning_planner is None:
+            raise RuntimeError("Dynamic reasoning planner is not initialized")
+        if request is None or not getattr(self.config, "reasoning_session_once", True):
+            return await self._choose_reasoning_effort(request_id, messages)
+
+        # Runtime preparation normally established this lineage already. Keep
+        # direct serving calls on exactly the same response/call-association path.
+        conversation = getattr(self, "_request_conversation_keys", {}).get(request_id)
+        if conversation is None:
+            conversation = self._response_conversation_key(
+                request_id=request_id,
+                previous_response_id=previous_response_id,
+                request=request,
+                canonical_identity=self._canonical_response_identity(request),
+                call_ids=(
+                    str(call.get("call_id"))
+                    for call, _ in self._response_tool_events(request.input)
+                    if call.get("call_id")
+                ),
+            )
+        session = stable_digest(
+            "reasoning-session-v1",
+            str(getattr(request, "user", None) or ""),
+            str(getattr(request, "session_id", None) or ""),
+        )
+        scope = (conversation, session)
+        if not hasattr(self, "_reasoning_task_selections"):
+            self._reasoning_task_selections = OrderedDict()
+            self._reasoning_tasks_by_response = OrderedDict()
+            self._reasoning_latest_tasks = OrderedDict()
+        entries = self._reasoning_task_selections
+        aliases = self._reasoning_tasks_by_response
+        latest = self._reasoning_latest_tasks
+        users = [
+            (index, message)
+            for index, message in enumerate(messages)
+            if message.get("role") == "user"
+        ]
+        raw_input = request.input
+        has_new_user = isinstance(raw_input, str) or any(
+            (item.get("role") if isinstance(item, dict) else getattr(item, "role", None))
+            == "user"
+            for item in (raw_input or ())
+        )
+        parent_key = aliases.get(previous_response_id)
+        if parent_key is not None and parent_key[:2] != scope:
+            parent_key = None
+        if not has_new_user and parent_key is not None:
+            key = parent_key
+        elif users:
+            # Include occurrence positions, not just text: the same user text
+            # submitted after another actual turn is a new task. Later assistant
+            # and tool evidence cannot change this fingerprint or the JEV input.
+            digest = hashlib.sha256()
+            for index, message in users:
+                digest.update(
+                    json.dumps(
+                        [index, message.get("content")],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+            key = (*scope, digest.hexdigest())
+        else:
+            key = latest.get(scope)
+        entry = entries.get(key) if key is not None else None
+        fresh_submission = (
+            previous_response_id is None
+            and len(users) == 1
+            and not any(message.get("role") in {"assistant", "tool"} for message in messages)
+        )
+        if entry is not None and fresh_submission and not entry.waiters:
+            # An independent fresh submission is not a continuation, even if it
+            # repeats the same text. Concurrent first submissions still coalesce.
+            self._forget_reasoning_task(key)
+            entry = None
+        reused = entry is not None
+        if entry is None:
+            task_messages = [users[-1][1]] if users else []
+            if not task_messages:
+                original = getattr(self, "_original_tasks_by_association", {}).get(
+                    conversation
+                )
+                if original:
+                    task_messages = [{"role": "user", "content": original}]
+            if not task_messages:
+                raise RuntimeError("User task is unavailable for reasoning selection")
+            if key is None:
+                key = (*scope, stable_digest("reasoning-task-v1", request_id))
+            limit = max(1, int(getattr(self, "_max_conversation_keys", 512)))
+            while len(entries) >= limit:
+                evict = next(
+                    (candidate for candidate, value in entries.items() if not value.waiters),
+                    None,
+                )
+                if evict is None:
+                    raise RuntimeError("Reasoning task selection capacity is exhausted")
+                self._forget_reasoning_task(evict)
+            entry = ReasoningTaskSelection(
+                asyncio.create_task(
+                    self._choose_reasoning_effort(
+                        request_id, task_messages, task_chain=True
+                    )
+                )
+            )
+            entries[key] = entry
+        entries.move_to_end(key)
+        aliases[request_id] = key
+        aliases.move_to_end(request_id)
+        latest[scope] = key
+        latest.move_to_end(scope)
+        limit = max(1, int(getattr(self, "_max_conversation_keys", 512)))
+        while len(aliases) > limit:
+            aliases.popitem(last=False)
+        while len(latest) > limit:
+            latest.popitem(last=False)
+        entry.waiters += 1
+        try:
+            effort = await asyncio.shield(entry.task)
+            if reused:
+                self.telemetry.emit(
+                    request_id,
+                    "reasoning.effort_reused",
+                    {
+                        "effort": effort,
+                        "max_reasoning_tokens": self.config.reasoning_budget_for_effort(effort),
+                    },
+                )
+            return effort
+        finally:
+            entry.waiters -= 1
+            if not entry.waiters:
+                if not entry.task.done():
+                    # One cancelled caller must not cancel another caller's JEV.
+                    # With no remaining callers, abort rather than orphan work.
+                    self._forget_reasoning_task(key, entry)
+                    entry.task.cancel()
+                    await asyncio.gather(entry.task, return_exceptions=True)
+                elif entry.task.cancelled() or entry.task.exception() is not None:
+                    self._forget_reasoning_task(key, entry)
+
     async def build_reasoning_cutoff_injection(
         self,
         request_id: str,
         *,
         observed_tokens: int,
         generation_index: int,
+        max_reasoning_tokens: int,
     ) -> ThinkContextInjection | None:
         """At the reasoning-budget cutoff, synchronously build the self-question
         injection (if enabled) that precedes the stop-and-go boundary.
@@ -5676,7 +5957,7 @@ class QwenExoRuntime:
             request_id,
             "reasoning.budget_forced",
             {
-                "max_reasoning_tokens": self.max_reasoning_tokens,
+                "max_reasoning_tokens": int(max_reasoning_tokens),
                 "observed_tokens": int(observed_tokens),
                 "generation_index": int(generation_index),
                 "cutoff_questions": questions is not None,
@@ -6530,6 +6811,7 @@ class QwenExoRuntime:
             self._replay_tasks.pop(request_id, None)
             self._capsule_tasks.pop(request_id, None)
             self._request_questions.pop(request_id, None)
+            self._decision_contexts.pop(request_id, None)
             self._foreground_last_activity = time.monotonic()
             self._request_outputs.pop(request_id, None)
             self._request_output_state.pop(request_id, None)
@@ -6552,6 +6834,7 @@ class QwenExoRuntime:
             self._request_score_bias_user_query_prepared.discard(request_id)
             self._request_score_bias_user_query_captured.discard(request_id)
             self._request_conversation_keys.pop(request_id, None)
+            self._request_memory_gate_keys.pop(request_id, None)
             self._parent_response_ids.pop(request_id, None)
             self._request_completion_emitted.discard(request_id)
             self._parent_capsules.pop(request_id, None)
@@ -6599,6 +6882,7 @@ class QwenExoRuntime:
             decision="request_cancelled",
         )
         self._request_questions.pop(request_id, None)
+        self._decision_contexts.pop(request_id, None)
         self._foreground_last_activity = time.monotonic()
         self._request_outputs.pop(request_id, None)
         self._request_output_state.pop(request_id, None)
@@ -6618,6 +6902,7 @@ class QwenExoRuntime:
         }
         self._request_score_bias_capture_failure_emitted.discard(request_id)
         self._request_conversation_keys.pop(request_id, None)
+        self._request_memory_gate_keys.pop(request_id, None)
         self._parent_response_ids.pop(request_id, None)
         self._parent_capsules.pop(request_id, None)
         self._capsule_restorations.pop(request_id, None)
@@ -7828,23 +8113,6 @@ class QwenExoRuntime:
                     if merged_path != relative_path:
                         self.knowledge.delete(merged_path)
                 bank = await self._reindex_tensor_bank_unlocked()
-                if self.query_probe is None:
-                    tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
-                    if tokenizer is None:
-                        raise RuntimeError(
-                            "Reflection memory QK retrieval requires a tokenizer"
-                        )
-                    self.query_probe = QueryProbeService(
-                        self.internal_jobs,
-                        tokenizer,
-                        self.telemetry,
-                        max_prompt_tokens=self.config.max_internal_tokens,
-                        timeout_seconds=_query_probe_timeout_seconds(
-                            self.tokenizer_manager
-                        ),
-                        cognition_token_ids=self.tensor_bank.cognition_token_ids(),
-                        query_pooling=self.config.qk_query_pooling,
-                    )
                 if effective_category:
                     self.document_categories.ensure(
                         effective_category,
@@ -8703,6 +8971,46 @@ class QwenExoRuntime:
         self.telemetry.emit("admin", "policy_data.reindexed", payload)
         return payload
 
+    def _ensure_query_probe(self) -> None:
+        if self.query_probe is not None:
+            return
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        if tokenizer is None or self.tensor_bank is None:
+            raise RuntimeError("QWEN-EXO QK retrieval requires a tokenizer and native Bank")
+        model_config = getattr(self.tokenizer_manager, "model_config", None)
+        text_config = (
+            getattr(model_config, "hf_text_config", None)
+            or getattr(model_config, "hf_config", None)
+        )
+        heads = int(
+            getattr(model_config, "num_attention_heads", 0)
+            or getattr(text_config, "num_attention_heads", 0)
+        )
+        hidden_size = int(
+            getattr(model_config, "hidden_size", 0)
+            or getattr(text_config, "hidden_size", 0)
+        )
+        head_dim = int(
+            getattr(model_config, "head_dim", 0)
+            or getattr(text_config, "head_dim", 0)
+            or (hidden_size // heads if heads else 0)
+        )
+        if heads < 1 or head_dim < 1:
+            raise RuntimeError("QWEN-EXO QueryProbe requires model Attention head geometry")
+        self.query_probe = QueryProbeService(
+            self.internal_jobs,
+            tokenizer,
+            self.telemetry,
+            max_prompt_tokens=self.config.max_internal_tokens,
+            timeout_seconds=_query_probe_timeout_seconds(self.tokenizer_manager),
+            cognition_token_ids=self.tensor_bank.cognition_token_ids(),
+            query_head_count=heads,
+            head_dim=head_dim,
+            query_pooling=self.config.qk_query_pooling,
+        )
+        if self.refresh_service is not None:
+            self.refresh_service.query_probe = self.query_probe
+
     async def _reindex_tensor_bank_unlocked(
         self,
         *,
@@ -8717,6 +9025,8 @@ class QwenExoRuntime:
                 included_documents=included_documents
             )
         )
+        if snapshot.ready:
+            self._ensure_query_probe()
         payload = snapshot.public_dict()
         self.telemetry.emit("admin", "tensor_bank.reindexed", payload)
         return payload

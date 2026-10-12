@@ -107,7 +107,10 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import (
+    QWEN_EXO_REASONING_BUDGET_KEY,
+    SamplingParams,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import (
@@ -1472,6 +1475,22 @@ class Req(ReqDllmMixin):
 
         return False
 
+    def _reasoning_budget_exhausted(self) -> bool:
+        budget = (self.sampling_params.custom_params or {}).get(
+            QWEN_EXO_REASONING_BUDGET_KEY
+        )
+        if not budget:
+            return False
+        max_tokens = int(budget["max_tokens"])
+        if len(self.output_ids) < max_tokens or int(
+            budget["end_token_id"]
+        ) in self.output_ids[:max_tokens]:
+            return False
+        # Speculative steps may overshoot the budget; trim like max_new_tokens.
+        self.finished_reason = FINISH_LENGTH(length=max_tokens)
+        self.finished_len = max_tokens
+        return True
+
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
             return
@@ -1486,6 +1505,9 @@ class Req(ReqDllmMixin):
                 length=self.sampling_params.max_new_tokens
             )
             self.finished_len = self.sampling_params.max_new_tokens
+            return
+
+        if self._reasoning_budget_exhausted():
             return
 
         if self.grammar is not None:

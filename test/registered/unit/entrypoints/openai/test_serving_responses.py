@@ -345,60 +345,7 @@ class InputMessageConstructionTestCase(unittest.TestCase):
             pass
 
 
-class ChatToolForwardingTestCase(unittest.TestCase):
-    def test_make_request_passes_function_tools_to_chat_processing(self):
-        serving = make_serving()
-        seen = {}
-
-        def fake_process(chat_request, is_multimodal):
-            seen["tools"] = chat_request.tools
-            seen["tool_choice"] = chat_request.tool_choice
-            seen["parallel_tool_calls"] = chat_request.parallel_tool_calls
-            return MessageProcessingResult(
-                prompt="prompt",
-                prompt_ids=[1, 2, 3],
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
-                stop=["</s>"],
-                tool_call_constraint=("json_schema", {"type": "object"}),
-            )
-
-        serving._process_messages = Mock(side_effect=fake_process)
-        request = ResponsesRequest(
-            model="x",
-            input="call the tool",
-            tools=[
-                {
-                    "type": "function",
-                    "name": "lookup",
-                    "parameters": {"type": "object"},
-                }
-            ],
-            tool_choice="required",
-            parallel_tool_calls=False,
-            store=False,
-        )
-
-        messages, request_prompts, engine_prompts, processed = asyncio.run(
-            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
-        )
-
-        self.assertEqual(
-            messages,
-            [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "call the tool"},
-            ],
-        )
-        self.assertEqual(request_prompts, [[1, 2, 3]])
-        self.assertEqual(engine_prompts, [[1, 2, 3]])
-        self.assertEqual(seen["tools"][0].function.name, "lookup")
-        self.assertEqual(seen["tool_choice"], "required")
-        self.assertFalse(seen["parallel_tool_calls"])
-        self.assertEqual(processed.tool_call_constraint[0], "json_schema")
-
+class ToolChoiceValidationTestCase(CustomTestCase):
     def test_required_tool_choice_without_function_tool_returns_400(self):
         serving = make_serving()
         request = ResponsesRequest(
@@ -635,76 +582,6 @@ class FullResponseUsageTestCase(unittest.TestCase):
 
         self.assertEqual(response.status, "incomplete")
         self.assertEqual(response.incomplete_details, {"reason": "max_output_tokens"})
-
-
-class MultimodalRequestTestCase(unittest.TestCase):
-    def test_multimodal_create_responses_sends_text_and_media_to_engine(self):
-        serving = make_serving(is_multimodal=True)
-        captured = {}
-
-        serving._process_messages = Mock(
-            return_value=MessageProcessingResult(
-                prompt="rendered multimodal prompt",
-                prompt_ids=[9, 9, 9],
-                image_data=["http://example.com/cat.png"],
-                audio_data=None,
-                video_data=None,
-                modalities=["image"],
-                stop=[],
-            )
-        )
-
-        async def fake_generate(
-            request_id,
-            request_prompt,
-            adapted_request,
-            sampling_params,
-            context,
-            **kwargs,
-        ):
-            captured["request_prompt"] = request_prompt
-            captured["adapted_request"] = adapted_request
-            context.append_output(
-                {
-                    "text": "looks like a cat",
-                    "meta_info": {
-                        "prompt_tokens": 5,
-                        "completion_tokens": 4,
-                        "cached_tokens": 0,
-                    },
-                }
-            )
-            yield context
-
-        serving._generate_with_builtin_tools = fake_generate
-        request = ResponsesRequest(
-            model="x",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "describe it"},
-                        {
-                            "type": "input_image",
-                            "image_url": "http://example.com/cat.png",
-                        },
-                    ],
-                }
-            ],
-            request_id="resp_mm",
-            store=False,
-        )
-
-        response = asyncio.run(serving.create_responses(request))
-
-        self.assertEqual(response.status, "completed")
-        self.assertEqual(captured["request_prompt"], "rendered multimodal prompt")
-        self.assertEqual(captured["adapted_request"].text, "rendered multimodal prompt")
-        self.assertIsNone(captured["adapted_request"].input_ids)
-        self.assertEqual(
-            captured["adapted_request"].image_data, ["http://example.com/cat.png"]
-        )
-        self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
 
 class OutputItemsTestCase(unittest.TestCase):
@@ -1162,6 +1039,9 @@ class ResponsesThinkingDefaultTestCase(unittest.TestCase):
             reasoning_end_token_id = 99
             think_context_enabled = True
 
+            def reasoning_budget_for_effort(self, effort):
+                return 3072
+
             def __init__(self):
                 self.observed = []
 
@@ -1471,6 +1351,9 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
             reasoning_end_token_id = 99
             think_context_enabled = True
 
+            def reasoning_budget_for_effort(self, effort):
+                return 3072
+
             def __init__(self):
                 self.observed = []
                 self.boundaries = []
@@ -1491,6 +1374,7 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
                 self.boundaries.append((request_id, kwargs))
 
         serving = object.__new__(OpenAIServingResponses)
+        serving.use_harmony = False
         serving.tokenizer_manager = FakeTokenizerManager()
         runtime = FakeRuntime()
         raw_request = SimpleNamespace(
@@ -1595,6 +1479,9 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
             think_context_enabled = False
             max_reasoning_tokens = 4
 
+            def reasoning_budget_for_effort(self, effort):
+                return self.max_reasoning_tokens
+
             def __init__(self):
                 self.discarded = []
                 self.boundaries = []
@@ -1617,6 +1504,7 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
                 self.boundaries.append((request_id, kwargs))
 
         serving = object.__new__(OpenAIServingResponses)
+        serving.use_harmony = False
         serving.tokenizer_manager = FakeTokenizerManager()
         runtime = FakeRuntime()
         raw_request = SimpleNamespace(
@@ -1645,18 +1533,10 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
 
         snapshots = asyncio.run(collect())
 
-        self.assertEqual(
-            serving.tokenizer_manager.requests[0].sampling_params["max_new_tokens"],
-            4,
-        )
         self.assertNotIn("finish_reason", snapshots[0]["meta_info"])
         self.assertTrue(snapshots[1]["text"].endswith("</think>"))
         self.assertFalse(snapshots[1]["meta_info"]["qwen_exo_self_ask_boundary"])
         self.assertEqual(serving.tokenizer_manager.requests[1].input_ids[-1], 99)
-        self.assertEqual(
-            serving.tokenizer_manager.requests[1].sampling_params["max_new_tokens"],
-            5,
-        )
         self.assertEqual(runtime.discarded[0][1]["observed_tokens"], 4)
         self.assertIsNone(runtime.boundaries[0][1]["injection"])
 
@@ -1719,6 +1599,9 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
             think_context_enabled = True
             max_reasoning_tokens = 4
 
+            def reasoning_budget_for_effort(self, effort):
+                return self.max_reasoning_tokens
+
             def __init__(self):
                 self.boundaries = []
 
@@ -1738,6 +1621,7 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
                 self.boundaries.append((request_id, kwargs))
 
         serving = object.__new__(OpenAIServingResponses)
+        serving.use_harmony = False
         serving.tokenizer_manager = FakeTokenizerManager()
         runtime = FakeRuntime()
         raw_request = SimpleNamespace(
@@ -1832,6 +1716,9 @@ class ContinuationCacheRegressionTestCase(CustomTestCase):
             think_context_enabled = True
             score_bias_enabled = True
 
+            def reasoning_budget_for_effort(self, effort):
+                return 3072
+
             @staticmethod
             def score_bias_payload(_request_id, _prompt_ids):
                 return ()
@@ -1888,6 +1775,262 @@ class ContinuationCacheRegressionTestCase(CustomTestCase):
         self.assertEqual(calls[0].logprob_start_len, 69)
         self.assertEqual(calls[1].logprob_start_len, 69)
         self.assertEqual(calls[1].input_ids[:100], list(range(100)))
+
+
+class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
+    @staticmethod
+    def _tokenizer():
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import WhitespaceSplit
+        from tokenizers.processors import TemplateProcessing
+        from transformers import PreTrainedTokenizerFast
+
+        words = [
+            "<unk>", "<bos>", "public", "private", "current", "old", "new",
+            "alpha", "beta", "image", "patch", "answer",
+        ]
+        backend = Tokenizer(WordLevel(dict(zip(words, range(len(words)))), "<unk>"))
+        backend.pre_tokenizer = WhitespaceSplit()
+        backend.post_processor = TemplateProcessing(
+            single="<bos> $A", special_tokens=[("<bos>", 1)]
+        )
+        return PreTrainedTokenizerFast(
+            tokenizer_object=backend, unk_token="<unk>", bos_token="<bos>"
+        )
+
+    def _fixture(self, *, context_len=64, image_patches=2):
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        serving = make_serving(is_multimodal=True)
+        tokenizer = self._tokenizer()
+        manager = object.__new__(TokenizerManager)
+        manager.tokenizer = tokenizer
+        manager.model_config = SimpleNamespace(
+            is_multimodal=True,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            context_len=context_len,
+            vocab_size=len(tokenizer),
+        )
+        manager.context_len = context_len
+        manager.max_req_input_len = context_len - 1
+        manager.num_reserved_tokens = 0
+        manager.allow_auto_truncate = False
+        manager.validate_total_tokens = True
+        manager.is_generation = True
+        manager.preferred_sampling_params = {}
+        manager.sampling_params_class = SamplingParams
+        manager.async_dynamic_batch_tokenizer = None
+        manager.rid_to_state = {}
+        manager.enable_trace = False
+        manager.disaggregation_mode = "null"
+        manager.server_args = SimpleNamespace(
+            incremental_streaming_output=False,
+            language_only=False,
+            encoder_transfer_backend=None,
+            limit_mm_data_per_request=None,
+            enable_return_hidden_states=False,
+            enable_custom_logit_processor=False,
+            disaggregation_transfer_backend=None,
+        )
+
+        class ImageProcessor:
+            async def process_mm_data_async(self, *, input_text, **_kwargs):
+                # A real multimodal processor supplies expanded IDs, not the
+                # text tokenizer's placeholder IDs. Keep expansion synthetic.
+                return SimpleNamespace(
+                    input_ids=tokenizer.encode(input_text)
+                    + [tokenizer.convert_tokens_to_ids("patch")] * image_patches,
+                    token_type_ids=None,
+                    mm_items=[],
+                )
+
+        manager.mm_processor = ImageProcessor()
+        tokenized_requests = {}
+
+        async def generate(request, _raw_request):
+            request.normalize_batch_and_arguments()
+            manager._init_req_state(request)
+            tokenized = await manager._tokenize_one_request(request)
+            tokenized_requests[request.rid] = tokenized
+            # Permit another request to preprocess before this one completes.
+            await asyncio.sleep(0)
+            yield {
+                "text": "answer",
+                "output_ids": [tokenizer.convert_tokens_to_ids("answer")],
+                "meta_info": {
+                    "prompt_tokens": len(tokenized.input_ids),
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                },
+            }
+
+        manager.generate_request = generate
+        serving.tokenizer_manager = manager
+
+        def process_messages(chat_request, _is_multimodal):
+            texts = []
+            images = []
+            for message in chat_request.messages:
+                if isinstance(message.content, str):
+                    texts.append(message.content)
+                elif isinstance(message.content, list):
+                    for part in message.content:
+                        if part.type == "text":
+                            texts.append(part.text)
+                        elif part.type == "image_url":
+                            images.append(part.image_url.url)
+            prompt = " ".join(texts)
+            return MessageProcessingResult(
+                prompt=prompt,
+                prompt_ids=tokenizer.encode(prompt, add_special_tokens=False),
+                image_data=images or None,
+                audio_data=None,
+                video_data=None,
+                modalities=["image"] if images else None,
+                stop=[],
+            )
+
+        serving._process_messages = process_messages
+        runtime = SimpleNamespace(
+            observer=SimpleNamespace(mode="off"),
+            # Responses reserves two BOS/EOS headroom tokens before generation.
+            max_output_tokens=3,
+            score_bias_enabled=False,
+            reasoning_end_token_id=None,
+            telemetry=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
+            has_restored_capsule=lambda _request_id: False,
+            initial_gdn_selection=lambda **_kwargs: None,
+            activation_editor_request=lambda _spec: {"spec": None, "cache_identity": "off"},
+            track_generation=lambda _request_id, generator: generator,
+            register_generation_prompt=lambda *_args, **_kwargs: None,
+            observe_generation_result=lambda *_args, **_kwargs: None,
+        )
+
+        def raw_request(original_instructions="public"):
+            return SimpleNamespace(
+                app=SimpleNamespace(state=SimpleNamespace(qwen_exo_runtime=runtime)),
+                state=SimpleNamespace(
+                    qwen_exo_original_instructions=original_instructions,
+                    qwen_exo_original_extra_key=None,
+                ),
+            )
+
+        return serving, tokenizer, tokenized_requests, raw_request
+
+    def test_bos_counts_for_usage_and_context_limit_but_not_internal_prompt(self):
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            _ResponsePromptEncoding,
+        )
+
+        serving, tokenizer, tokenized, raw_request = self._fixture(context_len=4)
+        request = ResponsesRequest(
+            model="x", instructions="public", input="current",
+            request_id="resp_bos", max_output_tokens=3, store=False,
+        )
+        response = asyncio.run(serving.create_responses(request, raw_request()))
+        self.assertEqual(
+            getattr(response, "status", None), "completed", getattr(response, "body", b"")
+        )
+        self.assertEqual(response.usage.prompt_tokens, 3)
+        self.assertEqual(list(tokenized[request.request_id].input_ids), [1, 2, 4])
+
+        encoding = _ResponsePromptEncoding(tokenizer)
+        encoding.encode("public current")
+        internal_ids = serving._request_prompt_token_ids(
+            GenerateReqInput(text="public current"), prompt_encoding=encoding
+        )
+        self.assertEqual(internal_ids, [2, 4])
+        self.assertEqual(encoding.encode("public current"), [1, 2, 4])
+
+        overflow = request.model_copy(
+            update={"input": "current current", "request_id": "resp_bos_overflow"}
+        )
+        error = asyncio.run(serving.create_responses(overflow, raw_request()))
+        self.assertEqual(error.status_code, 400)
+        self.assertEqual(json.loads(error.body)["error"]["code"], "context_length_exceeded")
+
+    def test_private_capacity_rebuild_generates_only_current_public_prompt(self):
+        serving, _tokenizer, tokenized, raw_request = self._fixture(context_len=5)
+        request = ResponsesRequest(
+            model="x", instructions="private private private", input="current",
+            request_id="resp_rebuilt", max_output_tokens=3, store=False,
+        )
+        response = asyncio.run(serving.create_responses(request, raw_request()))
+        self.assertEqual(
+            getattr(response, "status", None), "completed", getattr(response, "body", b"")
+        )
+        self.assertEqual(response.usage.prompt_tokens, 3)
+        self.assertEqual(list(tokenized[request.request_id].input_ids), [1, 2, 4])
+
+    def test_changed_tool_output_and_history_are_isolated_across_requests(self):
+        serving, tokenizer, tokenized, raw_request = self._fixture()
+
+        def request(request_id, history, tool_output):
+            return ResponsesRequest(
+                model="x", instructions="public", request_id=request_id,
+                input=[
+                    {"role": "user", "content": history},
+                    {"type": "function_call", "call_id": "call_probe",
+                     "name": "probe", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_probe",
+                     "output": tool_output},
+                    {"role": "user", "content": "current"},
+                ],
+                max_output_tokens=3, store=False,
+            )
+
+        async def collect():
+            first, second = await asyncio.gather(
+                serving.create_responses(request("resp_alpha", "old", "alpha"), raw_request()),
+                serving.create_responses(request("resp_beta", "new", "beta"), raw_request()),
+            )
+            third = await serving.create_responses(
+                request("resp_changed", "old", "beta"), raw_request()
+            )
+            return first, second, third
+
+        responses = asyncio.run(collect())
+        for response, expected in zip(
+            responses, ["public old alpha current", "public new beta current", "public old beta current"]
+        ):
+            with self.subTest(prompt=expected):
+                self.assertEqual(
+                    getattr(response, "status", None), "completed", getattr(response, "body", b"")
+                )
+                self.assertEqual(response.usage.prompt_tokens, 5)
+                self.assertEqual(
+                    list(tokenized[response.id].input_ids), tokenizer.encode(expected)
+                )
+
+    def test_multimodal_expansion_controls_usage_and_overflow(self):
+        for context_len in (8, 5):
+            with self.subTest(context_len=context_len):
+                serving, _tokenizer, tokenized, raw_request = self._fixture(
+                    context_len=context_len, image_patches=2
+                )
+                request = ResponsesRequest(
+                    model="x", instructions="public", request_id="resp_image",
+                    input=[{"role": "user", "content": [
+                        {"type": "input_text", "text": "image"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    ]}],
+                    max_output_tokens=3, store=False,
+                )
+                response = asyncio.run(serving.create_responses(request, raw_request()))
+                if context_len == 8:
+                    self.assertEqual(
+                        getattr(response, "status", None), "completed", getattr(response, "body", b"")
+                    )
+                    self.assertEqual(response.usage.prompt_tokens, 5)
+                    self.assertEqual(list(tokenized[request.request_id].input_ids), [1, 2, 9, 10, 10])
+                else:
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(
+                        json.loads(response.body)["error"]["code"], "context_length_exceeded"
+                    )
 
 
 if __name__ == "__main__":

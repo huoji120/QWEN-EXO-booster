@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.qwen4_ple import (
+    fused_qwen4_fp8_rowscale,
     fused_qwen4_gate_value,
     fused_qwen4_ngram_hash,
     fused_qwen4_short_conv_state,
@@ -115,6 +116,28 @@ def test_qwen4_ple_fused_kernels_are_bitwise_exact(num_tokens):
     )
     assert torch.equal(state[indices[real], :, -1], x[real])
     assert torch.equal(state[0], original_state[0])
+
+
+
+def test_qwen4_fp8_rowscale_decode_edges_and_tail():
+    bits = torch.tensor(
+        [0x00, 0x80, 0x01, 0x81, 0x7E, 0xFE, 0x40, 0xC0, 0x7F, 0xFF],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    rows = bits.repeat(1025, 2)[:, :11].contiguous()
+    scales = torch.tensor(
+        [0.0, -0.0, 2.0**-20, -3.5, 1.0e20, -1.0e20, 0.75, 4.0, 1.0, -1.0],
+        dtype=torch.float32,
+        device="cuda",
+    ).repeat(103)
+    scales = scales[: rows.shape[0]]
+    output = torch.empty(rows.shape, dtype=torch.bfloat16, device="cuda")
+    actual = fused_qwen4_fp8_rowscale(rows, scales, output)
+    reference = rows.cpu().view(torch.float8_e4m3fn).float().mul_(scales.cpu()[:, None]).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0, equal_nan=True)
 
 
 def test_qwen4_ple_fusion_is_enabled_by_default(monkeypatch):

@@ -430,7 +430,10 @@ def _available_layers(manager: Any) -> list[int]:
     available = [
         index
         for index, kind in enumerate(types)
-        if str(kind).lower() in {"full_attention", "attention", "full"}
+        if str(kind).lower() in {
+            "full_attention", "attention", "full",
+            "qwen_sparse_attention", "sparse_attention",
+        }
     ]
     if not available:
         raise AttentionDiagnosticError(
@@ -488,9 +491,9 @@ def _preflight_worker(manager: Any) -> None:
     backend = _config_value(args, "prefill_attention_backend") or _config_value(
         args, "attention_backend"
     )
-    if backend and backend not in {"triton", "flashinfer"}:
+    if backend and backend not in {"triton", "flashinfer", "qsa"}:
         raise AttentionDiagnosticError(
-            "Attention diagnostics currently require the Triton or FlashInfer Full Attention prefill backend",
+            "Attention diagnostics require Triton, FlashInfer, or QSA prefill",
             503,
         )
     graph = _config_value(_config_value(args, "cuda_graph_config"), "prefill")

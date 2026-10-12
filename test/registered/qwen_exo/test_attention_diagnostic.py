@@ -20,6 +20,7 @@ from qwen_exo_booster.attention_diagnostic_capture import (
     attention_diagnostic_specs,
     diagnostic_position_matches,
     mean_cached_attention,
+    mean_sparse_cached_attention,
     runtime_profile_lora_ids,
 )
 
@@ -44,6 +45,37 @@ def test_cached_attention_matches_gqa_sdpa():
         .mean(0)
     )
     torch.testing.assert_close(actual, reference, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("descale", [1.0, 0.7])
+@pytest.mark.parametrize("positions", [[5, 0, 3], [5, 0, 5]])
+def test_sparse_diagnostic_preserves_selection_and_gqa_mass(descale, positions):
+    generator = torch.Generator().manual_seed(28)
+    query = torch.randn(4, 8, generator=generator).bfloat16()
+    keys = torch.randn(7, 2, 8, generator=generator).bfloat16()
+    # This excluded row would dominate dense attention.
+    keys[1] = query[0].expand(2, -1) * 100
+    selected = torch.tensor(positions)
+    actual = mean_sparse_cached_attention(
+        query, keys[selected], selected,
+        token_count=7, scaling=.25, key_descale=descale,
+    )
+    native_keys = (keys[selected] * descale).repeat_interleave(2, dim=1)
+    logits = torch.einsum("hd,thd->ht", query.float(), native_keys.float()) * .25
+    expected = torch.zeros(7)
+    expected.scatter_add_(0, selected, logits.softmax(-1).mean(0))
+    torch.testing.assert_close(actual, expected)
+    assert actual[1].item() == 0
+    torch.testing.assert_close(actual.sum(), torch.tensor(1.))
+
+
+@pytest.mark.parametrize("positions", [[-1, 0], [0, 4], [0]])
+def test_sparse_diagnostic_rejects_invalid_coordinates(positions):
+    with pytest.raises(ValueError):
+        mean_sparse_cached_attention(
+            torch.ones(2, 4), torch.ones(2, 1, 4), torch.tensor(positions),
+            token_count=4, scaling=.5, key_descale=1.,
+        )
 
 
 def test_nvfp4_split_backend_cache_is_read_back_for_diagnostics(monkeypatch):
@@ -430,11 +462,12 @@ def test_structured_tool_markers_are_inert_in_rendered_content(item):
 
 
 @pytest.mark.parametrize("available", [[2], [1, 4, 8], list(range(3, 64, 4))])
-def test_preview_representative_layers_span_actual_full_attention_depth(available):
+@pytest.mark.parametrize("kind", ["full_attention", "qwen_sparse_attention", "sparse_attention"])
+def test_preview_representative_layers_span_actual_attention_depth(available, kind):
     runtime = _diagnostic_runtime()
     types = ["linear_attention"] * (available[-1] + 1)
     for layer in available:
-        types[layer] = "full_attention"
+        types[layer] = kind
     runtime.tokenizer_manager.model_config.hf_text_config = {"layer_types": types}
     preview = prepare_attention_preview(runtime, "inspect")
     chosen = preview["default_layer_ids"]

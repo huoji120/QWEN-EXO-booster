@@ -78,6 +78,7 @@ class InternalOptionScoreResult:
     prompt_tokens: int
     completion_tokens: int
     latency_seconds: float
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class InternalJobRunner:
@@ -395,18 +396,18 @@ class InternalJobRunner:
         input_ids: Iterable[Iterable[int]],
         option_token_ids: Iterable[int],
     ) -> tuple[InternalOptionScoreResult, ...]:
-        """Read two next-token scores from one target-only prefill per job."""
+        """Read N>=2 next-token scores from one target-only prefill per job."""
         job_list = tuple(jobs)
         prefixes = tuple(tuple(tokens) for tokens in input_ids)
         options = tuple(option_token_ids)
         if not job_list or len(job_list) != len(prefixes):
             raise ContractViolation("Option score batch requires one prefix per job")
         if (
-            len(options) != 2
+            len(options) < 2
             or any(type(token) is not int or token < 0 for token in options)
-            or len(set(options)) != 2
+            or len(set(options)) != len(options)
         ):
-            raise ContractViolation("Option scores require two distinct token IDs")
+            raise ContractViolation("Option scores require distinct token IDs")
         if any(
             not tokens or any(type(token) is not int or token < 0 for token in tokens)
             for tokens in prefixes
@@ -554,7 +555,11 @@ class InternalJobRunner:
         ):
             raise RuntimeError("Option score result input rows are misaligned")
         rows = meta.get("input_token_ids_logprobs")
-        if not sequence(rows, 2) or rows[0] is not None or not sequence(rows[1], 2):
+        if (
+            not sequence(rows, 2)
+            or rows[0] is not None
+            or not sequence(rows[1], len(options))
+        ):
             raise RuntimeError("Option score result option rows are misaligned")
         scores = []
         for token, entry in zip(options, rows[1]):
@@ -569,12 +574,16 @@ class InternalJobRunner:
                     "Option score result contains invalid option logprobs"
                 )
             scores.append(float(entry[0]))
+        cached_tokens = meta.get("cached_tokens", 0)
+        if type(cached_tokens) is not int or cached_tokens < 0:
+            cached_tokens = 0
         return InternalOptionScoreResult(
             job=job,
             option_logprobs=tuple(scores),
             prompt_tokens=meta["prompt_tokens"],
             completion_tokens=0,
             latency_seconds=latency_seconds,
+            metadata={"cached_tokens": cached_tokens},
         )
 
     async def cancel_parent(self, parent_request_id: str) -> None:

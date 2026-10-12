@@ -1605,9 +1605,12 @@ class Qwen4ExpAttentionDecoderLayer(
                 hidden_states, positions, forward_batch
             )
 
-        if forward_batch.qwen_exo_attention_diagnostics is not None:
-            capture_attention_diagnostic(self, q, positions, forward_batch)
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
+        if forward_batch.qwen_exo_attention_diagnostics is not None:
+            capture_attention_diagnostic(
+                self, q, positions, forward_batch,
+                sparse_topk=attention_kwargs.get("topk_indices"), current_keys=k,
+            )
         if gate is not None:
             if attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the

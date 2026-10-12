@@ -82,6 +82,15 @@ fi
 : "${QWEN_EXO_CHUNKED_PREFILL_SIZE:=}"
 : "${QWEN_EXO_MAX_OUTPUT_TOKENS:=8192}"
 : "${QWEN_EXO_MAX_REASONING_TOKENS:=3072}"
+: "${QWEN_EXO_REASONING_BUDGET_MIN:=512}"
+: "${QWEN_EXO_REASONING_BUDGET_LOW:=1024}"
+: "${QWEN_EXO_REASONING_BUDGET_MEDIUM:=2048}"
+: "${QWEN_EXO_REASONING_BUDGET_HIGH:=4090}"
+: "${QWEN_EXO_REASONING_BUDGET_XHIGH:=8192}"
+: "${QWEN_EXO_REASONING_MODE:=fixed}"
+: "${QWEN_EXO_FORCE_AUTO_REASONING:=1}"
+: "${QWEN_EXO_REASONING_SESSION_ONCE:=1}"
+: "${QWEN_EXO_REASONING_DYNAMIC_CONTEXT_TOKENS:=2048}"
 : "${QWEN_EXO_TENSOR_BANK_MAX_DOCUMENT_TOKENS:=$((QWEN_EXO_CONTEXT_LENGTH - 2048))}"
 : "${QWEN_EXO_TENSOR_BANK_SALIENT_TOKEN_BUDGET:=4096}"
 : "${QWEN_EXO_TENSOR_BANK_SURPRISAL_THRESHOLD:=6.0}"
@@ -448,6 +457,9 @@ server_args=(
   --host 127.0.0.1
   --port "${QWEN_EXO_PORT}"
 )
+if [[ -n "${QWEN_EXO_MM_PROCESS_CONFIG:-}" ]]; then
+  server_args+=( --mm-process-config "${QWEN_EXO_MM_PROCESS_CONFIG}" )
+fi
 if [[ -n "${QWEN_EXO_NATIVE_PLE_DISK_PATH}" ]]; then
   if [[ "${native_mode}" == "1" ]]; then
     runtime_ple_disk_path="${QWEN_EXO_NATIVE_PLE_DISK_PATH}"
@@ -557,6 +569,13 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-max-internal-tokens "${QWEN_EXO_MAX_INTERNAL_TOKENS}"
     --qwen-exo-max-output-tokens "${QWEN_EXO_MAX_OUTPUT_TOKENS}"
     --qwen-exo-max-reasoning-tokens "${QWEN_EXO_MAX_REASONING_TOKENS}"
+    --qwen-exo-reasoning-budget-min "${QWEN_EXO_REASONING_BUDGET_MIN}"
+    --qwen-exo-reasoning-budget-low "${QWEN_EXO_REASONING_BUDGET_LOW}"
+    --qwen-exo-reasoning-budget-medium "${QWEN_EXO_REASONING_BUDGET_MEDIUM}"
+    --qwen-exo-reasoning-budget-high "${QWEN_EXO_REASONING_BUDGET_HIGH}"
+    --qwen-exo-reasoning-budget-xhigh "${QWEN_EXO_REASONING_BUDGET_XHIGH}"
+    --qwen-exo-reasoning-mode "${QWEN_EXO_REASONING_MODE}"
+    --qwen-exo-reasoning-dynamic-context-tokens "${QWEN_EXO_REASONING_DYNAMIC_CONTEXT_TOKENS}"
     --qwen-exo-tensor-bank-max-document-tokens "${QWEN_EXO_TENSOR_BANK_MAX_DOCUMENT_TOKENS}"
     --qwen-exo-tensor-bank-salient-token-budget "${QWEN_EXO_TENSOR_BANK_SALIENT_TOKEN_BUDGET}"
     --qwen-exo-tensor-bank-surprisal-threshold "${QWEN_EXO_TENSOR_BANK_SURPRISAL_THRESHOLD}"
@@ -594,6 +613,16 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-dflash-think-accept-mode "${QWEN_EXO_DFLASH_THINK_ACCEPT_MODE}"
     --qwen-exo-dflash-think-accept-probability "${QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY}"
   )
+  if [[ "${QWEN_EXO_FORCE_AUTO_REASONING}" == "1" ]]; then
+    server_args+=( --qwen-exo-force-auto-reasoning )
+  else
+    server_args+=( --no-qwen-exo-force-auto-reasoning )
+  fi
+  if [[ "${QWEN_EXO_REASONING_SESSION_ONCE}" == "1" ]]; then
+    server_args+=( --qwen-exo-reasoning-session-once )
+  else
+    server_args+=( --no-qwen-exo-reasoning-session-once )
+  fi
   if [[ -n "${QWEN_EXO_MOE_TOP_K}" ]]; then
     server_args+=( --qwen-exo-moe-top-k "${QWEN_EXO_MOE_TOP_K}" )
   fi

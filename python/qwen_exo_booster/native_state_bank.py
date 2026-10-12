@@ -31,6 +31,8 @@ def _quantize_fp8(
     source = value.detach().to(device="cpu", dtype=torch.float32).contiguous()
     if source.numel() == 0:
         raise NativeStateBankError("cannot quantize an empty native-state tensor")
+    if not bool(torch.isfinite(source).all().item()):
+        raise NativeStateBankError("cannot quantize nonfinite native state")
     maximum = source.abs().amax(dim=reduce_dims, keepdim=True)
     scale = (maximum / _FP8_MAX).clamp_min(torch.finfo(torch.float32).tiny)
     encoded = (source / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
@@ -175,17 +177,15 @@ def _load_page_payload(
 def load_page_compression_ratio(
     root: str | Path, *, source_digest: str, page_id: int
 ) -> int:
-    """Read the native artifact's selection granularity without loading tensors."""
+    """Read and validate the native artifact's selection granularity."""
     payload = _load_page_payload(Path(root), source_digest=source_digest, page_id=page_id, rank=0)
     state = payload.get("qwen4_state")
     if state is None:
         return 1
-    if not isinstance(state, dict) or state.get("schema") != _QWEN4_STATE_SCHEMA:
-        raise NativeStateBankError("native Qwen4 state schema is stale")
-    ratio = int(state.get("compress_ratio", 0))
-    if ratio < 2 or 64 % ratio:
-        raise NativeStateBankError("native Qwen4 compression layout is invalid")
-    return ratio
+    state = _validate_qwen4_artifact(
+        payload, layer_ids=tuple(payload.get("full_layer_ids") or ()),
+    )
+    return state["compress_ratio"]
 
 
 def reuse_page_artifacts(
@@ -477,6 +477,130 @@ def validate_session_initial_gdn_artifacts(
     }
 
 
+def _validate_native_fp8(payload: Any, *, shape: tuple[int, ...] | None = None) -> None:
+    if not isinstance(payload, dict):
+        raise NativeStateBankError("native FP8 state is incomplete")
+    dimensions = payload.get("shape")
+    data, scale = payload.get("data"), payload.get("scale")
+    if (
+        not isinstance(dimensions, (tuple, list)) or not dimensions
+        or any(not isinstance(item, int) or item <= 0 for item in dimensions)
+        or (shape is not None and tuple(dimensions) != shape)
+        or not isinstance(data, torch.Tensor) or data.device.type != "cpu"
+        or data.dtype != torch.uint8 or tuple(data.shape) != tuple(dimensions)
+        or not isinstance(scale, torch.Tensor) or scale.device.type != "cpu"
+        or scale.dtype != torch.float32 or scale.ndim != len(dimensions)
+        or any(size not in (1, dimension) for size, dimension in zip(scale.shape, dimensions))
+    ):
+        raise NativeStateBankError("native FP8 state shape/dtype is stale")
+    # E4M3FN has one NaN magnitude code (both signs); no infinities.
+    if (
+        bool(((data & 0x7F) == 0x7F).any().item())
+        or not bool(torch.isfinite(scale).all().item())
+        or bool((scale <= 0).any().item())
+    ):
+        raise NativeStateBankError("native FP8 state contains nonfinite or invalid values")
+
+
+def _validate_qwen4_artifact(
+    payload: dict[str, Any], *, layer_ids: tuple[int, ...],
+) -> dict[str, Any]:
+    """Validate native side-state before publishing or adopting a Bank page."""
+    state = payload.get("qwen4_state")
+    if not isinstance(state, dict) or state.get("schema") != _QWEN4_STATE_SCHEMA:
+        raise NativeStateBankError(
+            "Qwen4 artifact lacks complete QSA and PLE state; rebuild the Bank"
+        )
+    ratio = state.get("compress_ratio")
+    count = payload.get("capture_count")
+    capture_start = state.get("capture_start")
+    if (
+        not isinstance(ratio, int) or ratio < 2 or 64 % ratio
+        or not isinstance(count, int) or count <= 0 or count % ratio
+        or not isinstance(capture_start, int) or capture_start < 0 or capture_start % ratio
+    ):
+        raise NativeStateBankError("Qwen4 artifact contains an invalid compression layout")
+    for name in ("index_heads", "index_head_dim", "token_topk"):
+        if not isinstance(state.get(name), int) or state[name] <= 0:
+            raise NativeStateBankError(f"Qwen4 {name} is invalid")
+    short_layers = state.get("short_conv_layers")
+    short_shape = state.get("short_conv_shape")
+    ngram_shape = state.get("ngram_shape")
+    if (
+        not isinstance(short_layers, (tuple, list)) or not short_layers
+        or any(not isinstance(item, int) or item < 0 for item in short_layers)
+        or len(set(short_layers)) != len(short_layers)
+        or not isinstance(short_shape, (tuple, list)) or len(short_shape) != 2
+        or not isinstance(ngram_shape, (tuple, list)) or len(ngram_shape) != 1
+        or any(not isinstance(item, int) or item <= 0 for item in (*short_shape, *ngram_shape))
+        or not isinstance(state.get("ngram_eos_token_id"), int)
+    ):
+        raise NativeStateBankError("Qwen4 PLE layout is invalid")
+
+    def tensor(name, value, shape, dtype):
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.device.type != "cpu"
+            or tuple(value.shape) != shape or value.dtype not in (
+                (dtype,) if isinstance(dtype, torch.dtype) else dtype
+            )
+        ):
+            raise NativeStateBankError(f"Qwen4 {name} shape/dtype is stale")
+        if value.is_floating_point() and not bool(torch.isfinite(value).all().item()):
+            raise NativeStateBankError(f"Qwen4 {name} contains nonfinite state")
+
+    group_count = count // ratio
+    layers = state.get("layers")
+    if not isinstance(layers, dict) or set(layers) != {str(i) for i in layer_ids}:
+        raise NativeStateBankError("Qwen4 QSA layer map is incomplete")
+    for value in layers.values():
+        if not isinstance(value, dict):
+            raise NativeStateBankError("Qwen4 QSA layer payload is invalid")
+        for name, rows in (("compressed_key", group_count), ("pending_key", ratio)):
+            tensor(
+                name, value.get(name),
+                (rows, state["index_heads"], state["index_head_dim"]), torch.bfloat16,
+            )
+    tensor(
+        "short_conv", state.get("short_conv"),
+        (len(short_layers), 1, *short_shape),
+        (torch.float16, torch.bfloat16, torch.float32, torch.float64),
+    )
+    tensor("ngram", state.get("ngram"), (1, *ngram_shape), torch.int64)
+    tensor("pending_rope", state.get("pending_rope"), (ratio, 3), torch.int64)
+    tensor(
+        "source_group_positions", state.get("source_group_positions"),
+        (group_count,), torch.int64,
+    )
+    if not torch.equal(
+        state["source_group_positions"],
+        torch.arange(capture_start, capture_start + count, ratio),
+    ):
+        raise NativeStateBankError("Qwen4 group RoPE provenance is stale")
+    if state.get("pending_count") != 0:
+        raise NativeStateBankError("Qwen4 native artifact ends inside a pending compression group")
+    delta = payload.get("section_delta")
+    if not isinstance(delta, dict) or not isinstance(delta.get("conv"), (tuple, list)) or not delta["conv"]:
+        raise NativeStateBankError("Qwen4 artifact lacks complete GDN state")
+    for component in (*delta["conv"], delta.get("temporal")):
+        _validate_native_fp8(component)
+    full_attention = payload.get("full_attention")
+    if (
+        not layer_ids or not isinstance(full_attention, dict)
+        or set(full_attention) != {str(layer) for layer in layer_ids}
+    ):
+        raise NativeStateBankError("Qwen4 Full-Attention layer map is incomplete")
+    for layer in full_attention.values():
+        if not isinstance(layer, dict):
+            raise NativeStateBankError("Qwen4 Full-Attention payload is invalid")
+        for name in ("key", "value"):
+            component = layer.get(name)
+            _validate_native_fp8(component)
+            if len(component["shape"]) != 3 or component["shape"][0] != count:
+                raise NativeStateBankError("Qwen4 Full-Attention token coordinates are stale")
+    return state
+
+
 def validate_page_artifacts(
     root: str | Path,
     *,
@@ -510,6 +634,10 @@ def validate_page_artifacts(
         if not (has_cuda_delta or has_mlx_delta):
             raise NativeStateBankError(
                 "native Bank rank artifact lacks complete CUDA or MLX GDN state"
+            )
+        if "qwen4_state" in payload:
+            _validate_qwen4_artifact(
+                payload, layer_ids=tuple(payload.get("full_layer_ids") or ()),
             )
 
 
@@ -751,6 +879,7 @@ class NativeStateBankManager:
         self.session_gdn_sources = OrderedDict()
         self.session_gdn_loads = 0
         self.session_gdn_binds = 0
+        self._qwen4_layout()
 
     def _qwen4_layout(self) -> dict[str, Any] | None:
         hf_config = getattr(self.model_config, "hf_config", self.model_config)
@@ -766,6 +895,9 @@ class NativeStateBankManager:
         ngram = getattr(self.req_pool, "ngram_pool", None)
         if short is None or ngram is None or not short.enabled or not ngram.enabled:
             raise NativeStateBankError("Qwen4 native Bank requires complete PLE state pools")
+        siblings = tuple(getattr(self.req_pool.mamba_pool, "_slot_siblings", ()))
+        if len(siblings) != 2 or siblings[0] is not short or siblings[1] is not ngram:
+            raise NativeStateBankError("Qwen4 PLE pools must share the GDN slot lifecycle")
         return {
             "compress_ratio": int(pool.qsa_compress_ratio),
             "index_heads": int(pool.qsa_index_kv_heads),
@@ -793,8 +925,13 @@ class NativeStateBankManager:
         if capture_start + capture_count != len(req.origin_input_ids):
             raise NativeStateBankError("Qwen4 native export must end at its complete document state")
         groups = mapping.reshape(-1, ratio)
-        if bool((groups // ratio != groups[:, :1] // ratio).any().item()):
-            raise NativeStateBankError("Qwen4 KV mapping splits a compression group")
+        expected = groups[:, :1] + torch.arange(ratio, device=mapping.device)
+        if (
+            bool((groups[:, 0] % ratio != 0).any().item())
+            or not torch.equal(groups, expected)
+            or groups[:, 0].unique().numel() != groups.shape[0]
+        ):
+            raise NativeStateBankError("Qwen4 KV mapping splits or aliases a compression group")
         compressed_slots = groups[:, 0] // ratio
         source_positions = torch.arange(
             capture_start, capture_start + capture_count, ratio,
@@ -829,62 +966,50 @@ class NativeStateBankManager:
             if state is not None:
                 raise NativeStateBankError("Qwen4 state cannot restore into a non-Qwen4 pool")
             return
-        if not isinstance(state, dict) or state.get("schema") != _QWEN4_STATE_SCHEMA:
-            raise NativeStateBankError("Qwen4 artifact lacks complete QSA and PLE state; rebuild the Bank")
+        state = _validate_qwen4_artifact(payload, layer_ids=self.full_layer_ids)
         if any(state.get(key) != value for key, value in layout.items()):
             raise NativeStateBankError("Qwen4 QSA/PLE layout is stale")
+        if state["short_conv"].dtype != self.req_pool.short_conv_pool.conv_state.dtype:
+            raise NativeStateBankError("Qwen4 short_conv dtype is stale")
+        cache = self.req_pool.mamba_pool.mamba_cache
+        delta = payload["section_delta"]
+        if len(delta["conv"]) != len(cache.conv):
+            raise NativeStateBankError("Qwen4 GDN convolution layout is stale")
+        for component, target in zip(delta["conv"], cache.conv):
+            _validate_native_fp8(component, shape=(target.shape[0], 1, *target.shape[2:]))
+        temporal = cache.temporal
+        _validate_native_fp8(
+            delta["temporal"], shape=(temporal.shape[0], 1, *temporal.shape[2:]),
+        )
         ratio = layout["compress_ratio"]
-        if len(local_positions) % ratio:
-            raise NativeStateBankError("Qwen4 selection splits compression groups")
+        if (
+            not local_positions or len(local_positions) % ratio
+            or local_positions[0] < 0
+            or local_positions[-1] >= int(payload["capture_count"])
+            or any(left >= right for left, right in zip(local_positions, local_positions[1:]))
+        ):
+            raise NativeStateBankError("Qwen4 selection must preserve ordered source groups")
         for offset in range(0, len(local_positions), ratio):
             start = local_positions[offset]
             if start % ratio or local_positions[offset:offset + ratio] != tuple(range(start, start + ratio)):
                 raise NativeStateBankError("Qwen4 selection must preserve complete ordered source groups")
-        count = int(payload["capture_count"])
-        if count <= 0 or count % ratio:
-            raise NativeStateBankError("Qwen4 artifact contains an incomplete compression group")
-        expected_groups = count // ratio
-        layers = state.get("layers")
-        if not isinstance(layers, dict) or set(layers) != {str(i) for i in self.full_layer_ids}:
-            raise NativeStateBankError("Qwen4 QSA layer map is incomplete")
-        for value in layers.values():
-            if not isinstance(value, dict):
-                raise NativeStateBankError("Qwen4 QSA layer payload is invalid")
-            for name, shape in (
-                ("compressed_key", (expected_groups, layout["index_heads"], layout["index_head_dim"])),
-                ("pending_key", (ratio, layout["index_heads"], layout["index_head_dim"])),
-            ):
-                tensor = value.get(name)
-                if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape or tensor.dtype != torch.bfloat16:
-                    raise NativeStateBankError(f"Qwen4 {name} shape/dtype is stale")
-        for name, shape, dtype in (
-            ("short_conv", (len(layout["short_conv_layers"]), 1, *layout["short_conv_shape"]), self.req_pool.short_conv_pool.conv_state.dtype),
-            ("ngram", (1, *layout["ngram_shape"]), self.req_pool.ngram_pool.context.dtype),
-            ("pending_rope", (ratio, 3), torch.int64),
-            ("source_group_positions", (expected_groups,), torch.int64),
-        ):
-            tensor = state.get(name)
-            if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape or tensor.dtype != dtype:
-                raise NativeStateBankError(f"Qwen4 {name} shape/dtype is stale")
-        capture_start = int(state.get("capture_start", -1))
-        if capture_start < 0 or capture_start % ratio or not torch.equal(
-            state["source_group_positions"], torch.arange(capture_start, capture_start + count, ratio)
-        ):
-            raise NativeStateBankError("Qwen4 group RoPE provenance is stale")
-        if int(state.get("pending_count", -1)) != 0:
-            raise NativeStateBankError("Qwen4 native artifact ends inside a pending compression group")
 
     def _restore_qwen4_state(
         self, payload: dict[str, Any], local_positions: tuple[int, ...],
-        kv_indices: torch.Tensor, physical_mamba: torch.Tensor,
+        kv_indices: torch.Tensor,
     ) -> None:
         state = payload.get("qwen4_state")
         if state is None:
             return
         ratio = int(state["compress_ratio"])
         groups = kv_indices.long().reshape(-1, ratio)
-        if bool((groups // ratio != groups[:, :1] // ratio).any().item()):
-            raise NativeStateBankError("Qwen4 restored KV allocation splits compression groups")
+        expected = groups[:, :1] + torch.arange(ratio, device=kv_indices.device)
+        if (
+            bool((groups[:, 0] % ratio != 0).any().item())
+            or not torch.equal(groups, expected)
+            or groups[:, 0].unique().numel() != groups.shape[0]
+        ):
+            raise NativeStateBankError("Qwen4 restored KV allocation splits or aliases a compression group")
         selected_groups = torch.tensor(local_positions[::ratio], dtype=torch.long) // ratio
         compressed_slots = groups[:, 0] // ratio
         positions = torch.arange(0, len(local_positions), ratio, device=kv_indices.device)
@@ -899,8 +1024,6 @@ class NativeStateBankManager:
         # Prefixes are page/group aligned: there are no live pending ring members.
         # Stored ring rows retain export provenance but must not be treated as
         # pending members of the selected (possibly sparse) virtual prefix.
-        self.req_pool.short_conv_pool.load_cpu_slots(state["short_conv"], physical_mamba)
-        self.req_pool.ngram_pool.load_cpu_slots(state["ngram"], physical_mamba)
 
     @classmethod
     def from_scheduler(cls, scheduler: Any) -> NativeStateBankManager:
@@ -992,6 +1115,7 @@ class NativeStateBankManager:
             "mamba_state": mamba_pool.get_cpu_copy(physical_mamba),
             "mamba_state_components": tuple(components),
         }
+        self._validate_session_initial_gdn_payload(payload)
         _atomic_torch_save(
             payload,
             _session_initial_gdn_path(
@@ -1322,6 +1446,7 @@ class NativeStateBankManager:
         }
         if qwen4_state is not None:
             payload["qwen4_state"] = qwen4_state
+            self._validate_qwen4_state(payload, tuple(range(capture_count)))
         _atomic_torch_save(
             payload, _page_path(self.root, source_digest, page_id, self.rank)
         )
@@ -1556,10 +1681,18 @@ class NativeStateBankManager:
             if payload.get("qwen4_state") is not None:
                 # Complete PLE slot siblings accompany the GDN slot lifecycle.
                 if getattr(self.req_pool.mamba_pool, "replayssm_cache_base", None) is not None:
-                    state = (*state, tuple(torch.zeros(1, dtype=torch.int64) for _ in range(3)))
+                    state = (
+                        *state,
+                        (
+                            torch.zeros(1, dtype=torch.int32),
+                            torch.zeros(1, dtype=torch.int32),
+                            torch.zeros(1, dtype=torch.int8),
+                        ),
+                    )
+                # Pool loading owns PLE together with the recurrent slot lifecycle.
                 state = (*state, [payload["qwen4_state"]["short_conv"], payload["qwen4_state"]["ngram"]])
             self.req_pool.mamba_pool.load_cpu_copy(state, physical_mamba)
-            self._restore_qwen4_state(payload, local_positions, kv_indices, physical_mamba)
+            self._restore_qwen4_state(payload, local_positions, kv_indices)
             insert_params_factory = self.insert_params_factory
             if insert_params_factory is None:
                 from sglang.srt.mem_cache.base_prefix_cache import InsertParams

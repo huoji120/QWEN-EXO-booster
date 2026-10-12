@@ -264,7 +264,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         from pydantic import ValidationError
 
         messages = [{"role": "user", "content": "Hello"}]
-        for effort in ("xhigh", "max"):
+        for effort in ("min", "minimal", "low", "medium", "high", "xhigh", "max"):
             with self.subTest(effort=effort, request_form="top-level"):
                 request = ChatCompletionRequest(
                     model="test-model",
@@ -591,6 +591,33 @@ class TestValidationEdgeCases(unittest.TestCase):
 
 class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
+
+
+class TestReasoningEffortStreamCompatibility(unittest.TestCase):
+    def test_every_requested_tier_serializes_created_and_terminal_events(self):
+        from openai.types.responses import ResponseCreatedEvent, ResponseCompletedEvent
+        from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, ResponsesResponse
+
+        for effort, serialized in (
+            ("min", "minimal"), ("minimal", "minimal"), ("low", "low"),
+            ("medium", "medium"), ("high", "high"), ("xhigh", "high"),
+            ("max", "high"), ("none", None),
+        ):
+            with self.subTest(effort=effort):
+                request = ResponsesRequest(input="task", reasoning={"effort": effort})
+                for event_type, event_class, status in (
+                    ("response.created", ResponseCreatedEvent, "in_progress"),
+                    ("response.completed", ResponseCompletedEvent, "completed"),
+                ):
+                    response = ResponsesResponse.from_request(
+                        request, {}, "model", 1, [], status, None,
+                    )
+                    event = event_class(
+                        type=event_type, sequence_number=0,
+                        response=response.model_dump(),
+                    )
+                    self.assertEqual(event.response.reasoning.effort, serialized)
+                    self.assertEqual(request.reasoning.effort, effort)
 
 
 if __name__ == "__main__":

@@ -82,6 +82,7 @@ _QWEN38_REASONING_EFFORT_MARKER = (
     "Supported types are xhigh (default), medium, and low."
 )
 _QWEN38_REASONING_EFFORT_ALIASES = {
+    "min": "low",
     "minimal": "low",
     "high": "xhigh",
     "max": "xhigh",
@@ -94,8 +95,8 @@ def _normalize_model_reasoning_effort(tokenizer: Any, effort):
     """Map generic effort aliases only for Qwen3.8-style templates.
 
     Qwen3.8 exposes ``low``, ``medium``, and ``xhigh`` in its chat template,
-    while the OpenAI-compatible protocol also accepts ``minimal``, ``high``,
-    and ``max``. Detect the model capability from the template contract rather
+    while the OpenAI-compatible protocol also accepts ``min``, ``minimal``,
+    ``high``, and ``max``. Detect capability from the template contract rather
     than its path or marketing name so other Qwen checkpoints are unchanged.
     """
     if not isinstance(effort, str) or effort not in _QWEN38_REASONING_EFFORT_ALIASES:
@@ -921,22 +922,6 @@ class OpenAIServingChat(OpenAIServingBase):
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
 
-        template_effort = (
-            request.chat_template_kwargs.get("reasoning_effort")
-            if request.chat_template_kwargs
-            and "reasoning_effort" in request.chat_template_kwargs
-            else request.reasoning_effort
-        )
-        normalized_effort = _normalize_model_reasoning_effort(
-            self.tokenizer_manager.tokenizer, template_effort
-        )
-        if (
-            request.chat_template_kwargs
-            and "reasoning_effort" in request.chat_template_kwargs
-        ):
-            request.chat_template_kwargs["reasoning_effort"] = normalized_effort
-        request.reasoning_effort = normalized_effort
-
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
@@ -1162,6 +1147,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
+            if "reasoning_effort" in extra_template_kwargs:
+                extra_template_kwargs["reasoning_effort"] = (
+                    _normalize_model_reasoning_effort(
+                        self.tokenizer_manager.tokenizer,
+                        extra_template_kwargs["reasoning_effort"],
+                    )
+                )
 
             rc = self.template_manager.reasoning_config
             if rc is not None and rc.effort_kwarg is not None:

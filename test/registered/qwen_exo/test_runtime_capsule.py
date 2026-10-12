@@ -1054,8 +1054,9 @@ async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
     # and refresh context lane are inactive, even if the service exists.
     injection = await value.build_reasoning_cutoff_injection(
         request_id,
-        observed_tokens=3072,
+        observed_tokens=4090,
         generation_index=2,
+        max_reasoning_tokens=4090,
     )
 
     assert injection is None
@@ -1066,8 +1067,8 @@ async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
     events = value.telemetry.events(request_id, limit=10)
     assert [event.event_type for event in events] == ["reasoning.budget_forced"]
     assert events[0].payload == {
-        "max_reasoning_tokens": 3072,
-        "observed_tokens": 3072,
+        "max_reasoning_tokens": 4090,
+        "observed_tokens": 4090,
         "generation_index": 2,
         "cutoff_questions": False,
         "had_pending_context": True,

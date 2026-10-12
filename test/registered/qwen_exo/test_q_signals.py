@@ -23,6 +23,150 @@ from qwen_exo_booster.tensor_bank import TensorBank
 from qwen_exo_booster.query_probe import QueryStateSpan
 
 
+def test_rank_key_cache_bounds_preserve_evicted_and_oversized_pages(monkeypatch):
+    import qwen_exo_booster.tensor_bank as module
+
+    monkeypatch.setattr(module, "_RANK_KEY_CACHE_MAX_BYTES", 64)
+    bank = TensorBank.__new__(TensorBank)
+    bank._snapshot = SimpleNamespace(source_digest="source")
+    bank._rank_device = torch.device("cpu")
+    bank._rank_key_cache = {}
+    sources = [torch.arange(8, dtype=torch.bfloat16) + index for index in range(6)]
+    for index in (0, 1, 2, 3, 0, 4, 5):
+        actual = bank._rank_key_heads(SimpleNamespace(page_id=index), sources[index])
+        torch.testing.assert_close(actual, sources[index].float(), rtol=0, atol=0)
+        assert sum(t.numel() * t.element_size() for t in bank._rank_key_cache.values()) <= 64
+    oversized = torch.arange(32, dtype=torch.bfloat16)
+    actual = bank._rank_key_heads(SimpleNamespace(page_id=99), oversized)
+    torch.testing.assert_close(actual, oversized.float(), rtol=0, atol=0)
+    assert not bank._rank_key_cache
+    actual = bank._rank_key_heads(SimpleNamespace(page_id=0), sources[0])
+    torch.testing.assert_close(actual, sources[0].float(), rtol=0, atol=0)
+    bank._rank_key_cache.clear()
+    actual = bank._rank_key_heads(SimpleNamespace(page_id=1), sources[1])
+    torch.testing.assert_close(actual, sources[1].float(), rtol=0, atol=0)
+    assert bank._rank_key_cache_bytes == actual.numel() * actual.element_size()
+
+
+def _reference_page_analysis(queries, keys, page, mask, width, selected_heads):
+    """CPU reference for original full-scan score and evidence mathematics."""
+    count, heads, dim = queries.shape
+    key_heads = keys.shape[1]
+    empty = ((), (), 0, 0, float("-inf"), ())
+    if not mask.any():
+        return torch.full((count,), float("-inf")), (empty,) * count
+    logits = torch.einsum(
+        "qkrd,tkd->qtkr", queries.reshape(count, key_heads, heads // key_heads, dim), keys
+    ).flatten(start_dim=2) / dim**0.5
+    selected_heads = tuple(head for head in selected_heads if 0 <= head < heads)
+    if selected_heads:
+        keep = torch.zeros(heads, dtype=torch.bool)
+        keep[list(selected_heads)] = True
+        logits = logits.masked_fill(~keep, float("-inf"))
+    head_top = logits.topk(min(4, len(selected_heads) or heads), dim=2, sorted=False)
+    start, end = page.cognition_token_count, page.token_end
+    token_scores = head_top.values.mean(dim=2)[:, start:end]
+    width = min(max(1, width), token_scores.shape[1])
+    if width < 1 or not mask[start:end].any():
+        return torch.full((count,), float("-inf")), (empty,) * count
+    windows = token_scores.unfold(1, width, 1)
+    search = mask[start:end].unfold(0, width, 1)
+    finite = search.unsqueeze(0) & torch.isfinite(windows)
+    top = windows.masked_fill(~finite, float("-inf")).topk(
+        min(4, width), dim=2, sorted=True
+    )
+    support = top.values.mean(dim=2).masked_fill(
+        finite.sum(dim=2) < min(4, width), float("-inf")
+    )
+    scores, best = support.max(dim=1)
+    groups = head_top.indices // (heads // key_heads)
+    evidence = []
+    for row, window in enumerate(best.tolist()):
+        offsets = [
+            offset for offset in top.indices[row, window].tolist() if search[window, offset]
+        ]
+        raw = tuple(sorted(start + window + offset for offset in offsets))
+        positions = tuple(sorted(page.source_positions[index] for index in raw))
+        evidence.append(
+            (
+                raw,
+                positions,
+                page.source_positions[start + window],
+                page.source_positions[start + window + width - 1] + 1,
+                scores[row].item(),
+                tuple(sorted({group for index in raw for group in groups[row, index].tolist()})),
+            )
+        )
+    return scores, tuple(evidence)
+
+
+@pytest.mark.parametrize("selected_heads", [(), (0, 3, 5), (99,)])
+@pytest.mark.parametrize("mode", ["random", "ties", "nonfinite", "short", "sparse", "empty", "prefix_only"])
+def test_score_only_and_shortlisted_evidence_match_cpu_reference(selected_heads, mode):
+    generator = torch.Generator().manual_seed(1789)
+    queries = torch.randn(3, 8, 4, generator=generator)
+    keys = torch.randn(19, 2, 4, generator=generator)
+    page = SimpleNamespace(
+        cognition_token_count=2,
+        token_end=5 if mode == "short" else 17,
+        source_positions=tuple(100 + index * 3 for index in range(19)),
+    )
+    mask = torch.ones(19, dtype=torch.bool)
+    mask[[0, 1, 7, 11, 18]] = False
+    if mode == "ties":
+        queries.fill_(1)
+        keys.fill_(1)
+    elif mode == "nonfinite":
+        keys[4] = float("nan")
+        keys[6] = float("inf")
+    elif mode in {"sparse", "empty", "prefix_only"}:
+        mask.zero_()
+        if mode == "sparse":
+            mask[3] = True
+        elif mode == "prefix_only":
+            mask[0] = True
+    bank = TensorBank.__new__(TensorBank)
+    bank.span_tokens = 6
+    bank.qk_query_heads = selected_heads
+    bank._token_search_mask = lambda _page, _available: mask
+    expected_scores, expected_evidence = _reference_page_analysis(
+        queries, keys, page, mask, bank.span_tokens, selected_heads
+    )
+    scores = bank._page_query_scores(queries, page, keys)
+    evidence_scores, evidence = bank._page_query_analysis(queries, page, keys)
+    torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
+    torch.testing.assert_close(evidence_scores, expected_scores, rtol=0, atol=0)
+    assert tuple(
+        (
+            item.raw_positions,
+            item.source_positions,
+            item.window_start,
+            item.window_end,
+            item.support_score,
+            item.head_groups,
+        )
+        for item in evidence
+    ) == expected_evidence
+
+
+def test_robust_score_background_keeps_nonfinite_and_degenerate_rows():
+    scores = torch.tensor(
+        [
+            [1.0, 2.0, 4.0, float("-inf"), float("nan")],
+            [2.0, 2.0, 2.0, float("inf"), float("nan")],
+            [float("-inf"), float("nan"), float("inf"), float("nan"), float("-inf")],
+        ]
+    )
+    actual, medians, scales = TensorBank._robust_standardize(scores)
+    expected = torch.full_like(scores, float("-inf"))
+    expected[0, :3] = torch.tensor([-1.0, 0.0, 2.0]) / 1.4826
+    expected[1, :3] = 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert medians[:2] == (2.0, 2.0)
+    assert scales[:2] == pytest.approx((1.4826, 1.0))
+    assert torch.isnan(torch.tensor([medians[2], scales[2]])).all()
+
+
 def _query_states(count, role="current_user"):
     return tuple(
         QueryStateSpan(role, index, index + 1, index, index + 1)
@@ -1274,6 +1418,16 @@ async def test_tensor_bank_document_group_collapses_shards_before_top_n(tmp_path
         trajectory_candidates[0].relative_path,
         "unrelated.md",
     }
+    grouped_candidate = trajectory_candidates[0]
+    assert grouped_candidate.document_group == "shared-trajectory"
+    assert grouped_candidate.group_member_count == 2
+    assert {item[1] for item in grouped_candidate.group_sources} == {
+        "trajectory-a.md", "trajectory-b.md"
+    }
+    unrelated = next(c for c in candidates if c.relative_path == "unrelated.md")
+    assert unrelated.document_group is None
+    assert unrelated.group_member_count == 1
+    assert [item[1] for item in unrelated.group_sources] == ["unrelated.md"]
 
 
 @pytest.mark.parametrize("same_group", (False, True))

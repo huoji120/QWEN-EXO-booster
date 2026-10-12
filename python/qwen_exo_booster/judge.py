@@ -16,10 +16,15 @@ from qwen_exo_booster.contracts import (
     InternalJobType,
     stable_digest,
 )
+from qwen_exo_booster.decision_context import CanonicalDecisionContext
 from qwen_exo_booster.internal_jobs import InternalJobRunner
 from qwen_exo_booster.knowledge import (
     KnowledgeCandidate,
     KnowledgeRepository,
+)
+from qwen_exo_booster.system_one import (
+    render_shared_decision_prompt,
+    shared_decision_prefix_key,
 )
 
 _REFERENCE_JUDGE_SYSTEM = (
@@ -87,6 +92,11 @@ class JudgeBatchResult:
     question_truncated: bool = False
     question_original_tokens: int = 0
     question_review_tokens: int = 0
+    decision_prefix_tokens: int = 0
+    decision_prefix_digest: str = ""
+    decision_context_digest: str = ""
+    lineage_namespace: str = ""
+    cached_tokens: int = 0
 
     @classmethod
     def combine(
@@ -145,6 +155,15 @@ class JudgeBatchResult:
                 int(getattr(batch, "question_review_tokens", 0))
                 for batch in batch_tuple
             ),
+            decision_prefix_tokens=max(
+                int(getattr(batch, "decision_prefix_tokens", 0)) for batch in batch_tuple
+            ),
+            decision_prefix_digest=str(getattr(last, "decision_prefix_digest", "")),
+            decision_context_digest=str(getattr(last, "decision_context_digest", "")),
+            lineage_namespace=str(getattr(last, "lineage_namespace", "")),
+            cached_tokens=sum(
+                int(getattr(batch, "cached_tokens", 0)) for batch in batch_tuple
+            ),
         )
 
 
@@ -158,12 +177,14 @@ class ReferenceJudge:
         model_fingerprint: str,
         timeout_seconds: float = 30.0,
         max_question_tokens: int = 2048,
+        max_prompt_tokens: int | None = None,
         max_reference_tokens: int = 4096,
         cache_size: int = 1024,
     ):
         if (
             timeout_seconds <= 0
             or max_question_tokens < 32
+            or (max_prompt_tokens is not None and max_prompt_tokens < 64)
             or max_reference_tokens < 64
             or cache_size < 1
         ):
@@ -175,7 +196,11 @@ class ReferenceJudge:
         # The runner reserves one scoring position, never an answer generation.
         self.token_budget = 1
         self.timeout_seconds = float(timeout_seconds)
+        # max_question_tokens is retained only for legacy non-canonical callers.
         self.max_question_tokens = int(max_question_tokens)
+        self.max_prompt_tokens = int(
+            max_prompt_tokens if max_prompt_tokens is not None else 32768
+        )
         self.max_reference_tokens = int(max_reference_tokens)
         self.cache_size = int(cache_size)
         self._option_token_ids = self._single_token_options()
@@ -210,18 +235,27 @@ class ReferenceJudge:
         candidates: Iterable[KnowledgeCandidate],
         telemetry_correlation_id: str,
         reuse_scope: str | None = None,
+        decision_context: CanonicalDecisionContext | None = None,
     ) -> JudgeBatchResult:
-        """Judge candidates; ``reuse_scope`` (conversation + original task)
-        lets a fresh decision for the same document be reused across turns."""
+        """Judge candidates against complete canonical context when supplied."""
         started = time.perf_counter()
         original_question = str(question or "")
         candidate_list = tuple(candidates)
-        shared_prefix_key = (
-            "qwen-exo:v1:reference-judge-binary-v1:"
-            + stable_digest(
-                self.model_fingerprint, _REFERENCE_JUDGE_SYSTEM, original_question
-            )[:24]
-        )
+        if decision_context is not None:
+            shared_prefix_key = shared_decision_prefix_key(
+                self.model_fingerprint, decision_context
+            )
+            context_digest = decision_context.digest
+            lineage_namespace = decision_context.lineage_namespace
+        else:
+            shared_prefix_key = (
+                "qwen-exo:v1:reference-judge-binary-v1:"
+                + stable_digest(
+                    self.model_fingerprint, _REFERENCE_JUDGE_SYSTEM, original_question
+                )[:24]
+            )
+            context_digest = ""
+            lineage_namespace = ""
         decisions = [
             self._decision(
                 parent_request_id, original_question, candidate,
@@ -230,7 +264,17 @@ class ReferenceJudge:
             for candidate in candidate_list
         ]
         try:
-            bounded_question = self._bounded_question(original_question)
+            if decision_context is None:
+                bounded_question = self._bounded_question(original_question)
+            else:
+                if not isinstance(decision_context, CanonicalDecisionContext):
+                    raise TypeError("decision_context must be CanonicalDecisionContext")
+                bounded_question = _BoundedQuestion(
+                    text=decision_context.text,
+                    original_tokens=decision_context.token_count,
+                    review_tokens=decision_context.token_count,
+                    truncated=False,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -244,20 +288,64 @@ class ReferenceJudge:
                 prompt_tokens=0,
                 completion_tokens=0,
                 presented_candidate_count=len(candidate_list),
+                decision_context_digest=context_digest,
+                lineage_namespace=lineage_namespace,
             )
-        deadline = time.monotonic() + self.timeout_seconds
+        deadline = time.monotonic() + (
+            max(self.timeout_seconds, 120.0)
+            if decision_context is not None
+            else self.timeout_seconds
+        )
         pending: list[tuple[int, str, tuple[int, ...]]] = []
         session_keys: dict[int, str] = {}
         cache_hits = 0
+        decision_prefix_tokens = 0
+        decision_prefix_digest = ""
         for index, candidate in enumerate(candidate_list):
             try:
-                prompt = self._render_prompt(
-                    question=bounded_question.text,
-                    reference=self._candidate_reference(candidate),
+                reference = self._candidate_reference(candidate)
+                role_question = (
+                    "Evaluate the supplied reference against the complete canonical "
+                    "decision context above. Do not repeat or summarize that context."
+                    if decision_context is not None
+                    else bounded_question.text
+                )
+                role_content = self._role_content(
+                    question=role_question,
+                    reference=reference,
                     lane=candidate.lane,
+                    source_group=candidate.document_group,
+                    source_path=candidate.relative_path,
+                    source_digest=candidate.reference_digest,
+                    group_member_count=candidate.group_member_count,
                     scope_note=candidate.scope_note,
                 )
-                cache_key = self._cache_key(original_question, candidate, prompt)
+                if decision_context is None:
+                    prompt = self._render_prompt(
+                        question=bounded_question.text,
+                        reference=reference,
+                        lane=candidate.lane,
+                        source_group=candidate.document_group,
+                        source_path=candidate.relative_path,
+                        source_digest=candidate.reference_digest,
+                        group_member_count=candidate.group_member_count,
+                        scope_note=candidate.scope_note,
+                    )
+                    prefix = tuple(self.tokenizer.encode(prompt, add_special_tokens=False))
+                else:
+                    rendered = render_shared_decision_prompt(
+                        self.tokenizer, decision_context, role_content
+                    )
+                    prefix = rendered.token_ids
+                    decision_prefix_tokens = rendered.prefix_token_count
+                    decision_prefix_digest = rendered.prefix_digest
+                    if len(prefix) > self.max_prompt_tokens:
+                        raise ValueError(
+                            f"canonical judge prompt has {len(prefix)} tokens; "
+                            f"the limit is {self.max_prompt_tokens}"
+                        )
+                cache_identity = prompt if decision_context is None else role_content
+                cache_key = self._cache_key(original_question, candidate, cache_identity)
                 async with self._cache_lock:
                     cached = self._decision_cache.get(cache_key)
                     if cached is not None:
@@ -270,7 +358,9 @@ class ReferenceJudge:
                     )
                     cache_hits += 1
                     continue
-                if reuse_scope:
+                # A canonical request represents the current full turn; do not reuse
+                # a stale session decision that omits newly arrived tool evidence.
+                if reuse_scope and decision_context is None:
                     session_key = self._session_key(reuse_scope, candidate)
                     reused = await self._session_decision(session_key)
                     if reused is not None:
@@ -281,7 +371,6 @@ class ReferenceJudge:
                         cache_hits += 1
                         continue
                     session_keys[index] = session_key
-                prefix = tuple(self.tokenizer.encode(prompt, add_special_tokens=False))
                 pending.append((index, cache_key, prefix))
             except asyncio.CancelledError:
                 raise
@@ -290,12 +379,20 @@ class ReferenceJudge:
                 continue
 
         prompt_tokens = 0
+        cached_tokens = 0
         executed_count = 0
         cache_updates: list[tuple[str, tuple[EligibilityStatus, float]]] = []
         session_updates: list[tuple[str, tuple[EligibilityStatus, float]]] = []
         wave_size = max(1, int(getattr(self.runner, "max_fanout", 32)))
-        for offset in range(0, len(pending), wave_size):
-            wave = pending[offset : offset + wave_size]
+        if decision_context is not None and len(pending) > 1:
+            waves = [pending[:1]]
+            waves.extend(
+                pending[offset : offset + wave_size]
+                for offset in range(1, len(pending), wave_size)
+            )
+        else:
+            waves = [pending[offset : offset + wave_size] for offset in range(0, len(pending), wave_size)]
+        for wave in waves:
             jobs = []
             for index, cache_key, _ in wave:
                 job_id = "qwen-exo-binary-judge-" + stable_digest(
@@ -347,6 +444,10 @@ class ReferenceJudge:
                 # Never cache failures or substitute autoregressive generation.
                 continue
             prompt_tokens += sum(result.prompt_tokens for result in results)
+            cached_tokens += sum(
+                int(getattr(result, "metadata", {}).get("cached_tokens", 0) or 0)
+                for result in results
+            )
             for (index, cache_key, _), margin in zip(wave, margins):
                 status = (
                     EligibilityStatus.ELIGIBLE if margin > 0
@@ -391,6 +492,11 @@ class ReferenceJudge:
             question_truncated=bounded_question.truncated,
             question_original_tokens=bounded_question.original_tokens,
             question_review_tokens=bounded_question.review_tokens,
+            decision_prefix_tokens=decision_prefix_tokens,
+            decision_prefix_digest=decision_prefix_digest,
+            decision_context_digest=context_digest,
+            lineage_namespace=lineage_namespace,
+            cached_tokens=cached_tokens,
         )
 
     def _bounded_question(self, question: str) -> _BoundedQuestion:
@@ -466,16 +572,54 @@ class ReferenceJudge:
             return document.content
         return candidate.reference_content
 
+    def _role_content(
+        self,
+        *,
+        question: str,
+        reference: str,
+        lane: str,
+        source_group: str | None = None,
+        source_path: str = "",
+        source_digest: str = "",
+        group_member_count: int = 1,
+        scope_note: str | None = None,
+    ) -> str:
+        payload = {
+            "lane": str(lane or "knowledge"),
+            "source_group": str(source_group or ""),
+            "source_path": source_path,
+            "source_digest": source_digest,
+            "group_member_count": group_member_count,
+            "source_boundary": "Only the supplied fragment is evidence. A group ID is provenance, not proof of applicability or permission to transfer source-task facts.",
+            "question": question,
+            "reference": self._bounded_reference(reference),
+        }
+        if scope_note:
+            payload["scope"] = str(scope_note)
+        return "REFERENCE JUDGE INSTRUCTIONS:\n" + _REFERENCE_JUDGE_SYSTEM + (
+            "\nREFERENCE PAYLOAD:\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        )
+
     def _render_prompt(
         self,
         *,
         question: str,
         reference: str,
         lane: str,
+        source_group: str | None = None,
+        source_path: str = "",
+        source_digest: str = "",
+        group_member_count: int = 1,
         scope_note: str | None = None,
     ) -> str:
         payload = {
             "lane": str(lane or "knowledge"),
+            "source_group": str(source_group or ""),
+            "source_path": source_path,
+            "source_digest": source_digest,
+            "group_member_count": group_member_count,
+            "source_boundary": "Only the supplied fragment is evidence. A group ID is provenance, not proof of applicability or permission to transfer source-task facts.",
             "question": question,
             "reference": self._bounded_reference(reference),
         }
@@ -501,6 +645,8 @@ class ReferenceJudge:
             _REFERENCE_JUDGE_SYSTEM,
             reuse_scope,
             candidate.lane,
+            str(candidate.document_group or ""),
+            str(candidate.group_sources),
             candidate.reference_digest,
             stable_digest(candidate.reference_content),
             str(candidate.scope_note or ""),

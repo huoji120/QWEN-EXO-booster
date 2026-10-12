@@ -2986,8 +2986,47 @@ class ServerArgs:
     ] = 8192
     qwen_exo_max_reasoning_tokens: A[
         int,
-        "Maximum Qwen reasoning tokens before QWEN-EXO closes the thinking phase.",
+        "Fallback reasoning-token budget for omitted/numeric effort and internal jobs; explicit tiers use their own budgets.",
     ] = 3072
+    qwen_exo_reasoning_budget_min: A[
+        int, "Maximum thinking tokens for explicit min/minimal reasoning effort."
+    ] = 512
+    qwen_exo_reasoning_budget_low: A[
+        int, "Maximum thinking tokens for explicit low reasoning effort."
+    ] = 1024
+    qwen_exo_reasoning_budget_medium: A[
+        int, "Maximum thinking tokens for explicit medium reasoning effort."
+    ] = 2048
+    qwen_exo_reasoning_budget_high: A[
+        int, "Maximum thinking tokens for explicit high reasoning effort."
+    ] = 4090
+    qwen_exo_reasoning_budget_xhigh: A[
+        int, "Maximum thinking tokens for explicit xhigh/max reasoning effort."
+    ] = 8192
+    qwen_exo_reasoning_mode: A[
+        str,
+        Arg(
+            help="When forced automatic reasoning is off: use the fixed fallback or dynamically select omitted effort; explicit effort wins.",
+            choices=["fixed", "dynamic"],
+        ),
+    ] = "fixed"
+    qwen_exo_force_auto_reasoning: A[
+        bool,
+        Arg(
+            help="Force automatic effort for Responses, overriding even explicit none and the reasoning mode; task-chain reuse controls how often JEV scores.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
+    qwen_exo_reasoning_session_once: A[
+        bool,
+        Arg(
+            help="Choose automatic effort once from the initial user task and reuse it for tool continuations; a new user task or session chooses again. Disable for per-request JEV scoring.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
+    qwen_exo_reasoning_dynamic_context_tokens: A[
+        int, "Maximum context tokens used by the dynamic reasoning-tier evaluator (at least 256)."
+    ] = 2048
     qwen_exo_enable_hybrid_prefix: A[
         bool,
         Arg(
@@ -4249,6 +4288,25 @@ class ServerArgs:
             raise ValueError("QWEN-EXO max output tokens must be positive")
         if self.qwen_exo_max_reasoning_tokens < 1:
             raise ValueError("QWEN-EXO max reasoning tokens must be positive")
+        if self.qwen_exo_reasoning_mode not in ("fixed", "dynamic"):
+            raise ValueError("qwen_exo_reasoning_mode must be fixed or dynamic")
+        if type(self.qwen_exo_force_auto_reasoning) is not bool:
+            raise ValueError("qwen_exo_force_auto_reasoning must be a boolean")
+        if type(self.qwen_exo_reasoning_session_once) is not bool:
+            raise ValueError("qwen_exo_reasoning_session_once must be a boolean")
+        if (
+            type(self.qwen_exo_reasoning_dynamic_context_tokens) is not int
+            or self.qwen_exo_reasoning_dynamic_context_tokens < 256
+        ):
+            raise ValueError(
+                "qwen_exo_reasoning_dynamic_context_tokens must be an integer >= 256"
+            )
+        for effort in ("min", "low", "medium", "high", "xhigh"):
+            budget = getattr(self, f"qwen_exo_reasoning_budget_{effort}")
+            if type(budget) is not int or budget < 1:
+                raise ValueError(
+                    f"qwen_exo_reasoning_budget_{effort} must be a positive integer"
+                )
         if self.qwen_exo_observer_mode != "off" and not self.disable_prefill_cuda_graph:
             logger.warning(
                 "QWEN-EXO observer keeps prefill eager for exact span capture; "

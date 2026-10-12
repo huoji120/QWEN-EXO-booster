@@ -15,12 +15,14 @@ import os
 import re
 import struct
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import msgspec
+import numpy as np
 import torch
 from torch import nn
 
@@ -35,6 +37,7 @@ class PLESourceIdentity(str, Enum):
 
 _PLE_SHARD_PATTERN = re.compile(r"^(?P<prefix>.+\.ngram_embedding)\.shard_(?P<index>\d+)\.weight$")
 _NATIVE_MARKER = "native-ple.json"
+_GPU_DECODE_MIN_ROWS = 1024
 
 
 class PLEShard(msgspec.Struct, frozen=True):
@@ -358,21 +361,100 @@ class PLEFileReader:
     def _read(self, path: Path, offset: int, size: int) -> bytes:
         if path not in self.files:
             self.files[path] = path.open("rb")
-            if self.backend == "mmap":
-                self.maps[path] = mmap.mmap(self.files[path].fileno(), 0, access=mmap.ACCESS_READ)
-        if self.backend == "pread":
-            data = os.pread(self.files[path].fileno(), size, offset)
-        else:
-            data = self.maps[path][offset : offset + size]
+        data = os.pread(self.files[path].fileno(), size, offset)
         if len(data) != size:
             raise OSError(f"incomplete PLE row at {path}:{offset}")
         return data
 
-    def read_rows(self, rows: list[int]) -> tuple[bytes, bytes]:
-        dim = self.manifest.embedding_dim
+    def _mapping(self, path: Path) -> mmap.mmap:
+        if path not in self.files:
+            self.files[path] = path.open("rb")
+        if path not in self.maps:
+            if os.fstat(self.files[path].fileno()).st_size == 0:
+                raise OSError(f"incomplete PLE row at {path}:0")
+            self.maps[path] = mmap.mmap(
+                self.files[path].fileno(), 0, access=mmap.ACCESS_READ
+            )
+        return self.maps[path]
+
+    def _read_mmap_rows(self, rows: list[int], data: bytearray, scales: bytearray):
+        try:
+            row_ids = np.asarray(rows, dtype=np.int64)
+        except OverflowError as exc:
+            raise IndexError("PLE row is outside the table") from exc
+        invalid = (row_ids < 0) | (row_ids >= self.manifest.total_rows)
+        if invalid.any():
+            row = row_ids[np.flatnonzero(invalid)[0]]
+            raise IndexError(f"PLE row {row} is outside [0, {self.manifest.total_rows})")
+        row_bytes = self.manifest.shards[0].row_bytes
+        output = np.ndarray((len(rows), row_bytes), dtype=np.uint8, buffer=data)
+        scale_output = (
+            np.ndarray((len(rows), 4), dtype=np.uint8, buffer=scales)
+            if scales else None
+        )
+        shard_ids = np.minimum(
+            row_ids // self.manifest.shard_size, len(self.manifest.shards) - 1
+        )
+        order = np.argsort(shard_ids, kind="stable")
+        grouped_shards = shard_ids[order]
+        boundaries = np.flatnonzero(grouped_shards[1:] != grouped_shards[:-1]) + 1
+        starts = np.concatenate(([0], boundaries))
+        ends = np.concatenate((boundaries, [len(rows)]))
+        # Only mapped views span a shard; each advanced-index temporary is <=4 MiB.
+        chunk_rows = max(1, (4 * 1024 * 1024) // max(row_bytes, 4))
+        for start, end in zip(starts, ends):
+            shard = self.manifest.shards[int(grouped_shards[start])]
+            mapping = self._mapping(shard.path)
+            positions = order[start:end]
+            local_rows = row_ids[positions] - shard.row_start
+            last_row = int(local_rows.max())
+            available_rows = min(
+                shard.row_end - shard.row_start,
+                max(0, (len(mapping) - shard.offset) // shard.row_bytes),
+            )
+            if local_rows.min() < 0 or last_row >= available_rows:
+                raise OSError(f"incomplete PLE row at {shard.path}:{shard.offset}")
+            row_view = scale_view = None
+            try:
+                row_view = np.ndarray(
+                    (available_rows, shard.row_bytes), dtype=np.uint8,
+                    buffer=mapping, offset=shard.offset,
+                )
+                if scale_output is not None and shard.scale_offset >= 0:
+                    per_row = shard.scale_row_bytes == 4 and self.manifest.scale_is_per_row
+                    scale_rows = last_row + 1 if per_row else 1
+                    if shard.scale_offset + scale_rows * 4 > len(mapping):
+                        raise OSError(f"incomplete PLE row at {shard.path}:{shard.scale_offset}")
+                    scale_view = np.ndarray(
+                        (scale_rows, 4), dtype=np.uint8,
+                        buffer=mapping, offset=shard.scale_offset,
+                    )
+                for chunk_start in range(0, len(positions), chunk_rows):
+                    chunk_end = chunk_start + chunk_rows
+                    dest = positions[chunk_start:chunk_end]
+                    indices = local_rows[chunk_start:chunk_end]
+                    output[dest] = row_view[indices]
+                    if scale_output is not None:
+                        if scale_view is None:
+                            scale_output[dest] = np.frombuffer(struct.pack("<f", 1.0), dtype=np.uint8)
+                        elif per_row:
+                            scale_output[dest] = scale_view[indices]
+                        else:
+                            scale_output[dest] = scale_view[0]
+            finally:
+                # No exported mmap view may survive a return or an exception.
+                row_view = scale_view = None
+
+    def read_rows(self, rows: list[int]) -> tuple[bytearray, bytearray]:
+        """Return owned writable row/scale buffers, independent of mmap lifetime."""
         data = bytearray(len(rows) * self.manifest.shards[0].row_bytes)
         scale_bytes = 4 if any(s.scale_row_bytes for s in self.manifest.shards) else 0
         scales = bytearray(len(rows) * scale_bytes)
+        if not rows:
+            return data, scales
+        if self.backend == "mmap":
+            self._read_mmap_rows(rows, data, scales)
+            return data, scales
         unique: dict[int, tuple[bytes, bytes]] = {}
         for i, row in enumerate(rows):
             item = unique.get(row)
@@ -395,7 +477,7 @@ class PLEFileReader:
             if scale_bytes:
                 scale_start = i * 4
                 scales[scale_start : scale_start + 4] = item[1]
-        return bytes(data), bytes(scales)
+        return data, scales
 
     def close(self):
         for mapping in self.maps.values():
@@ -406,9 +488,17 @@ class PLEFileReader:
         self.files.clear()
 
 
+@dataclass
+class _GatherPayload:
+    raw_data: bytearray | None = None
+    raw_scales: bytearray | None = None
+    decoded: torch.Tensor | None = None
+
+
 class PendingGather(msgspec.Struct):
     future: Future
     shape: tuple[int, ...]
+
 
 
 class NVMePLEEmbedding(nn.Module):
@@ -441,6 +531,19 @@ class NVMePLEEmbedding(nn.Module):
         self.register_buffer("weight_scale", torch.ones(1, dtype=torch.bfloat16))
         self.reader = PLEFileReader(self.manifest, envs.SGLANG_QWEN4_PLE_NVME_BACKEND.get())
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple-prefetch")
+        # Host/device leases are reused at high-water capacity and cannot be
+        # overwritten until the stream event after the last decode/copy signals.
+        self._staging_lock = Lock()
+        self._pinned_staging = None
+        self._pinned_raw = None
+        self._pinned_scales = None
+        self._cuda_raw = None
+        self._cuda_scales = None
+        self._staging_capacity = 0
+        self._staging_device = None
+        self._staging_event = None
+        self._staging_event_recorded = False
+        self._staging_event_device = None
 
     @property
     def source_dtype(self) -> torch.dtype:
@@ -456,32 +559,155 @@ class NVMePLEEmbedding(nn.Module):
     def allocate_output(self, shape, device):
         return torch.empty(shape, dtype=torch.bfloat16, device=device)
 
+    def _decode_raw(
+        self, raw_data: bytearray, raw_scales: bytearray, rows: int
+    ) -> torch.Tensor:
+        if not rows:
+            return torch.empty((0, self.embedding_dim), dtype=torch.bfloat16)
+        source_bytes = torch.frombuffer(raw_data, dtype=torch.uint8)
+        source = source_bytes.view(self.source_dtype).reshape(rows, self.embedding_dim)
+        if raw_scales:
+            scales = torch.frombuffer(raw_scales, dtype=torch.float32).reshape(rows, 1)
+            # Preserve FP8/F16/BF16 -> FP32 * FP32 -> BF16 rounding.
+            return source.float().mul_(scales).to(torch.bfloat16)
+        return source.to(torch.bfloat16)
+
+    def _read_and_decode(self, rows: list[int], raw_only: bool) -> _GatherPayload:
+        raw_data, raw_scales = self.reader.read_rows(rows)
+        if raw_only:
+            return _GatherPayload(raw_data=raw_data, raw_scales=raw_scales)
+        return _GatherPayload(
+            decoded=self._decode_raw(raw_data, raw_scales, len(rows))
+        )
+
+    def _release_staging(self):
+        if self._staging_event_recorded:
+            self._staging_event.synchronize()
+            self._staging_event_recorded = False
+
+    def _record_staging_event(self, stream):
+        if self._staging_event is None or self._staging_event_device != stream.device:
+            self._staging_event = torch.cuda.Event()
+            self._staging_event_device = stream.device
+        self._staging_event.record(stream)
+        self._staging_event_recorded = True
+
+    def _ensure_raw_staging(self, rows: int, device: torch.device):
+        if self._staging_device != device:
+            self._cuda_raw = None
+            self._cuda_scales = None
+            self._staging_device = device
+        if self._pinned_raw is None or self._staging_capacity < rows:
+            self._pinned_raw = torch.empty(
+                (rows, self.embedding_dim), dtype=torch.uint8, pin_memory=True
+            )
+            self._pinned_scales = torch.empty(rows, dtype=torch.float32, pin_memory=True)
+            self._cuda_raw = torch.empty(
+                (rows, self.embedding_dim), dtype=torch.uint8, device=device
+            )
+            self._cuda_scales = torch.empty(rows, dtype=torch.float32, device=device)
+            self._staging_capacity = rows
+        elif self._cuda_raw is None:
+            self._cuda_raw = torch.empty(
+                (self._staging_capacity, self.embedding_dim), dtype=torch.uint8, device=device
+            )
+            self._cuda_scales = torch.empty(
+                self._staging_capacity, dtype=torch.float32, device=device
+            )
+
+    def _copy_decoded(self, decoded: torch.Tensor, output: torch.Tensor, shape, device, stream):
+        with self._staging_lock, torch.cuda.device(device):
+            self._release_staging()
+            rows = decoded.shape[0]
+            if self._pinned_staging is None or self._pinned_staging.shape[0] < rows:
+                self._pinned_staging = torch.empty(
+                    (rows, self.embedding_dim), dtype=torch.bfloat16, pin_memory=True
+                )
+            staging = self._pinned_staging[:rows]
+            staging.copy_(decoded)
+            copy_stream = stream if stream is not None else torch.cuda.current_stream(device)
+            with torch.cuda.stream(copy_stream):
+                try:
+                    output.copy_(staging.view(shape), non_blocking=True)
+                finally:
+                    self._record_staging_event(copy_stream)
+
     def start_gather(self, input_ids: torch.Tensor) -> PendingGather:
         if get_is_capture_mode():
             raise ValueError("disk PLE requires CUDA graph backends disabled")
         ids = input_ids.detach().reshape(-1).to(device="cpu", dtype=torch.int64).tolist()
-        return PendingGather(future=self.executor.submit(self.reader.read_rows, ids), shape=tuple(input_ids.shape))
+        raw_only = (
+            input_ids.is_cuda
+            and self.manifest.storage == "fp8_e4m3_rowscale"
+            and len(ids) >= _GPU_DECODE_MIN_ROWS
+        )
+        return PendingGather(
+            future=self.executor.submit(self._read_and_decode, ids, raw_only),
+            shape=tuple(input_ids.shape),
+        )
 
-    def finish_gather(self, pending: PendingGather, device: torch.device, out=None, stream=None):
-        raw_data, raw_scales = pending.future.result()
+    def finish_gather(
+        self, pending: PendingGather, device: torch.device, out=None, stream=None
+    ):
+        if get_is_capture_mode():
+            raise ValueError("disk PLE gather must finish before CUDA graph capture")
+        payload = pending.future.result()
         shape = (*pending.shape, self.embedding_dim)
         output = out if out is not None else self.allocate_output(shape, device)
-        if tuple(output.shape) != shape or output.device != device or output.dtype != torch.bfloat16:
+        if (
+            tuple(output.shape) != shape
+            or output.device != device
+            or output.dtype != torch.bfloat16
+        ):
             raise ValueError("invalid native PLE output buffer")
         row_count = math.prod(pending.shape)
         if row_count == 0:
             return output
-        source_bytes = torch.frombuffer(bytearray(raw_data), dtype=torch.uint8)
-        source = source_bytes.view(self.source_dtype).reshape(row_count, self.embedding_dim)
-        if raw_scales:
-            scales = torch.frombuffer(bytearray(raw_scales), dtype=torch.float32).reshape(row_count, 1)
-            decoded = (source.float() * scales).to(torch.bfloat16)
-        else:
-            decoded = source.to(torch.bfloat16)
-        if device.type == "cuda":
-            decoded = decoded.pin_memory()
-        with torch.cuda.stream(stream) if stream is not None and device.type == "cuda" else nullcontext():
-            output.copy_(decoded.view(shape), non_blocking=device.type == "cuda")
+
+        raw_fast = (
+            payload.raw_data is not None
+            and device.type == "cuda"
+            and output.is_contiguous()
+        )
+        if not raw_fast:
+            decoded = payload.decoded
+            if decoded is None:
+                decoded = self._decode_raw(payload.raw_data, payload.raw_scales, row_count)
+            if device.type != "cuda":
+                output.copy_(decoded.view(shape))
+            else:
+                self._copy_decoded(decoded, output, shape, device, stream)
+            return output
+
+        from sglang.kernels.ops.qwen4_ple import fused_qwen4_fp8_rowscale
+
+        with self._staging_lock, torch.cuda.device(device):
+            self._release_staging()
+            self._ensure_raw_staging(row_count, device)
+            raw = torch.frombuffer(payload.raw_data, dtype=torch.uint8).view(
+                row_count, self.embedding_dim
+            )
+            scales = torch.frombuffer(payload.raw_scales, dtype=torch.float32)
+            self._pinned_raw[:row_count].copy_(raw)
+            self._pinned_scales[:row_count].copy_(scales)
+            copy_stream = stream if stream is not None else torch.cuda.current_stream(device)
+            with torch.cuda.stream(copy_stream):
+                try:
+                    self._cuda_raw[:row_count].copy_(
+                        self._pinned_raw[:row_count], non_blocking=True
+                    )
+                    self._cuda_scales[:row_count].copy_(
+                        self._pinned_scales[:row_count], non_blocking=True
+                    )
+                    fused_qwen4_fp8_rowscale(
+                        self._cuda_raw[:row_count],
+                        self._cuda_scales[:row_count],
+                        output.view(row_count, self.embedding_dim),
+                    )
+                finally:
+                    # Protect both DMA sources and decode inputs if compilation
+                    # or launch fails after either transfer has been enqueued.
+                    self._record_staging_event(copy_stream)
         return output
 
     def gather(self, input_ids, out=None):
@@ -495,6 +721,17 @@ class NVMePLEEmbedding(nn.Module):
 
     def close(self):
         self.executor.shutdown(wait=True)
+        with self._staging_lock:
+            self._release_staging()
+            self._pinned_staging = None
+            self._pinned_raw = None
+            self._pinned_scales = None
+            self._cuda_raw = None
+            self._cuda_scales = None
+            self._staging_capacity = 0
+            self._staging_device = None
+            self._staging_event = None
+            self._staging_event_device = None
         self.reader.close()
 
 

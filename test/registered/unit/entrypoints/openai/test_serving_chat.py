@@ -14,6 +14,7 @@ import json
 import unittest
 import uuid
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -23,10 +24,10 @@ from fastapi import Request
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    ResponsesRequest,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
-    _normalize_model_reasoning_effort,
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -472,49 +473,169 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertEqual(req.reasoning_effort, "high")
 
-    def test_qwen38_effort_aliases_are_template_scoped(self):
-        self.tm.tokenizer.chat_template = (
-            "Supported types are xhigh (default), medium, and low."
-        )
-        for effort, expected in {
-            "minimal": "low",
-            "high": "xhigh",
-            "max": "xhigh",
-            "low": "low",
-            "medium": "medium",
-            "xhigh": "xhigh",
-        }.items():
-            with self.subTest(effort=effort):
-                self.assertEqual(
-                    _normalize_model_reasoning_effort(self.tm.tokenizer, effort),
-                    expected,
-                )
+    def test_qwen38_efforts_render_without_changing_requested_tier(self):
+        from jinja2 import Environment, TemplateError
 
-        self.tm.tokenizer.chat_template = "generic template"
-        self.assertEqual(
-            _normalize_model_reasoning_effort(self.tm.tokenizer, "high"), "high"
-        )
-
-    def test_qwen38_effort_alias_is_forwarded_to_template(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.tm.tokenizer.chat_template = (
-            "Supported types are xhigh (default), medium, and low."
-        )
-        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "What is 2+2?"}],
-            reasoning_effort="high",
-        )
+        # Exact existing-ple checkpoint template, captured read-only from js4090.
+        template = Path(__file__).with_name("fixtures").joinpath(
+            "qwen38_flash_next_chat_template.jinja"
+        ).read_text(encoding="utf-8")
+        self.tm.tokenizer.chat_template = template
+        env = Environment()
 
-        self.chat._process_messages(req, is_multimodal=False)
+        def raise_exception(message):
+            raise TemplateError(message)
 
-        self.assertEqual(req.reasoning_effort, "xhigh")
-        self.assertEqual(
-            self.tm.tokenizer.apply_chat_template.call_args.kwargs["reasoning_effort"],
-            "xhigh",
-        )
+        env.globals["raise_exception"] = raise_exception
+        compiled = env.from_string(template)
+        for unsupported in ("min", "minimal", "high", "max"):
+            with self.subTest(native_rejects=unsupported), self.assertRaises(TemplateError):
+                compiled.render(
+                    messages=[{"role": "user", "content": "Hello"}],
+                    reasoning_effort=unsupported,
+                    enable_thinking=True,
+                    add_generation_prompt=True,
+                )
+        rendered = []
+
+        def render(messages, **kwargs):
+            result = compiled.render(messages=messages, **kwargs)
+            rendered.append(result)
+            return result
+
+        self.tm.tokenizer.apply_chat_template.side_effect = render
+        for effort, native in {
+            "min": "low", "minimal": "low", "low": "low",
+            "medium": "medium", "high": "xhigh", "xhigh": "xhigh",
+            "max": "xhigh", "none": "none",
+        }.items():
+            for explicit_kwargs in (False, True):
+                with self.subTest(effort=effort, explicit_kwargs=explicit_kwargs):
+                    response_request = ResponsesRequest(
+                        model="x", input="What is 2+2?",
+                        reasoning={"effort": effort},
+                    )
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "What is 2+2?"}],
+                        reasoning_effort=effort,
+                        chat_template_kwargs=(
+                            {"reasoning_effort": effort} if explicit_kwargs else None
+                        ),
+                    )
+                    self.chat._process_messages(request, is_multimodal=False)
+                    self.assertEqual(request.reasoning_effort, effort)
+                    self.assertEqual(response_request.reasoning.effort, effort)
+                    if explicit_kwargs:
+                        self.assertEqual(
+                            request.chat_template_kwargs["reasoning_effort"], effort
+                        )
+                    if native in ("low", "xhigh"):
+                        self.assertIn(f"Reasoning effort is set to {native}.", rendered[-1])
+                    else:
+                        self.assertNotIn("Reasoning effort is set to", rendered[-1])
+                    self.assertTrue(rendered[-1].endswith(
+                        "<think>\n\n</think>\n\n" if effort == "none" else "<think>\n"
+                    ))
+
+    def test_automatic_budgets_share_the_exact_long_template_prefix(self):
+        from jinja2 import Environment, TemplateError
+        from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        template = Path(__file__).with_name("fixtures").joinpath(
+            "qwen38_flash_next_chat_template.jinja"
+        ).read_text(encoding="utf-8")
+        self.tm.tokenizer.chat_template = template
+        env = Environment()
+
+        def raise_exception(message):
+            raise TemplateError(message)
+
+        env.globals["raise_exception"] = raise_exception
+        compiled = env.from_string(template)
+        rendered = []
+
+        def render(messages, **kwargs):
+            result = compiled.render(messages=messages, **kwargs)
+            rendered.append(result)
+            return result
+
+        self.tm.tokenizer.apply_chat_template.side_effect = render
+        # An existing default must not make the automatic prefix tier-dependent.
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "low"}
+        serving = object.__new__(OpenAIServingResponses)
+        serving.tokenizer_manager = self.tm
+        serving._process_messages = self.chat._process_messages
+        serving.msg_store = {}
+
+        class Runtime:
+            config = SimpleNamespace(force_auto_reasoning=True, reasoning_mode="dynamic")
+            effort = "min"
+
+            async def plan_reasoning_effort(self, request_id, messages, **kwargs):
+                return self.effort
+
+        runtime = Runtime()
+        history = [
+            {"role": "user", "content": "Synthetic task.\n" + "Stable observation.\n" * 2048},
+            {"type": "function_call", "call_id": "call_synthetic", "name": "inspect", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_synthetic", "output": "Synthetic observation ready."},
+        ]
+
+        async def exercise():
+            for effort in ("min", "low", "medium", "high", "xhigh"):
+                runtime.effort = effort
+                original = ResponsesRequest(model="x", input=history, reasoning={"effort": "none"})
+                selected = await serving._resolve_reasoning_effort(original, None, runtime)
+                # The same internal state must survive normal request rebuilds.
+                selected = selected.model_copy(update={"metadata": {"rebuilt": True}})
+                await serving._make_request(selected, None, self.tm.tokenizer)
+                self.assertEqual(serving._requested_reasoning_effort(selected), effort)
+                self.assertNotIn("_qwen_exo_auto_reasoning", selected.model_dump())
+            self.assertTrue(all(text == rendered[0] for text in rendered[1:]))
+            self.assertIn("Reasoning effort is set to xhigh.", rendered[0])
+            self.assertTrue(rendered[0].endswith("<think>\n"))
+
+            runtime.config.force_auto_reasoning = False
+            forged = ResponsesRequest(
+                model="x", input=history, reasoning={"effort": "low"},
+                _qwen_exo_auto_reasoning=True,
+            )
+            manual = await serving._resolve_reasoning_effort(forged, None, runtime)
+            await serving._make_request(manual, None, self.tm.tokenizer)
+            self.assertIn("Reasoning effort is set to low.", rendered[-1])
+            self.assertNotEqual(rendered[0], rendered[-1])
+
+        get_or_create_event_loop().run_until_complete(exercise())
+
+    def test_nonmatching_template_preserves_effort(self):
+        from jinja2 import Environment
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        template = "{{ reasoning_effort }}"
+        self.tm.tokenizer.chat_template = template
+        rendered = []
+
+        def render(messages, **kwargs):
+            result = Environment().from_string(template).render(**kwargs)
+            rendered.append(result)
+            return result
+
+        self.tm.tokenizer.apply_chat_template.side_effect = render
+        for effort in ("min", "minimal", "low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                request = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hello"}],
+                    reasoning_effort=effort,
+                )
+                self.chat._process_messages(request, is_multimodal=False)
+                self.assertEqual(rendered[-1], effort)
+                self.assertEqual(request.reasoning_effort, effort)
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None

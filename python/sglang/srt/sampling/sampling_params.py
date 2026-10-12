@@ -38,6 +38,10 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+# Custom param carrying {"end_token_id", "max_tokens"}: the request keeps
+# generating its answer after a natural reasoning end, but a still-open
+# reasoning phase finishes with FINISH_LENGTH at its token budget.
+QWEN_EXO_REASONING_BUDGET_KEY = "qwen_exo_reasoning_budget"
 
 logger = logging.getLogger(__name__)
 
