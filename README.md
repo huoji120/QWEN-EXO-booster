@@ -126,6 +126,11 @@ Responses 的动态选档与记忆 Judge 分开处理：动态选档只把当前
 
 Responses 在单次请求内复用同一份已渲染文本、相同编码选项的 token IDs；prompt 重建后不复用旧结果，缓存不跨请求。默认特殊 token 编码与内部无特殊 token 编码分别保留。纯文本 QWEN-EXO 生成将已编码 IDs 与原文一并交给原生引擎，避免重复编码；Harmony 和多模态仍走原处理路径。该优化减少工具结果回传后的 CPU 前处理，不改变 THINK、上下文上限、工具语义或 KV/GDN 状态。
 
+原生 Flash-Next EAGLE/MTP 在单卡、普通非混批 chunked-prefill 路径下，每个已调度的 prefill 后让仍在生成的请求获得一次 decode 机会，避免连续长 prefill 饿死流式输出；没有生成请求时持续 prefill，没有新 prefill 时持续 decode。该调度不启用 speculative mixed-chunk，也不释放停放请求的 KV/GDN/PLE 状态，不改变采样、思考预算或缓存隔离。PP、disaggregation、DP 同步、HiSparse、hybrid-SWA、DLLM 等未验证路径保持原行为。
+
+一次三轮 64K 冷 prefill 与 512-token 生成重叠实验中，最长流式停顿中位数从 5.56 秒降至 1.46 秒，生成总耗时从 14.92 秒降至 10.50 秒；冷请求耗时从 5.93 秒增至 6.36 秒。两侧均使用相同输入哈希、MTP/Graph 配置和输出上限，冷请求缓存为 0，后续热请求均命中 61440 tokens；测试期间生产流量仍可进入，因此这是该批样本的调度权衡，不是全负载性能保证或 GPU 算子加速倍率。
+
+
 ### 可观测性：不是黑盒魔法
 
 一次请求到底看到了哪些 query、命中了哪些 K、哪些候选被 Judge 拒绝、是否使用了原生状态、是否发生了 Think 截断，都可以通过控制台和 telemetry 查看。性能提升可以测量，错误召回可以定位，反思记忆可以回滚——**未经验证的"模型好像记住了"不会被当成事实**。
@@ -264,6 +269,12 @@ PLE 从原始 safetensors 按需读行，不把约 51GB 表常驻 CPU/GPU；`pre
 选择 `QWEN_EXO_NATIVE_PLE_BACKEND=mmap` 时，reader 按 shard 批量收集行与 scale，保持原始顺序和重复行；映射不等于整表常驻。大批量 CUDA 原生逐行 FP8 查询传输原始 FP8 与 FP32 scale，由融合内核执行 FP32 乘法后转 BF16，直接填入已有输出 buffer；小批次、CPU、非连续输出及其他存储格式保留 CPU 解码。回归覆盖有限值逐位一致、带符号零和 NaN 类别。pinned／CUDA staging 在前次异步复制及解码完成后才复用，磁盘读取和准备不进入 graph capture。
 
 QSA 普通 prefill 的地址与累计长度计划只在当前 forward 内共享，各层仍读取自己的 KV；decode graph 保留固定容量 buffer，但仅提取和缩放当前捕获形状（含 dummy rows）。这些优化不改变原生路由、稀疏选择、接受状态或 prefill/decode 调度策略；组件提速不能直接当作端到端加速倍数。
+
+带缓存前缀的普通 QSA prefill 仅在纯 GPU KV pool 中直接将原生稀疏位置映射到 KV bank，在 attention 内读取、转换并缩放选中行，不再物化完整前缀 K/V。`QwenHostFP8KVPool` 只要 `gpu_size < size`（存在主机后缀），就保留每层一次 `get_kv_tokens` 物化完整前缀的基线，再执行 cast/scale 和 dense chunk attention；即使本批选中位置恰好全部在 GPU，也不启用 direct 路径。不从 token 数推断驻留位置，不每层同步读取设备槽位；未经验证的主机分块去重暂存候选不进入此路径。query 长度上界从现有 CPU metadata 每个 forward 计算一次，避免每层读取 GPU 标量。保留 FP8→query dtype→scale→query dtype 的舍入顺序和当前 chunk 写入；无前缀 prefill、decode 和 MTP verify 路径不变。不同 tile/warp 的累加只保证数值容差，不宣称逐位一致。
+
+这是降低临时显存峰值的取舍，不保证所有 chunk 提速：SM120、单请求、全部选中 KV 在 GPU、128K 前缀和 `24/2` 个 Q/KV heads、head dim 256、Top-K 2051 的隔离单层 A/B 中，256-token 增量约 `1.27→0.72ms`、临时峰值 `259.5→3MiB`；1024-token 增量约 `1.79→2.27ms`、`272→12MiB`；4096-token 增量约 `3.98→8.21ms`、`312→48MiB`。基线使用原 GPU-first pool 的 gather/cast/scale 路径，时间为五次交替测量的中位数；服务负载在测量前后采样为空，但 GPU 并非独占。上述不是整模型 TTFT、常驻显存下降或可直接增加 KV 容量的证明，也不代表已部署；主机驻留行仅验证正确性，未测性能。
+
+以上安全边界是本地候选的适用约束，不代表重新部署。线上两个 prefill 文件已回滚；主机分块暂存没有可追溯的基准结果，不能将上述 GPU 单层数据当作它的性能证据。
 
 Host-capable QSA 的选中 KV 路径将槽位清空、逻辑位置映射及 K/V 两次读取合为一个 Triton kernel；不分配选中槽位 scratch，保留原有 BF16 舍入和独立 scale 操作。CUDA 验证覆盖两种 FP8、GPU/主机混合驻留、图重放、因果行与 padding。SM120 上 `2×256` KV 几何、verify width 4、Top-K 2051 的隔离微基准中，batch 1/2 全 GPU 冷读约快 10%，热读耗时约降 40%；50% 主机读取基本持平。这不是端到端吞吐承诺，混入其他请求的测量不计入结论。
 

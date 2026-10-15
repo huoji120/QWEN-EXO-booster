@@ -74,7 +74,7 @@ class WorkClassAdmission:
 
 
 class BackgroundPrefillFairness:
-    """Alternate background prefill with useful foreground work at chunk boundaries.
+    """Track background priority and useful decode turns at chunk boundaries.
 
     No request, cache, or token ownership lives here. An unscheduled chunk stays
     in Scheduler.chunked_req and uses the existing resume/abort/pause paths.
@@ -82,6 +82,11 @@ class BackgroundPrefillFairness:
 
     def __init__(self) -> None:
         self.last_was_background_prefill = False
+        self.last_was_prefill = False
+
+    def should_yield_to_decode(self, *, decoding: bool) -> bool:
+        """One admitted prefill buys one decode turn, never an idle turn."""
+        return self.last_was_prefill and decoding
 
     def should_yield(self, *, foreground_waiting: bool, foreground_decoding: bool) -> bool:
         return self.last_was_background_prefill and (
@@ -90,9 +95,11 @@ class BackgroundPrefillFairness:
 
     def record_prefill(self, reqs: Iterable[Any]) -> None:
         self.last_was_background_prefill = any(is_background_request(req) for req in reqs)
+        self.last_was_prefill = True
 
     def record_decode(self) -> None:
         self.last_was_background_prefill = False
+        self.last_was_prefill = False
 
 
 def fits_complete_prefill(req: Any, *, remaining_chunk_tokens: int, page_size: int) -> bool:

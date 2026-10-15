@@ -3634,11 +3634,17 @@ class Scheduler(
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
-            prefill_plan = self.get_new_batch_prefill(
-                running_batch, last_batch=last_batch
-            )
-            new_batch = prefill_plan.batch_to_run
-            running_batch = prefill_plan.running_batch
+            if self._should_yield_qwen4_prefill_to_decode(running_batch):
+                # The chunk was stashed/excluded above. Keep its request slot,
+                # KV, recurrent state and PLE row resident; do not run admission,
+                # rematch a prefix, or mutate the parked chunk on a decode turn.
+                new_batch = None
+            else:
+                prefill_plan = self.get_new_batch_prefill(
+                    running_batch, last_batch=last_batch
+                )
+                new_batch = prefill_plan.batch_to_run
+                running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -3683,6 +3689,33 @@ class Scheduler(
                 ret.fpm_start_time = self._fpm_batch_t0
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _should_yield_qwen4_prefill_to_decode(
+        self, running_batch: ScheduleBatch
+    ) -> bool:
+        fairness = getattr(self, "_qwen_exo_prefill_fairness", None)
+        if fairness is None or not fairness.last_was_prefill:
+            return False
+        # Only the native Flash-Next path audited for parked KV/GDN/PLE owners.
+        # In particular, spec must not use enable_mixed_chunk, and rank-local
+        # decisions must not diverge under DP synchronization or PP/disagg.
+        if (
+            self.spec_algorithm != SpeculativeAlgorithm.EAGLE
+            or not self._supports_target_only_lane()
+            or self.ps.pp_size != 1
+            or self.disaggregation_mode != DisaggregationMode.NULL
+            or self.require_mlp_sync
+            or self.enable_hisparse
+            or self.is_hybrid_swa
+            or self.dllm_config is not None
+            or self.chunked_prefill_size is None
+            or self.is_mixed_chunk
+        ):
+            return False
+        return fairness.should_yield_to_decode(
+            decoding=not running_batch.is_prefill_only
+            and any(not req.finished() for req in running_batch.reqs)
+        )
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_server_args().pp_max_micro_batch_size - running_bs

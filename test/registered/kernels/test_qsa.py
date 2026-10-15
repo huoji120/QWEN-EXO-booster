@@ -904,6 +904,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
             cu_seqlens_q=torch.tensor([0, 15], dtype=torch.int64, device="cuda"),
             cu_seqlens_k=None,
             max_sequence_len=15,
+            max_query_len=15,
         ),
     )
     layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)

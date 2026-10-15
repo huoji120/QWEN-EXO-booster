@@ -39,9 +39,11 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
+    sparse_gqa_fwd_interface_triton_paged,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostFP8KVPool
+
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,7 @@ class QwenSparsePrefillMetadata(msgspec.Struct, frozen=True):
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: Optional[torch.Tensor]
     max_sequence_len: int
+    max_query_len: int
     kv_locations: Optional[torch.Tensor] = None
 
 
@@ -760,6 +763,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     if has_prefix else None
                 ),
                 max_sequence_len=max(lengths_cpu, default=1),
+                max_query_len=max(extend_cpu, default=0),
                 kv_locations=kv_locations,
             )
             if (
@@ -1528,31 +1532,63 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        # The validated chunk-prefill kernel consumes tightly packed full-context
-        # K/V. Current-chunk K/V has already been committed to the cache above.
+        # Current-chunk K/V was committed above; speculative modes returned
+        # before this ordinary-extend path.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
-        locations = prefill.kv_locations
-        if isinstance(pool.full_kv_pool, QwenHostFP8KVPool):
-            keys, values = pool.get_kv_tokens(layer.layer_id, locations, q.dtype)
-        else:
-            keys = k_buffer.index_select(0, locations).to(q.dtype)
-            values = v_buffer.index_select(0, locations).to(q.dtype)
-        if k_buffer.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        full_pool = pool.full_kv_pool
+        if (
+            isinstance(full_pool, QwenHostFP8KVPool)
+            and full_pool.gpu_size < full_pool.size
+        ):
+            # A nonempty host suffix always retains the materialized baseline.
+            # Do not infer residency from token counts or inspect device slots
+            # per layer: even a currently GPU-resident selection belongs to a
+            # host-capable pool. Staged/deduplicated host chunks are unvalidated.
+            keys, values = pool.get_kv_tokens(
+                layer.layer_id, prefill.kv_locations, q.dtype
+            )
             if layer.k_scale_float is not None:
                 keys.mul_(layer.k_scale_float)
             if layer.v_scale_float is not None:
                 values.mul_(layer.v_scale_float)
-        output = sparse_gqa_fwd_interface_triton_ck(
-            q.contiguous(),
-            keys,
-            values,
+            output = sparse_gqa_fwd_interface_triton_ck(
+                q.contiguous(),
+                keys,
+                values,
+                topk_indices,
+                cu_seqlens_q,
+                prefill.cu_seqlens_k,
+                metadata.sequence_lengths,
+                layer.scaling,
+                max_q=prefill.max_query_len,
+            )
+            return self._pad_extend_output(output, num_output_rows)
+
+        # Pure GPU pools read selected slots directly without allocating a
+        # dense cached prefix. A GPU-only host-pool instance has no host suffix.
+        if isinstance(full_pool, QwenHostFP8KVPool):
+            local_layer_id = (
+                pool._transfer_full_attention_id(layer.layer_id) - full_pool.start_layer
+            )
+            k_buffer = full_pool.gpu_k_buffer[local_layer_id].view(full_pool.dtype)
+            v_buffer = full_pool.gpu_v_buffer[local_layer_id].view(full_pool.dtype)
+        else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+        is_fp8 = k_buffer.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        output = sparse_gqa_fwd_interface_triton_paged(
+            q,
+            k_buffer,
+            v_buffer,
             topk_indices,
             cu_seqlens_q,
             prefill.cu_seqlens_k,
             metadata.sequence_lengths,
             layer.scaling,
+            prefill.kv_locations,
+            max_q=prefill.max_query_len,
+            k_scale=layer.k_scale_float if is_fp8 else None,
+            v_scale=layer.v_scale_float if is_fp8 else None,
         )
         return self._pad_extend_output(output, num_output_rows)
 

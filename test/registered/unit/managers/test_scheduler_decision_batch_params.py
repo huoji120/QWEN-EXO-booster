@@ -4,6 +4,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -11,11 +12,13 @@ maybe_stub_sgl_kernel()
 
 from qwen_exo_booster.scheduler_fairness import BackgroundPrefillFairness
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -153,17 +156,22 @@ class TestDFlashPriorityYield(CustomTestCase):
         )
         batch.chunked_req = None
         batch.batch_is_full = False
+        batch.forward_mode = ForwardMode.DECODE
+        batch.batch_size.side_effect = lambda: len(batch.reqs)
         batch.is_prefill_only = False
         batch.return_logprob = False
         batch.input_embeds = None
         batch.is_empty.side_effect = lambda: not batch.reqs
 
-        def filter_batch(*, keep_indices=None):
+        def filter_batch(*, keep_indices=None, chunked_req_to_exclude=()):
             batch.reqs = [
                 req
                 for i, req in enumerate(batch.reqs)
-                if (keep_indices is None and not req.finished())
-                or (keep_indices is not None and i in keep_indices)
+                if req not in chunked_req_to_exclude
+                and (
+                    (keep_indices is None and not req.finished())
+                    or (keep_indices is not None and i in keep_indices)
+                )
             ]
 
         def release_req(index, remaining, server_args):
@@ -171,6 +179,7 @@ class TestDFlashPriorityYield(CustomTestCase):
 
         batch.filter_batch.side_effect = filter_batch
         batch.release_req.side_effect = release_req
+        batch.merge_batch.side_effect = lambda other: batch.reqs.extend(other.reqs)
         return batch
 
     def _scheduler(self, waiting, *, low_first=False):
@@ -278,6 +287,7 @@ class TestDFlashPriorityYield(CustomTestCase):
 
         def init_batch(reqs, *args, **kwargs):
             batch = self._batch(reqs, target_only=args[-1].is_none())
+            batch.forward_mode = ForwardMode.EXTEND
             batch.spec_algorithm = args[-1]
             batch.chunked_req = kwargs.get("chunked_req")
             return batch
@@ -430,6 +440,233 @@ class TestDFlashPriorityYield(CustomTestCase):
         self.assertIs(scheduler.chunked_req, background)
         self.assertEqual(background.extend_range.end, 2048)
         self.assertEqual(background.inflight_middle_chunks, 0)
+
+    def _qwen4_chunk_decode_scheduler(self, *, decoding=True):
+        cold = self._request("cold-prefill", 0)
+        cold.full_untruncated_fill_ids = list(range(8192))
+        cold.prefix_indices = torch.arange(7 * 8192, 7 * 8192 + 2048)
+        cold.set_extend_range(0, 2048)
+        cold.req_pool_idx = 7
+        cold.mamba_pool_idx = torch.tensor(5)
+        decoder = self._request("streaming", 0)
+        scheduler = self._scheduler([])
+        scheduler.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        scheduler.server_args.enable_qwen_exo = True
+        scheduler.model_config.hf_text_config = SimpleNamespace(model_type="qwen4_exp_text")
+        scheduler.chunked_prefill_size = 2048
+        scheduler.chunked_req = cold
+        scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
+        scheduler._qwen_exo_prefill_fairness.record_prefill([cold])
+        scheduler.running_batch = self._batch([decoder] if decoding else [])
+        scheduler.running_batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        scheduler.last_batch = None
+        scheduler.require_mlp_sync = False
+        scheduler.enable_fpm = False
+        scheduler._pending_chunked_abort_req = None
+        scheduler._abort_on_waiting_timeout = MagicMock()
+        scheduler._abort_on_running_timeout = MagicMock()
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch, **kwargs: batch
+        )
+        scheduler.ngram_embedding_manager = SimpleNamespace(
+            prepare_for_forward=lambda batch, **kwargs: batch
+        )
+        # Real cache stashing must advance only the owned chunk's KV prefix.
+        pool = SimpleNamespace(req_to_token=torch.arange(8 * 8192).reshape(8, 8192))
+        cache = ChunkCache(SimpleNamespace(
+            req_to_token_pool=pool, token_to_kv_pool_allocator=None, page_size=1
+        ))
+        scheduler.stash_chunked_request = lambda req: cache.cache_unfinished_req(req, chunked=True)
+
+        def prefill(running, *, last_batch):
+            batch, retained = self._prefill(scheduler, running, last_batch, real_admission=True)
+            return NextBatchPlan(batch_to_run=batch, running_batch=retained)
+
+        scheduler.get_new_batch_prefill = MagicMock(side_effect=prefill)
+
+        def decode(batch):
+            batch.filter_batch()
+            batch.forward_mode = ForwardMode.DECODE
+            return batch
+
+        scheduler.update_running_batch = decode
+        return scheduler, cold, decoder, pool
+
+    @staticmethod
+    def _select_chunk_turn(scheduler):
+        with patch("sglang.srt.managers.scheduler.set_schedule_time_batch"):
+            plan = scheduler.get_next_batch_to_run(scheduler.running_batch, scheduler.last_batch)
+        scheduler.running_batch = plan.running_batch
+        scheduler.last_batch = plan.batch_to_run
+        return plan.batch_to_run
+
+    def test_mtp_long_prefill_and_decode_alternate_without_releasing_chunk_owner(self):
+        scheduler, cold, decoder, pool = self._qwen4_chunk_decode_scheduler()
+        sequence = []
+        for _ in range(6):
+            batch = self._select_chunk_turn(scheduler)
+            if batch.forward_mode.is_extend():
+                sequence.append("prefill")
+                cold.inflight_middle_chunks -= int(batch.chunked_req is cold)
+            else:
+                sequence.append("decode")
+                self.assertNotIn(cold, batch.reqs)
+                self.assertEqual(batch.reqs, [decoder])
+                self.assertEqual(cold.inflight_middle_chunks, 0)
+            self.assertEqual(cold.req_pool_idx, 7)
+            self.assertEqual(cold.mamba_pool_idx.item(), 5)
+            self.assertEqual(cold.output_ids, [4, 5])
+            self.assertEqual(cold.retraction_count, 0)
+            self.assertTrue(torch.equal(
+                cold.prefix_indices, pool.req_to_token[7, :len(cold.prefix_indices)]
+            ))
+        self.assertEqual(sequence, ["decode", "prefill"] * 3)
+        self.assertEqual(cold.extend_range.end, 8192)
+        self.assertIsNone(scheduler.chunked_req)
+        # Final prefill joins decode once; it is not left parked or lost.
+        merged = self._select_chunk_turn(scheduler)
+        self.assertEqual(merged.reqs, [decoder, cold])
+        self.assertEqual(scheduler.get_new_batch_prefill.call_count, 3)
+
+    def test_no_decoder_runs_cold_chunks_without_artificial_idle_turns(self):
+        scheduler, cold, _, _ = self._qwen4_chunk_decode_scheduler(decoding=False)
+        for expected_end in (4096, 6144, 8192):
+            batch = self._select_chunk_turn(scheduler)
+            self.assertTrue(batch.forward_mode.is_extend())
+            self.assertEqual(batch.reqs, [cold])
+            self.assertEqual(cold.extend_range.end, expected_end)
+            cold.inflight_middle_chunks -= int(batch.chunked_req is cold)
+
+    def test_finished_decoder_does_not_delay_owned_prefill(self):
+        scheduler, cold, decoder, _ = self._qwen4_chunk_decode_scheduler()
+        decoder.finished.return_value = True
+        batch = self._select_chunk_turn(scheduler)
+        self.assertEqual(batch.reqs, [cold])
+        self.assertEqual(cold.extend_range.end, 4096)
+
+    def test_no_prefill_backlog_decodes_every_turn(self):
+        scheduler, _, decoder, _ = self._qwen4_chunk_decode_scheduler()
+        scheduler.chunked_req = None
+        for _ in range(4):
+            batch = self._select_chunk_turn(scheduler)
+            self.assertEqual(batch.reqs, [decoder])
+            self.assertTrue(batch.forward_mode.is_decode())
+
+    def test_unsupported_scheduler_paths_keep_prefill_priority(self):
+        overrides = (
+            ("spec_algorithm", SpeculativeAlgorithm.DFLASH),
+            ("server_args.enable_qwen_exo", False),
+            ("model_config.hf_text_config.model_type", "qwen3_5_text"),
+            ("ps.pp_size", 2),
+            ("disaggregation_mode", DisaggregationMode.PREFILL),
+            ("require_mlp_sync", True),
+            ("enable_hisparse", True),
+            ("is_hybrid_swa", True),
+            ("dllm_config", object()),
+            ("chunked_prefill_size", None),
+            ("is_mixed_chunk", True),
+        )
+        for path, value in overrides:
+            with self.subTest(path=path):
+                scheduler, _, _, _ = self._qwen4_chunk_decode_scheduler()
+                owner = scheduler
+                *parents, field = path.split(".")
+                for parent in parents:
+                    owner = getattr(owner, parent)
+                setattr(owner, field, value)
+                self.assertFalse(scheduler._should_yield_qwen4_prefill_to_decode(scheduler.running_batch))
+
+    def test_opposite_lane_waiter_does_not_enter_parked_chunk_decode_turn(self):
+        scheduler, cold, decoder, _ = self._qwen4_chunk_decode_scheduler()
+        export = self._request("export", 0, target_only=True)
+        scheduler.waiting_queue = [export]
+        decoded = self._select_chunk_turn(scheduler)
+        self.assertEqual(decoded.reqs, [decoder])
+        scheduler.get_new_batch_prefill.assert_not_called()
+        resumed = self._select_chunk_turn(scheduler)
+        self.assertEqual(resumed.reqs, [cold])
+        self.assertEqual(resumed.spec_algorithm, SpeculativeAlgorithm.EAGLE)
+        self.assertEqual(scheduler.waiting_queue, [export])
+        self.assertEqual(cold.retraction_count, 0)
+
+    def test_cancel_parked_chunk_releases_once_without_launching_another_chunk(self):
+        scheduler, cold, decoder, _ = self._qwen4_chunk_decode_scheduler()
+        self._select_chunk_turn(scheduler)
+        scheduler._pending_chunked_abort_req = cold
+        cold.time_stats.trace_ctx = MagicMock()
+        scheduler.ipc_channels = MagicMock()
+
+        def abort(req, reason):
+            req.finished.return_value = True
+
+        def release(req, cache, *, is_insert):
+            self.assertFalse(is_insert)
+            self.assertEqual(req.inflight_middle_chunks, 0)
+            req.req_pool_idx = None
+            req.mamba_pool_idx = None
+
+        with (
+            patch("sglang.srt.managers.scheduler.prepare_abort", side_effect=abort),
+            patch("sglang.srt.managers.scheduler.release_kv_cache", side_effect=release) as free,
+        ):
+            for _ in range(2):
+                batch = self._select_chunk_turn(scheduler)
+                self.assertEqual(batch.reqs, [decoder])
+            free.assert_called_once()
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertIsNone(scheduler._pending_chunked_abort_req)
+        self.assertIsNone(cold.req_pool_idx)
+        scheduler._release_qwen_exo_hybrid_state.assert_called_once_with(cold)
+
+    def test_overlap_decode_turn_commits_pending_chunk_result_once(self):
+        scheduler, cold, decoder, _ = self._qwen4_chunk_decode_scheduler()
+        scheduler.enable_overlap = True
+        scheduler.gracefully_exit = False
+        scheduler._engine_paused = False
+        scheduler.enable_unified_memory = False
+        scheduler.is_generation = False
+        scheduler.is_disable_overlap_for_batch = lambda *args, **kwargs: False
+        pending = self._batch([cold])
+        pending.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        pending.forward_mode = ForwardMode.EXTEND
+        pending.chunked_req = cold
+        scheduler.last_batch = pending
+        cold.inflight_middle_chunks = 1
+
+        def receive():
+            scheduler.result_queue.append((pending, object()))
+            return []
+
+        scheduler.request_receiver = SimpleNamespace(recv_requests=receive)
+        scheduler.process_input_requests = MagicMock()
+
+        def commit(batch, result):
+            self.assertIs(batch, pending)
+            cold.inflight_middle_chunks -= 1
+
+        scheduler.process_batch_result = MagicMock(side_effect=commit)
+
+        def run(batch):
+            self.assertEqual(batch.reqs, [decoder])
+            self.assertIs(scheduler.chunked_req, cold)
+            self.assertEqual(cold.req_pool_idx, 7)
+            self.assertEqual(cold.inflight_middle_chunks, 1)
+            scheduler.gracefully_exit = True
+            return object()
+
+        scheduler.run_batch = run
+        scheduler._apply_war_barrier = MagicMock()
+        with (
+            patch("sglang.srt.managers.scheduler.envs") as envs,
+            patch("sglang.srt.managers.scheduler.set_schedule_time_batch"),
+        ):
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get.return_value = False
+            inspect.unwrap(Scheduler.event_loop_overlap)(scheduler)
+        scheduler.process_batch_result.assert_called_once()
+        self.assertEqual(cold.inflight_middle_chunks, 0)
+        self.assertEqual(cold.req_pool_idx, 7)
+        self.assertEqual(len(scheduler.result_queue), 1)
+        scheduler.get_new_batch_prefill.assert_not_called()
 
     def test_higher_priority_switch_retracts_entire_lane_and_resumes(self):
         for low_first in (False, True):
