@@ -871,7 +871,12 @@ class SchedulerMetricsReporter:
 
             # Basics
             self.stats.num_running_reqs = QueueCount.from_reqs(
-                batch.reqs, priority_enabled
+                (
+                    self.scheduler._qwen_exo_load_reqs()
+                    if getattr(self.scheduler, "_qwen_exo_parked_batch", None) is not None
+                    else batch.reqs
+                ),
+                priority_enabled,
             )
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
@@ -1115,7 +1120,9 @@ class SchedulerMetricsReporter:
         # no later report zeroes). If it disagrees with running_batch -- the
         # true idle value -- publish now instead of waiting out the window.
         gauge_stale = self.stats.num_running_reqs.total != len(
-            self.scheduler.running_batch.reqs
+            self.scheduler._qwen_exo_load_reqs()
+            if getattr(self.scheduler, "_qwen_exo_parked_batch", None) is not None
+            else self.scheduler.running_batch.reqs
         )
         if (
             not gauge_stale
@@ -1135,7 +1142,12 @@ class SchedulerMetricsReporter:
 
         priority_enabled = self.scheduler.enable_priority_scheduling
         self.stats.num_running_reqs = QueueCount.from_reqs(
-            self.scheduler.running_batch.reqs, priority_enabled
+            (
+                self.scheduler._qwen_exo_load_reqs()
+                if getattr(self.scheduler, "_qwen_exo_parked_batch", None) is not None
+                else self.scheduler.running_batch.reqs
+            ),
+            priority_enabled,
         )
         self.stats.gen_throughput = 0
         self.stats.num_queue_reqs = QueueCount.from_reqs(

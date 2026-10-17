@@ -1004,6 +1004,10 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # Resident cross-mode time sharing keeps the original batch, including
+        # speculative inputs and request-slot/KV/GDN/PLE ownership, intact.
+        self._qwen_exo_parked_batch: Optional[ScheduleBatch] = None
+        self._qwen_exo_active_target_only: Optional[bool] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1494,15 +1498,18 @@ class Scheduler(
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
-        if running_batch.is_empty():
+        parked_requests = self._qwen_exo_parked_reqs()
+        if running_batch.is_empty() and not parked_requests:
             return
 
         deadline = time.perf_counter() - timeout_s
-        for req in running_batch.reqs:
+        for req in chain(running_batch.reqs, parked_requests):
             if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
+                if req is self.chunked_req:
+                    self._pending_chunked_abort_req = req
 
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
@@ -1635,22 +1642,29 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # A cross-mode handoff must commit the previous accepted tokens and
-            # GDN state before preemption releases its KV/Mamba allocations.
-            # Keep last_batch for the normal prefill-to-decode merge below.
+            # Drain before a resident lane handoff: both result processing and
+            # the forward stream must stop using the outgoing lane's buffers.
             last_result_processed = False
-            if (
-                self._supports_target_only_lane()
-                and self.enable_priority_preemption
-                and self.result_queue
-                and any(
-                    self._can_yield_dflash_mode(
-                        req, self.running_batch, self.last_batch
+            resident_handoff = self._qwen_exo_lane_rotation_due(
+                self.running_batch, self.last_batch
+            )
+            if self.result_queue and (
+                resident_handoff
+                or (
+                    self._supports_target_only_lane()
+                    and self.enable_priority_preemption
+                    and any(
+                        self._can_yield_dflash_mode(
+                            req, self.running_batch, self.last_batch
+                        )
+                        for req in self.waiting_queue
                     )
-                    for req in self.waiting_queue
                 )
             ):
-                pop_and_process()
+                while self.result_queue:
+                    pop_and_process()
+                if resident_handoff:
+                    self.forward_stream.synchronize()
                 last_result_processed = True
 
             # Get the next batch to run
@@ -1869,6 +1883,7 @@ class Scheduler(
             max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_parked_requests=self._qwen_exo_parked_reqs,
         )
 
     def init_invariant_checker(self) -> None:
@@ -1887,6 +1902,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_parked_requests=self._qwen_exo_parked_reqs,
             get_reserved_mamba_slots=lambda: (
                 self.qwen_exo_native_state_bank.reserved_mamba_slots()
                 if self.qwen_exo_native_state_bank is not None
@@ -1921,6 +1937,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
+            get_owned_requests=self._qwen_exo_load_reqs,
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
@@ -2524,6 +2541,7 @@ class Scheduler(
         for batch in (
             getattr(self, "running_batch", None),
             getattr(self, "last_batch", None),
+            getattr(self, "_qwen_exo_parked_batch", None),
         ):
             if batch is not None:
                 collect(batch.reqs)
@@ -3468,8 +3486,11 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
+        finish_reason = getattr(req, "to_finish", None)
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        if finish_reason is not None:
+            req.finished_reason = finish_reason
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
@@ -3630,14 +3651,18 @@ class Scheduler(
             running_batch.filter_batch()
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
+        running_batch, lane_switched = self._rotate_qwen4_resident_lane(
+            running_batch, last_batch
+        )
+        if lane_switched:
+            # The previous prefill was merged above. Never expose its mode to
+            # admission in the new lane, nor merge it again after a resume.
+            last_batch = None
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
             if self._should_yield_qwen4_prefill_to_decode(running_batch):
-                # The chunk was stashed/excluded above. Keep its request slot,
-                # KV, recurrent state and PLE row resident; do not run admission,
-                # rematch a prefix, or mutate the parked chunk on a decode turn.
                 new_batch = None
             else:
                 prefill_plan = self.get_new_batch_prefill(
@@ -3645,6 +3670,24 @@ class Scheduler(
                 )
                 new_batch = prefill_plan.batch_to_run
                 running_batch = prefill_plan.running_batch
+
+            if (
+                lane_switched
+                and new_batch is None
+                and running_batch.is_empty()
+            ):
+                # No request fit the physical gates (or the sole chunk belongs
+                # to the other lane). Resume useful resident work this turn.
+                running_batch = self._swap_qwen4_resident_lane(running_batch)
+                last_batch = None
+                if (
+                    self.chunked_req is not None
+                    and is_dflash_target_only_request(self.chunked_req)
+                    == self._qwen_exo_active_target_only
+                ):
+                    prefill_plan = self.get_new_batch_prefill(running_batch)
+                    new_batch = prefill_plan.batch_to_run
+                    running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -3684,6 +3727,8 @@ class Scheduler(
         )
 
         if ret:
+            if self._supports_qwen4_resident_lanes():
+                self._qwen_exo_active_target_only = ret.spec_algorithm.is_none()
             set_schedule_time_batch(ret)
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
@@ -3717,10 +3762,149 @@ class Scheduler(
             and any(not req.finished() for req in running_batch.reqs)
         )
 
+    def _supports_qwen4_resident_lanes(self) -> bool:
+        """Only the native, rank-local Flash-Next ownership contract is audited."""
+        return (
+            self.spec_algorithm == SpeculativeAlgorithm.EAGLE
+            and self._supports_target_only_lane()
+            and all(
+                getattr(getattr(self, "ps", None), dimension, 0) == 1
+                for dimension in (
+                    "tp_size", "pp_size", "dp_size", "attn_cp_size",
+                    "attn_dp_size", "dcp_size",
+                )
+            )
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and not self.require_mlp_sync
+            and not self.enable_hisparse
+            and not self.is_hybrid_swa
+            and self.dllm_config is None
+            and not self.is_mixed_chunk
+            and not self.enable_lora
+            and not self.enable_pdmux
+            and self.decode_offload_manager is None
+        )
+
+    def _qwen_exo_parked_reqs(self) -> List[Req]:
+        batch = getattr(self, "_qwen_exo_parked_batch", None)
+        if batch is None:
+            return []
+        chunk = getattr(self, "chunked_req", None)
+        if (
+            chunk is not None
+            and not chunk.finished()
+            and is_dflash_target_only_request(chunk)
+            != self._qwen_exo_active_target_only
+            and all(req is not chunk for req in batch.reqs)
+        ):
+            return [*batch.reqs, chunk]
+        return batch.reqs
+
+    def _qwen_exo_owned_reqs(self) -> List[Req]:
+        """All resident owners, once, for admission and externally visible load."""
+        owners = {}
+        for batch in (
+            self.running_batch,
+            self.last_batch,
+            getattr(self, "_qwen_exo_parked_batch", None),
+        ):
+            if batch is not None:
+                for req in batch.reqs:
+                    if not req.finished():
+                        owners[id(req)] = req
+        if self.chunked_req is not None and not self.chunked_req.finished():
+            owners[id(self.chunked_req)] = self.chunked_req
+        return list(owners.values())
+
+    def _qwen_exo_load_reqs(self) -> List[Req]:
+        if getattr(self, "_qwen_exo_parked_batch", None) is None:
+            return self.running_batch.reqs
+        return self._qwen_exo_owned_reqs()
+
+    def _qwen_exo_lane_rotation_due(
+        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    ) -> bool:
+        if not self._supports_qwen4_resident_lanes():
+            return False
+        active_mode = self._qwen_exo_active_target_only
+        if active_mode is None:
+            return False
+        active = {
+            id(req): req
+            for batch in (running_batch, last_batch)
+            if batch is not None
+            for req in batch.reqs
+            if not req.finished()
+        }
+        if self.chunked_req is not None and not self.chunked_req.finished():
+            chunk = self.chunked_req
+            if is_dflash_target_only_request(chunk) == active_mode:
+                active[id(chunk)] = chunk
+        candidates = chain(self._qwen_exo_parked_reqs(), self.waiting_queue)
+        if self.chunked_req is not None:
+            candidates = chain((self.chunked_req,), candidates)
+        priority_sign = -1 if self.server_args.schedule_low_priority_values_first else 1
+        for req in candidates:
+            if req.finished() or is_dflash_target_only_request(req) == active_mode:
+                continue
+            # Cancellation/timeout of a resident owner must not depend on the
+            # priority of work that happened to be scheduled while it paused.
+            if getattr(req, "to_finish", None) is not None:
+                return True
+            if all(
+                work_class_preemption(req, owner) is True
+                or (
+                    work_class_preemption(req, owner) is None
+                    and (
+                        not self.enable_priority_scheduling
+                        or (req.priority - owner.priority) * priority_sign >= 0
+                    )
+                )
+                for owner in active.values()
+            ):
+                return True
+        return False
+
+    def _swap_qwen4_resident_lane(
+        self, running_batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        parked = self._qwen_exo_parked_batch
+        self._release_finished_qwen_exo_states(running_batch.reqs)
+        running_batch.filter_batch()
+        owns_chunk = (
+            self.chunked_req is not None
+            and not self.chunked_req.finished()
+            and is_dflash_target_only_request(self.chunked_req)
+            == self._qwen_exo_active_target_only
+        )
+        self._qwen_exo_parked_batch = (
+            running_batch if not running_batch.is_empty() or owns_chunk else None
+        )
+        self._qwen_exo_active_target_only = not self._qwen_exo_active_target_only
+        return (
+            parked
+            if parked is not None
+            else ScheduleBatch(reqs=[], batch_is_full=False)
+        )
+
+    def _rotate_qwen4_resident_lane(
+        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    ) -> Tuple[ScheduleBatch, bool]:
+        if (
+            not self._qwen_exo_lane_rotation_due(running_batch, last_batch)
+            or (self.enable_overlap and self.result_queue)
+        ):
+            return running_batch, False
+        parked = self._qwen_exo_parked_batch
+        if parked is not None:
+            self._release_finished_qwen_exo_states(parked.reqs)
+            parked.filter_batch()
+        return self._swap_qwen4_resident_lane(running_batch), True
+
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_server_args().pp_max_micro_batch_size - running_bs
-        res = min(res, self.req_to_token_pool.available_size())
-        return res
+        parked = self._qwen_exo_parked_reqs()
+        res = get_server_args().pp_max_micro_batch_size - running_bs - len(parked)
+        return min(res, self.req_to_token_pool.available_size())
 
     def _supports_target_only_lane(self) -> bool:
         if self.spec_algorithm.is_dflash():
@@ -3791,6 +3975,7 @@ class Scheduler(
         """Allow a lane switch only when every owner can yield by priority."""
         if (
             not self._supports_target_only_lane()
+            or self._supports_qwen4_resident_lanes()
             or not self.enable_priority_preemption
             or self.chunked_req is not None
             or preselected_requests
@@ -3910,12 +4095,21 @@ class Scheduler(
             and self.chunked_req is not None
             and is_background_request(self.chunked_req)
         )
+        resident_lanes = self._supports_qwen4_resident_lanes()
+        yield_parked_chunk = (
+            resident_lanes
+            and self._qwen_exo_active_target_only is not None
+            and self.chunked_req is not None
+            and is_dflash_target_only_request(self.chunked_req)
+            != self._qwen_exo_active_target_only
+        )
         work_admission = (
             WorkClassAdmission(
                 self.max_running_requests,
                 chain(
                     running_batch.reqs,
                     last_batch.reqs if last_batch is not None else (),
+                    self._qwen_exo_parked_reqs(),
                     (self.chunked_req,) if self.chunked_req is not None else (),
                 ),
             )
@@ -3991,6 +4185,7 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        parked_batch = getattr(self, "_qwen_exo_parked_batch", None)
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -4007,9 +4202,21 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            parked_requests=self._qwen_exo_parked_reqs(),
+            parked_decode_tokens=(
+                parked_batch.new_tokens_required_next_decode()
+                if parked_batch is not None
+                and not parked_batch.is_empty()
+                and not parked_batch.is_prefill_only
+                else 0
+            ),
         )
 
-        if self.chunked_req is not None and not yield_background_chunk:
+        if (
+            self.chunked_req is not None
+            and not yield_background_chunk
+            and not yield_parked_chunk
+        ):
             self._resume_qwen_exo_chunked_prefill(self.chunked_req)
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -4039,12 +4246,21 @@ class Scheduler(
             and not active_has_target_only
             and any(is_dflash_target_only_request(item) for item in self.waiting_queue)
         )
+        if resident_lanes and self._qwen_exo_active_target_only is not None:
+            target_only_waiting = self._qwen_exo_active_target_only
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if (
+                resident_lanes
+                and self._qwen_exo_active_target_only is not None
+                and is_dflash_target_only_request(req)
+                != self._qwen_exo_active_target_only
+            ):
+                continue
             if work_admission is not None and not work_admission.can_admit(req):
                 continue
             if interleave_background and is_background_request(req):
@@ -4219,7 +4435,10 @@ class Scheduler(
 
         batch_chunked_req = (
             None
-            if yield_background_chunk and self.chunked_req not in can_run_set
+            if (
+                (yield_background_chunk or yield_parked_chunk)
+                and self.chunked_req not in can_run_set
+            )
             else self.chunked_req
         )
         if batch_chunked_req is not None:
@@ -4285,7 +4504,7 @@ class Scheduler(
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
-            running_batch.reqs,
+            list(chain(running_batch.reqs, self._qwen_exo_parked_reqs())),
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
@@ -4910,6 +5129,7 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
+            and not any(not req.finished() for req in self._qwen_exo_parked_reqs())
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
@@ -5376,7 +5596,11 @@ class Scheduler(
 
         # Delete requests in the running batch
         if self.ps.pp_size == 1:
-            inflight_batches = [self.running_batch, self.last_batch]
+            inflight_batches = [
+                self.running_batch,
+                self.last_batch,
+                getattr(self, "_qwen_exo_parked_batch", None),
+            ]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
 
@@ -5432,9 +5656,15 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+        retract_reqs = list(
+            {id(req): req for req in chain(retract_reqs, self._qwen_exo_parked_reqs())
+             if not req.finished()}.values()
+        )
 
         self.last_batch = None
         self.cur_batch_for_debug = None
+        self._qwen_exo_parked_batch = None
+        self._qwen_exo_active_target_only = None
 
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from

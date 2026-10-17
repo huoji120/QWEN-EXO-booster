@@ -55,6 +55,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_parked_requests: Callable = lambda: ()
     get_reserved_mamba_slots: Callable[[], int] = lambda: 0
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
@@ -236,37 +237,31 @@ class SchedulerInvariantChecker:
         For full pool: uncached = allocated - cache_protected_len
         For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
         """
-        # After decode: running_batch IS last_batch (same object), count once.
-        # After prefill: they differ, both hold uncached tokens.
-        # Use identity (is / is not), not membership or ==: ScheduleBatch's
-        # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
-        last_batch = self.get_last_batch()
-        running_batch = self.get_running_batch()
-        batches = [last_batch]
-        if (
-            running_batch is not None
-            and running_batch is not last_batch
-            and not running_batch.is_empty()
-        ):
-            batches.append(running_batch)
+        batches = (self.get_last_batch(), self.get_running_batch())
+        requests = {
+            id(req): req
+            for batch in batches
+            if batch is not None
+            for req in batch.reqs
+        }
+        requests.update((id(req), req) for req in self.get_parked_requests())
 
         full_uncached = 0
         swa_uncached = 0
-        for batch in batches:
-            for req in batch.reqs:
-                if req.kv is None:
-                    continue
+        for req in requests.values():
+            if req.kv is None:
+                continue
 
-                allocated_len = req.kv.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+            allocated_len = req.kv.kv_allocated_len
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+                assert req.cache_protected_len % self.page_size == 0
 
-                full_uncached += allocated_len - req.cache_protected_len
-                if self.is_hybrid_swa:
-                    swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.kv.swa_evicted_seqlen
-                    )
+            full_uncached += allocated_len - req.cache_protected_len
+            if self.is_hybrid_swa:
+                swa_uncached += allocated_len - max(
+                    req.cache_protected_len, req.kv.swa_evicted_seqlen
+                )
 
         return full_uncached, swa_uncached
 
@@ -320,18 +315,23 @@ class SchedulerInvariantChecker:
             owners.append((label, rpi, allocated))
 
         owners: list[tuple[str, Optional[int], int]] = []
-        batch = self.get_last_batch()
-        if batch is not None:
-            for req in batch.reqs:
-                if req.kv is None:
-                    continue
-                _add_owner(
-                    req,
-                    f"req {req.rid}",
-                    req.req_pool_idx,
-                    req.kv_committed_len,
-                    req.kv.kv_allocated_len,
-                )
+        requests = {
+            id(req): req
+            for batch in (self.get_last_batch(), self.get_running_batch())
+            if batch is not None
+            for req in batch.reqs
+        }
+        requests.update((id(req), req) for req in self.get_parked_requests())
+        for req in requests.values():
+            if req.kv is None:
+                continue
+            _add_owner(
+                req,
+                f"req {req.rid}",
+                req.req_pool_idx,
+                req.kv_committed_len,
+                req.kv.kv_allocated_len,
+            )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:
             for sid, slot in sess.items():

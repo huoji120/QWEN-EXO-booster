@@ -30,7 +30,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Union
 
 import torch
 from qwen_exo_booster.scheduler_fairness import (
@@ -460,11 +460,16 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        parked_requests: Iterable[Req] = (),
+        parked_decode_tokens: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
+        self.parked_requests = tuple(
+            req for req in parked_requests if not req.finished()
+        )
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
@@ -495,6 +500,15 @@ class PrefillAdder:
                     self._get_running_request_total_token_offset(r)
                     for r in running_batch.reqs
                 ]
+            )
+        if self.parked_requests:
+            # A paused generator cannot be a later retraction victim. Reserve
+            # its remaining output, not the ordinary probabilistic estimate,
+            # plus the next speculative verify allocation and page slack.
+            self.rem_total_token_offset += parked_decode_tokens + self.page_size
+            self.rem_total_token_offset += sum(
+                max(0, req.sampling_params.max_new_tokens - len(req.output_ids))
+                for req in self.parked_requests
             )
 
         # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
@@ -836,6 +850,9 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            if self.parked_requests:
+                _rem_tokens = min(_rem_tokens, int(self.rem_total_tokens) - self.page_size)
+                _rem_tokens = _rem_tokens // self.page_size * self.page_size
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
@@ -845,7 +862,7 @@ class PrefillAdder:
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
+                if self.is_hybrid_swa or self.parked_requests:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
@@ -929,6 +946,8 @@ class PrefillAdder:
             if self.running_batch is not None:
                 for r in self.running_batch.reqs:
                     add_req_state(r)
+            for r in self.parked_requests:
+                add_req_state(r)
             for r in self.can_run_list:
                 add_req_state(r)
             self.req_states.sort(key=lambda x: x[0])
@@ -1008,7 +1027,7 @@ class PrefillAdder:
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
-                running_batch=self.running_batch.batch_size(),
+                running_batch=self.running_batch.batch_size() + len(self.parked_requests),
                 max_prefill_bs=self.max_prefill_bs,
                 max_running_requests=self.max_running_requests,
                 waiting_queue_len=self.waiting_queue_len,

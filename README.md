@@ -130,6 +130,10 @@ Responses 在单次请求内复用同一份已渲染文本、相同编码选项�
 
 一次三轮 64K 冷 prefill 与 512-token 生成重叠实验中，最长流式停顿中位数从 5.56 秒降至 1.46 秒，生成总耗时从 14.92 秒降至 10.50 秒；冷请求耗时从 5.93 秒增至 6.36 秒。两侧均使用相同输入哈希、MTP/Graph 配置和输出上限，冷请求缓存为 0，后续热请求均命中 61440 tokens；测试期间生产流量仍可进入，因此这是该批样本的调度权衡，不是全负载性能保证或 GPU 算子加速倍率。
 
+原生单卡 Flash-Next 的 target-only 打分与 MTP 生成在安全 forward 边界轮转：同优先级的另一通道不必等待长生成结束。切换前提交 overlap 结果并同步 forward stream，停放原 batch 与 KV/GDN/PLE/请求槽；准入仍计算停放请求、剩余输出和下一轮 decode 的内存需求，不以回收长生成状态换取打分执行。资源不足时继续原生成；不混合两种执行模式。此路径不适用于多卡、PP/DP/CP、disaggregation、LoRA、HiSparse、hybrid-SWA、DLLM、PD multiplexing 或 decode offload。
+
+`/v1/systemone` 在读取完整请求体后监听客户端断开，取消并等待该请求的评分、子任务和预留资源清理；正在等待准入的任务不会在调用方离开后继续派发。正常完成、断连和 handler 取消的竞态都等待 parent 清理结束，不取消其他请求。
+
 
 ### 可观测性：不是黑盒魔法
 

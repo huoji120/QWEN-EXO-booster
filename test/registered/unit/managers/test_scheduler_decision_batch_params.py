@@ -17,6 +17,13 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.scheduler_components.invariant_checker import (
+    SchedulerInvariantChecker,
+)
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    SchedulerPoolStatsObserver,
+)
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -197,6 +204,8 @@ class TestDFlashPriorityYield(CustomTestCase):
         scheduler.chunked_req = None
         scheduler.enable_overlap = False
         scheduler.result_queue = deque()
+        scheduler._qwen_exo_parked_batch = None
+        scheduler._qwen_exo_active_target_only = None
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.enable_hierarchical_cache = False
@@ -252,6 +261,7 @@ class TestDFlashPriorityYield(CustomTestCase):
         adder = object.__new__(PrefillAdder)
         adder.running_batch = running
         adder.preempt_list = []
+        adder.parked_requests = tuple(scheduler._qwen_exo_parked_reqs())
         adder.can_run_list = []
         adder.new_chunked_req = None
         adder.new_token_ratio = 1.0
@@ -262,6 +272,11 @@ class TestDFlashPriorityYield(CustomTestCase):
         adder.rem_total_token_offset = sum(
             adder._get_running_request_total_token_offset(req) for req in running.reqs
         )
+        if adder.parked_requests:
+            adder.rem_total_token_offset += scheduler.page_size + sum(
+                max(0, req.sampling_params.max_new_tokens - len(req.output_ids))
+                for req in adder.parked_requests
+            )
         adder.page_size = scheduler.page_size
         adder.rem_chunk_tokens = scheduler.chunked_prefill_size
         adder.rem_input_tokens = scheduler.max_prefill_tokens
@@ -478,7 +493,7 @@ class TestDFlashPriorityYield(CustomTestCase):
         ))
         scheduler.stash_chunked_request = lambda req: cache.cache_unfinished_req(req, chunked=True)
 
-        def prefill(running, *, last_batch):
+        def prefill(running, *, last_batch=None):
             batch, retained = self._prefill(scheduler, running, last_batch, real_admission=True)
             return NextBatchPlan(batch_to_run=batch, running_batch=retained)
 
@@ -667,6 +682,304 @@ class TestDFlashPriorityYield(CustomTestCase):
         self.assertEqual(cold.req_pool_idx, 7)
         self.assertEqual(len(scheduler.result_queue), 1)
         scheduler.get_new_batch_prefill.assert_not_called()
+
+    def _resident_lane_scheduler(self, score_tokens=3):
+        scheduler, _, generator, pool = self._qwen4_chunk_decode_scheduler()
+        scheduler.ps = SimpleNamespace(
+            tp_size=1, pp_size=1, dp_size=1, attn_cp_size=1, attn_dp_size=1,
+            dcp_size=1,
+        )
+        scheduler.enable_pdmux = False
+        scheduler.decode_offload_manager = None
+        scheduler.chunked_req = None
+        scheduler._qwen_exo_active_target_only = False
+        scheduler._qwen_exo_prefill_fairness.record_decode()
+        generator.to_finish = None
+        generator.req_pool_idx = 7
+        generator.mamba_pool_idx = torch.tensor(5)
+        generator.kv = SimpleNamespace(kv_allocated_len=2048)
+        scheduler.running_batch.new_tokens_required_next_decode.return_value = 8
+        score = self._request("score", 0, target_only=True)
+        score.to_finish = None
+        score.req_pool_idx = 6
+        score.sampling_params.max_new_tokens = 0
+        score.output_ids = []
+        score.full_untruncated_fill_ids = list(range(score_tokens))
+        score.set_extend_range(0, score_tokens)
+        scheduler.waiting_queue = [score]
+        return scheduler, generator, score, pool
+
+    def test_equal_priority_score_completes_before_resident_generator_finishes(self):
+        scheduler, generator, score, pool = self._resident_lane_scheduler()
+        original = scheduler.running_batch
+        spec_inputs = original.spec_info
+        kv_owner = generator.kv
+        gdn_owner = generator.mamba_pool_idx
+        ple_row = pool.req_to_token[7].clone()
+        scoring = self._select_chunk_turn(scheduler)
+        self.assertEqual(scoring.reqs, [score])
+        self.assertEqual(scoring.spec_algorithm, SpeculativeAlgorithm.NONE)
+        self.assertIs(scheduler._qwen_exo_parked_batch, original)
+        self.assertFalse(generator.finished())
+        score.finished.return_value = True
+        resumed = self._select_chunk_turn(scheduler)
+        self.assertIs(resumed, original)
+        self.assertIs(resumed.spec_info, spec_inputs)
+        self.assertIs(generator.kv, kv_owner)
+        self.assertIs(generator.mamba_pool_idx, gdn_owner)
+        self.assertEqual(generator.req_pool_idx, 7)
+        self.assertTrue(torch.equal(pool.req_to_token[7], ple_row))
+        self.assertEqual(generator.retraction_count, 0)
+        self.assertEqual(scheduler.waiting_queue, [])
+
+    def test_finished_outgoing_generator_is_removed_before_decode_reservation(self):
+        scheduler, generator, score, _ = self._resident_lane_scheduler()
+        original = scheduler.running_batch
+        completed = self._request("completed", 0)
+        completed.finished.return_value = True
+        completed.kv = None
+        original.reqs.append(completed)
+
+        def reserve_next_decode():
+            return sum(req.kv.kv_allocated_len for req in original.reqs) // 256
+
+        original.new_tokens_required_next_decode.side_effect = reserve_next_decode
+        selected = self._select_chunk_turn(scheduler)
+        self.assertEqual(selected.reqs, [score])
+        self.assertEqual(original.reqs, [generator])
+        self.assertIs(scheduler._qwen_exo_parked_batch, original)
+        self.assertEqual(generator.retraction_count, 0)
+
+    def test_disabled_priority_scheduling_rotates_requests_with_absent_priorities(self):
+        for score_priority in (None, 0):
+            with self.subTest(score_priority=score_priority):
+                scheduler, generator, score, _ = self._resident_lane_scheduler()
+                scheduler.enable_priority_scheduling = False
+                generator.priority = None
+                score.priority = score_priority
+                selected = self._select_chunk_turn(scheduler)
+                self.assertEqual(selected.reqs, [score])
+                score.finished.return_value = True
+                self.assertEqual(self._select_chunk_turn(scheduler).reqs, [generator])
+                self.assertEqual(generator.retraction_count, 0)
+
+    def test_long_score_chunks_rotate_with_generation_at_every_safe_boundary(self):
+        scheduler, generator, score, _ = self._resident_lane_scheduler(8192)
+        turns = []
+        for _ in range(8):
+            batch = self._select_chunk_turn(scheduler)
+            if batch.spec_algorithm.is_none():
+                turns.append("score")
+                self.assertEqual(batch.reqs, [score])
+                score.inflight_middle_chunks -= int(batch.chunked_req is score)
+                if scheduler.chunked_req is None:
+                    score.finished.return_value = True
+            else:
+                turns.append("generate")
+                self.assertEqual(batch.reqs, [generator])
+                generator.output_ids.append(6)
+            self.assertEqual(generator.req_pool_idx, 7)
+            self.assertEqual(generator.mamba_pool_idx.item(), 5)
+            self.assertEqual(generator.retraction_count, 0)
+        self.assertEqual(turns, ["score", "generate"] * 4)
+        self.assertEqual(score.extend_range.end, 8192)
+        self.assertEqual(generator.output_ids, [4, 5, 6, 6, 6, 6])
+        self.assertTrue(score.finished())
+        self.assertFalse(generator.finished())
+
+    def test_failed_score_admission_resumes_generation_without_retraction_or_idle(self):
+        for resource in ("tokens", "slots"):
+            with self.subTest(resource=resource):
+                scheduler, generator, score, _ = self._resident_lane_scheduler()
+                original = scheduler.running_batch
+                if resource == "tokens":
+                    scheduler.token_to_kv_pool_allocator.available_size.return_value = 1
+                else:
+                    scheduler.get_num_allocatable_reqs = lambda running_bs: 0
+                selected = self._select_chunk_turn(scheduler)
+                self.assertIs(selected, original)
+                self.assertEqual(selected.reqs, [generator])
+                self.assertEqual(scheduler.waiting_queue, [score])
+                self.assertEqual(generator.retraction_count, 0)
+
+    def test_resident_handoff_waits_for_overlap_commit_and_stream_fence(self):
+        scheduler, generator, score, _ = self._resident_lane_scheduler()
+        scheduler.enable_overlap = True
+        outgoing = scheduler.running_batch
+        scheduler.last_batch = outgoing
+        scheduler.result_queue.append((outgoing, object()))
+        retained, switched = scheduler._rotate_qwen4_resident_lane(outgoing, outgoing)
+        self.assertIs(retained, outgoing)
+        self.assertFalse(switched)
+        self.assertIsNone(scheduler._qwen_exo_parked_batch)
+        scheduler.result_queue.clear()
+        scheduler.gracefully_exit = False
+        scheduler._engine_paused = False
+        scheduler.enable_unified_memory = False
+        scheduler.is_generation = False
+        scheduler.is_disable_overlap_for_batch = lambda *args, **kwargs: False
+        order = []
+        scheduler.forward_stream = SimpleNamespace(
+            synchronize=lambda: order.append("fence")
+        )
+
+        def receive():
+            scheduler.result_queue.append((outgoing, object()))
+            return []
+
+        def commit(batch, result):
+            self.assertIs(batch, outgoing)
+            self.assertIsNone(scheduler._qwen_exo_parked_batch)
+            generator.output_ids.append(6)
+            order.append("commit")
+
+        def run(batch):
+            self.assertEqual(order, ["commit", "fence"])
+            self.assertEqual(batch.reqs, [score])
+            self.assertTrue(batch.spec_algorithm.is_none())
+            self.assertEqual(generator.output_ids, [4, 5, 6])
+            self.assertEqual(generator.retraction_count, 0)
+            scheduler.gracefully_exit = True
+            return object()
+
+        scheduler.request_receiver = SimpleNamespace(recv_requests=receive)
+        scheduler.process_input_requests = MagicMock()
+        scheduler.process_batch_result = MagicMock(side_effect=commit)
+        scheduler.run_batch = run
+        scheduler._apply_war_barrier = MagicMock()
+        with (
+            patch("sglang.srt.managers.scheduler.envs") as envs,
+            patch("sglang.srt.managers.scheduler.set_schedule_time_batch"),
+        ):
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get.return_value = False
+            inspect.unwrap(Scheduler.event_loop_overlap)(scheduler)
+        scheduler.process_batch_result.assert_called_once()
+        self.assertEqual(len(scheduler.result_queue), 1)
+        self.assertIs(scheduler._qwen_exo_parked_batch, outgoing)
+
+    def test_cancel_parked_scoring_chunk_releases_once_then_generation_continues(self):
+        scheduler, generator, score, _ = self._resident_lane_scheduler(8192)
+        scored = self._select_chunk_turn(scheduler)
+        score.inflight_middle_chunks -= 1
+        self._select_chunk_turn(scheduler)
+        scheduler._pending_chunked_abort_req = score
+        score.time_stats.trace_ctx = MagicMock()
+        scheduler.ipc_channels = MagicMock()
+
+        def finish(req, reason):
+            req.finished.return_value = True
+
+        def release(req, cache, *, is_insert):
+            self.assertIs(req, score)
+            self.assertFalse(is_insert)
+            self.assertEqual(req.inflight_middle_chunks, 0)
+            req.req_pool_idx = None
+
+        with (
+            patch("sglang.srt.managers.scheduler.prepare_abort", side_effect=finish),
+            patch("sglang.srt.managers.scheduler.release_kv_cache", side_effect=release) as free,
+        ):
+            for _ in range(2):
+                self.assertEqual(self._select_chunk_turn(scheduler).reqs, [generator])
+            free.assert_called_once()
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertIsNone(score.req_pool_idx)
+        self.assertEqual(generator.retraction_count, 0)
+
+    def test_resident_generator_abort_and_timeout_are_not_hidden_by_active_score(self):
+        for action in ("abort", "timeout"):
+            with self.subTest(action=action):
+                scheduler, generator, score, _ = self._resident_lane_scheduler()
+                self._select_chunk_turn(scheduler)
+                generator.time_stats.forward_entry_time = 1
+                if action == "abort":
+                    scheduler.abort_request(AbortReq(rid=generator.rid))
+                else:
+                    with (
+                        patch("sglang.srt.managers.scheduler.envs") as envs,
+                        patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=100),
+                    ):
+                        envs.SGLANG_REQ_RUNNING_TIMEOUT.get.return_value = 10
+                        Scheduler._abort_on_running_timeout(scheduler, scheduler.running_batch)
+                self.assertIsNotNone(generator.to_finish)
+                self.assertTrue(scheduler._qwen_exo_lane_rotation_due(
+                    scheduler.running_batch, scheduler.last_batch
+                ))
+                self.assertEqual(generator.retraction_count, 0)
+                self.assertEqual(generator.req_pool_idx, 7)
+
+    def test_parked_owners_remain_visible_to_slots_load_and_pool_accounting(self):
+        scheduler, generator, score, _ = self._resident_lane_scheduler(8192)
+        self._select_chunk_turn(scheduler)
+        score.kv = SimpleNamespace(kv_allocated_len=2048)
+        generator.cache_protected_len = score.cache_protected_len = 0
+        # Outgoing overlap metadata and the resident batch reference the same
+        # generator. Neither physical owners nor their KV may be double-counted.
+        scheduler.last_batch = scheduler._qwen_exo_parked_batch
+        scheduler.running_batch.reqs = [score]
+        self.assertCountEqual(scheduler._qwen_exo_load_reqs(), [generator, score])
+        scheduler.req_to_token_pool.available_size = lambda: 1
+        with patch("sglang.srt.managers.scheduler.get_server_args", return_value=SimpleNamespace(
+            pp_max_micro_batch_size=2
+        )):
+            self.assertEqual(Scheduler.get_num_allocatable_reqs(scheduler, 1), 0)
+        observer = SimpleNamespace(
+            get_last_batch=lambda: scheduler.last_batch,
+            get_running_batch=lambda: scheduler.running_batch,
+            get_parked_requests=scheduler._qwen_exo_parked_reqs,
+        )
+        self.assertEqual(SchedulerPoolStatsObserver.active_pool_idxs(observer), {6, 7})
+        checker = SimpleNamespace(
+            get_last_batch=observer.get_last_batch,
+            get_running_batch=observer.get_running_batch,
+            get_parked_requests=scheduler._qwen_exo_parked_reqs,
+            page_size=1,
+            is_hybrid_swa=False,
+        )
+        self.assertEqual(SchedulerInvariantChecker._get_total_uncached_sizes(checker), (4096, 0))
+
+    def test_resident_chunk_cannot_borrow_parked_decode_headroom(self):
+        scheduler, generator, score, _ = self._resident_lane_scheduler(8192)
+        scheduler.token_to_kv_pool_allocator.available_size.return_value = 106
+        scheduler.tree_cache.supports_mamba.return_value = False
+        policy = "sglang.srt.managers.schedule_policy."
+        with (
+            patch(policy + "is_dsa_prefill_cp_in_seq_split", return_value=False),
+            patch(policy + "is_prefill_context_parallel_enabled", return_value=False),
+        ):
+            adder = PrefillAdder(
+                1, scheduler.tree_cache, scheduler.token_to_kv_pool_allocator,
+                self._batch([], target_only=True), 0.1, 2048, 2048,
+                parked_requests=[generator], parked_decode_tokens=8,
+            )
+        score.prefix_indices = list(range(2048))
+        score.set_extend_range(0, 2048)
+        self.assertLess(adder.rem_total_tokens, 0)
+        self.assertIs(adder.add_chunked_req(score), score)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(score.extend_range.end, 2048)
+        self.assertEqual(generator.retraction_count, 0)
+
+    def test_unsupported_native_modes_keep_original_lane_admission(self):
+        for field, value in (
+            ("ps.tp_size", 2), ("ps.pp_size", 2), ("ps.dp_size", 2),
+            ("ps.attn_cp_size", 2), ("ps.dcp_size", 2),
+            ("enable_hisparse", True), ("is_hybrid_swa", True),
+            ("require_mlp_sync", True), ("is_mixed_chunk", True),
+            ("enable_lora", True), ("disaggregation_mode", DisaggregationMode.PREFILL),
+        ):
+            with self.subTest(field=field):
+                scheduler, generator, score, _ = self._resident_lane_scheduler()
+                owner = scheduler
+                *parents, name = field.split(".")
+                for part in parents:
+                    owner = getattr(owner, part)
+                setattr(owner, name, value)
+                outgoing = scheduler.running_batch
+                selected, switched = scheduler._rotate_qwen4_resident_lane(outgoing, None)
+                self.assertFalse(switched)
+                self.assertIs(selected, outgoing)
+                self.assertIsNone(scheduler._qwen_exo_parked_batch)
 
     def test_higher_priority_switch_retracts_entire_lane_and_resumes(self):
         for low_first in (False, True):

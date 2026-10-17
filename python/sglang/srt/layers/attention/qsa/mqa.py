@@ -9,6 +9,8 @@ import math
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -29,6 +31,13 @@ except ImportError:
 def _validate_q(q: torch.Tensor) -> None:
     if q.ndim != 3 or q.shape[1] <= 0 or q.shape[2] <= 0:
         raise ValueError(f"QSA requires q [tokens, heads, head_dim], got {q.shape}")
+def _as_dtype_contiguous(tensor: torch.Tensor, dtype: torch.dtype, device=None) -> torch.Tensor:
+    if device is None:
+        device = tensor.device
+    if tensor.dtype == dtype and tensor.device == device and tensor.is_contiguous():
+        return tensor
+    return tensor.to(device=device, dtype=dtype).contiguous()
+
 
 
 def _validate_k(k: torch.Tensor) -> None:
@@ -310,9 +319,9 @@ def tilelang_qsa_mqa_prefill(
     logits = torch.zeros(
         (padded_rows, keys), dtype=torch.float32, device=q.device
     )
-    q_padded = q.to(torch.bfloat16).contiguous()
-    starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
-    ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
+    q_padded = _as_dtype_contiguous(q, torch.bfloat16, q.device)
+    starts = _as_dtype_contiguous(row_starts, torch.int32, q.device)
+    ends = _as_dtype_contiguous(row_ends, torch.int32, q.device)
     if padding:
         q_padded = torch.cat([q_padded, q_padded.new_zeros(padding, heads, head_dim)])
         starts = torch.cat([starts, starts[-1:].expand(padding)])
@@ -320,7 +329,7 @@ def tilelang_qsa_mqa_prefill(
 
     _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
         q_padded.reshape(-1, head_dim),
-        k[:, 0].to(torch.bfloat16).contiguous(),
+        _as_dtype_contiguous(k[:, 0], torch.bfloat16, q.device),
         logits,
         starts,
         ends,
@@ -364,7 +373,7 @@ def tilelang_qsa_mqa_decode(
     # multiple of eight. Zero-padding preserves the weight-free head sum.
     query_heads, head_dim = q.shape[1:]
     kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
-    q_kernel = q.to(torch.bfloat16)
+    q_kernel = _as_dtype_contiguous(q, torch.bfloat16, q.device)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(
             [
@@ -377,11 +386,114 @@ def tilelang_qsa_mqa_decode(
         heads=kernel_heads, head_dim=head_dim, page_size=page_size
     )(
         q_kernel.unsqueeze(1).contiguous(),
-        k_cache.to(torch.bfloat16).contiguous(),
-        page_table.to(device=q.device, dtype=torch.int32).contiguous(),
-        context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+        _as_dtype_contiguous(k_cache, torch.bfloat16, q.device),
+        _as_dtype_contiguous(page_table, torch.int32, q.device),
+        _as_dtype_contiguous(context_lens, torch.int32, q.device),
         logits,
         float(score_scale or math.sqrt(head_dim)),
+    )
+    return logits
+
+
+@triton.jit
+def _qsa_shared_mqa_decode_kernel(
+    q_ptr,
+    page_table_ptr,
+    context_lens_ptr,
+    k_ptr,
+    logits_ptr,
+    q_stride,
+    page_stride,
+    max_pages,
+    max_model_len,
+    scale,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    group = tl.program_id(0)
+    q_rows = group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    q_lengths = tl.load(context_lens_ptr + q_rows)
+    d = tl.arange(0, HEAD_DIM)
+    for block_start in tl.range(0, max_model_len, BLOCK_N):
+        positions = block_start + tl.arange(0, BLOCK_N)
+        page_indices = positions // PAGE_SIZE
+        in_page = positions % PAGE_SIZE
+        page_ids = tl.load(
+            page_table_ptr + group * page_stride + page_indices,
+            mask=page_indices < max_pages,
+            other=0,
+        )
+        k_offsets = (
+            page_ids[:, None] * PAGE_SIZE * HEAD_DIM
+            + in_page[:, None] * HEAD_DIM
+            + d[None, :]
+        )
+        k = tl.load(
+            k_ptr + k_offsets,
+            mask=positions[:, None] < max_model_len,
+            other=0.0,
+        ).to(tl.bfloat16)
+        for query_offset in range(GROUP_SIZE):
+            row = group * GROUP_SIZE + query_offset
+            q_offsets = (
+                row * q_stride
+                + tl.arange(0, NUM_HEADS)[:, None] * HEAD_DIM
+                + d[None, :]
+            )
+            q = tl.load(q_ptr + q_offsets).to(tl.bfloat16)
+            scores = tl.sum(tl.maximum(tl.dot(q, tl.trans(k)), 0.0), axis=0) / scale
+            valid = positions < tl.load(context_lens_ptr + row)
+            tl.store(
+                logits_ptr + row * max_model_len + positions,
+                scores,
+                mask=(positions < max_model_len) & valid,
+            )
+
+
+def tilelang_qsa_mqa_decode_shared(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+) -> Optional[torch.Tensor]:
+    """Share compressed-K loads across four same-request verify queries.
+
+    This eager-only path requires identical page tables per four-row group;
+    ragged or reordered batches return ``None`` and use the validated fallback.
+    """
+    if (
+        not q.is_cuda or q.dtype not in (torch.bfloat16, torch.float16)
+        or q.ndim != 3 or q.shape[0] < 4 or q.shape[0] % 4
+        or page_table.ndim != 2 or page_table.shape[0] != q.shape[0]
+        or not q.is_contiguous() or not page_table.is_cuda or not context_lens.is_cuda
+    ):
+        return None
+    rows, heads, head_dim = q.shape
+    if head_dim not in (64, 128, 256) or heads <= 0 or k_cache.ndim != 4:
+        return None
+    grouped_pages = page_table.view(rows // 4, 4, page_table.shape[1])
+    if not torch.equal(
+        grouped_pages[:, 1:], grouped_pages[:, :1].expand_as(grouped_pages[:, 1:])
+    ):
+        return None
+    page_size = int(k_cache.shape[1])
+    if page_size not in (8, 16, 32, 64):
+        return None
+    logits = torch.full((rows, max_model_len), -float("inf"), dtype=torch.float32, device=q.device)
+    if max_model_len == 0:
+        return logits
+    q_kernel = q.to(torch.bfloat16).contiguous()
+    k_kernel = k_cache[:, :, 0, :].to(torch.bfloat16).contiguous()
+    _qsa_shared_mqa_decode_kernel[(rows // 4,)](
+        q_kernel, grouped_pages[:, 0].contiguous(), context_lens.to(torch.int32).contiguous(),
+        k_kernel, logits, q_kernel.stride(0), grouped_pages.shape[-1],
+        grouped_pages.shape[-1], max_model_len, float(math.sqrt(head_dim)),
+        NUM_HEADS=heads, HEAD_DIM=head_dim, PAGE_SIZE=page_size, GROUP_SIZE=4,
+        BLOCK_N=64, num_warps=8,
     )
     return logits
 

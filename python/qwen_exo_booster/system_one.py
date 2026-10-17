@@ -521,7 +521,16 @@ class SystemOneEvaluator:
                 504, "timeout", "System One evaluation exceeded its deadline"
             ) from exc
         finally:
-            await self.runner.finish_parent(parent_request_id)
+            cleanup = asyncio.create_task(self.runner.finish_parent(parent_request_id))
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup.result()
+            if cancelled:
+                raise asyncio.CancelledError
         usage = {
             "input_tokens": input_tokens,
             "output_tokens": 0,
@@ -551,3 +560,44 @@ class SystemOneEvaluator:
                 "lineage_namespace": lineage_namespace,
             }
         return response
+
+
+async def evaluate_system_one_request(
+    evaluator: SystemOneEvaluator, payload: Any, raw_request: Any
+) -> dict[str, Any]:
+    """Evaluate after body consumption, stopping child work before HTTP cleanup."""
+
+    async def wait_for_disconnect():
+        while True:
+            if (await raw_request.receive())["type"] == "http.disconnect":
+                return
+
+    work = asyncio.create_task(evaluator.evaluate(payload))
+    disconnected = asyncio.create_task(wait_for_disconnect())
+    try:
+        done, _ = await asyncio.wait(
+            (work, disconnected), return_when=asyncio.FIRST_COMPLETED
+        )
+        # A completed evaluation has already released its parent. Do not turn a
+        # simultaneous disconnect into an error or cancel completed child work.
+        if work in done:
+            return await work
+        disconnected.result()
+        raise SystemOneError(
+            499, "client_disconnected", "Client disconnected; System One evaluation aborted"
+        )
+    finally:
+        for task in (work, disconnected):
+            if not task.done():
+                task.cancel()
+        cleanup = asyncio.gather(work, disconnected, return_exceptions=True)
+        cancelled = False
+        # Do not inject a second cancellation into runner release/finish_parent,
+        # even when the ASGI handler is cancelled again during disconnect cleanup.
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError

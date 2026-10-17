@@ -651,12 +651,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self, contexts: torch.Tensor, *, decode_sized: bool = False
     ) -> torch.Tensor:
         contexts = contexts.to(torch.long)
-        if self.enable_ple_fusion and decode_sized:
+        # The same fixed Qwen4 N-gram hash applies to prefill windows when the
+        # checkpoint uses the native 3-gram/8-head layout.  Prefill often
+        # reaches this path with a strided unfold view; materialize only that
+        # compact [windows, 3] view before the fused kernel, rather than
+        # launching one shift/cummax/gather chain per N-gram order.
+        use_fused_hash = self.enable_ple_fusion and (
+            decode_sized
+            or (
+                contexts.ndim == 2
+                and self.ngram_size == 3
+                and contexts.shape[1] == 3
+            )
+        )
+        if use_fused_hash:
             from sglang.kernels.ops.qwen4_ple import (
                 can_fuse_qwen4_ngram_hash,
                 fused_qwen4_ngram_hash,
             )
 
+            if contexts.is_cuda and not contexts.is_contiguous():
+                contexts = contexts.contiguous()
             if can_fuse_qwen4_ngram_hash(
                 contexts,
                 self.layer_multipliers,

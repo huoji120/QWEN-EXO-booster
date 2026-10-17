@@ -16,26 +16,31 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
-from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.attention.qsa.mqa import (
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+    tilelang_qsa_mqa_decode_shared,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import get_is_capture_mode
 
 
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
-# row tiles without changing the selected blocks.
-_QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+# row tiles without changing the selected blocks. The budget is runtime-tunable
+# for high-memory GPUs; the default remains the conservative 128 MiB path.
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
     block_q = max(1, 128 // heads)
     bytes_per_row = keys * torch.float32.itemsize
-    max_padded_rows = max(
-        block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row
-    )
+    budget_mb = max(1, int(envs.SGLANG_QWEN4_EXP_QSA_MAX_LOGITS_MB.get()))
+    budget_bytes = budget_mb * 1024 * 1024
+    max_padded_rows = max(block_q, budget_bytes // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
 
@@ -527,14 +532,29 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        share_mtp_queries: bool = False,
     ) -> torch.Tensor:
-        logits = qsa_mqa_decode(
-            q,
-            compressed_cache,
-            compressed_page_table,
-            compressed_lengths,
-            max_model_len,
-        )
+        logits = None
+        if (
+            share_mtp_queries
+            and envs.SGLANG_QWEN4_EXP_QSA_SHARED_MTP.get()
+            and not get_is_capture_mode()
+        ):
+            logits = tilelang_qsa_mqa_decode_shared(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+            )
+        if logits is None:
+            logits = qsa_mqa_decode(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+            )
         if logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so lengths are the compressed lengths
             # themselves; calling the JIT kernel directly skips the zeros_like
@@ -684,6 +704,7 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
+                share_mtp_queries=is_target_verify,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (

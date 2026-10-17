@@ -9,6 +9,7 @@ from qwen_exo_booster.internal_jobs import InternalJobRunner
 from qwen_exo_booster.system_one import (
     SystemOneError,
     SystemOneEvaluator,
+    evaluate_system_one_request,
     parse_system_one_request,
     render_shared_decision_prompt,
 )
@@ -67,6 +68,44 @@ class FakeTokenizerManager:
 
     def abort_request(self, rid):
         self.aborted.append(rid)
+
+
+class RequestConnection:
+    def __init__(self):
+        self.disconnected = asyncio.Event()
+        self.watching = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def receive(self):
+        self.watching.set()
+        try:
+            await self.disconnected.wait()
+            return {"type": "http.disconnect"}
+        finally:
+            self.closed.set()
+
+
+class ControlledTokenizerManager(FakeTokenizerManager):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Queue()
+        self.stopped = asyncio.Queue()
+        self.dispatched = []
+        self.gates = {}
+        self.running = set()
+
+    async def generate_request(self, request, raw_request):
+        self.dispatched.append(request)
+        self.gates[request.rid[0]] = gate = asyncio.Event()
+        self.running.update(request.rid)
+        self.started.put_nowait(request)
+        try:
+            await gate.wait()
+            async for output in super().generate_request(request, raw_request):
+                yield output
+        finally:
+            self.running.difference_update(request.rid)
+            self.stopped.put_nowait(request)
 
 
 def evaluator(max_fanout=4, **kwargs):
@@ -262,3 +301,228 @@ def test_cross_role_prompts_share_exact_canonical_prefix_tokens():
         judge.prefix_token_count :
     ]
     assert system.prefix_digest == judge.prefix_digest
+
+
+@pytest.mark.parametrize("cancel_kind", ["disconnect", "handler"])
+@pytest.mark.parametrize("waiting_for_capacity", [False, True])
+def test_request_cancellation_stops_own_jobs_without_affecting_other_parent(
+    cancel_kind, waiting_for_capacity
+):
+    async def scenario():
+        baseline = asyncio.all_tasks()
+        system_one, _, runner = evaluator(
+            max_fanout=1 if waiting_for_capacity else 2
+        )
+        runner.tokenizer_manager = manager = ControlledTokenizerManager()
+        admissions = asyncio.Queue()
+        reserve = runner._reserve
+
+        async def observe_reserve(parent_request_id, jobs):
+            admissions.put_nowait(parent_request_id)
+            await reserve(parent_request_id, jobs)
+
+        runner._reserve = observe_reserve
+        survivor_connection = RequestConnection()
+        survivor = asyncio.create_task(
+            evaluate_system_one_request(
+                system_one,
+                {
+                    "model": "m",
+                    "state": "PREFER:A",
+                    "questions": {"keep": {"type": "noul"}},
+                },
+                survivor_connection,
+            )
+        )
+        survivor_request = await asyncio.wait_for(manager.started.get(), timeout=5)
+        survivor_parent = admissions.get_nowait()
+        victim_connection = RequestConnection()
+        victim = asyncio.create_task(
+            evaluate_system_one_request(
+                system_one,
+                {
+                    "model": "m",
+                    "state": "x" * 600,
+                    "questions": {f"q{i}": {"type": "noul"} for i in range(3)},
+                },
+                victim_connection,
+            )
+        )
+        victim_parent = await asyncio.wait_for(admissions.get(), timeout=5)
+        victim_request = None
+        if not waiting_for_capacity:
+            victim_request = await asyncio.wait_for(manager.started.get(), timeout=5)
+        await asyncio.wait_for(victim_connection.watching.wait(), timeout=5)
+        if cancel_kind == "disconnect":
+            victim_connection.disconnected.set()
+            with pytest.raises(SystemOneError) as caught:
+                await asyncio.wait_for(victim, timeout=5)
+            assert caught.value.status_code == 499
+            assert caught.value.code == "client_disconnected"
+        else:
+            victim.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(victim, timeout=5)
+
+        assert victim_connection.closed.is_set()
+        assert manager.running == set(survivor_request.rid)
+        assert runner._active == {survivor_parent: set(survivor_request.rid)}
+        assert runner._reserved_tokens == {survivor_parent: 1}
+        assert runner._lane_active["foreground"] == 1
+        assert set(runner._active_lanes) == {
+            (survivor_parent, rid) for rid in survivor_request.rid
+        }
+        assert victim_parent not in runner._cancelled_parents
+        assert set(manager.aborted) == (
+            set(victim_request.rid) if victim_request is not None else set()
+        )
+        assert not survivor.done()
+
+        manager.gates[survivor_request.rid[0]].set()
+        response = await asyncio.wait_for(survivor, timeout=5)
+        assert response["model"] == "qwen-exo-jev"
+        assert response["answers"]["keep"]["verdict"] is True
+        assert response["usage"]["output_tokens"] == 0
+        assert survivor_connection.closed.is_set()
+        # Opening capacity must not dispatch a cancelled waiter or later waves.
+        assert manager.dispatched == [
+            survivor_request,
+            *([victim_request] if victim_request is not None else []),
+        ]
+        assert not manager.running
+        assert not runner._active
+        assert not runner._reserved_tokens
+        assert not runner._active_lanes
+        assert not any(runner._lane_active.values())
+        assert asyncio.all_tasks() == baseline
+
+    run(scenario())
+
+
+def test_repeated_handler_cancellation_waits_for_runner_cleanup():
+    async def scenario():
+        baseline = asyncio.all_tasks()
+        system_one, _, runner = evaluator(max_fanout=1)
+        runner.tokenizer_manager = manager = ControlledTokenizerManager()
+        connection = RequestConnection()
+        handler = asyncio.create_task(
+            evaluate_system_one_request(
+                system_one,
+                {"model": "m", "state": "s", "questions": {"q": {"type": "noul"}}},
+                connection,
+            )
+        )
+        request = await asyncio.wait_for(manager.started.get(), timeout=5)
+        # Hold admission's lock so release and finish_parent cannot complete yet.
+        await runner._lock.acquire()
+        try:
+            handler.cancel()
+            await asyncio.wait_for(connection.closed.wait(), timeout=5)
+            await asyncio.wait_for(manager.stopped.get(), timeout=5)
+            handler.cancel()
+            await asyncio.sleep(0)
+            assert not handler.done()
+        finally:
+            runner._lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(handler, timeout=5)
+        assert set(manager.aborted) == set(request.rid)
+        assert not manager.running
+        assert not runner._active
+        assert not runner._reserved_tokens
+        assert not runner._active_lanes
+        assert not any(runner._lane_active.values())
+        assert asyncio.all_tasks() == baseline
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("cancel_kind", ["disconnect", "handler"])
+def test_cancellation_after_parent_finalization_started_releases_reservations(cancel_kind):
+    async def scenario():
+        baseline = asyncio.all_tasks()
+        system_one, _, runner = evaluator()
+        entered = asyncio.Event()
+        finish_parent = runner.finish_parent
+
+        async def blocked_finalization(parent_id):
+            await runner._lock.acquire()
+            entered.set()
+            await finish_parent(parent_id)
+
+        runner.finish_parent = blocked_finalization
+        connection = RequestConnection()
+        handler = asyncio.create_task(evaluate_system_one_request(
+            system_one,
+            {"model": "m", "state": "s", "questions": {
+                "q": {"type": "choice", "criteria": {"a": "A", "b": "B"}}
+            }},
+            connection,
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            if cancel_kind == "disconnect":
+                connection.disconnected.set()
+            else:
+                handler.cancel()
+            await asyncio.wait_for(connection.closed.wait(), timeout=5)
+            assert not handler.done()
+        finally:
+            runner._lock.release()
+        if cancel_kind == "disconnect":
+            with pytest.raises(SystemOneError) as error:
+                await asyncio.wait_for(handler, timeout=5)
+            assert error.value.status_code == 499
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(handler, timeout=5)
+        assert not runner._reserved_tokens
+        assert asyncio.all_tasks() == baseline
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("disconnect_ready", [False, True])
+def test_completed_request_wins_disconnect_race_without_leaking_watcher(disconnect_ready):
+    async def scenario():
+        baseline = asyncio.all_tasks()
+        system_one, manager, runner = evaluator()
+        connection = RequestConnection()
+        if disconnect_ready:
+            evaluate = system_one.evaluate
+
+            async def complete_then_disconnect(payload):
+                result = await evaluate(payload)
+                connection.disconnected.set()
+                return result
+
+            system_one.evaluate = complete_then_disconnect
+        response = await evaluate_system_one_request(
+            system_one,
+            {
+                "model": "m",
+                "state": "s",
+                "questions": {"q": {"type": "choice", "criteria": {"only": "Only"}}},
+            },
+            connection,
+        )
+        assert response == {
+            "model": "qwen-exo-jev",
+            "answers": {
+                "q": {
+                    "type": "choice",
+                    "choice": "only",
+                    "confidence": 1.0,
+                    "probabilities": {"only": 1.0},
+                }
+            },
+            "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0},
+        }
+        assert connection.closed.is_set()
+        assert not manager.requests
+        assert not manager.aborted
+        assert not runner._active
+        assert not runner._reserved_tokens
+        assert asyncio.all_tasks() == baseline
+
+    run(scenario())

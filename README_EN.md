@@ -130,6 +130,10 @@ Native single-GPU Flash-Next EAGLE/MTP gives an active decoder one turn after ea
 
 In one three-round experiment overlapping a cold 64K prefill with 512-token generation, median maximum stream gap decreased from 5.56s to 1.46s and generation duration from 14.92s to 10.50s; cold-request duration increased from 5.93s to 6.36s. Both sides used identical input hashes, MTP/Graph settings and output limits, with zero cold cache hits and 61440 cached tokens on each subsequent warm request. Production traffic could still enter during measurement: these are sample-specific scheduling tradeoffs, not a full-load guarantee or GPU-kernel speedup.
 
+Native single-GPU Flash-Next alternates target-only scoring and MTP generation at safe forward boundaries: an equal-priority opposite lane need not wait for long generation to finish. A handoff commits overlap results and synchronizes the forward stream while retaining the original batch and its KV/GDN/PLE/request-slot ownership. Admission accounts for parked requests, remaining output and next-decode memory; it does not reclaim a long generator to admit scoring. If resources are insufficient, generation continues. Execution modes are never mixed. Multi-GPU, PP/DP/CP, disaggregation, LoRA, HiSparse, hybrid-SWA, DLLM, PD multiplexing and decode offload retain their previous paths.
+
+After consuming the request body, `/v1/systemone` watches for client disconnects and cancels and drains that request's evaluation, child jobs and reservations. Admission waiters do not dispatch after their caller leaves. Completion/disconnect/handler-cancellation races await parent cleanup without cancelling unrelated requests.
+
 
 ### Observability: no black-box magic
 

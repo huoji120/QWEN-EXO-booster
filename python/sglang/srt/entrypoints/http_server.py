@@ -1888,7 +1888,11 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
 async def v1_systemone_request(raw_request: Request):
     """TypeSafe System One (jev-latest) compatible noul/choice/score evaluation."""
-    from qwen_exo_booster.system_one import SystemOneError, SystemOneEvaluator
+    from qwen_exo_booster.system_one import (
+        SystemOneError,
+        SystemOneEvaluator,
+        evaluate_system_one_request,
+    )
 
     qwen_exo_runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
     if qwen_exo_runtime is None:
@@ -1911,7 +1915,9 @@ async def v1_systemone_request(raw_request: Request):
         error = SystemOneError(400, "invalid_json", "request body is not valid JSON")
         return ORJSONResponse(error.public_dict(), status_code=error.status_code)
     try:
-        return ORJSONResponse(await evaluator.evaluate(payload))
+        return ORJSONResponse(
+            await evaluate_system_one_request(evaluator, payload, raw_request)
+        )
     except SystemOneError as error:
         return ORJSONResponse(error.public_dict(), status_code=error.status_code)
     except Exception:

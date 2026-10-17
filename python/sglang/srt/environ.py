@@ -240,6 +240,15 @@ class Envs:
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
+    # FP32 QSA prefill logits workspace budget. Larger values reduce chunk
+    # boundaries on high-memory GPUs; keep the conservative default portable.
+    SGLANG_QWEN4_EXP_QSA_MAX_LOGITS_MB = EnvInt(128)
+    # Experimental four-query QSA verification tile; keep off until its
+    # workload crossover beats the validated TileLang selector on SM120.
+    SGLANG_QWEN4_EXP_QSA_SHARED_MTP = EnvBool(False)
+    # Optional page-aligned GPU raw-KV prefix for Qwen4 host-KV serving.
+    # Zero keeps the memory-derived split; positive values override it.
+    SGLANG_QWEN4_GPU_KV_TOKENS = EnvInt(0)
     # Native PLE table paging via POSIX pread or portable mmap.
     SGLANG_QWEN4_PLE_NVME_PATH = EnvStr("")
     SGLANG_QWEN4_PLE_NVME_BACKEND = EnvStr("pread")

@@ -719,10 +719,14 @@ def commit_mamba_states_after_verify(
         0, bs * draft_token_num, step=draft_token_num,
         dtype=accept_lens.dtype, device=accept_lens.device,
     )
-    req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-    # The accepted chain's final tree node need not be accept_lens - 1.
+    # Gather rows with one regular CUDA gather instead of 2-D advanced indexing;
+    # the latter materializes an index kernel and a temporary per verify step.
     last_correct_step_indices = (
-        accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+        torch.gather(
+            accept_index,
+            1,
+            (accept_lens - 1).to(torch.int64).unsqueeze(1),
+        ).squeeze(1)
         - accept_indices_offset
     )
     if batch.mamba_track_indices is not None:
@@ -740,7 +744,10 @@ def commit_mamba_states_after_verify(
             tracking_point - seq_lens_pre_verify - 1, min=0,
             max=accept_index.shape[1] - 1,
         ).to(torch.int64)
-        candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
+        candidate_track_steps = (
+            torch.gather(accept_index, 1, to_track_ith.unsqueeze(1)).squeeze(1)
+            - accept_indices_offset
+        )
         mamba_steps_to_track = torch.where(
             to_track_mask, candidate_track_steps,
             torch.full_like(candidate_track_steps, -1),

@@ -393,14 +393,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         gpu_tokens = 0
         if self._host_raw_cell_size:
-            metadata_bytes = (max_total_num_tokens + page_size) * self._cell_size
-            raw_budget = max(0, self._available_bytes - metadata_bytes)
-            # Every nonempty GPU bank includes its own raw dummy page. Do not
-            # charge that page when the bank is entirely pinned on the host.
-            raw_pages = raw_budget // (page_size * self._host_raw_cell_size)
-            gpu_tokens = min(
-                max_total_num_tokens, max(0, raw_pages - 1) * page_size
-            )
+            override = int(envs.SGLANG_QWEN4_GPU_KV_TOKENS.get())
+            if override > 0:
+                if override % page_size:
+                    raise ValueError(
+                        "SGLANG_QWEN4_GPU_KV_TOKENS must be page-aligned: "
+                        f"got {override}, page_size={page_size}"
+                    )
+                gpu_tokens = min(max_total_num_tokens, override)
+            else:
+                metadata_bytes = (max_total_num_tokens + page_size) * self._cell_size
+                raw_budget = max(0, self._available_bytes - metadata_bytes)
+                # Every nonempty GPU bank includes its own raw dummy page. Do not
+                # charge that page when the bank is entirely pinned on the host.
+                raw_pages = raw_budget // (page_size * self._host_raw_cell_size)
+                gpu_tokens = min(
+                    max_total_num_tokens, max(0, raw_pages - 1) * page_size
+                )
         return MemoryPoolConfig(
             max_total_num_tokens=max_total_num_tokens,
             qwen4_gpu_kv_tokens=gpu_tokens,
