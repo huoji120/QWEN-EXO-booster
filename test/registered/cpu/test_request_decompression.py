@@ -1,9 +1,11 @@
 import asyncio
+import gzip
 import unittest
 
 import zstandard
 
 from sglang.srt.entrypoints.http_request_decompression import (
+    MAX_DECOMPRESSED_BYTES,
     RequestDecompressionMiddleware,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -85,12 +87,42 @@ class TestRequestDecompressionMiddleware(unittest.TestCase):
             ],
         )
 
-    def test_unsupported_method_returns_400(self):
-        scope = {"type": "http", "headers": [(b"x-body-compressed", b"gzip")]}
+    def test_unsupported_method_returns_415(self):
+        scope = {"type": "http", "headers": [(b"content-encoding", b"br")]}
         seen, sent = _drive(scope, [(b"abcd", False)])
         self.assertIsNone(seen)
         self.assertEqual(sent[0]["type"], "http.response.start")
-        self.assertEqual(sent[0]["status"], 400)
+        self.assertEqual(sent[0]["status"], 415)
+
+    def test_standard_content_encoding_gzip_is_decoded_and_stripped(self):
+        # OpenAI-compatible gateways (sub4api) send Content-Encoding, not the
+        # legacy x-body-compressed header.
+        compressed = gzip.compress(PAYLOAD, compresslevel=1)
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-encoding", b"GZIP"),
+                (b"content-length", str(len(compressed)).encode()),
+            ],
+        }
+        seen, sent = _drive(scope, [(compressed, False)])
+        self.assertEqual(seen["body"], PAYLOAD)
+        self.assertEqual(
+            seen["scope"]["headers"],
+            [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(PAYLOAD)).encode()),
+            ],
+        )
+        self.assertEqual(sent, [])
+
+    def test_decompression_bomb_is_rejected(self):
+        bomb = gzip.compress(b"\0" * (MAX_DECOMPRESSED_BYTES + 1))
+        scope = {"type": "http", "headers": [(b"content-encoding", b"gzip")]}
+        seen, sent = _drive(scope, [(bomb, False)])
+        self.assertIsNone(seen)
+        self.assertEqual(sent[0]["status"], 413)
 
     def test_chunked_body_reassembled(self):
         half = len(COMPRESSED) // 2

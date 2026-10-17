@@ -1,13 +1,15 @@
 """Pure-ASGI middleware that decompresses compressed request bodies.
 
-Gated on `SGLANG_ENABLE_REQUEST_DECOMPRESSION` and request header
-`x-body-compressed`, whose value names the method. For example, a caller that
-compressed the body with zstd sets the `x-body-compressed: zstd` header.
+Gated on `SGLANG_ENABLE_REQUEST_DECOMPRESSION`. A body is decompressed when it
+carries either the standard `Content-Encoding` header (`gzip`, `x-gzip`,
+`deflate`, `zstd`; what OpenAI-compatible gateways send) or the legacy
+`x-body-compressed` header naming the method (e.g. `x-body-compressed: zstd`).
 """
 
 import asyncio
 import io
 import logging
+import zlib
 
 import zstandard
 from fastapi.responses import Response
@@ -15,12 +17,50 @@ from starlette.datastructures import Headers
 
 logger = logging.getLogger(__name__)
 
+# Decompressed-size ceiling: a small compressed body must not be able to
+# expand into unbounded memory (decompression bomb).
+MAX_DECOMPRESSED_BYTES = 128 * 1024 * 1024
+
+
+class _TooLarge(ValueError):
+    pass
+
 
 def _zstd_decompress(raw: bytes) -> bytes:
-    return zstandard.ZstdDecompressor().stream_reader(io.BytesIO(raw)).read()
+    body = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(raw)).read(
+        MAX_DECOMPRESSED_BYTES + 1
+    )
+    if len(body) > MAX_DECOMPRESSED_BYTES:
+        raise _TooLarge()
+    return body
 
 
-_DECOMPRESSORS = {"zstd": _zstd_decompress}
+def _zlib_decompress(raw: bytes, wbits: int) -> bytes:
+    decompressor = zlib.decompressobj(wbits)
+    body = decompressor.decompress(raw, MAX_DECOMPRESSED_BYTES + 1)
+    if len(body) > MAX_DECOMPRESSED_BYTES or decompressor.unconsumed_tail:
+        raise _TooLarge()
+    return body + decompressor.flush()
+
+
+def _gzip_decompress(raw: bytes) -> bytes:
+    return _zlib_decompress(raw, 16 + zlib.MAX_WBITS)
+
+
+def _deflate_decompress(raw: bytes) -> bytes:
+    # RFC 9110 "deflate" is zlib-wrapped; some clients send raw deflate.
+    try:
+        return _zlib_decompress(raw, zlib.MAX_WBITS)
+    except zlib.error:
+        return _zlib_decompress(raw, -zlib.MAX_WBITS)
+
+
+_DECOMPRESSORS = {
+    "zstd": _zstd_decompress,
+    "gzip": _gzip_decompress,
+    "x-gzip": _gzip_decompress,
+    "deflate": _deflate_decompress,
+}
 
 
 def _rewrite_headers(headers, new_len):
@@ -28,33 +68,43 @@ def _rewrite_headers(headers, new_len):
     out = [
         (k, v)
         for (k, v) in headers
-        if k not in (b"content-length", b"x-body-compressed")
+        if k not in (b"content-length", b"x-body-compressed", b"content-encoding")
     ]
     out.append((b"content-length", str(new_len).encode()))
     return out
 
 
+def _requested_method(headers: Headers) -> str | None:
+    legacy = headers.get("x-body-compressed")
+    if legacy is not None:
+        return legacy
+    encoding = (headers.get("content-encoding") or "").strip().lower()
+    if not encoding or encoding == "identity":
+        return None
+    return encoding
+
+
 class RequestDecompressionMiddleware:
-    """Decompress request body per request header `x-body-compressed`."""
+    """Decompress request bodies per `Content-Encoding` / `x-body-compressed`."""
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        # No-op passthrough for any request without the compression header.
+        # No-op passthrough for any request without a compression header.
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        method = Headers(scope=scope).get("x-body-compressed")
+        method = _requested_method(Headers(scope=scope))
         if method is None:
             return await self.app(scope, receive, send)
 
-        # Fail loud on an unsupported compression method.
+        # Fail loud on an unsupported (or stacked, e.g. "gzip, br") method.
         decompress = _DECOMPRESSORS.get(method)
         if decompress is None:
             return await Response(
-                f"unsupported x-body-compressed {method!r}; "
+                f"unsupported request body encoding {method!r}; "
                 f"supported: {sorted(_DECOMPRESSORS)}",
-                status_code=400,
+                status_code=415,
             )(scope, receive, send)
 
         # Collect request body.
@@ -72,6 +122,11 @@ class RequestDecompressionMiddleware:
         try:
             loop = asyncio.get_running_loop()
             body = await loop.run_in_executor(None, decompress, body)
+        except _TooLarge:
+            return await Response(
+                f"decompressed body exceeds {MAX_DECOMPRESSED_BYTES} bytes",
+                status_code=413,
+            )(scope, receive, send)
         except Exception as e:
             logger.warning("request body decompress failed: %s", e)
             return await Response("decompress failed", status_code=400)(

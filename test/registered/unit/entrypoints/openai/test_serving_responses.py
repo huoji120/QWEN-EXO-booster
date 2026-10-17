@@ -69,6 +69,8 @@ class InputMessageConstructionTestCase(unittest.TestCase):
 
         messages = serving._construct_input_messages(request, prev_response)
 
+        # The parent's output replays exactly as a stateless client's replay of
+        # the same items would (see test_previous_response_chaining).
         self.assertEqual(
             messages,
             [
@@ -76,7 +78,10 @@ class InputMessageConstructionTestCase(unittest.TestCase):
                 {"role": "user", "content": "old input"},
                 {
                     "role": "assistant",
-                    "content": "first answer part\nsecond answer part",
+                    "content": [
+                        {"type": "text", "text": "first answer part"},
+                        {"type": "text", "text": "second answer part"},
+                    ],
                 },
                 {"role": "user", "content": "new input"},
             ],

@@ -81,6 +81,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     UsageInfo,
 )
+from sglang.srt.entrypoints.openai.bounded_store import BoundedStore
 from sglang.srt.entrypoints.openai.memory_tool_rounds import (
     MAX_MEMORY_TOOL_ROUNDS,
     MEMORY_ROUND_META_KEY,
@@ -124,6 +125,19 @@ _DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 _CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
 # Identifies the synthetic tool message that carries retrieved QWEN-EXO memory.
 _MEMORY_ATTACHMENT_TOOL_CALL_ID = "qwen_exo_memory"
+
+
+_STORED_RESPONSE_MAX_ENTRIES = 4096
+# Matches the idle TTL gateways keep chain baselines for, with headroom.
+_STORED_RESPONSE_IDLE_TTL_SECONDS = 2 * 60 * 60
+_STORED_MESSAGES_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _stored_messages_size(messages: Any) -> int:
+    try:
+        return len(orjson.dumps(messages, default=str))
+    except TypeError:
+        return 0
 
 
 class _ResponsePromptEncoding:
@@ -303,18 +317,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                 get_stop_tokens_for_assistant_actions()
             )
 
-        # Response storage for background and retrieval operations
-        # Note: In production, this should use a proper storage backend (Redis, database)
-        # with TTL/expiration to prevent memory leaks
-        self.response_store: dict[str, ResponsesResponse] = {}
+        # Stored responses and their conversation messages, for
+        # previous_response_id chaining and retrieval. Bounded: gateways that
+        # chain every turn force store=true, and each msg_store entry holds a
+        # conversation's full history.
+        self.response_store: BoundedStore[ResponsesResponse] = BoundedStore(
+            max_entries=_STORED_RESPONSE_MAX_ENTRIES,
+            idle_ttl_seconds=_STORED_RESPONSE_IDLE_TTL_SECONDS,
+        )
         self.response_store_lock = asyncio.Lock()
-
-        # Message storage for conversation continuity
-        # Note: In production, this should use a proper storage backend (Redis, database)
-        # with TTL/expiration to prevent memory leaks
-        self.msg_store: dict[
-            str, Union[list[ChatCompletionMessageParam], list[OpenAIMessage]]
-        ] = {}
+        self.msg_store: BoundedStore[
+            Union[list[ChatCompletionMessageParam], list[OpenAIMessage]]
+        ] = BoundedStore(
+            max_entries=_STORED_RESPONSE_MAX_ENTRIES,
+            idle_ttl_seconds=_STORED_RESPONSE_IDLE_TTL_SECONDS,
+            max_bytes=_STORED_MESSAGES_MAX_BYTES,
+            sizer=_stored_messages_size,
+        )
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
@@ -1264,7 +1283,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 public_messages = (
                     self._construct_input_messages_with_harmony(request, prev_response)
                     if self.use_harmony
-                    else self._construct_input_messages(request, prev_response)
+                    else self._conversation_messages(request, prev_response)
                 )
                 self.msg_store[request.request_id] = public_messages
             created_time = int(time.time())
@@ -2161,28 +2180,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "content": request.instructions,
                 }
             )
-
-        # Prepend the conversation history
-        if prev_response is not None:
-            prev_msg = self.msg_store[prev_response.id]
-            for message in prev_msg:
-                messages.extend(self._normalize_response_items_for_chat(message))
-
-            for output_item in prev_response.output:
-                assistant_text = self._output_message_text(output_item)
-                if assistant_text is None:
-                    continue
-                messages.append({"role": "assistant", "content": assistant_text})
-
-        # Append the new input
-        # Responses API supports simple text inputs without chat format
-        if isinstance(request.input, str):
-            messages.append({"role": "user", "content": request.input})
-        else:
-            for input_item in request.input:
-                messages.extend(  # type: ignore
-                    self._normalize_response_items_for_chat(input_item)
-                )
+        messages.extend(self._conversation_messages(request, prev_response))
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message
@@ -2225,6 +2223,36 @@ class OpenAIServingResponses(OpenAIServingChat):
             "\n\n".join(system_chunks) if system_chunks else _DEFAULT_SYSTEM_PROMPT
         )
         return [{"role": "system", "content": system_content}] + other_msgs
+
+    def _conversation_messages(
+        self,
+        request: ResponsesRequest,
+        prev_response: Optional[ResponsesResponse],
+    ) -> list[ChatCompletionMessageParam]:
+        """The conversation as chat messages, without ``instructions`` or the
+        memory attachment and before assistant merging: the form kept in
+        ``msg_store`` for ``previous_response_id`` chaining.
+
+        A chained turn replays the parent's stored messages and *every* parent
+        output item (reasoning, tool calls, ``mcp_call``, messages) through the
+        same normalization a stateless client's replay takes, so a chained
+        prompt renders exactly like the equivalent full-history request.
+        """
+        messages: list[ChatCompletionMessageParam] = []
+        if prev_response is not None:
+            for message in self.msg_store[prev_response.id]:
+                messages.extend(self._normalize_response_items_for_chat(message))
+            for output_item in prev_response.output:
+                messages.extend(self._normalize_response_items_for_chat(output_item))
+        # Responses API supports simple text inputs without chat format
+        if isinstance(request.input, str):
+            messages.append({"role": "user", "content": request.input})
+        else:
+            for input_item in request.input:
+                messages.extend(  # type: ignore
+                    self._normalize_response_items_for_chat(input_item)
+                )
+        return messages
 
     def _construct_input_messages_with_harmony(
         self,
