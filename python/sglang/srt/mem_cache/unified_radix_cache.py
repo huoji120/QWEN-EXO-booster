@@ -93,6 +93,9 @@ class UnifiedTreeNode:
         self.hash_value = None
         self.hit_count = 0
         self.priority = priority
+        # rid of the request whose chunked prefill donated this node's mamba state
+        # as an intermediate checkpoint; None for every other node.
+        self.prefill_checkpoint_rid: Optional[str] = None
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
         )
@@ -183,6 +186,12 @@ class UnifiedLRUList:
         assert node.id in self.cache
         self._remove_node(node)
         self._add_node(node)
+
+    def demote_node_lru(self, node: UnifiedTreeNode):
+        """Move an existing node to the LRU end, so it is evicted first."""
+        assert node.id in self.cache
+        self._remove_node(node)
+        self._add_node_after(self.tail.lru_prev[self._pt], node)
 
     def reset_node_and_parents_mru(
         self,
@@ -775,6 +784,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
+        self._demote_superseded_prefill_checkpoint(req.last_node, req.rid)
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
@@ -865,6 +875,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
+        if chunked:
+            self._mark_prefill_checkpoint(
+                match_result.best_match_node, insert_params, req.rid
+            )
+        self._demote_superseded_prefill_checkpoint(req.last_node, req.rid)
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
@@ -894,6 +909,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
     # ---- Internal Helpers ----
+
+    def _mark_prefill_checkpoint(
+        self, node: UnifiedTreeNode, insert_params: InsertParams, rid: str
+    ) -> None:
+        """Tag the node holding the mamba state this chunk just donated."""
+        if (
+            ComponentType.MAMBA in self.tree_components
+            and insert_params.mamba_value is not None
+            and node.component_data[ComponentType.MAMBA].value
+            is insert_params.mamba_value
+        ):
+            node.prefill_checkpoint_rid = rid
+
+    def _demote_superseded_prefill_checkpoint(
+        self, node: UnifiedTreeNode, rid: str
+    ) -> None:
+        """Make a request's own intermediate prefill checkpoint the first mamba
+        eviction candidate once a deeper state of the same request supersedes it.
+
+        Chunked prefill donates one mamba state per chunk; left at MRU, a single
+        long cold prompt evicts every other session's leaf (and its KV) from the
+        small mamba pool. Demoted checkpoints stay reusable (e.g. a shared system
+        prompt) until there is pressure, and are then tombstoned before any leaf.
+        """
+        if node.prefill_checkpoint_rid != rid or len(node.children) == 0:
+            return
+        lru = self.lru_lists[ComponentType.MAMBA]
+        if node.component_data[ComponentType.MAMBA].value is not None and lru.in_list(
+            node
+        ):
+            lru.demote_node_lru(node)
 
     def _match_prefix_helper(
         self, key: RadixKey

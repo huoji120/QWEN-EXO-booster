@@ -449,6 +449,55 @@ class TestMamba(unittest.TestCase):
         self.assertGreater(order.index(a1), order.index(a2))
         tree.sanity_check()
 
+    def test_superseded_prefill_checkpoint_is_evicted_first(self):
+        """Chunked prefill donates one mamba checkpoint per chunk. Once superseded,
+        each must drop to the mamba LRU end, so pool pressure tombstones the
+        prefill's own checkpoints instead of evicting another session's leaf (and
+        with it that session's whole KV prefix).
+        """
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
+        )
+
+        def insert(token_ids):
+            req = make_dummy_req()
+            key = RadixKey(array("q", token_ids))
+            tree.insert(
+                InsertParams(
+                    key=key,
+                    value=allocator.alloc(len(token_ids)),
+                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+            return tree.match_prefix(MatchPrefixParams(key=key)).last_device_node
+
+        session_leaf = insert([1, 2, 3])
+        # A later cold prompt: two chunk checkpoints, then its prompt-end state.
+        chunk1 = insert([7, 8, 9])
+        chunk1.prefill_checkpoint_rid = "cold"
+        chunk2 = insert([7, 8, 9, 10, 11, 12])
+        chunk2.prefill_checkpoint_rid = "cold"
+        tree._demote_superseded_prefill_checkpoint(chunk1, "cold")
+        prompt = [7, 8, 9, 10, 11, 12, 13, 14, 15]
+        prompt_end = insert(prompt)
+        tree._demote_superseded_prefill_checkpoint(chunk2, "cold")
+        # Leaves and nodes not donated by this request stay where they are.
+        tree._demote_superseded_prefill_checkpoint(prompt_end, "cold")
+        tree._demote_superseded_prefill_checkpoint(session_leaf, "cold")
+        tree._demote_superseded_prefill_checkpoint(chunk1, "other")
+        tree.sanity_check()
+
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=2))
+        self.assertEqual(result.mamba_num_evicted, 2)
+        self.assertIsNone(chunk1.mamba_value)
+        self.assertIsNone(chunk2.mamba_value)
+        self.assertIsNotNone(session_leaf.mamba_value)
+        self.assertIsNotNone(prompt_end.mamba_value)
+        # Tombstoned checkpoints keep their KV: the prompt still matches in full.
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prompt))))
+        self.assertEqual(len(match.device_indices), len(prompt))
+        tree.sanity_check()
+
     def test_mamba_radix_cache_kv_events(self):
         tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
             enable_kv_cache_events=True

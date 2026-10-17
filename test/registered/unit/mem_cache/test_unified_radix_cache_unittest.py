@@ -4126,6 +4126,56 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
         self.assertIs(order[0], b1)
         self.assertGreater(order.index(a1), order.index(a2))
 
+    def test_superseded_prefill_checkpoint_is_evicted_first(self):
+        """Chunked prefill donates one mamba checkpoint per chunk. Once superseded,
+        each must drop to the mamba LRU end, so pool pressure tombstones the
+        prefill's own checkpoints instead of evicting another session's leaf (and
+        with it that session's whole KV prefix).
+        """
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        def insert(tokens):
+            req = self._make_req(req_to_token_pool)
+            params = InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=allocator.alloc(len(tokens))[: len(tokens)],
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+            )
+            cache.insert(params)
+            node = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).best_match_node
+            return node, params
+
+        session_leaf, _ = insert([1, 2, 3])
+        # A later cold prompt: two chunk checkpoints, then its prompt-end state.
+        chunk1, params1 = insert([7, 8, 9])
+        cache._mark_prefill_checkpoint(chunk1, params1, "cold")
+        chunk2, params2 = insert([7, 8, 9, 10, 11, 12])
+        cache._mark_prefill_checkpoint(chunk2, params2, "cold")
+        cache._demote_superseded_prefill_checkpoint(chunk1, "cold")
+        prompt = [7, 8, 9, 10, 11, 12, 13, 14, 15]
+        prompt_end, _ = insert(prompt)
+        cache._demote_superseded_prefill_checkpoint(chunk2, "cold")
+        # Leaves and nodes not donated by this request stay where they are.
+        cache._demote_superseded_prefill_checkpoint(prompt_end, "cold")
+        cache._demote_superseded_prefill_checkpoint(session_leaf, "cold")
+        cache._demote_superseded_prefill_checkpoint(chunk1, "other")
+        self.assertIsNone(session_leaf.prefill_checkpoint_rid)
+        self.assertEqual(self._mamba_lru_mru_to_lru(cache)[-2:], [chunk1, chunk2])
+
+        result = cache.evict(EvictParams(num_tokens=0, mamba_num=2))
+        self.assertEqual(result.mamba_num_evicted, 2)
+        ct = ComponentType.MAMBA
+        self.assertIsNone(chunk1.component_data[ct].value)
+        self.assertIsNone(chunk2.component_data[ct].value)
+        self.assertIsNotNone(session_leaf.component_data[ct].value)
+        self.assertIsNotNone(prompt_end.component_data[ct].value)
+        # Tombstoned checkpoints keep their KV: the prompt still matches in full.
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prompt))))
+        self.assertEqual(len(match.device_indices), len(prompt))
+        cache.sanity_check()
+
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
     cfg = CacheConfig(

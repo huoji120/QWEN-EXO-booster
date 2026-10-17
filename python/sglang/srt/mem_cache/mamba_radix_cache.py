@@ -87,6 +87,9 @@ class TreeNode:
         # actually consumed per access, so the two orders diverge and need separate stamps.
         self.last_access_time = get_last_access_time()
         self.mamba_last_access_time = self.last_access_time
+        # rid of the request whose chunked prefill donated this node's mamba state
+        # as an intermediate checkpoint; None for every other node.
+        self.prefill_checkpoint_rid: Optional[str] = None
 
         self.hit_count = 0
         # QSA compressed pages ending exactly at this node's group boundary
@@ -268,6 +271,18 @@ class LRUList:
             node.mamba_last_access_time = get_last_access_time()
         self.cache[node.id] = node
         self._add_node(node)
+
+    def demote_node_lru(self, node):
+        """
+        Move an (existing) node to least recently used position, so it is evicted
+        before every other node.
+        """
+        assert node.id in self.cache, f"Demoting node {node.id=} not in lru list"
+        lru = self._get_lru()
+        if lru is not node:
+            setattr(node, self.time_attr, getattr(lru, self.time_attr) - 1.0)
+            self._remove_node(node)
+            self._add_node_after(getattr(self.tail, self.prv), node)
 
     def remove_node(self, node: TreeNode):
         """
@@ -649,6 +664,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
             )
 
+        self._demote_superseded_prefill_checkpoint(req.last_node, req.rid)
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
@@ -746,6 +762,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if not mamba_exist:
             assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
+            if chunked:
+                new_last_node.prefill_checkpoint_rid = req.rid
+        self._demote_superseded_prefill_checkpoint(req.last_node, req.rid)
 
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
@@ -770,6 +789,23 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
+
+    def _demote_superseded_prefill_checkpoint(self, node: TreeNode, rid: str) -> None:
+        """Make a request's own intermediate prefill checkpoint the first mamba
+        eviction candidate once a deeper state of the same request supersedes it.
+
+        Chunked prefill donates one mamba state per chunk; left at MRU, a single
+        long cold prompt evicts every other session's leaf (and its KV) from the
+        small mamba pool. Demoted checkpoints stay reusable (e.g. a shared system
+        prompt) until there is pressure, and are then tombstoned before any leaf.
+        """
+        if (
+            node.prefill_checkpoint_rid == rid
+            and node.mamba_value is not None
+            and len(node.children) > 0
+            and self.mamba_lru_list.in_list(node)
+        ):
+            self.mamba_lru_list.demote_node_lru(node)
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
