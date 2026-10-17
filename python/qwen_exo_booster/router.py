@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import os
 from pathlib import Path
@@ -35,12 +36,6 @@ from qwen_exo_booster.attention_diagnostic_conversations import (
 from qwen_exo_booster.server_sessions import ServerSessionStore
 from qwen_exo_booster.config import PROJECT_NAME
 from qwen_exo_booster.contracts import ATTENTION_DIAGNOSTIC_MAX_LAYERS
-from qwen_exo_booster.document_categories import DocumentCategoryError
-from qwen_exo_booster.document_ingest import (
-    KnowledgeIngestError,
-    preview_knowledge_upload,
-    validate_upload_batch,
-)
 from qwen_exo_booster.model_catalog import ModelCatalogError, ModelCatalogStore
 from qwen_exo_booster.recall_visualization import render_recall_trace_html
 from qwen_exo_booster.runtime import QwenExoRuntimeState
@@ -63,34 +58,42 @@ router = APIRouter(prefix="/qwen-exo", tags=[PROJECT_NAME])
 compat_router = APIRouter(tags=[PROJECT_NAME])
 
 
-class KnowledgeWriteRequest(BaseModel):
+
+
+class PolicyDataWriteRequest(BaseModel):
     content: str = Field(min_length=1)
     tags: list[str] = Field(default_factory=list, max_length=16)
 
 
-class KnowledgeUploadItem(BaseModel):
-    filename: str = Field(min_length=1, max_length=255)
-    content_base64: str = Field(min_length=1, max_length=6_000_000)
-    retrieval_category: str | None = Field(default=None, min_length=1, max_length=128)
+# 100 MiB after base64 (the console uses the raw-byte endpoints instead).
+_KNOWLEDGE_BASE64_MAX = 140_000_000
 
 
-class KnowledgeIngestRequest(BaseModel):
-    files: list[KnowledgeUploadItem] = Field(min_length=1, max_length=20)
+class KnowledgeFileUploadRequest(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=1024)
+    content_base64: str = Field(min_length=1, max_length=_KNOWLEDGE_BASE64_MAX)
 
 
-class DocumentCategoryWriteRequest(BaseModel):
-    category_id: str = Field(min_length=1, max_length=128)
-    title: str = Field(min_length=1, max_length=128)
-    parent_id: str | None = Field(default=None, min_length=1, max_length=128)
+class KnowledgeArchiveUploadRequest(BaseModel):
+    content_base64: str = Field(min_length=1, max_length=_KNOWLEDGE_BASE64_MAX)
+    target_directory: str = Field(default="", max_length=512)
 
 
-class DocumentCategoryUpdateRequest(BaseModel):
-    title: str = Field(min_length=1, max_length=128)
-    parent_id: str | None = Field(default=None, min_length=1, max_length=128)
+async def _read_body_capped(request: Request, limit: int) -> bytes:
+    """Read a raw upload body, failing with 413 as soon as it passes ``limit``."""
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > limit:
+        raise HTTPException(status_code=413, detail=f"上传超过 {limit // (1024 * 1024)} MiB")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(status_code=413, detail=f"上传超过 {limit // (1024 * 1024)} MiB")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
-class DocumentCategoryAssignmentRequest(BaseModel):
-    relative_paths: list[str] = Field(min_length=1, max_length=1000)
 
 
 class ServiceConfigWriteRequest(BaseModel):
@@ -104,7 +107,7 @@ class ModelSelectionRequest(BaseModel):
 
 
 class SourceSelectionRequest(BaseModel):
-    lane: Literal["knowledge", "policydata"]
+    lane: Literal["policydata"]
     relative_paths: list[str] = Field(min_length=1, max_length=1000)
 
 
@@ -608,12 +611,143 @@ async def telemetry_stream(
     )
 
 
-@router.get("/knowledge")
-async def list_knowledge(request: Request, q: str = Query(default="", max_length=256)):
+
+
+@router.get("/knowledge/files")
+async def list_knowledge_files(request: Request):
+    index = _runtime(request).file_knowledge
+    await asyncio.to_thread(index.refresh)
+    return {"files": await asyncio.to_thread(index.metadata)}
+
+
+async def _store_knowledge_file(request: Request, relative_path: str, raw: bytes):
+    from qwen_exo_booster.file_knowledge import validate_text_upload
+
+    index = _runtime(request).file_knowledge
+    try:
+        validate_text_upload(raw)
+        row = await asyncio.to_thread(index.upsert, relative_path, raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"file": row}
+
+
+async def _import_knowledge_archive(request: Request, raw: bytes, directory: str):
+    index = _runtime(request).file_knowledge
+    try:
+        imported, skipped = await asyncio.to_thread(
+            index.import_archive, raw, directory=directory
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"files": imported, "skipped": skipped}
+
+
+@router.post("/knowledge/files")
+async def upload_knowledge_file(payload: KnowledgeFileUploadRequest, request: Request):
+    try:
+        raw = base64.b64decode(payload.content_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _store_knowledge_file(request, payload.relative_path, raw)
+
+
+@router.post("/knowledge/upload")
+async def upload_knowledge_file_raw(
+    request: Request, path: str = Query(min_length=1, max_length=1024)
+):
+    """Raw-byte upload (``application/octet-stream``) of one text file."""
+    from qwen_exo_booster.file_knowledge import MAX_UPLOAD_BYTES
+
+    raw = await _read_body_capped(request, MAX_UPLOAD_BYTES)
+    return await _store_knowledge_file(request, path, raw)
+
+
+@router.post("/knowledge/upload-archive")
+async def upload_knowledge_archive_raw(
+    request: Request, target_directory: str = Query(default="", max_length=512)
+):
+    """Raw-byte ZIP upload; each text member becomes its own knowledge file."""
+    from qwen_exo_booster.file_knowledge import MAX_ARCHIVE_BYTES
+
+    raw = await _read_body_capped(request, MAX_ARCHIVE_BYTES)
+    return await _import_knowledge_archive(request, raw, target_directory)
+
+
+@router.post("/knowledge/archives")
+async def upload_knowledge_archive(
+    payload: KnowledgeArchiveUploadRequest, request: Request
+):
+    """Unpack a ZIP into separate knowledge files (one per text member)."""
+    try:
+        raw = base64.b64decode(payload.content_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _import_knowledge_archive(request, raw, payload.target_directory)
+
+
+@router.delete("/knowledge/files/{relative_path:path}")
+async def delete_knowledge_file(relative_path: str, request: Request):
+    try:
+        await asyncio.to_thread(_runtime(request).file_knowledge.delete, relative_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="知识库文件不存在")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"deleted": True, "relative_path": relative_path}
+
+
+@router.get("/knowledge/search")
+async def search_knowledge_files(
+    request: Request,
+    pattern: str = Query(min_length=1, max_length=4096),
+    path_glob: str = Query(default="**/*", min_length=1, max_length=1024),
+    case_sensitive: bool = Query(default=False),
+    regex: bool = Query(default=False),
+    max_results: int = Query(default=50, ge=1, le=1000),
+    context_before: int = Query(default=0, ge=0, le=20),
+    context_after: int = Query(default=0, ge=0, le=20),
+):
+    index = _runtime(request).file_knowledge
+    try:
+        return await asyncio.to_thread(
+            index.search,
+            pattern,
+            path_glob=path_glob,
+            case_sensitive=case_sensitive,
+            regex=regex,
+            max_results=max_results,
+            context_before=context_before,
+            context_after=context_after,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/knowledge/read")
+async def read_knowledge_file(
+    request: Request,
+    path: str = Query(min_length=1, max_length=1024),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=65536, ge=1, le=1_048_576),
+):
+    index = _runtime(request).file_knowledge
+    try:
+        return await asyncio.to_thread(index.read, path, offset=offset, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/knowledge/index")
+async def knowledge_index(request: Request):
     runtime = _runtime(request)
+    await asyncio.to_thread(runtime.file_knowledge.refresh)
+    rows = await asyncio.to_thread(runtime.file_knowledge.metadata)
     return {
-        "source_digest": runtime.knowledge.snapshot.source_digest,
-        "documents": runtime.knowledge_documents(query=q),
+        "file_count": len(rows),
+        "total_bytes": sum(int(row["byte_count"]) for row in rows),
+        "source_digest": runtime._file_knowledge_digest(),
+        "indexed_ns": max((int(row["indexed_ns"]) for row in rows), default=None),
     }
 
 
@@ -1193,28 +1327,11 @@ async def preview_qk_rank(payload: QKRankPreviewRequest, request: Request):
         raise HTTPException(status_code=409, detail=str(exc))
 
 
-@router.post("/knowledge/preview")
-async def preview_knowledge(payload: KnowledgeIngestRequest):
-    files = [item.model_dump() for item in payload.files]
-    try:
-        validate_upload_batch(files)
-        drafts = [
-            preview_knowledge_upload(
-                str(item["filename"]), str(item["content_base64"])
-            ).public_dict()
-            for item in files
-        ]
-    except KnowledgeIngestError as error:
-        return JSONResponse(
-            status_code=422,
-            content={"detail": error.public_dict()},
-        )
-    return {"drafts": drafts, "persisted": False}
 
 
 @router.put("/policydata/{relative_path:path}")
 async def put_policy_data(
-    relative_path: str, payload: KnowledgeWriteRequest, request: Request
+    relative_path: str, payload: PolicyDataWriteRequest, request: Request
 ):
     runtime = _runtime(request)
     try:
@@ -1237,101 +1354,4 @@ async def delete_policy_data(relative_path: str, request: Request):
     return {"deleted": True, "relative_path": relative_path}
 
 
-@router.post("/knowledge/ingest")
-async def ingest_knowledge(payload: KnowledgeIngestRequest, request: Request):
-    runtime = _runtime(request)
-    try:
-        return await runtime.ingest_knowledge_files(
-            [item.model_dump() for item in payload.files]
-        )
-    except KnowledgeIngestError as error:
-        return JSONResponse(
-            status_code=422,
-            content={"detail": error.public_dict()},
-        )
-    except TensorBankCompileError as error:
-        return JSONResponse(
-            status_code=422,
-            content={"detail": error.public_dict()},
-        )
 
-
-@router.get("/knowledge/categories")
-async def list_document_categories(request: Request):
-    return {"categories": _runtime(request).document_category_listing()}
-
-
-@router.post("/knowledge/categories", status_code=201)
-async def create_document_category(
-    payload: DocumentCategoryWriteRequest, request: Request
-):
-    try:
-        return _runtime(request).create_document_category(
-            payload.category_id, payload.title, payload.parent_id
-        )
-    except DocumentCategoryError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-
-@router.patch("/knowledge/categories/{category_id}")
-async def update_document_category(
-    category_id: str, payload: DocumentCategoryUpdateRequest, request: Request
-):
-    try:
-        return _runtime(request).update_document_category(
-            category_id, payload.title, payload.parent_id
-        )
-    except DocumentCategoryError as exc:
-        status_code = 404 if str(exc) == "分类不存在" else 422
-        raise HTTPException(status_code=status_code, detail=str(exc))
-
-
-@router.post("/knowledge/categories/{category_id}/assign")
-async def assign_document_category(
-    category_id: str, payload: DocumentCategoryAssignmentRequest, request: Request
-):
-    try:
-        return await _runtime(request).assign_document_category(
-            category_id, payload.relative_paths
-        )
-    except DocumentCategoryError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=f"未找到知识文档：{exc}")
-
-
-@router.post("/knowledge/reindex")
-async def reindex_knowledge(request: Request):
-    return _runtime(request).reindex_knowledge()
-
-
-@router.get("/knowledge/{relative_path:path}")
-async def get_knowledge(relative_path: str, request: Request):
-    runtime = _runtime(request)
-    try:
-        return runtime.knowledge_document(relative_path)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="未找到知识库文档")
-
-
-@router.put("/knowledge/{relative_path:path}")
-async def put_knowledge(
-    relative_path: str, payload: KnowledgeWriteRequest, request: Request
-):
-    runtime = _runtime(request)
-    try:
-        return runtime.upsert_knowledge(relative_path, payload.content, payload.tags)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@router.delete("/knowledge/{relative_path:path}")
-async def delete_knowledge(relative_path: str, request: Request):
-    runtime = _runtime(request)
-    try:
-        runtime.delete_knowledge(relative_path)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="未找到知识库文档")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"deleted": True, "relative_path": relative_path}

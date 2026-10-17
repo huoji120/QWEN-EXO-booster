@@ -1524,6 +1524,9 @@ class ResponsesRequest(BaseModel):
     # Server-only: survives model_copy, never accepts a client override or
     # enters serialized Responses history. Budget selection stays in reasoning.
     _qwen_exo_auto_reasoning: bool = PrivateAttr(default=False)
+    # Chat-template kwargs the prompt was rendered with; server-executed memory
+    # tool rounds render their tool-result block with the same kwargs.
+    _qwen_exo_template_kwargs: Dict[str, Any] = PrivateAttr(default_factory=dict)
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0

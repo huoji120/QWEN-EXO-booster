@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -51,9 +52,11 @@ from qwen_exo_booster.document_ingest import (
     is_supported_knowledge_filename,
     prepare_knowledge_bytes,
     prepare_knowledge_upload,
+    validate_knowledge_source_bytes,
     validate_prepared_batch,
     validate_upload_batch,
 )
+from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
 from qwen_exo_booster.fingerprint import ModelIdentity
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.internal_jobs import InternalJobRunner
@@ -375,7 +378,20 @@ class QwenExoRuntime:
         self.config = config
         self.tokenizer_manager = tokenizer_manager
         self.hybrid_policy = hybrid_policy
+        if bool(
+            getattr(
+                getattr(tokenizer_manager, "server_args", None),
+                "qwen_exo_qk_only_knowledge",
+                False,
+            )
+        ):
+            logger.warning(
+                "qwen_exo_qk_only_knowledge is deprecated; ordinary Knowledge uses file retrieval"
+            )
         self.knowledge = KnowledgeRepository(config.knowledge_directory)
+        self.file_knowledge = FileKnowledgeIndex(
+            config.knowledge_directory, config.state_directory
+        )
         self.document_categories = DocumentCategoryStore(
             config.state_directory / "document-categories.sqlite3"
         )
@@ -1437,6 +1453,7 @@ class QwenExoRuntime:
                 self.config.knowledge_directory.mkdir(parents=True, exist_ok=True)
                 self.config.policy_data_directory.mkdir(parents=True, exist_ok=True)
                 self.config.cognition_directory.mkdir(parents=True, exist_ok=True)
+                self.file_knowledge.refresh()
                 self.knowledge.refresh()
                 self.policy_data.refresh()
                 self.cognition.refresh()
@@ -1518,11 +1535,7 @@ class QwenExoRuntime:
                         tokenizer,
                         {
                             "cognition": self.cognition,
-                            "knowledge": (
-                                self.knowledge
-                                if self.config.feature_flags.external_memory
-                                else None
-                            ),
+                            "knowledge": None,
                             "policydata": (
                                 self.policy_data
                                 if self.config.feature_flags.policy_data
@@ -1553,15 +1566,12 @@ class QwenExoRuntime:
                         qk_layer_id=self.config.qk_layer_id,
                         qk_query_heads=self.config.qk_query_heads,
                     )
-                    self._stage_pre_complete_knowledge(tokenizer)
+                    if self.config.knowledge_retrieval_mode != "file":
+                        self._stage_pre_complete_knowledge(tokenizer)
                     if self.memory_pipeline is not None:
                         self.memory_pipeline.tensor_bank = self.tensor_bank
                     bank_sources_present = (
                         bool(self.cognition.snapshot.documents)
-                        or bool(
-                            self.config.feature_flags.external_memory
-                            and self.knowledge.snapshot.documents
-                        )
                         or bool(
                             self.config.feature_flags.policy_data
                             and self.policy_data.snapshot.documents
@@ -1576,7 +1586,8 @@ class QwenExoRuntime:
                         self.telemetry.emit(
                             "runtime", "tensor_bank.ready", bank_snapshot.public_dict()
                         )
-                        self._commit_pre_complete_knowledge()
+                        if self.config.knowledge_retrieval_mode != "file":
+                            self._commit_pre_complete_knowledge()
                         self._ensure_query_probe()
                 if (
                     self.config.feature_flags.adaptive_refresh
@@ -8550,19 +8561,31 @@ class QwenExoRuntime:
             )
             payloads.append(payload)
         return payloads
-
     def knowledge_documents(
         self, *, include_content: bool = False, query: str = ""
     ) -> list[dict[str, object]]:
-        return self._source_documents(
-            "knowledge",
-            self.knowledge,
-            include_content=include_content,
-            query=query,
-        )
+        del include_content
+        rows = self.file_knowledge.metadata()
+        needle = str(query or "").casefold()
+        return [
+            {
+                "relative_path": str(row["relative_path"]),
+                "sha256": str(row["sha256"]),
+                "byte_count": int(row["byte_count"]),
+                "modified_ns": int(row["mtime_ns"]),
+                "line_count": int(row["line_count"]),
+                "encoding": str(row["encoding"]),
+                "indexed_ns": int(row["indexed_ns"]),
+                "retrieval_mode": "file",
+                "content_source": "filesystem",
+                "native_tensor_bank": False,
+            }
+            for row in rows
+            if not needle or needle in str(row["relative_path"]).casefold()
+        ]
 
     def knowledge_document(self, relative_path: str) -> dict[str, object]:
-        for document in self.knowledge_documents(include_content=True):
+        for document in self.knowledge_documents():
             if document["relative_path"] == relative_path:
                 return document
         raise KeyError(relative_path)
@@ -8631,53 +8654,52 @@ class QwenExoRuntime:
     def upsert_knowledge(
         self, relative_path: str, content: str, tags: object = None
     ) -> dict[str, object]:
-        document = self.knowledge.upsert(relative_path, content, tags=tags)
-        self._sync_document_categories()
-        self.telemetry.emit(
-            "admin",
-            "knowledge.upserted",
-            {
-                "relative_path": document.relative_path,
-                "sha256": document.sha256,
-                "byte_count": document.byte_count,
-            },
+        del tags
+        raw = str(content).encode("utf-8")
+        validate_knowledge_source_bytes(relative_path, raw)
+        previous = next(
+            (row for row in self.file_knowledge.metadata()
+             if row["relative_path"] == relative_path), None
         )
-        return document.public_dict(include_content=True)
+        row = self.file_knowledge.upsert(relative_path, raw)
+        self.knowledge.refresh()
+        self._sync_document_categories()
+        self.telemetry.emit("admin", "knowledge.upserted", {
+            "relative_path": row["relative_path"], "sha256": row["sha256"],
+            "byte_count": row["byte_count"], "retrieval_mode": "file",
+        })
+        return {
+            "relative_path": row["relative_path"], "sha256": row["sha256"],
+            "byte_count": row["byte_count"], "retrieval_mode": "file",
+            "content_source": "filesystem", "native_tensor_bank": False,
+            "previous_sha256": previous["sha256"] if previous else None,
+        }
 
     def delete_knowledge(self, relative_path: str) -> None:
-        document = next(
-            (
-                item
-                for item in self.knowledge.snapshot.documents
-                if item.relative_path == relative_path
-            ),
-            None,
-        )
-        self.knowledge.delete(relative_path)
-        reflection_record_deleted = bool(
-            document is not None
-            and document.source_kind == "trajectory_reflection"
-            and self.reflection_memory_store.delete_document(relative_path)
-        )
+        self.file_knowledge.delete(relative_path)
+        self.knowledge.refresh()
         self._sync_document_categories()
-        self.telemetry.emit(
-            "admin",
-            "knowledge.deleted",
-            {
-                "relative_path": relative_path,
-                "sha256": document.sha256 if document is not None else None,
-                "reflection_record_deleted": reflection_record_deleted,
-            },
-        )
+        self.telemetry.emit("admin", "knowledge.deleted", {
+            "relative_path": relative_path, "retrieval_mode": "file",
+        })
+
+    def _file_knowledge_digest(self) -> str:
+        digest = hashlib.sha256()
+        for row in self.file_knowledge.metadata():
+            digest.update(str(row["relative_path"]).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(row["sha256"]).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest()
 
     def reindex_knowledge(self) -> dict[str, object]:
-        snapshot = self.knowledge.refresh()
+        result = self.file_knowledge.refresh()
+        self.knowledge.refresh()
         payload: dict[str, object] = {
-            "source_digest": snapshot.source_digest,
-            "document_count": len(snapshot.documents),
-            "compiled": True,
+            **result, "source_digest": self._file_knowledge_digest(),
+            "document_count": result["files"], "compiled": False,
+            "retrieval_mode": "file",
         }
-        self._sync_document_categories()
         self.telemetry.emit("admin", "knowledge.reindexed", payload)
         return payload
 
@@ -8685,126 +8707,46 @@ class QwenExoRuntime:
         self, files: list[dict[str, object]]
     ) -> dict[str, object]:
         validate_upload_batch(files)
-        if self.tensor_bank is None:
-            raise KnowledgeIngestError(
-                "tensor_bank_disabled",
-                "Native Tensor Bank 未启用，不能在线录入 Knowledge",
-            )
-        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
-        if tokenizer is None:
-            raise KnowledgeIngestError(
-                "tokenizer_unavailable",
-                "Tokenizer 尚未初始化，不能清洗和切分文件",
-            )
-        max_source_tokens = self.config.tensor_bank_max_document_tokens - len(
-            self.tensor_bank.cognition_token_ids()
-        )
-        prepared_by_file = tuple(
-            (
-                str(item["filename"]),
-                prepare_knowledge_upload(
-                    str(item["filename"]),
-                    str(item["content_base64"]),
-                    tokenizer=tokenizer,
-                    max_source_tokens=max_source_tokens,
-                    retrieval_category=(
-                        str(item["retrieval_category"])
-                        if item.get("retrieval_category")
-                        else None
-                    ),
-                ),
-            )
-            for item in files
-        )
-        prepared = tuple(
-            document for _, documents in prepared_by_file for document in documents
-        )
-        validate_prepared_batch(prepared)
-        groups = {document.document_group for document in prepared}
-        if len(groups) != len(prepared_by_file):
-            raise KnowledgeIngestError(
-                "duplicate_document_group",
-                "多个文件清洗后生成了相同的文档路径，请调整文件名",
-            )
-
-        async with self._tensor_bank_admin_lock:
-            before = self.knowledge.snapshot
-            existing_by_path = {
-                document.relative_path: document for document in before.documents
-            }
-            for document in prepared:
-                existing = existing_by_path.get(document.relative_path)
-                if existing is not None and existing.document_group not in groups:
-                    raise KnowledgeIngestError(
-                        "path_conflict",
-                        f"目标路径已被非上传文档占用：{document.relative_path}",
-                        filename=document.original_filename,
-                    )
-            replaced = tuple(
-                document
-                for document in before.documents
-                if document.document_group in groups
-                and document.relative_path.startswith("uploads/")
-            )
+        decoded: list[tuple[str, str, bytes]] = []
+        seen_paths: set[str] = set()
+        for item in files:
+            filename = str(item["filename"])
             try:
-                for document in replaced:
-                    self.knowledge.delete(document.relative_path)
-                for document in prepared:
-                    self.knowledge.upsert(document.relative_path, document.content)
-                bank_snapshot = await self._reindex_tensor_bank_unlocked()
-            except BaseException as error:
-                rollback_paths = tuple(
-                    document.relative_path
-                    for document in self.knowledge.snapshot.documents
-                    if document.document_group in groups
-                    and document.relative_path.startswith("uploads/")
+                raw = base64.b64decode(str(item["content_base64"]), validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise KnowledgeIngestError(
+                    "invalid_base64", "文件内容不是有效的 Base64", filename=filename
+                ) from exc
+            relative_path = str(item.get("relative_path") or filename)
+            if relative_path in seen_paths:
+                raise KnowledgeIngestError(
+                    "duplicate_path", "同一批次存在重复相对路径", filename=relative_path
                 )
-                for relative_path in rollback_paths:
-                    self.knowledge.delete(relative_path)
-                for document in replaced:
-                    self.knowledge.upsert(document.relative_path, document.content)
-                self.knowledge.refresh()
-                self._sync_document_categories()
-                self.telemetry.emit(
-                    "admin",
-                    "knowledge.ingest_failed",
-                    {
-                        "filenames": [filename for filename, _ in prepared_by_file],
-                        "error_type": type(error).__name__,
-                        "error": str(error),
-                        "rolled_back": True,
-                    },
-                )
-                raise
-
-            knowledge_snapshot = self.knowledge.snapshot
-            payload: dict[str, object] = {
-                "hot_updated": True,
-                "restart_required": False,
-                "source_digest": knowledge_snapshot.source_digest,
-                "document_count": len(knowledge_snapshot.documents),
-                "replaced_document_count": len(replaced),
-                "files": [
-                    {
-                        "filename": filename,
-                        "documents": [document.public_dict() for document in documents],
-                    }
-                    for filename, documents in prepared_by_file
-                ],
-                "tensor_bank": bank_snapshot,
-            }
-            self.telemetry.emit(
-                "admin",
-                "knowledge.ingested",
-                {
-                    "filenames": [filename for filename, _ in prepared_by_file],
-                    "document_paths": [document.relative_path for document in prepared],
-                    "source_digest": knowledge_snapshot.source_digest,
-                    "document_count": len(knowledge_snapshot.documents),
-                    "restart_required": False,
-                },
+            validate_knowledge_source_bytes(relative_path, raw)
+            seen_paths.add(relative_path)
+            decoded.append((filename, relative_path, raw))
+        written: list[dict[str, object]] = []
+        for filename, relative_path, raw in decoded:
+            previous = next(
+                (row for row in self.file_knowledge.metadata()
+                 if row["relative_path"] == relative_path), None
             )
-            return payload
+            row = self.file_knowledge.upsert(relative_path, raw)
+            written.append({
+                "filename": filename, "relative_path": relative_path,
+                "sha256": row["sha256"], "byte_count": row["byte_count"],
+                "previous_sha256": previous["sha256"] if previous else None,
+            })
+        self.knowledge.refresh()
+        payload = {
+            "hot_updated": True, "restart_required": False,
+            "source_digest": self._file_knowledge_digest(),
+            "document_count": len(self.file_knowledge.metadata()),
+            "files": written, "retrieval_mode": "file",
+            "content_source": "filesystem", "native_tensor_bank": False,
+        }
+        self.telemetry.emit("admin", "knowledge.ingested", payload)
+        return payload
 
     def policy_data_documents(
         self, *, include_content: bool = False, query: str = ""
@@ -9159,8 +9101,8 @@ class QwenExoRuntime:
             },
             "session_initial_gdn": session_initial_gdn,
             "knowledge": {
-                "source_digest": self.knowledge.snapshot.source_digest,
-                "document_count": len(self.knowledge.snapshot.documents),
+                "source_digest": self._file_knowledge_digest(),
+                "document_count": len(self.file_knowledge.metadata()),
             },
             "cognition": {
                 "source_digest": self.cognition.snapshot.source_digest,

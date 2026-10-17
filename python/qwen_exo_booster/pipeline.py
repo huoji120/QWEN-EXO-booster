@@ -1140,7 +1140,8 @@ class MemoryPipeline:
             query_states = ()
             query_probe_status = "role_plan_mismatch"
         if (
-            self.tensor_bank is not None
+            self.config.knowledge_retrieval_mode != "file"
+            and self.tensor_bank is not None
             and query_heads
             and (
                 self.config.feature_flags.external_memory
@@ -1258,7 +1259,8 @@ class MemoryPipeline:
         candidate_tuple = tuple(
             candidate
             for candidate in candidates
-            if (
+            if candidate.lane != "knowledge"
+            and (
                 not self.config.qk_only_knowledge
                 or candidate.lane != "knowledge"
                 or candidate.candidate_origin == "attention_q_native_tensor_bank"

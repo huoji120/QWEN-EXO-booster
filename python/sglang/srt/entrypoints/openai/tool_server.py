@@ -189,3 +189,47 @@ class NativeToolServer(DemoToolServer):
 
     def __init__(self):
         super().__init__(enable_python=False)
+
+class FileMemoryToolServer(ToolServer):
+    """Server-executed qwen-exo memory tools over the ordinary Knowledge files.
+
+    Unlike the harmony builtins these are plain function tools rendered into
+    the Qwen prompt; ``serving_responses`` runs them through ``executor``.
+    """
+
+    def __init__(self, root, state_directory):
+        from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
+        from qwen_exo_booster.memory_tools import (
+            MEMORY_TOOL_SCHEMAS,
+            MemoryToolExecutor,
+        )
+
+        self.executor = MemoryToolExecutor(FileKnowledgeIndex(root, state_directory))
+        self.chat_tool_schemas = MEMORY_TOOL_SCHEMAS
+        self._descriptions = {
+            schema["function"]["name"]: ToolDescription.new(
+                name=schema["function"]["name"],
+                description=schema["function"]["description"],
+                parameters=schema["function"]["parameters"],
+            )
+            for schema in MEMORY_TOOL_SCHEMAS
+        }
+
+    def has_tool(self, tool_name: str):
+        return tool_name in self._descriptions
+
+    def get_tool_description(self, tool_name: str):
+        return self._descriptions.get(tool_name)
+
+    @asynccontextmanager
+    async def get_tool_session(self, tool_name: str):
+        executor = self.executor
+
+        class Session:
+            async def call_tool(self, name, arguments):
+                _ok, text = await executor.run(name, arguments)
+                return type(
+                    "ToolResult", (), {"content": [type("Text", (), {"text": text})()]}
+                )()
+
+        yield Session()

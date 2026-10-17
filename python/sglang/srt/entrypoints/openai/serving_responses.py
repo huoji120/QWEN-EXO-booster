@@ -49,6 +49,7 @@ from openai_harmony import Message as OpenAIMessage
 from openai_harmony import Role
 from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
 from qwen_exo_booster.memory_span import locate_memory_span
+from qwen_exo_booster.memory_tools import MEMORY_TOOL_NAMES
 from qwen_exo_booster.pipeline import response_memory_metadata
 
 from sglang.srt.entrypoints.context import (
@@ -80,8 +81,25 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     UsageInfo,
 )
+from sglang.srt.entrypoints.openai.memory_tool_rounds import (
+    MAX_MEMORY_TOOL_ROUNDS,
+    MEMORY_ROUND_META_KEY,
+    ROUND_LIMIT_OUTPUT,
+    ToolResponseTemplate,
+    generation_prompt_ids,
+    is_memory_tool,
+    mcp_call_item,
+    mcp_item_to_chat_messages,
+    neutralize_control_markers,
+    new_memory_call,
+    split_memory_calls,
+)
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.tool_server import (
+    FileMemoryToolServer,
+    MCPToolServer,
+    ToolServer,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -456,9 +474,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             raise ValueError("Compaction replay summary cannot be empty")
         public_messages: list[ChatCompletionMessageParam] = []
         for item in user_items:
-            normalized = self._normalize_response_message_for_chat(item)
-            if normalized is not None:
-                public_messages.append(normalized)  # type: ignore[arg-type]
+            public_messages.extend(  # type: ignore[arg-type]
+                self._normalize_response_items_for_chat(item)
+            )
         output_text = ResponseOutputText(
             text=summary,
             annotations=[],
@@ -1196,17 +1214,37 @@ class OpenAIServingResponses(OpenAIServingChat):
                         ),
                     )
 
-                    generator = self._generate_with_builtin_tools(
-                        request.request_id,
-                        request_prompts[i],
-                        adapted_request,
-                        sampling_params,
-                        context,
-                        raw_request=raw_request,
-                        response_request=request,
-                        priority=request.priority,
-                        prompt_encoding=prompt_encoding,
-                    )
+                    if (
+                        isinstance(context, SimpleContext)
+                        and (
+                            adapted_request.input_ids is not None
+                            or isinstance(adapted_request.text, str)
+                        )
+                        and self._memory_tools_active(request)
+                    ):
+                        generator = self._generate_with_memory_tools(
+                            request.request_id,
+                            request_prompts[i],
+                            adapted_request,
+                            sampling_params,
+                            context,
+                            raw_request=raw_request,
+                            response_request=request,
+                            priority=request.priority,
+                            prompt_encoding=prompt_encoding,
+                        )
+                    else:
+                        generator = self._generate_with_builtin_tools(
+                            request.request_id,
+                            request_prompts[i],
+                            adapted_request,
+                            sampling_params,
+                            context,
+                            raw_request=raw_request,
+                            response_request=request,
+                            priority=request.priority,
+                            prompt_encoding=prompt_encoding,
+                        )
                     if qwen_exo_runtime is not None:
                         generator = qwen_exo_runtime.track_generation(
                             request.request_id, generator
@@ -1348,7 +1386,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             memory_attachment=request.qwen_exo_memory_attachment,
         )
 
-        chat_tools = self._response_tools_to_chat_tools(request)
+        chat_tools = self._chat_tools_for_request(request)
         # Automatic selection controls the hard token budget, not the leading
         # system tokens. Changing native effort here destroys long-prefix reuse.
         # The shared "high" spelling maps to Qwen3.8's native default "xhigh".
@@ -1377,6 +1415,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
+        request._qwen_exo_template_kwargs = dict(chat_request.chat_template_kwargs or {})
 
         if is_multimodal:
             request_prompts = [processed_messages.prompt]
@@ -1437,9 +1476,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
-            output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
-            )
+            output = self._memory_round_output_items(
+                request, context, tokenizer
+            ) + self._make_response_output_items(request, final_res["text"], tokenizer)
 
             # Calculate usage from actual output
             num_reasoning_tokens = 0
@@ -1647,7 +1686,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             output_items.append(reasoning_item)
 
-        chat_tools = self._response_tools_to_chat_tools(request)
+        chat_tools = self._chat_tools_for_request(request)
         is_required = request.tool_choice == "required"
         tool_call_items: list[ResponseFunctionToolCall] = []
         parsed_via_native = False
@@ -1724,8 +1763,36 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
             )
             output_items.append(message)
-        output_items.extend(tool_call_items)
+        # Memory tool calls are server-executed; they surface as ``mcp_call``
+        # items (see _memory_round_output_items), never as client calls.
+        output_items.extend(
+            item for item in tool_call_items if not is_memory_tool(item.name)
+        )
         return output_items
+
+    def _memory_round_output_items(
+        self,
+        request: ResponsesRequest,
+        context: ConversationContext,
+        tokenizer: Any,
+    ) -> list:
+        """Items for completed server-side memory rounds, in wire order:
+        each round's reasoning/text, then its ``mcp_call`` items."""
+        items: list = []
+        for round_record in getattr(context, "qwen_exo_memory_rounds", ()):
+            items.extend(
+                item
+                for item in self._make_response_output_items(
+                    request, round_record["text"], tokenizer
+                )
+                # Whitespace the model put before its <tool_call> is not a message.
+                if not (
+                    isinstance(item, ResponseOutputMessage)
+                    and not "".join(part.text for part in item.content).strip()
+                )
+            )
+            items.extend(mcp_call_item(call) for call in round_record["calls"])
+        return items
 
     def _make_response_output_items_with_harmony(
         self,
@@ -1740,6 +1807,55 @@ class OpenAIServingResponses(OpenAIServingChat):
         if last_items:
             output_items.extend(last_items)
         return output_items
+
+    def _memory_tools_active(self, request: ResponsesRequest) -> bool:
+        """Whether the server-executed qwen-exo memory tools join this turn.
+
+        Only under ``tool_choice="auto"``: a forced call would loop on the
+        memory tools, and ``none`` must keep the prompt tool-free.
+        """
+        return (
+            isinstance(self.tool_server, FileMemoryToolServer)
+            and not self.use_harmony
+            and bool(self.tool_call_parser)
+            and request.tool_choice == "auto"
+            and not any(
+                tool.type == "function" and tool.name in MEMORY_TOOL_NAMES
+                for tool in request.tools
+            )
+            # The server loop continues on token ids; media prompts can't be.
+            and not self._request_has_media(request)
+        )
+
+    @staticmethod
+    def _request_has_media(request: ResponsesRequest) -> bool:
+        if isinstance(request.input, str):
+            return False
+        text_parts = {"input_text", "output_text", "text", "reasoning_text", "summary_text"}
+        for item in request.input:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(exclude_none=True)
+            content = item.get("content") if isinstance(item, dict) else None
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if hasattr(part, "model_dump"):
+                    part = part.model_dump(exclude_none=True)
+                if isinstance(part, dict) and part.get("type") not in text_parts:
+                    return True
+        return False
+
+    def _chat_tools_for_request(self, request: ResponsesRequest) -> list[Tool]:
+        """Client function tools, then the memory tools. The memory schemas are
+        constants appended last, so the rendered tool block is byte-stable
+        across turns and the radix prefix keeps matching."""
+        chat_tools = self._response_tools_to_chat_tools(request)
+        if self._memory_tools_active(request):
+            chat_tools.extend(
+                Tool.model_validate(schema)
+                for schema in self.tool_server.chat_tool_schemas
+            )
+        return chat_tools
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
@@ -1820,6 +1936,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             suffix = remaining[suffix_start:].lstrip()
             remaining = "\n".join(part for part in (prefix, suffix) if part)
         return remaining.strip()
+
+    @classmethod
+    def _normalize_response_items_for_chat(cls, message: Any) -> list[Any]:
+        """Convert one input item to zero or more chat messages. A replayed
+        ``mcp_call`` (server-executed tool) expands to the assistant call plus
+        its tool result, matching the prompt the model generated from."""
+        if hasattr(message, "model_dump"):
+            message = message.model_dump(exclude_none=True)
+        if isinstance(message, dict) and message.get("type") == "mcp_call":
+            return mcp_item_to_chat_messages(message)
+        normalized = cls._normalize_response_message_for_chat(message)
+        return [] if normalized is None else [normalized]
 
     @classmethod
     def _normalize_response_message_for_chat(cls, message: Any) -> Any:
@@ -2038,9 +2166,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if prev_response is not None:
             prev_msg = self.msg_store[prev_response.id]
             for message in prev_msg:
-                normalized = self._normalize_response_message_for_chat(message)
-                if normalized is not None:
-                    messages.append(normalized)
+                messages.extend(self._normalize_response_items_for_chat(message))
 
             for output_item in prev_response.output:
                 assistant_text = self._output_message_text(output_item)
@@ -2054,9 +2180,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append({"role": "user", "content": request.input})
         else:
             for input_item in request.input:
-                normalized = self._normalize_response_message_for_chat(input_item)
-                if normalized is not None:
-                    messages.append(normalized)  # type: ignore
+                messages.extend(  # type: ignore
+                    self._normalize_response_items_for_chat(input_item)
+                )
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message
@@ -2922,10 +3048,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         )
 
-        chat_tools = self._response_tools_to_chat_tools(request)
+        chat_tools = self._chat_tools_for_request(request)
         is_required = request.tool_choice == "required"
-        tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
-        if chat_tools and request.tool_choice != "none":
+
+        # Per model turn; rebuilt after each server-side memory tool round,
+        # whose continuation opens a fresh ``<think>`` turn.
+        def _new_tool_parser() -> Optional[Union[FunctionCallParser, JsonArrayParser]]:
+            if not chat_tools or request.tool_choice == "none":
+                return None
             native_supports_structural_tag = False
             if self.tool_call_parser:
                 probe = FunctionCallParser(
@@ -2937,22 +3067,28 @@ class OpenAIServingResponses(OpenAIServingChat):
                     probe.detector.supports_structural_tag()
                 )
             if is_required and not native_supports_structural_tag:
-                tool_parser = JsonArrayParser()
-            elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(
+                return JsonArrayParser()
+            if self.tool_call_parser:
+                return FunctionCallParser(
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
-        reasoning_parser_obj: Optional[ReasoningParser] = None
-        if self.reasoning_parser:
-            reasoning_parser_obj = ReasoningParser(
+            return None
+
+        def _new_reasoning_parser() -> Optional[ReasoningParser]:
+            if not self.reasoning_parser:
+                return None
+            return ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=True,
                 force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
+
+        tool_parser = _new_tool_parser()
+        reasoning_parser_obj = _new_reasoning_parser()
 
         current_output_index = -1
         reasoning_state = {
@@ -3128,6 +3264,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             state = tool_call_states.get(tool_index)
             if state is None or state.get("done"):
                 return []
+            if state.get("internal"):
+                # Server-executed memory call: surfaced as ``mcp_call`` later.
+                state["done"] = True
+                return []
             arguments = state["arguments"]
             completed_item = ResponseFunctionToolCall(
                 arguments=arguments,
@@ -3165,10 +3305,82 @@ class OpenAIServingResponses(OpenAIServingChat):
             state = tool_call_states.get(tool_index)
             return state is not None and not state["done"]
 
+        def _mcp_call_events(call: dict[str, Any]):
+            """Standard hosted-tool events for one server-executed call."""
+            nonlocal current_output_index
+            current_output_index += 1
+            output_index = current_output_index
+            completed_item = mcp_call_item(call)
+            in_progress_item = completed_item.model_copy(
+                update={"output": None, "error": None, "status": "in_progress"}
+            )
+            terminal_event = (
+                openai_responses_types.ResponseMcpCallCompletedEvent(
+                    type="response.mcp_call.completed",
+                    item_id=call["id"],
+                    output_index=output_index,
+                    sequence_number=-1,
+                )
+                if call["ok"]
+                else openai_responses_types.ResponseMcpCallFailedEvent(
+                    type="response.mcp_call.failed",
+                    item_id=call["id"],
+                    output_index=output_index,
+                    sequence_number=-1,
+                )
+            )
+            events = [
+                _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=output_index,
+                        item=in_progress_item,
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseMcpCallInProgressEvent(
+                        type="response.mcp_call.in_progress",
+                        item_id=call["id"],
+                        output_index=output_index,
+                        sequence_number=-1,
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseMcpCallArgumentsDoneEvent(
+                        type="response.mcp_call_arguments.done",
+                        item_id=call["id"],
+                        output_index=output_index,
+                        arguments=call["arguments"],
+                        sequence_number=-1,
+                    )
+                ),
+                _send_event(terminal_event),
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=output_index,
+                        item=completed_item,
+                    )
+                ),
+            ]
+            emitted_items.append(completed_item)
+            return events
+
         def _tool_call_delta_events(call):
             nonlocal current_output_index
             events = []
             state = tool_call_states.get(call.tool_index)
+            if (state is None or state["done"]) and is_memory_tool(call.name):
+                tool_call_states[call.tool_index] = {
+                    "internal": True,
+                    "done": False,
+                    "name": call.name,
+                }
+                return events
+            if state is not None and state.get("internal"):
+                return events
             if state is None or state["done"]:
                 current_output_index += 1
                 state = {
@@ -3228,6 +3440,28 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not isinstance(chunk, dict):
                     continue
                 meta = chunk.get("meta_info") or {}
+                memory_round = meta.get(MEMORY_ROUND_META_KEY)
+                if memory_round is not None:
+                    # A server-side memory round ended this model turn: close
+                    # its items, report the calls, and parse the continuation
+                    # turn (which reopens ``<think>``) from scratch.
+                    for ev in _close_reasoning_item():
+                        yield ev
+                    for ev in _close_message_item():
+                        yield ev
+                    for tool_index in list(tool_call_states):
+                        for ev in _close_tool_call_state(tool_index):
+                            yield ev
+                    for call in memory_round["calls"]:
+                        for ev in _mcp_call_events(call):
+                            yield ev
+                    tool_call_states.clear()
+                    tool_parser = _new_tool_parser()
+                    reasoning_parser_obj = _new_reasoning_parser()
+                    self_ask_spill_router = _QwenExoSelfAskSpillRouter()
+                    stream_offset = 0
+                    finish_reason = None
+                    continue
                 prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
                 completion_tokens = meta.get("completion_tokens", completion_tokens)
                 cached_tokens = meta.get("cached_tokens", cached_tokens)
@@ -3767,6 +4001,240 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         return self._copy_sampling_params(sampling_params, max_new_tokens=remaining)
 
+    def _parse_memory_round_calls(
+        self, request: ResponsesRequest, text: str
+    ) -> tuple[list[Any], list[Any]]:
+        """Parse a finished model turn into (memory calls, client calls)."""
+        content = text
+        if self.reasoning_parser:
+            reasoning_parser = ReasoningParser(
+                model_type=self.reasoning_parser,
+                stream_reasoning=False,
+                force_reasoning=self._is_thinking_enabled_for_request(request),
+                request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
+            _reasoning, content = reasoning_parser.parse_non_stream(text)
+        if not content:
+            return [], []
+        tool_parser = FunctionCallParser(
+            self._chat_tools_for_request(request),
+            self.tool_call_parser,
+            tokenizer=self.tokenizer_manager.tokenizer,
+        )
+        if not tool_parser.has_tool_call(content):
+            return [], []
+        try:
+            _normal_text, calls = tool_parser.parse_non_stream(content)
+        except Exception:
+            logger.exception("Memory tool round: tool call parsing failed")
+            return [], []
+        return split_memory_calls(calls)
+
+    async def _run_memory_round(
+        self, memory_calls: list[Any], *, limit_reached: bool
+    ) -> list[dict[str, Any]]:
+        calls = []
+        for parsed in memory_calls:
+            call = new_memory_call(parsed.name, parsed.parameters)
+            if limit_reached:
+                call["output"] = ROUND_LIMIT_OUTPUT
+            else:
+                ok, output = await self.tool_server.executor.run(
+                    call["name"], call["arguments"]
+                )
+                call["ok"] = ok
+                call["output"] = neutralize_control_markers(output)
+            calls.append(call)
+        return calls
+
+    async def _generate_with_memory_tools(
+        self,
+        request_id: str,
+        request_prompt: Any,
+        adapted_request: GenerateReqInput,
+        sampling_params: Any,
+        context: SimpleContext,
+        *,
+        raw_request: Optional[Request],
+        response_request: ResponsesRequest,
+        priority: Optional[int],
+        prompt_encoding: _ResponsePromptEncoding | None,
+    ) -> AsyncGenerator[Any, None]:
+        """Run model turns, executing qwen-exo memory tool calls server-side.
+
+        Each pass is one full model turn (reasoning boundary continuation
+        included). When a pass ends with only memory tool calls, the server runs
+        them, appends ``output ids + tool-result block + assistant header`` to
+        the token prompt (exact KV reuse) and starts the next pass. A synthetic
+        chunk carrying ``MEMORY_ROUND_META_KEY`` separates passes so consumers
+        can emit ``mcp_call`` items and restart their per-turn parsers.
+        """
+        tokenizer = self.tokenizer_manager.tokenizer
+        template = ToolResponseTemplate(
+            tokenizer, response_request._qwen_exo_template_kwargs
+        )
+        incremental = bool(
+            adapted_request.stream
+            and self.tokenizer_manager.server_args.incremental_streaming_output
+        )
+        if adapted_request.input_ids is None:
+            # Multimodal-capable models get a text prompt; this request has no
+            # media (see _memory_tools_active), so encode it the way the
+            # generation loop does for qwen-exo requests.
+            adapted_request = replace(
+                adapted_request,
+                input_ids=list(
+                    (prompt_encoding or _ResponsePromptEncoding(tokenizer)).encode(
+                        adapted_request.text
+                    )
+                ),
+            )
+        prompt_ids = list(adapted_request.input_ids)
+        try:
+            assistant_header = generation_prompt_ids(
+                prompt_ids, tokenizer.convert_tokens_to_ids("<|im_start|>")
+            )
+            template.continuation_ids(
+                output_ids=(), outputs=("",), generation_prompt_ids=()
+            )
+        except Exception:
+            logger.exception("Memory tools disabled: unsupported chat template")
+            async for item in self._generate_with_builtin_tools(
+                request_id,
+                request_prompt,
+                adapted_request,
+                sampling_params,
+                context,
+                raw_request=raw_request,
+                response_request=response_request,
+                priority=priority,
+                prompt_encoding=prompt_encoding,
+            ):
+                yield item
+            return
+        context.qwen_exo_memory_rounds = []
+        pass_request = adapted_request
+        pass_sampling_params = sampling_params
+        consumed_tokens = 0
+        first_usage: dict[str, Any] = {}
+        prior_completion = 0
+        prior_reasoning = 0
+        for round_index in range(MAX_MEMORY_TOOL_ROUNDS + 2):
+            pass_ids: list[int] = []
+            pass_text = ""
+            final_meta: dict[str, Any] = {}
+            async for _ in self._generate_with_builtin_tools(
+                request_id,
+                request_prompt,
+                pass_request,
+                pass_sampling_params,
+                context,
+                raw_request=raw_request,
+                response_request=response_request,
+                priority=priority,
+                prompt_encoding=prompt_encoding,
+                generation_index_start=round_index,
+            ):
+                chunk = context.last_output
+                if isinstance(chunk, dict):
+                    ids = [int(token) for token in (chunk.get("output_ids") or ())]
+                    text = str(chunk.get("text") or "")
+                    if incremental:
+                        pass_ids.extend(ids)
+                        pass_text += text
+                    else:
+                        pass_ids, pass_text = ids, text
+                    meta = chunk.get("meta_info") or {}
+                    if meta.get("finish_reason"):
+                        final_meta = dict(meta)
+                        if round_index == 0:
+                            first_usage = final_meta
+                        else:
+                            # Report one turn: the client's prompt, plus every
+                            # pass's generated tokens.
+                            completion = prior_completion + int(
+                                meta.get("completion_tokens") or 0
+                            )
+                            patched = dict(meta)
+                            patched.update(
+                                prompt_tokens=first_usage.get("prompt_tokens", 0),
+                                cached_tokens=first_usage.get("cached_tokens", 0),
+                                completion_tokens=completion,
+                                reasoning_tokens=prior_reasoning
+                                + int(meta.get("reasoning_tokens") or 0),
+                                total_tokens=int(first_usage.get("prompt_tokens") or 0)
+                                + completion,
+                            )
+                            context.append_output({**chunk, "meta_info": patched})
+                yield context
+
+            finish = final_meta.get("finish_reason") or {}
+            if not isinstance(finish, Mapping) or finish.get("type") != "stop":
+                return
+            memory_calls, client_calls = self._parse_memory_round_calls(
+                response_request, pass_text
+            )
+            if not memory_calls:
+                return
+            if client_calls:
+                # The turn ends here with the client's calls; results of memory
+                # calls made alongside them would never reach the model.
+                logger.warning(
+                    "QWEN_EXO_MEMORY_TOOL_ROUND request_id=%s dropped=%d "
+                    "reason=mixed_with_client_calls",
+                    request_id,
+                    len(memory_calls),
+                )
+                return
+            if round_index > MAX_MEMORY_TOOL_ROUNDS:
+                return
+            calls = await self._run_memory_round(
+                memory_calls, limit_reached=round_index == MAX_MEMORY_TOOL_ROUNDS
+            )
+            logger.info(
+                "QWEN_EXO_MEMORY_TOOL_ROUND request_id=%s round=%d calls=%s ok=%s "
+                "output_chars=%s",
+                request_id,
+                round_index,
+                [call["name"] for call in calls],
+                [call["ok"] for call in calls],
+                [len(call["output"]) for call in calls],
+            )
+            context.qwen_exo_memory_rounds.append({"text": pass_text, "calls": calls})
+            context.append_output(
+                {
+                    "text": "",
+                    "output_ids": [],
+                    "meta_info": {MEMORY_ROUND_META_KEY: {"calls": calls}},
+                }
+            )
+            yield context
+
+            prompt_ids = [
+                *prompt_ids,
+                *pass_ids,
+                *template.continuation_ids(
+                    output_ids=pass_ids,
+                    outputs=[call["output"] for call in calls],
+                    generation_prompt_ids=assistant_header,
+                ),
+            ]
+            consumed_tokens += len(pass_ids)
+            prior_completion += int(final_meta.get("completion_tokens") or 0)
+            prior_reasoning += int(final_meta.get("reasoning_tokens") or 0)
+            pass_sampling_params = self._phase_two_sampling_params(
+                sampling_params,
+                prompt_length=len(prompt_ids),
+                consumed_tokens=consumed_tokens,
+            )
+            pass_request = replace(
+                adapted_request,
+                text=None,
+                input_ids=prompt_ids,
+                sampling_params=pass_sampling_params,
+            )
+
     async def _generate_with_builtin_tools(
         self,
         request_id: str,
@@ -3778,13 +4246,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         response_request: ResponsesRequest | None = None,
         priority: Optional[int] = None,
         prompt_encoding: _ResponsePromptEncoding | None = None,
+        generation_index_start: int = 0,
         **kwargs,
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
         if prompt_encoding is None:
             prompt_encoding = _ResponsePromptEncoding(self.tokenizer_manager.tokenizer)
         orig_priority = priority or 0
-        generation_index = 0
+        generation_index = generation_index_start
         incremental_logprobs = bool(
             adapted_request.stream
             and self.tokenizer_manager.server_args.incremental_streaming_output

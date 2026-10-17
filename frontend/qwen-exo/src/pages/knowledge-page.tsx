@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { EmptyState } from "@/components/empty-state";
+import { FileKnowledgePanel } from "@/components/file-knowledge-panel";
 import { PageHeader } from "@/components/page-header";
 import { TagInput } from "@/components/tag-input";
 import { Badge } from "@/components/ui/badge";
@@ -344,9 +345,44 @@ function withRetrievalCategory(content: string, category: string) {
   return content.replace(frontMatter, `---\n${rows.join("\n")}\n---\n\n`);
 }
 
+const LANE_TABS = (
+  <TabsList>
+    <TabsTrigger value="knowledge">{t("知识资料")}</TabsTrigger>
+    <TabsTrigger value="policydata">{t("人格文档")}</TabsTrigger>
+  </TabsList>
+);
+
 export function KnowledgePage() {
+  const [lane, setLane] = useState<SourceView>("knowledge");
+  if (lane !== "knowledge") {
+    return <SourceDocumentsPage lane={lane} setLane={setLane} />;
+  }
+  return (
+    <div className="page-frame">
+      <PageHeader
+        title={t("知识库")}
+        description={t(
+          "服务端知识库原文文件。模型在需要时通过服务端工具 qwen_exo_memory_search / qwen_exo_memory_read 搜索和读取；文件内容只作参考，从不执行。",
+        )}
+      />
+      <div className="mb-4 border-b pb-4">
+        <Tabs value={lane} onValueChange={(value) => setLane(value as SourceView)}>
+          {LANE_TABS}
+        </Tabs>
+      </div>
+      <FileKnowledgePanel />
+    </div>
+  );
+}
+
+function SourceDocumentsPage({
+  lane,
+  setLane,
+}: {
+  lane: SourceView;
+  setLane: (lane: SourceView) => void;
+}) {
   const { language, locale } = useI18n();
-  const [lane, setLane] = useState<SourceView>("policydata");
   const [listing, setListing] = useState<SourceListing>({ documents: [] });
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -405,16 +441,13 @@ export function KnowledgePage() {
       listRequestRef.current = controller;
       setLoading(true);
       try {
-        const [categoryListing, next] = await Promise.all([
-          listDocumentCategories(controller.signal),
-          listSources(
-            storageLane(targetView),
-            targetView === "policydata" ? "" : targetQuery,
-            controller.signal,
-          ),
-        ]);
+        // Knowledge files have their own panel; this view lists policydata.
+        const next = await listSources(
+          storageLane(targetView),
+          targetView === "policydata" ? "" : targetQuery,
+          controller.signal,
+        );
         if (controller.signal.aborted || !mountedRef.current) return;
-        setCategories(categoryListing.categories);
         setListing(next);
         const available = new Set(
           next.documents.map((document) => document.relative_path),
@@ -1005,13 +1038,7 @@ export function KnowledgePage() {
             value={lane}
             onValueChange={(value) => setLane(value as SourceView)}
           >
-            <TabsList>
-              <TabsTrigger value="policydata">{t("人格文档")}</TabsTrigger>
-              <TabsTrigger value="knowledge">{t("知识资料")}</TabsTrigger>
-              <TabsTrigger value="reflection_memory">
-                {t("反思记忆")}
-              </TabsTrigger>
-            </TabsList>
+            {LANE_TABS}
           </Tabs>
           {lane !== "policydata" ? (
             <span className="text-xs text-muted-foreground">

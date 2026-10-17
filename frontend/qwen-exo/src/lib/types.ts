@@ -545,6 +545,43 @@ export type KnowledgeDraft = {
   changes: string[];
 };
 
+/** One file in the server-side knowledge base (searched by memory tools). */
+export type KnowledgeFile = {
+  relative_path: string;
+  sha256: string;
+  byte_count: number;
+  mtime_ns: number;
+  encoding: string;
+  line_count: number;
+  indexed_ns: number;
+};
+
+export type KnowledgeSearchResult = {
+  path: string;
+  line: number;
+  line_start_offset: number;
+  /** Matched substring; ``line_text`` is the whole (clipped) line. */
+  text: string;
+  line_text: string;
+  before: string[];
+  after: string[];
+};
+
+export type KnowledgeSearchResponse = {
+  results: KnowledgeSearchResult[];
+  count: number;
+  truncated: boolean;
+};
+
+export type KnowledgeReadResponse = {
+  path: string;
+  offset: number;
+  end_offset: number;
+  total_bytes: number;
+  text: string;
+  eof: boolean;
+};
+
 export type TraceCandidate = {
   relative_path: string;
   lane: string;

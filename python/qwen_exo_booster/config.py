@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from qwen_exo_booster.score_bias import SCORE_BIAS_KERNEL_MAX_BLOCKS
 from qwen_exo_booster.hybrid_state import (
@@ -181,6 +181,7 @@ class QwenExoConfig:
     replay_switch_margin: float = 0.05
     replay_maybe_kl_cap: float = 4.0
     qk_expansion_margin: float = 0.02
+    knowledge_retrieval_mode: Literal["file"] = "file"
     qk_only_knowledge: bool = False
     qk_recall_preset: str = "balanced"
     qk_prefilter_mode: str = "active"
@@ -644,9 +645,8 @@ class QwenExoConfig:
             qk_expansion_margin=float(
                 getattr(server_args, "qwen_exo_qk_expansion_margin", 0.02)
             ),
-            qk_only_knowledge=bool(
-                getattr(server_args, "qwen_exo_qk_only_knowledge", False)
-            ),
+            knowledge_retrieval_mode="file",
+            qk_only_knowledge=False,
             qk_recall_preset=str(
                 getattr(server_args, "qwen_exo_qk_recall_preset", "balanced")
             ),
@@ -922,6 +922,7 @@ class QwenExoConfig:
             "max_running_requests": self.max_running_requests,
             "context_length": self.context_length,
             "qk_expansion_margin": self.qk_expansion_margin,
+            "knowledge_retrieval_mode": self.knowledge_retrieval_mode,
             "qk_only_knowledge": self.qk_only_knowledge,
             "qk_recall_preset": self.qk_recall_preset,
             "qk_prefilter_mode": self.qk_prefilter_mode,

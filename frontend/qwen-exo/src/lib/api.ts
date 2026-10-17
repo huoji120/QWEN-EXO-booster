@@ -10,6 +10,9 @@ import type {
   ModelCatalog,
   DocumentCategory,
   KnowledgeDraft,
+  KnowledgeFile,
+  KnowledgeReadResponse,
+  KnowledgeSearchResponse,
   RecallTrace,
   RequestTraceListing,
   PendingReflectionMemory,
@@ -463,6 +466,92 @@ export async function reindexTensorBank() {
   return await (
     await apiFetch("/tensor-bank/reindex", { method: "POST" })
   ).json();
+}
+
+export async function listKnowledgeFiles(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/knowledge/files", { signal })
+  ).json()) as { files: KnowledgeFile[] };
+}
+
+export async function uploadKnowledgeFile(
+  relativePath: string,
+  contentBase64: string,
+) {
+  return (await (
+    await apiFetch("/knowledge/files", {
+      method: "POST",
+      body: JSON.stringify({
+        relative_path: relativePath,
+        content_base64: contentBase64,
+      }),
+    })
+  ).json()) as { file: KnowledgeFile };
+}
+
+/** Raw-byte upload of one text file (no base64; up to 100 MiB). */
+export async function uploadKnowledgeFileRaw(relativePath: string, file: Blob) {
+  return (await (
+    await apiFetch(`/knowledge/upload?${new URLSearchParams({ path: relativePath })}`, {
+      method: "POST",
+      body: file,
+      headers: { "Content-Type": "application/octet-stream" },
+    })
+  ).json()) as { file: KnowledgeFile };
+}
+
+/** Raw-byte ZIP upload; the server stores each text member as its own file. */
+export async function uploadKnowledgeArchiveRaw(file: Blob, targetDirectory: string) {
+  const params = new URLSearchParams({ target_directory: targetDirectory });
+  return (await (
+    await apiFetch(`/knowledge/upload-archive?${params}`, {
+      method: "POST",
+      body: file,
+      headers: { "Content-Type": "application/octet-stream" },
+    })
+  ).json()) as {
+    files: KnowledgeFile[];
+    skipped: { path: string; reason: string }[];
+  };
+}
+
+export async function deleteKnowledgeFile(relativePath: string) {
+  await apiFetch(`/knowledge/files/${encodeSourcePath(relativePath)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function searchKnowledge(options: {
+  pattern: string;
+  pathGlob?: string;
+  caseSensitive?: boolean;
+  regex?: boolean;
+  maxResults?: number;
+  context?: number;
+}) {
+  const params = new URLSearchParams({
+    pattern: options.pattern,
+    path_glob: options.pathGlob || "**/*",
+    case_sensitive: String(Boolean(options.caseSensitive)),
+    regex: String(Boolean(options.regex)),
+    max_results: String(options.maxResults ?? 200),
+    context_before: String(options.context ?? 1),
+    context_after: String(options.context ?? 1),
+  });
+  return (await (
+    await apiFetch(`/knowledge/search?${params}`)
+  ).json()) as KnowledgeSearchResponse;
+}
+
+export async function readKnowledge(path: string, offset = 0, limit = 262_144) {
+  const params = new URLSearchParams({
+    path,
+    offset: String(offset),
+    limit: String(limit),
+  });
+  return (await (
+    await apiFetch(`/knowledge/read?${params}`)
+  ).json()) as KnowledgeReadResponse;
 }
 
 export async function listEditors() {
