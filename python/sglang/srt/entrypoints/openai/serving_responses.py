@@ -1257,9 +1257,9 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         messages = self._construct_input_messages(request, prev_response)
         if request._qwen_exo_memory_block:
-            # The block is this turn's first output item and renders as its
-            # own assistant message, exactly as the client's replay of that
-            # item renders next turn, so the cached prefix keeps matching.
+            # Prompt-only, like the old memory attachment: the model reads it
+            # this turn; it is never returned or stored, so next turn only the
+            # previous turn's output after it is re-prefilled.
             messages.append(
                 {"role": "assistant", "content": request._qwen_exo_memory_block}
             )
@@ -1354,11 +1354,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
-            output = (
-                self._memory_block_output_items(request)
-                + self._memory_round_output_items(request, context, tokenizer)
-                + self._make_response_output_items(request, final_res["text"], tokenizer)
-            )
+            output = self._memory_round_output_items(
+                request, context, tokenizer
+            ) + self._make_response_output_items(request, final_res["text"], tokenizer)
 
             # Calculate usage from actual output
             num_reasoning_tokens = 0
@@ -1649,27 +1647,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             item for item in tool_call_items if not is_memory_tool(item.name)
         )
         return output_items
-
-    @staticmethod
-    def _memory_block_output_items(request: ResponsesRequest) -> list:
-        if not request._qwen_exo_memory_block:
-            return []
-        return [
-            ResponseOutputMessage(
-                id=f"msg_{random_uuid()}",
-                content=[
-                    ResponseOutputText(
-                        text=request._qwen_exo_memory_block,
-                        annotations=[],
-                        type="output_text",
-                        logprobs=None,
-                    )
-                ],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-        ]
 
     def _memory_round_output_items(
         self,
@@ -3383,71 +3360,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
             return events
-
-        for block_item in self._memory_block_output_items(request):
-            current_output_index += 1
-            yield _send_event(
-                openai_responses_types.ResponseOutputItemAddedEvent(
-                    type="response.output_item.added",
-                    sequence_number=-1,
-                    output_index=current_output_index,
-                    item=block_item.model_copy(
-                        update={"content": [], "status": "in_progress"}
-                    ),
-                )
-            )
-            (block_part,) = block_item.content
-            yield _send_event(
-                openai_responses_types.ResponseContentPartAddedEvent(
-                    type="response.content_part.added",
-                    sequence_number=-1,
-                    output_index=current_output_index,
-                    item_id=block_item.id,
-                    content_index=0,
-                    part=block_part.model_copy(update={"text": ""}),
-                )
-            )
-            yield _send_event(
-                openai_responses_types.ResponseTextDeltaEvent(
-                    type="response.output_text.delta",
-                    sequence_number=-1,
-                    content_index=0,
-                    output_index=current_output_index,
-                    item_id=block_item.id,
-                    delta=block_part.text,
-                    logprobs=[],
-                )
-            )
-            yield _send_event(
-                openai_responses_types.ResponseTextDoneEvent(
-                    type="response.output_text.done",
-                    sequence_number=-1,
-                    output_index=current_output_index,
-                    content_index=0,
-                    text=block_part.text,
-                    logprobs=[],
-                    item_id=block_item.id,
-                )
-            )
-            yield _send_event(
-                openai_responses_types.ResponseContentPartDoneEvent(
-                    type="response.content_part.done",
-                    sequence_number=-1,
-                    item_id=block_item.id,
-                    output_index=current_output_index,
-                    content_index=0,
-                    part=block_part,
-                )
-            )
-            yield _send_event(
-                openai_responses_types.ResponseOutputItemDoneEvent(
-                    type="response.output_item.done",
-                    sequence_number=-1,
-                    output_index=current_output_index,
-                    item=block_item,
-                )
-            )
-            emitted_items.append(block_item)
 
         try:
             async for ctx in result_generator:

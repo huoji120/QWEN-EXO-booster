@@ -245,10 +245,9 @@ class MemoryToolRoundsTestCase(CustomTestCase):
         )
         self.assertEqual(first, second)
 
-    def test_memory_block_replays_to_the_exact_prompt_message(self):
-        """The block is this turn's last prompt message and first output item;
-        replaying that item (plus the model's following reasoning/call) must
-        rebuild the same message, unmerged, or the cached prefix breaks."""
+    def test_memory_block_is_prompt_only(self):
+        """The block ends this turn's prompt and never reaches stored history
+        (the msg_store form chained turns replay)."""
         serving = make_serving(self.tool_server)
         serving.tokenizer_manager.model_config.is_multimodal = False
         captured = []
@@ -259,31 +258,13 @@ class MemoryToolRoundsTestCase(CustomTestCase):
 
         serving._process_messages = process
         block = render_memory_block([])
-        history = [
-            {"role": "user", "content": "fix the deploy"},
-            {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
-        ]
-        request = ResponsesRequest(model="m", input=history)
+        request = ResponsesRequest(model="m", input="fix the deploy")
         request._qwen_exo_memory_block = block
         asyncio.run(serving._make_request(request, None, None))
-        prompt = [
-            m if isinstance(m, dict) else m.model_dump(exclude_none=True)
-            for m in captured[0].messages
-        ]
-        self.assertEqual(prompt[-1], {"role": "assistant", "content": block})
-
-        (block_item,) = serving._memory_block_output_items(request)
-        replay = history + [
-            block_item.model_dump(),
-            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "think"}]},
-            {"type": "function_call", "call_id": "c2", "name": "bash", "arguments": "{}"},
-        ]
-        replayed = serving._construct_input_messages(
-            ResponsesRequest(model="m", input=replay)
-        )
-        self.assertEqual(replayed[: len(prompt)], prompt)
-        self.assertEqual(replayed[len(prompt)]["reasoning_content"], "think")
+        last = captured[0].messages[-1]
+        last = last if isinstance(last, dict) else last.model_dump(exclude_none=True)
+        self.assertEqual(last, {"role": "assistant", "content": block})
+        self.assertNotIn(block, json.dumps(serving._conversation_messages(request, None)))
 
     def test_memory_turn_context_reads_blocks_searches_and_new_text(self):
         serving = make_serving(self.tool_server)

@@ -116,9 +116,9 @@ from qwen_exo_booster.task_scheduling import internal_task_scope
 
 logger = logging.getLogger(__name__)
 
-# Until a conversation has searched memory, each turn opens with a server-side
-# memory block (an output message, so clients replay it and the prefix stays
-# cached); at most this many per conversation.
+# Until a conversation has searched memory, each turn's prompt ends with a
+# server-side memory block (prompt-only, never returned to the client); at most
+# this many per conversation.
 _MEMORY_BLOCK_MAX_TURNS = 8
 # Existing reflection memories offered to the model as update targets.
 _REFLECTION_SIMILAR_LIMIT = 4
@@ -535,6 +535,10 @@ class QwenExoRuntime:
         self._max_conversation_keys = self.capsule_store.max_records
         # conversation key -> memory blocks shown (None once memory was searched)
         self._memory_block_turns: OrderedDict[str, int | None] = OrderedDict()
+        # conversation key -> hints already shown, so blocks bring new ones
+        self._memory_block_hints: OrderedDict[str, frozenset[tuple[str, int]]] = (
+            OrderedDict()
+        )
         self._memory_tool_stats: Counter[str] = Counter()
         self._reasoning_task_selections: OrderedDict[
             tuple[str, str, str], ReasoningTaskSelection
@@ -6811,16 +6815,25 @@ class QwenExoRuntime:
         if shown >= _MEMORY_BLOCK_MAX_TURNS:
             return None
         self._refresh_memory_hints_if_stale()
+        shown_hints = turn.shown_hints | self._memory_block_hints.get(
+            conversation_key, frozenset()
+        )
         hints: list[dict[str, Any]] = []
         if turn.query_text:
             try:
                 hints = await asyncio.to_thread(
                     self.memory_hints.lookup,
                     turn.query_text,
-                    exclude=turn.shown_hints,
+                    exclude=shown_hints,
                 )
             except Exception:
                 logger.exception("memory hint lookup failed")
+        self._memory_block_hints[conversation_key] = shown_hints | {
+            (hint["path"], hint["line"]) for hint in hints
+        }
+        self._memory_block_hints.move_to_end(conversation_key)
+        while len(self._memory_block_hints) > self._max_conversation_keys:
+            self._memory_block_hints.popitem(last=False)
         self._remember_memory_block_turns(conversation_key, shown + 1)
         self._memory_tool_stats["blocks_shown"] += 1
         self._memory_tool_stats["hints_shown"] += len(hints)

@@ -1521,7 +1521,7 @@ class ResponsesRequest(BaseModel):
     # Chat-template kwargs the prompt was rendered with; server-executed memory
     # tool rounds render their tool-result block with the same kwargs.
     _qwen_exo_template_kwargs: Dict[str, Any] = PrivateAttr(default_factory=dict)
-    # Server-side memory block: this turn's first output message (server-only).
+    # Server-side memory block for this turn's prompt only (never returned).
     _qwen_exo_memory_block: Optional[str] = PrivateAttr(default=None)
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
