@@ -75,6 +75,19 @@ def test_refresh_drops_removed_and_reindexes_changed_files(tmp_path):
     assert set(index.indexed_files()) == {"ops/nginx.md", "notes/frontend.md", "noise/blob.json"}
 
 
+def test_lookup_skips_term_rows_whose_chunk_vanished(tmp_path):
+    """Prod: a refresh committed between the FTS match and the chunk fetch, the
+    fetch returned None and the memory block lookup raised TypeError."""
+    import sqlite3
+
+    index = MemoryHintIndex(tmp_path / "kb", tmp_path / "state" / "hints.sqlite3")
+    index.refresh(_rows(tmp_path / "kb", FILES))
+    with sqlite3.connect(index.database) as connection:
+        connection.execute("DELETE FROM chunks WHERE path = 'ops/release.md'")
+    assert index.lookup("灰度发布出问题了，怎么 rollback？谁负责值班") == []
+    assert index.lookup("reload nginx upstream")[0]["path"] == "ops/nginx.md"
+
+
 def test_memory_block_says_hits_are_unrelated_recollections():
     """Hits are framed as memory, not as files of the current workspace, and
     the no-hit block still prompts a memory search."""

@@ -271,6 +271,9 @@ class MemoryHintIndex:
         if not query_terms:
             return []
         with closing(self._connect()) as connection:
+            # One WAL snapshot: refresh() commits per file, so separate reads
+            # could see an FTS row whose chunk was deleted in between.
+            connection.execute("BEGIN")
             total = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
             if not total:
                 return []
@@ -308,10 +311,13 @@ class MemoryHintIndex:
             hints: list[dict[str, Any]] = []
             seen_paths: set[str] = set()
             for coverage, _score, rowid, matched in scored:
-                path, start, heading, body = connection.execute(
+                row = connection.execute(
                     "SELECT path, start_line, heading, text FROM chunks WHERE id = ?",
                     (rowid,),
                 ).fetchone()
+                if row is None:
+                    continue
+                path, start, heading, body = row
                 if path in seen_paths:
                     continue
                 line, excerpt = _best_line(body, start, matched)
@@ -415,7 +421,8 @@ _STOP_RULE = (
     "同一个方向最多搜两次（第一次 + 换词或换语言再试一次）。两次都搜不到，就认定"
     "记忆里没有这方面的内容，别再换着词反复搜，专心用自己的工具和推理把任务做完；"
     "也不要把“记忆里没有”当成回答。之后遇到新的问题或新的方向再搜。这件事完成或有"
-    "重大发现后，用 qwen_exo_memory_write 写下操作经验永久保存，下次就能搜到。"
+    "重大发现后，用 qwen_exo_memory_write 写下操作经验永久保存，下次就能搜到；发现"
+    "工作记忆（work-memory/）写错了或过时了，用它的 edit / replace / delete 直接改正。"
 )
 
 

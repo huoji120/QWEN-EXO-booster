@@ -87,6 +87,58 @@ def test_write_tool_creates_appends_and_refuses_secrets(index):
         work_path("../escape.md")
 
 
+def test_model_corrects_its_own_notes_but_never_imported_memory(index):
+    """A model that finds its note wrong can edit/replace/delete it; every old
+    version stays restorable, and imported files stay read-only."""
+    tools = MemoryToolExecutor(index)
+    write_note(index, "ops/port.md", title="port", content="The admin API listens on 8080.\nUse curl.")
+    (index.root / "imported.md").write_text("imported fact\n", encoding="utf-8")
+    index.refresh()
+    note = index.root / "work-memory/ops/port.md"
+
+    ok, text = tools.run_sync(
+        MEMORY_WRITE_TOOL, {"path": "ops/port.md", "mode": "edit", "old_text": "8080", "new_text": "30000"}
+    )
+    assert ok, text
+    fields, body = parse_note(note.read_text(encoding="utf-8"))
+    assert "listens on 30000" in body and "8080" not in body and fields["title"] == "port"
+    ok, text = tools.run_sync(
+        MEMORY_WRITE_TOOL, {"path": "ops/port.md", "mode": "edit", "old_text": "9999", "new_text": "x"}
+    )
+    assert not ok and "not found" in text
+    ok, text = tools.run_sync(
+        MEMORY_WRITE_TOOL,
+        {"path": "ops/port.md", "mode": "edit", "old_text": "Use curl.", "new_text": "token=Abcdefgh12345"},
+    )
+    assert not ok and "secrets" in text and "30000" in note.read_text(encoding="utf-8")
+    ok, _ = tools.run_sync(
+        MEMORY_WRITE_TOOL,
+        {
+            "path": "work-memory/ops/port.md",
+            "mode": "replace",
+            "title": "admin port",
+            "content": "# admin port\n\nPort 30000.",  # models often repeat the heading
+        },
+    )
+    assert ok and parse_note(note.read_text(encoding="utf-8"))[1].strip() == "# admin port\n\nPort 30000."
+    for path, mode in (("imported.md", "delete"), ("missing.md", "edit")):
+        ok, text = tools.run_sync(MEMORY_WRITE_TOOL, {"path": path, "mode": mode, "old_text": "a", "new_text": "b"})
+        assert not ok and ("read-only" in text if path == "imported.md" else "does not exist" in text)
+    assert (index.root / "imported.md").exists()
+    ok, _ = tools.run_sync(MEMORY_WRITE_TOOL, {"path": "ops/port.md", "mode": "delete"})
+    assert ok and not note.exists()
+
+    trash = WorkMemoryTrash(index)
+    versions = sorted(entry["batch"] for entry in trash.entries())
+    assert len(versions) == 3  # before edit, before replace, the deleted note
+    trash.restore(versions[0], "work-memory/ops/port.md")
+    assert "8080" in note.read_text(encoding="utf-8")
+    # Restoring over an existing note keeps the current version in the trash.
+    trash.restore(versions[1], "work-memory/ops/port.md")
+    assert "listens on 30000" in note.read_text(encoding="utf-8")
+    assert any(entry["batch"].startswith("replaced-") for entry in trash.entries())
+
+
 def test_trash_keeps_deleted_notes_restorable(index):
     write_note(index, "a/one.md", title="one", content="first note")
     write_note(index, "a/two.md", title="two", content="second note")

@@ -352,6 +352,9 @@ class MemoryDreamService:
                     )
                 )
             if name == "write":
+                note = work_path(str(action.get("path") or ""))
+                if self.index.path_of(note).is_file():
+                    self.trash.keep_copy(note, batch=batch)
                 result = write_note(
                     self.index,
                     str(action.get("path") or ""),

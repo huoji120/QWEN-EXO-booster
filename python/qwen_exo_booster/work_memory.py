@@ -145,6 +145,9 @@ def write_note(
     if mode not in {"create", "append", "replace"}:
         raise FileKnowledgeError("mode must be create or append")
     content = str(content or "").strip()
+    if content.startswith("# "):
+        # render_note writes the title heading itself.
+        content = _without_heading(content).strip()
     if not content:
         raise FileKnowledgeError("content is empty")
     if len(content.encode("utf-8")) > MAX_NOTE_BYTES:
@@ -168,7 +171,7 @@ def write_note(
             raise FileKnowledgeError("note is full; start a new note for further details")
         text = render_note(
             title=fields.get("title") or title or PurePosixPath(relative).stem,
-            body=body.split("\n", 1)[1] if body.startswith("# ") else body,
+            body=_without_heading(body),
             created=fields.get("created") or now,
             updated=now,
             source=fields.get("source") or source,
@@ -184,6 +187,59 @@ def write_note(
         )
     row = index.upsert(relative, text.encode("utf-8"))
     return {"path": relative, "bytes": int(row["byte_count"]), "mode": mode}
+
+
+def _without_heading(body: str) -> str:
+    return body.split("\n", 1)[1] if body.startswith("# ") else body
+
+
+def existing_note(index: FileKnowledgeIndex, path: str) -> str:
+    """Normalized path of a work note that must already exist."""
+    relative = work_path(path)
+    if not index.path_of(relative).is_file():
+        raise FileKnowledgeError(
+            f"{relative} does not exist; find the note with qwen_exo_memory_search first"
+        )
+    return relative
+
+
+def edit_note(
+    index: FileKnowledgeIndex,
+    path: str,
+    *,
+    old_text: str,
+    new_text: str,
+    title: str = "",
+    source: str = "model",
+) -> dict[str, Any]:
+    """Replace one exact passage of an existing note (and optionally its title)."""
+    relative = existing_note(index, path)
+    fields, body = parse_note(_read_existing(index, relative))
+    if not old_text:
+        raise FileKnowledgeError("old_text is empty; copy the exact passage to change")
+    count = body.count(old_text)
+    if count == 0:
+        raise FileKnowledgeError(
+            "old_text was not found in the note; read it with qwen_exo_memory_read and "
+            "copy the passage exactly (without the line-number prefix)"
+        )
+    if count > 1:
+        raise FileKnowledgeError(
+            f"old_text appears {count} times; include more surrounding text so it is unique"
+        )
+    reject_secrets(f"{title}\n{new_text}")
+    body = body.replace(old_text, new_text, 1)
+    if len(body.encode("utf-8")) > MAX_NOTE_TOTAL_BYTES:
+        raise FileKnowledgeError("the edited note is too large; split it into several notes")
+    text = render_note(
+        title=title or fields.get("title") or PurePosixPath(relative).stem,
+        body=_without_heading(body),
+        created=fields.get("created") or _now(),
+        updated=_now(),
+        source=fields.get("source") or source,
+    )
+    row = index.upsert(relative, text.encode("utf-8"))
+    return {"path": relative, "bytes": int(row["byte_count"]), "mode": "edit"}
 
 
 def list_notes(index: FileKnowledgeIndex, *, since_ns: int | None = None, until_ns: int | None = None) -> list[dict[str, Any]]:
@@ -233,6 +289,15 @@ class WorkMemoryTrash:
         self.index.refresh()
         return relative
 
+    def keep_copy(self, relative: str, *, batch: str, data: bytes | None = None) -> None:
+        """Save a version of a note (``data``, or its current bytes) to the trash."""
+        target = self.root / batch / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if data is None:
+            shutil.copy2(self.index.path_of(relative), target)
+        else:
+            target.write_bytes(data)
+
     def entries(self) -> list[dict[str, Any]]:
         found = []
         if not self.root.exists():
@@ -259,8 +324,11 @@ class WorkMemoryTrash:
         if not source.is_file():
             raise FileNotFoundError(relative)
         target = self.index.path_of(relative)
+        if target.is_dir():
+            raise FileKnowledgeError(f"{relative} is a folder")
         if target.exists():
-            raise FileKnowledgeError(f"{relative} already exists")
+            # Restoring an older version: the current one goes to the trash too.
+            self.keep_copy(relative, batch=f"replaced-{time.time_ns()}")
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(target))
         self._prune_empty(source.parent, stop=self.root)
@@ -278,6 +346,8 @@ __all__ = [
     "MAX_NOTE_BYTES",
     "WORK_ROOT",
     "WorkMemoryTrash",
+    "edit_note",
+    "existing_note",
     "find_secrets",
     "is_work_path",
     "list_notes",
