@@ -1864,6 +1864,7 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
             score_bias_enabled=False,
             reasoning_end_token_id=None,
             telemetry=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
+            memory_reminder_for_turn=lambda *_args, **_kwargs: None,
             has_restored_capsule=lambda _request_id: False,
             initial_gdn_selection=lambda **_kwargs: None,
             activation_editor_request=lambda _spec: {"spec": None, "cache_identity": "off"},

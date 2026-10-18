@@ -244,6 +244,69 @@ class MemoryToolRoundsTestCase(CustomTestCase):
         )
         self.assertEqual(first, second)
 
+    def test_search_reminder_is_the_last_prompt_message_and_never_stored(self):
+        serving = make_serving(self.tool_server)
+        serving.tokenizer_manager.model_config.is_multimodal = False
+        captured = []
+
+        def process(chat_request, _is_multimodal):
+            captured.append(chat_request)
+            return SimpleNamespace(prompt="", prompt_ids=[1])
+
+        serving._process_messages = process
+        request = ResponsesRequest(
+            model="m",
+            input=[
+                {"role": "user", "content": "fix the deploy"},
+                {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            ],
+        )
+        asyncio.run(serving._make_request(request, None, None))
+        request._qwen_exo_memory_reminder = "<memory>search first</memory>"
+        asyncio.run(serving._make_request(request, None, None))
+
+        plain, reminded = (
+            [m if isinstance(m, dict) else m.model_dump(exclude_none=True) for m in c.messages]
+            for c in captured
+        )
+        self.assertEqual(reminded[:-1], plain)
+        self.assertEqual(reminded[-1]["role"], "tool")
+        self.assertEqual(reminded[-1]["content"], "<memory>search first</memory>")
+        stored = serving._conversation_messages(request, None)
+        self.assertNotIn("search first", json.dumps(stored))
+
+    def test_reminder_gate_reports_why_memory_tools_are_absent(self):
+        serving = make_serving(self.tool_server)
+        self.assertIsNone(
+            serving._memory_tools_blocked_reason(ResponsesRequest(model="m", input="hi"))
+        )
+        self.assertEqual(
+            serving._memory_tools_blocked_reason(
+                ResponsesRequest(model="m", input="hi", tool_choice="none")
+            ),
+            "tool_choice",
+        )
+        searched = ResponsesRequest(
+            model="m",
+            input=[
+                {"role": "user", "content": "hi"},
+                {
+                    "type": "mcp_call",
+                    "id": "mcp_1",
+                    "server_label": "qwen_exo",
+                    "name": "qwen_exo_memory_search",
+                    "arguments": "{}",
+                    "output": "none",
+                    "status": "completed",
+                },
+            ],
+        )
+        self.assertTrue(serving._history_has_memory_search(searched))
+        self.assertFalse(
+            serving._history_has_memory_search(ResponsesRequest(model="m", input="hi"))
+        )
+
     def test_memory_round_executes_server_side_and_continues_on_exact_tokens(self):
         """A turn ending in only a memory call is executed by the server; the
         next pass prompt is prompt + generated ids + tool block + the original

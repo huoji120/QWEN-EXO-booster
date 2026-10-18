@@ -11,7 +11,7 @@ import os
 import threading
 import time
 import zlib
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -111,6 +111,15 @@ from qwen_exo_booster.task_scheduling import internal_task_scope
 
 logger = logging.getLogger(__name__)
 
+# Until a conversation has searched memory, each turn ends with this reminder
+# (a trailing tool message, so the prompt prefix stays cacheable); it stops once
+# the conversation searches or after this many turns.
+MEMORY_REMINDER_TEXT = (
+    "<memory>本会话尚未检索记忆。开始行动前，先调用 qwen_exo_memory_search 搜索与"
+    "当前任务相关的记忆（用户的笔记、项目文档、过往经验），优先用记忆解决问题；"
+    "搜到后用 qwen_exo_memory_read 读取上下文。</memory>"
+)
+_MEMORY_REMINDER_MAX_TURNS = 8
 # Existing reflection memories offered to the model as update targets.
 _REFLECTION_SIMILAR_LIMIT = 4
 _REFLECTION_SIMILAR_MIN_OVERLAP = 0.2
@@ -518,6 +527,9 @@ class QwenExoRuntime:
             str, tuple[str, ...]
         ] = OrderedDict()
         self._max_conversation_keys = self.capsule_store.max_records
+        # conversation key -> reminder turns shown (None once memory was searched)
+        self._memory_reminder_turns: OrderedDict[str, int | None] = OrderedDict()
+        self._memory_tool_stats: Counter[str] = Counter()
         self._reasoning_task_selections: OrderedDict[
             tuple[str, str, str], ReasoningTaskSelection
         ] = OrderedDict()
@@ -6744,6 +6756,8 @@ class QwenExoRuntime:
             )
         except Exception:
             logger.exception("memory tool log write failed")
+        if any(call["name"] == "qwen_exo_memory_search" for call in calls):
+            self._mark_memory_searched(request_id)
         for call in calls:
             self.telemetry.emit(
                 request_id,
@@ -6757,6 +6771,57 @@ class QwenExoRuntime:
                     "call_id": call["id"],
                 },
             )
+
+    def memory_reminder_for_turn(
+        self,
+        request_id: str,
+        *,
+        blocked_reason: str | None,
+        history_searched: bool,
+    ) -> str | None:
+        """Count whether this turn offers the memory tools (metadata only) and
+        return the search reminder while its conversation has not searched."""
+        self._memory_tool_stats["turns"] += 1
+        if blocked_reason is not None:
+            self._memory_tool_stats[f"not_offered:{blocked_reason}"] += 1
+            self.telemetry.emit(
+                request_id, "memory_tools.not_offered", {"reason": blocked_reason}
+            )
+            return None
+        self._memory_tool_stats["offered"] += 1
+        conversation_key = self._request_conversation_keys.get(request_id)
+        if conversation_key is None:
+            return None
+        turns = self._memory_reminder_turns.get(conversation_key, 0)
+        if history_searched:
+            turns = None
+        if turns is None or turns >= _MEMORY_REMINDER_MAX_TURNS:
+            self._remember_memory_reminder(conversation_key, turns)
+            return None
+        self._remember_memory_reminder(conversation_key, turns + 1)
+        self._memory_tool_stats["reminders_shown"] += 1
+        self.telemetry.emit(
+            request_id, "memory_tools.reminder_shown", {"turn": turns + 1}
+        )
+        return MEMORY_REMINDER_TEXT
+
+    def _remember_memory_reminder(self, conversation_key: str, turns: int | None) -> None:
+        self._memory_reminder_turns[conversation_key] = turns
+        self._memory_reminder_turns.move_to_end(conversation_key)
+        while len(self._memory_reminder_turns) > self._max_conversation_keys:
+            self._memory_reminder_turns.popitem(last=False)
+
+    def _mark_memory_searched(self, request_id: str) -> None:
+        conversation_key = self._request_conversation_keys.get(request_id)
+        if conversation_key is None:
+            return
+        turns = self._memory_reminder_turns.get(conversation_key, 0)
+        if turns is None:
+            return
+        self._memory_tool_stats[
+            "searched_after_reminder" if turns else "searched_unprompted"
+        ] += 1
+        self._remember_memory_reminder(conversation_key, None)
 
     def memory_tool_calls(self, request_id: str | None, limit: int = 100) -> dict[str, Any]:
         if request_id:
@@ -7009,6 +7074,10 @@ class QwenExoRuntime:
                 "memory_tools": True,
                 "policy_data": self.config.feature_flags.policy_data,
                 "cognition": bool(self.cognition.snapshot.documents),
+            },
+            "memory_tools": {
+                **dict(sorted(self._memory_tool_stats.items())),
+                "reminder_max_turns": _MEMORY_REMINDER_MAX_TURNS,
             },
             "telemetry": {
                 "event_count": len(self.telemetry.events(limit=4096)),

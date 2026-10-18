@@ -16,6 +16,7 @@ from qwen_exo_booster.reflection_memory import (
     ReflectionSourceSnapshot,
 )
 from qwen_exo_booster.runtime import (
+    MEMORY_REMINDER_TEXT,
     PendingReflectionMemory,
     QwenExoCapacityConflict,
     QwenExoRuntime,
@@ -1918,3 +1919,50 @@ async def test_compaction_checkpoint_never_blocks_a_user_request(tmp_path):
     release.set()
     value._compaction_reflection_worker.cancel()
     await asyncio.gather(value._compaction_reflection_worker, return_exceptions=True)
+
+
+def test_memory_reminder_repeats_until_searched_or_turn_limit(tmp_path):
+    value = runtime(tmp_path)
+
+    def turn(request_id, conversation, **kwargs):
+        value._request_conversation_keys[request_id] = conversation
+        kwargs.setdefault("blocked_reason", None)
+        kwargs.setdefault("history_searched", False)
+        return value.memory_reminder_for_turn(request_id, **kwargs)
+
+    shown = [turn(f"a{index}", "conv-a") for index in range(10)]
+    assert shown[:8] == [MEMORY_REMINDER_TEXT] * 8
+    assert shown[8:] == [None, None]
+
+    assert turn("b0", "conv-b") == MEMORY_REMINDER_TEXT
+    asyncio.run(
+        value.record_memory_tool_round(
+            "b0",
+            0,
+            [
+                {
+                    "id": "call-1",
+                    "name": "qwen_exo_memory_search",
+                    "arguments": "{}",
+                    "ok": True,
+                    "output": "no matches",
+                    "duration_ms": 1.0,
+                }
+            ],
+        )
+    )
+    assert turn("b1", "conv-b") is None
+
+    assert turn("c0", "conv-c", history_searched=True) is None
+    assert turn("c1", "conv-c") is None
+    assert turn("d0", "conv-d", blocked_reason="tool_choice") is None
+
+    stats = value.status()["memory_tools"]
+    assert stats["reminders_shown"] == 9
+    assert stats["searched_after_reminder"] == 1
+    assert stats["not_offered:tool_choice"] == 1
+    assert stats["offered"] == 14
+    assert stats["turns"] == 15
+    assert [
+        event["event_type"] for event in value.telemetry_events("d0")
+    ] == ["memory_tools.not_offered"]

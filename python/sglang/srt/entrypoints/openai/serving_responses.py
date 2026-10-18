@@ -650,6 +650,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status_code=503,
             )
 
+        if qwen_exo_runtime is not None and not self.use_harmony:
+            request._qwen_exo_memory_reminder = (
+                qwen_exo_runtime.memory_reminder_for_turn(
+                    request.request_id,
+                    blocked_reason=self._memory_tools_blocked_reason(request),
+                    history_searched=self._history_has_memory_search(request),
+                )
+            )
+
         try:
             model_name = request.model
             tokenizer = self.tokenizer_manager.tokenizer
@@ -1228,6 +1237,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
     ):
         messages = self._construct_input_messages(request, prev_response)
+        if request._qwen_exo_memory_reminder:
+            # A trailing ``tool`` message renders inside ``<tool_response>``:
+            # the Qwen template allows no late system message, and a trailing
+            # user message would move ``last_query_index`` and restrip the
+            # history's reasoning. The prefix before it stays byte-identical,
+            # and it never enters ``msg_store``.
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": "qwen_exo_memory_reminder",
+                    "content": request._qwen_exo_memory_reminder,
+                }
+            )
 
         chat_tools = self._chat_tools_for_request(request)
         # Automatic selection controls the hard token budget, not the leading
@@ -1652,23 +1674,46 @@ class OpenAIServingResponses(OpenAIServingChat):
         return output_items
 
     def _memory_tools_active(self, request: ResponsesRequest) -> bool:
-        """Whether the server-executed qwen-exo memory tools join this turn.
+        """Whether the server-executed qwen-exo memory tools join this turn."""
+        return self._memory_tools_blocked_reason(request) is None
+
+    def _memory_tools_blocked_reason(self, request: ResponsesRequest) -> Optional[str]:
+        """Why the memory tools stay out of this turn, or ``None`` if they join.
 
         Only under ``tool_choice="auto"``: a forced call would loop on the
         memory tools, and ``none`` must keep the prompt tool-free.
         """
-        return (
-            isinstance(self.tool_server, FileMemoryToolServer)
-            and not self.use_harmony
-            and bool(self.tool_call_parser)
-            and request.tool_choice == "auto"
-            and not any(
-                tool.type == "function" and tool.name in MEMORY_TOOL_NAMES
-                for tool in request.tools
-            )
-            # The server loop continues on token ids; media prompts can't be.
-            and not self._request_has_media(request)
-        )
+        if not isinstance(self.tool_server, FileMemoryToolServer):
+            return "no_tool_server"
+        if self.use_harmony or not self.tool_call_parser:
+            return "no_tool_parser"
+        if request.tool_choice != "auto":
+            return "tool_choice"
+        if any(
+            tool.type == "function" and tool.name in MEMORY_TOOL_NAMES
+            for tool in request.tools
+        ):
+            return "client_defines_memory_tools"
+        # The server loop continues on token ids; media prompts can't be.
+        if self._request_has_media(request):
+            return "media"
+        return None
+
+    @staticmethod
+    def _history_has_memory_search(request: ResponsesRequest) -> bool:
+        """A replayed ``mcp_call`` shows this conversation already searched."""
+        if isinstance(request.input, str):
+            return False
+        for item in request.input:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(exclude_none=True)
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "mcp_call"
+                and item.get("name") == "qwen_exo_memory_search"
+            ):
+                return True
+        return False
 
     @staticmethod
     def _request_has_media(request: ResponsesRequest) -> bool:
