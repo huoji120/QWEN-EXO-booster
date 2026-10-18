@@ -28,6 +28,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
+
+async def _no_memory_block(*_args, **_kwargs):
+    return None
+
 class InputMessageConstructionTestCase(unittest.TestCase):
     def test_previous_response_replays_assistant_text_not_instructions(self):
         serving = make_serving()
@@ -1864,7 +1868,7 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
             score_bias_enabled=False,
             reasoning_end_token_id=None,
             telemetry=SimpleNamespace(emit=lambda *_args, **_kwargs: None),
-            memory_reminder_for_turn=lambda *_args, **_kwargs: None,
+            memory_block_for_turn=_no_memory_block,
             has_restored_capsule=lambda _request_id: False,
             initial_gdn_selection=lambda **_kwargs: None,
             activation_editor_request=lambda _spec: {"spec": None, "cache_identity": "off"},

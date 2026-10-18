@@ -52,6 +52,11 @@ from qwen_exo_booster.document_ingest import (
     validate_upload_batch,
 )
 from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
+from qwen_exo_booster.memory_hints import (
+    MemoryHintIndex,
+    MemoryTurnContext,
+    render_memory_block,
+)
 from qwen_exo_booster.memory_tool_log import MemoryToolLog
 from qwen_exo_booster.fingerprint import ModelIdentity
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
@@ -111,15 +116,10 @@ from qwen_exo_booster.task_scheduling import internal_task_scope
 
 logger = logging.getLogger(__name__)
 
-# Until a conversation has searched memory, each turn ends with this reminder
-# (a trailing tool message, so the prompt prefix stays cacheable); it stops once
-# the conversation searches or after this many turns.
-MEMORY_REMINDER_TEXT = (
-    "<memory>本会话尚未检索记忆。开始行动前，先调用 qwen_exo_memory_search 搜索与"
-    "当前任务相关的记忆（用户的笔记、项目文档、过往经验），优先用记忆解决问题；"
-    "搜到后用 qwen_exo_memory_read 读取上下文。</memory>"
-)
-_MEMORY_REMINDER_MAX_TURNS = 8
+# Until a conversation has searched memory, each turn opens with a server-side
+# memory block (an output message, so clients replay it and the prefix stays
+# cached); at most this many per conversation.
+_MEMORY_BLOCK_MAX_TURNS = 8
 # Existing reflection memories offered to the model as update targets.
 _REFLECTION_SIMILAR_LIMIT = 4
 _REFLECTION_SIMILAR_MIN_OVERLAP = 0.2
@@ -374,6 +374,12 @@ class QwenExoRuntime:
         self.memory_tool_log = MemoryToolLog(
             config.state_directory / "memory-tool-calls.sqlite3"
         )
+        self.memory_hints = MemoryHintIndex(
+            config.knowledge_directory,
+            config.state_directory / "memory-hints.sqlite3",
+        )
+        self._memory_hints_fingerprint: str | None = None
+        self._memory_hints_refresh: asyncio.Task[None] | None = None
         self.document_categories = DocumentCategoryStore(
             config.state_directory / "document-categories.sqlite3"
         )
@@ -527,8 +533,8 @@ class QwenExoRuntime:
             str, tuple[str, ...]
         ] = OrderedDict()
         self._max_conversation_keys = self.capsule_store.max_records
-        # conversation key -> reminder turns shown (None once memory was searched)
-        self._memory_reminder_turns: OrderedDict[str, int | None] = OrderedDict()
+        # conversation key -> memory blocks shown (None once memory was searched)
+        self._memory_block_turns: OrderedDict[str, int | None] = OrderedDict()
         self._memory_tool_stats: Counter[str] = Counter()
         self._reasoning_task_selections: OrderedDict[
             tuple[str, str, str], ReasoningTaskSelection
@@ -1264,6 +1270,7 @@ class QwenExoRuntime:
                 self.knowledge.refresh()
                 self.policy_data.refresh()
                 self.cognition.refresh()
+                self._refresh_memory_hints_if_stale()
                 self._sync_document_categories()
                 self.model_identity = ModelIdentity.from_path(self.config.model_path)
                 self.model_identity.validate_qwen_exo_model()
@@ -1476,6 +1483,9 @@ class QwenExoRuntime:
             refresh_task = self._session_initial_gdn_refresh_task
             if refresh_task is not None and not refresh_task.done():
                 refresh_task.cancel()
+            hints_task = self._memory_hints_refresh
+            if hints_task is not None and not hints_task.done():
+                hints_task.cancel()
             with self._session_initial_gdn_value_lock:
                 self._session_initial_gdn_pins.clear()
             self._session_initial_gdn_refresh_task = None
@@ -6772,15 +6782,16 @@ class QwenExoRuntime:
                 },
             )
 
-    def memory_reminder_for_turn(
+    async def memory_block_for_turn(
         self,
         request_id: str,
         *,
         blocked_reason: str | None,
-        history_searched: bool,
+        turn: MemoryTurnContext,
     ) -> str | None:
         """Count whether this turn offers the memory tools (metadata only) and
-        return the search reminder while its conversation has not searched."""
+        return the server-side memory block while its conversation has not
+        searched memory: a note that the tools exist plus BM25 hints."""
         self._memory_tool_stats["turns"] += 1
         if blocked_reason is not None:
             self._memory_tool_stats[f"not_offered:{blocked_reason}"] += 1
@@ -6792,36 +6803,79 @@ class QwenExoRuntime:
         conversation_key = self._request_conversation_keys.get(request_id)
         if conversation_key is None:
             return None
-        turns = self._memory_reminder_turns.get(conversation_key, 0)
-        if history_searched:
-            turns = None
-        if turns is None or turns >= _MEMORY_REMINDER_MAX_TURNS:
-            self._remember_memory_reminder(conversation_key, turns)
+        shown = self._memory_block_turns.get(conversation_key, 0)
+        if turn.searched or shown is None:
+            self._remember_memory_block_turns(conversation_key, None)
             return None
-        self._remember_memory_reminder(conversation_key, turns + 1)
-        self._memory_tool_stats["reminders_shown"] += 1
+        shown = max(shown, turn.blocks_shown)
+        if shown >= _MEMORY_BLOCK_MAX_TURNS:
+            return None
+        self._refresh_memory_hints_if_stale()
+        hints: list[dict[str, Any]] = []
+        if turn.query_text:
+            try:
+                hints = await asyncio.to_thread(
+                    self.memory_hints.lookup,
+                    turn.query_text,
+                    exclude=turn.shown_hints,
+                )
+            except Exception:
+                logger.exception("memory hint lookup failed")
+        self._remember_memory_block_turns(conversation_key, shown + 1)
+        self._memory_tool_stats["blocks_shown"] += 1
+        self._memory_tool_stats["hints_shown"] += len(hints)
         self.telemetry.emit(
-            request_id, "memory_tools.reminder_shown", {"turn": turns + 1}
+            request_id,
+            "memory_tools.block_shown",
+            {"turn": shown + 1, "hints": len(hints)},
         )
-        return MEMORY_REMINDER_TEXT
+        return render_memory_block(hints)
 
-    def _remember_memory_reminder(self, conversation_key: str, turns: int | None) -> None:
-        self._memory_reminder_turns[conversation_key] = turns
-        self._memory_reminder_turns.move_to_end(conversation_key)
-        while len(self._memory_reminder_turns) > self._max_conversation_keys:
-            self._memory_reminder_turns.popitem(last=False)
+    def _refresh_memory_hints_if_stale(self) -> None:
+        """Re-index in the background when the knowledge files changed (any
+        upload/delete path); lookups use the previous index meanwhile."""
+        task = self._memory_hints_refresh
+        if task is not None and not task.done():
+            return
+        rows = self.file_knowledge.metadata()
+        fingerprint = stable_digest(
+            *(f"{row['relative_path']}:{row['sha256']}" for row in rows)
+        )
+        if fingerprint == self._memory_hints_fingerprint:
+            return
+
+        async def refresh() -> None:
+            try:
+                result = await asyncio.to_thread(self.memory_hints.refresh, rows)
+            except Exception:
+                logger.exception("memory hint index refresh failed")
+                return
+            self._memory_hints_fingerprint = fingerprint
+            self.telemetry.emit("runtime", "memory_hints.indexed", result)
+
+        self._memory_hints_refresh = asyncio.create_task(
+            refresh(), name="qwen-exo-memory-hints"
+        )
+
+    def _remember_memory_block_turns(
+        self, conversation_key: str, turns: int | None
+    ) -> None:
+        self._memory_block_turns[conversation_key] = turns
+        self._memory_block_turns.move_to_end(conversation_key)
+        while len(self._memory_block_turns) > self._max_conversation_keys:
+            self._memory_block_turns.popitem(last=False)
 
     def _mark_memory_searched(self, request_id: str) -> None:
         conversation_key = self._request_conversation_keys.get(request_id)
         if conversation_key is None:
             return
-        turns = self._memory_reminder_turns.get(conversation_key, 0)
-        if turns is None:
+        shown = self._memory_block_turns.get(conversation_key, 0)
+        if shown is None:
             return
         self._memory_tool_stats[
-            "searched_after_reminder" if turns else "searched_unprompted"
+            "searched_after_block" if shown else "searched_unprompted"
         ] += 1
-        self._remember_memory_reminder(conversation_key, None)
+        self._remember_memory_block_turns(conversation_key, None)
 
     def memory_tool_calls(self, request_id: str | None, limit: int = 100) -> dict[str, Any]:
         if request_id:
@@ -7077,7 +7131,7 @@ class QwenExoRuntime:
             },
             "memory_tools": {
                 **dict(sorted(self._memory_tool_stats.items())),
-                "reminder_max_turns": _MEMORY_REMINDER_MAX_TURNS,
+                "block_max_turns": _MEMORY_BLOCK_MAX_TURNS,
             },
             "telemetry": {
                 "event_count": len(self.telemetry.events(limit=4096)),

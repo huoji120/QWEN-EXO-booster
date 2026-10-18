@@ -1,0 +1,87 @@
+import hashlib
+
+from qwen_exo_booster.memory_hints import (
+    MemoryHintIndex,
+    chunk_text,
+    is_memory_block,
+    memory_block_hints,
+    render_memory_block,
+    text_terms,
+)
+
+
+def _rows(root, files):
+    rows = []
+    for path, text in files.items():
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        rows.append(
+            {
+                "relative_path": path,
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "encoding": "utf-8",
+            }
+        )
+    return rows
+
+
+FILES = {
+    "ops/release.md": "# 发布流程\n\n灰度发布前检查 canary 指标。\n回滚由值班表第二位负责。\n",
+    "ops/nginx.md": "# Nginx\n\nReload nginx after editing the upstream config.\n",
+    "notes/frontend.md": "# 前端视觉规范\n\n按钮圆角统一 8px，页面留白不少于 24px。\n",
+    "noise/blob.json": "{" + "\"k\": 1, " * 5000 + "}\n",
+}
+
+
+def test_terms_cover_words_identifier_parts_and_cjk_bigrams():
+    terms = text_terms("fileKnowledge memory_tool 灰度发布")
+    assert {"fileknowledge", "file", "knowledge", "memory_tool", "memory", "tool"} <= set(terms)
+    assert {"灰度", "度发", "发布"} <= set(terms)
+
+
+def test_chunks_follow_headings_and_skip_one_line_blobs():
+    chunks = chunk_text("# A\nx\ny\n# B\nz\n" + "q" * 30_000 + "\nlast\n")
+    assert [(start, end, heading) for start, end, heading, _ in chunks] == [
+        (1, 3, "A"),
+        (4, 5, "B"),
+        (7, 7, "B"),
+    ]
+
+
+def test_lookup_ranks_relevant_chunks_with_synonyms_and_threshold(tmp_path):
+    index = MemoryHintIndex(tmp_path / "kb", tmp_path / "state" / "hints.sqlite3")
+    assert index.refresh(_rows(tmp_path / "kb", FILES))["indexed"] == 4
+
+    hints = index.lookup("灰度发布出问题了，怎么 rollback？谁负责值班")
+    assert [hint["path"] for hint in hints] == ["ops/release.md"]
+    assert hints[0]["line"] in (3, 4) and hints[0]["heading"] == "发布流程"
+
+    assert index.lookup("今天天气怎么样") == []
+    assert index.lookup("reload nginx upstream")[0]["path"] == "ops/nginx.md"
+    excluded = index.lookup(
+        "reload nginx upstream", exclude=frozenset({("ops/nginx.md", 3)})
+    )
+    assert excluded == []
+
+
+def test_refresh_drops_removed_and_reindexes_changed_files(tmp_path):
+    index = MemoryHintIndex(tmp_path / "kb", tmp_path / "state" / "hints.sqlite3")
+    rows = _rows(tmp_path / "kb", FILES)
+    index.refresh(rows)
+    changed = _rows(tmp_path / "kb", {"ops/nginx.md": "# Nginx\n\nUse caddy instead.\n"})
+    result = index.refresh([row for row in rows if row["relative_path"] != "ops/release.md" and row["relative_path"] != "ops/nginx.md"] + changed)
+    assert result == {"removed": 1, "indexed": 1, "files": 3}
+    assert index.lookup("灰度发布 回滚 值班") == []
+    assert set(index.indexed_files()) == {"ops/nginx.md", "notes/frontend.md", "noise/blob.json"}
+
+
+def test_memory_block_round_trips_its_hints():
+    block = render_memory_block(
+        [{"path": "ops/release.md", "line": 4, "heading": "发布流程", "excerpt": "回滚由值班表第二位负责。"}]
+    )
+    assert is_memory_block(block)
+    assert "服务端" in block and "可以搜索，也可以不搜索" in block
+    assert memory_block_hints(block) == {("ops/release.md", 4)}
+    assert is_memory_block(render_memory_block([]))
+    assert not is_memory_block("plain answer")

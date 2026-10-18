@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from qwen_exo_booster.memory_hints import render_memory_block
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.memory_tool_rounds import (
     MEMORY_ROUND_META_KEY,
@@ -244,7 +245,10 @@ class MemoryToolRoundsTestCase(CustomTestCase):
         )
         self.assertEqual(first, second)
 
-    def test_search_reminder_is_the_last_prompt_message_and_never_stored(self):
+    def test_memory_block_replays_to_the_exact_prompt_message(self):
+        """The block is this turn's last prompt message and first output item;
+        replaying that item (plus the model's following reasoning/call) must
+        rebuild the same message, unmerged, or the cached prefix breaks."""
         serving = make_serving(self.tool_server)
         serving.tokenizer_manager.model_config.is_multimodal = False
         captured = []
@@ -254,57 +258,78 @@ class MemoryToolRoundsTestCase(CustomTestCase):
             return SimpleNamespace(prompt="", prompt_ids=[1])
 
         serving._process_messages = process
-        request = ResponsesRequest(
-            model="m",
-            input=[
-                {"role": "user", "content": "fix the deploy"},
-                {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
-            ],
-        )
+        block = render_memory_block([])
+        history = [
+            {"role": "user", "content": "fix the deploy"},
+            {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        ]
+        request = ResponsesRequest(model="m", input=history)
+        request._qwen_exo_memory_block = block
         asyncio.run(serving._make_request(request, None, None))
-        request._qwen_exo_memory_reminder = "<memory>search first</memory>"
-        asyncio.run(serving._make_request(request, None, None))
+        prompt = [
+            m if isinstance(m, dict) else m.model_dump(exclude_none=True)
+            for m in captured[0].messages
+        ]
+        self.assertEqual(prompt[-1], {"role": "assistant", "content": block})
 
-        plain, reminded = (
-            [m if isinstance(m, dict) else m.model_dump(exclude_none=True) for m in c.messages]
-            for c in captured
+        (block_item,) = serving._memory_block_output_items(request)
+        replay = history + [
+            block_item.model_dump(),
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "think"}]},
+            {"type": "function_call", "call_id": "c2", "name": "bash", "arguments": "{}"},
+        ]
+        replayed = serving._construct_input_messages(
+            ResponsesRequest(model="m", input=replay)
         )
-        self.assertEqual(reminded[:-1], plain)
-        self.assertEqual(reminded[-1]["role"], "tool")
-        self.assertEqual(reminded[-1]["content"], "<memory>search first</memory>")
-        stored = serving._conversation_messages(request, None)
-        self.assertNotIn("search first", json.dumps(stored))
+        self.assertEqual(replayed[: len(prompt)], prompt)
+        self.assertEqual(replayed[len(prompt)]["reasoning_content"], "think")
 
-    def test_reminder_gate_reports_why_memory_tools_are_absent(self):
+    def test_memory_turn_context_reads_blocks_searches_and_new_text(self):
         serving = make_serving(self.tool_server)
-        self.assertIsNone(
-            serving._memory_tools_blocked_reason(ResponsesRequest(model="m", input="hi"))
+        shown_block = render_memory_block(
+            [{"path": "ops.md", "line": 2, "heading": "", "excerpt": "reload nginx"}]
         )
+        turn = serving._memory_turn_context(
+            ResponsesRequest(
+                model="m",
+                input=[
+                    {"role": "user", "content": "fix the deploy"},
+                    {"role": "assistant", "content": shown_block},
+                    {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c1", "output": "nginx: bad gateway"},
+                ],
+            ),
+            None,
+        )
+        self.assertEqual(
+            (turn.searched, turn.blocks_shown, turn.shown_hints, turn.query_text),
+            (False, 1, frozenset({("ops.md", 2)}), "fix the deploy\nnginx: bad gateway"),
+        )
+        searched = serving._memory_turn_context(
+            ResponsesRequest(
+                model="m",
+                input=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "type": "mcp_call",
+                        "id": "mcp_1",
+                        "server_label": "qwen_exo",
+                        "name": "qwen_exo_memory_search",
+                        "arguments": "{}",
+                        "output": "none",
+                        "status": "completed",
+                    },
+                ],
+            ),
+            None,
+        )
+        self.assertTrue(searched.searched)
         self.assertEqual(
             serving._memory_tools_blocked_reason(
                 ResponsesRequest(model="m", input="hi", tool_choice="none")
             ),
             "tool_choice",
-        )
-        searched = ResponsesRequest(
-            model="m",
-            input=[
-                {"role": "user", "content": "hi"},
-                {
-                    "type": "mcp_call",
-                    "id": "mcp_1",
-                    "server_label": "qwen_exo",
-                    "name": "qwen_exo_memory_search",
-                    "arguments": "{}",
-                    "output": "none",
-                    "status": "completed",
-                },
-            ],
-        )
-        self.assertTrue(serving._history_has_memory_search(searched))
-        self.assertFalse(
-            serving._history_has_memory_search(ResponsesRequest(model="m", input="hi"))
         )
 
     def test_memory_round_executes_server_side_and_continues_on_exact_tokens(self):

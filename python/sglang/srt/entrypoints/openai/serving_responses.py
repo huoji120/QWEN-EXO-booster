@@ -48,6 +48,11 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
 from openai_harmony import Message as OpenAIMessage
 from openai_harmony import Role
 from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
+from qwen_exo_booster.memory_hints import (
+    MemoryTurnContext,
+    is_memory_block,
+    memory_block_hints,
+)
 from qwen_exo_booster.memory_tools import MEMORY_TOOL_NAMES
 
 from sglang.srt.entrypoints.context import (
@@ -128,6 +133,20 @@ _STORED_RESPONSE_MAX_ENTRIES = 4096
 # Matches the idle TTL gateways keep chain baselines for, with headroom.
 _STORED_RESPONSE_IDLE_TTL_SECONDS = 2 * 60 * 60
 _STORED_MESSAGES_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _chat_message_text(message: dict) -> str:
+    """Plain text of a chat message's content (string or text parts)."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("text")
+        )
+    return ""
 
 
 def _stored_messages_size(messages: Any) -> int:
@@ -651,11 +670,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         if qwen_exo_runtime is not None and not self.use_harmony:
-            request._qwen_exo_memory_reminder = (
-                qwen_exo_runtime.memory_reminder_for_turn(
+            request._qwen_exo_memory_block = (
+                await qwen_exo_runtime.memory_block_for_turn(
                     request.request_id,
                     blocked_reason=self._memory_tools_blocked_reason(request),
-                    history_searched=self._history_has_memory_search(request),
+                    turn=self._memory_turn_context(request, prev_response),
                 )
             )
 
@@ -1237,18 +1256,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
     ):
         messages = self._construct_input_messages(request, prev_response)
-        if request._qwen_exo_memory_reminder:
-            # A trailing ``tool`` message renders inside ``<tool_response>``:
-            # the Qwen template allows no late system message, and a trailing
-            # user message would move ``last_query_index`` and restrip the
-            # history's reasoning. The prefix before it stays byte-identical,
-            # and it never enters ``msg_store``.
+        if request._qwen_exo_memory_block:
+            # The block is this turn's first output item and renders as its
+            # own assistant message, exactly as the client's replay of that
+            # item renders next turn, so the cached prefix keeps matching.
             messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": "qwen_exo_memory_reminder",
-                    "content": request._qwen_exo_memory_reminder,
-                }
+                {"role": "assistant", "content": request._qwen_exo_memory_block}
             )
 
         chat_tools = self._chat_tools_for_request(request)
@@ -1341,9 +1354,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
-            output = self._memory_round_output_items(
-                request, context, tokenizer
-            ) + self._make_response_output_items(request, final_res["text"], tokenizer)
+            output = (
+                self._memory_block_output_items(request)
+                + self._memory_round_output_items(request, context, tokenizer)
+                + self._make_response_output_items(request, final_res["text"], tokenizer)
+            )
 
             # Calculate usage from actual output
             num_reasoning_tokens = 0
@@ -1635,6 +1650,27 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
         return output_items
 
+    @staticmethod
+    def _memory_block_output_items(request: ResponsesRequest) -> list:
+        if not request._qwen_exo_memory_block:
+            return []
+        return [
+            ResponseOutputMessage(
+                id=f"msg_{random_uuid()}",
+                content=[
+                    ResponseOutputText(
+                        text=request._qwen_exo_memory_block,
+                        annotations=[],
+                        type="output_text",
+                        logprobs=None,
+                    )
+                ],
+                role="assistant",
+                status="completed",
+                type="message",
+            )
+        ]
+
     def _memory_round_output_items(
         self,
         request: ResponsesRequest,
@@ -1699,21 +1735,55 @@ class OpenAIServingResponses(OpenAIServingChat):
             return "media"
         return None
 
-    @staticmethod
-    def _history_has_memory_search(request: ResponsesRequest) -> bool:
-        """A replayed ``mcp_call`` shows this conversation already searched."""
-        if isinstance(request.input, str):
-            return False
-        for item in request.input:
-            if hasattr(item, "model_dump"):
-                item = item.model_dump(exclude_none=True)
-            if (
-                isinstance(item, dict)
-                and item.get("type") == "mcp_call"
-                and item.get("name") == "qwen_exo_memory_search"
-            ):
-                return True
-        return False
+    def _memory_turn_context(
+        self,
+        request: ResponsesRequest,
+        prev_response: Optional[ResponsesResponse],
+    ) -> MemoryTurnContext:
+        """Read memory state from the conversation itself (chained or replayed):
+        whether it searched, the server blocks already shown and their hints,
+        and the text this turn reacts to (new tool output or user message)."""
+        try:
+            messages = self._conversation_messages(request, prev_response)
+        except (ValueError, TypeError):
+            return MemoryTurnContext()
+        searched = False
+        blocks = 0
+        shown: set[tuple[str, int]] = set()
+        last_assistant = -1
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if is_memory_block(content):
+                blocks += 1
+                shown |= memory_block_hints(content)
+                continue
+            last_assistant = index
+            for call in message.get("tool_calls") or ():
+                if (call.get("function") or {}).get("name") == "qwen_exo_memory_search":
+                    searched = True
+        latest = [
+            _chat_message_text(message)
+            for message in messages[last_assistant + 1 :]
+            if isinstance(message, dict) and message.get("role") in ("user", "tool")
+        ]
+        # The original task keeps short tool output (a file list) on topic.
+        task = next(
+            (
+                _chat_message_text(message)
+                for message in messages
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            "",
+        )
+        recent = "\n".join(text for text in latest if text)[-3000:]
+        return MemoryTurnContext(
+            searched=searched,
+            blocks_shown=blocks,
+            shown_hints=frozenset(shown),
+            query_text=recent if task in recent else f"{task[:1000]}\n{recent}".strip(),
+        )
 
     @staticmethod
     def _request_has_media(request: ResponsesRequest) -> bool:
@@ -1834,6 +1904,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             message = message.model_dump(exclude_none=True)
         if isinstance(message, dict) and message.get("type") == "mcp_call":
             return mcp_item_to_chat_messages(message)
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            # Request validation turns replayed output_text parts into
+            # input_text; either way the block must come back verbatim.
+            block = _chat_message_text(message)
+            if is_memory_block(block):
+                return [{"role": "assistant", "content": block}]
         normalized = cls._normalize_response_message_for_chat(message)
         return [] if normalized is None else [normalized]
 
@@ -1987,6 +2063,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged
                 and isinstance(merged[-1], dict)
                 and merged[-1].get("role") == "assistant"
+                # The server memory block stays its own message.
+                and not is_memory_block(msg.get("content"))
+                and not is_memory_block(merged[-1].get("content"))
             ):
                 prev = merged[-1] = dict(merged[-1])
                 # Lift mixed str/list content to list parts so non-text parts
@@ -3304,6 +3383,71 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
             return events
+
+        for block_item in self._memory_block_output_items(request):
+            current_output_index += 1
+            yield _send_event(
+                openai_responses_types.ResponseOutputItemAddedEvent(
+                    type="response.output_item.added",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item=block_item.model_copy(
+                        update={"content": [], "status": "in_progress"}
+                    ),
+                )
+            )
+            (block_part,) = block_item.content
+            yield _send_event(
+                openai_responses_types.ResponseContentPartAddedEvent(
+                    type="response.content_part.added",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item_id=block_item.id,
+                    content_index=0,
+                    part=block_part.model_copy(update={"text": ""}),
+                )
+            )
+            yield _send_event(
+                openai_responses_types.ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=-1,
+                    content_index=0,
+                    output_index=current_output_index,
+                    item_id=block_item.id,
+                    delta=block_part.text,
+                    logprobs=[],
+                )
+            )
+            yield _send_event(
+                openai_responses_types.ResponseTextDoneEvent(
+                    type="response.output_text.done",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    content_index=0,
+                    text=block_part.text,
+                    logprobs=[],
+                    item_id=block_item.id,
+                )
+            )
+            yield _send_event(
+                openai_responses_types.ResponseContentPartDoneEvent(
+                    type="response.content_part.done",
+                    sequence_number=-1,
+                    item_id=block_item.id,
+                    output_index=current_output_index,
+                    content_index=0,
+                    part=block_part,
+                )
+            )
+            yield _send_event(
+                openai_responses_types.ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item=block_item,
+                )
+            )
+            emitted_items.append(block_item)
 
         try:
             async for ctx in result_generator:
