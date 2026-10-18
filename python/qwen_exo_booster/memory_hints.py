@@ -55,6 +55,8 @@ _CJK_STOP_BIGRAMS = frozenset(
 )
 # Raw dumps (sessions, trajectories) match almost anything; curated notes win ties.
 _RAW_SUFFIX_WEIGHT = {".json": 0.8, ".jsonl": 0.8}
+# Generated summaries condense a whole file; prefer them over raw chunks.
+_SUMMARY_WEIGHT = 1.2
 
 # Each group is one concept: any member counts as a match.
 SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
@@ -223,12 +225,14 @@ class MemoryHintIndex:
                 self._drop(connection, path)
             for path in changed:
                 row = wanted[path]
-                try:
-                    text = (self.knowledge_directory / path).read_text(
-                        encoding=str(row.get("encoding") or "utf-8"), errors="replace"
-                    )
-                except OSError:
-                    continue
+                text = row.get("text")
+                if text is None:
+                    try:
+                        text = (self.knowledge_directory / path).read_text(
+                            encoding=str(row.get("encoding") or "utf-8"), errors="replace"
+                        )
+                    except OSError:
+                        continue
                 for start, end, heading, body in chunk_text(text):
                     cursor = connection.execute(
                         "INSERT INTO chunks(path, start_line, end_line, heading, text)"
@@ -297,7 +301,7 @@ class MemoryHintIndex:
                     if any(all(term in present for term in member) for member in members)
                 ]
                 coverage = sum(weight for _members, weight in matched) / total_weight
-                coverage *= _RAW_SUFFIX_WEIGHT.get(Path(paths.get(rowid, "")).suffix, 1.0)
+                coverage *= _path_weight(paths.get(rowid, ""))
                 if len(matched) >= MIN_MATCHED_CONCEPTS and coverage >= MIN_COVERAGE:
                     scored.append((coverage, -bm25_score, rowid, matched))
             scored.sort(reverse=True)
@@ -350,6 +354,12 @@ class MemoryHintIndex:
             seen.add(members)
             concepts.append((members, weight))
         return concepts
+
+
+def _path_weight(path: str) -> float:
+    if path.endswith(".summary.md"):
+        return _SUMMARY_WEIGHT
+    return _RAW_SUFFIX_WEIGHT.get(Path(path).suffix, 1.0)
 
 
 def _looks_garbled(text: str) -> bool:

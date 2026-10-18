@@ -37,6 +37,7 @@ class InternalJobType(str, Enum):
     RESPONSE_COMPACTION = "response_compaction"
     ATTENTION_DIAGNOSTIC = "attention_diagnostic"
     SYSTEM_ONE = "system_one"
+    MEMORY_SUMMARY = "memory_summary"
 
 
 class EligibilityStatus(str, Enum):

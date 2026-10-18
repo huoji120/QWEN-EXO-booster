@@ -45,6 +45,8 @@ class TestFileKnowledgeIndex(unittest.TestCase):
                 "line_count",
                 "indexed_ns",
                 "schema_version",
+                "kind",
+                "title",
             ],
         )
         self.assertEqual(row[1], hashlib.sha256(raw).hexdigest())
@@ -155,13 +157,11 @@ class TestFileKnowledgeIndex(unittest.TestCase):
             self.index.delete("nested/raw.bin")
 
     def test_zip_archive_unpacks_text_members_and_rejects_the_rest(self):
-        """A knowledge ZIP becomes one file per text member; traversal names,
-        macOS metadata, binaries and oversized members never reach the root."""
+        """A knowledge ZIP becomes one file per text member (no size limit);
+        traversal names, macOS metadata and binaries never reach the root."""
         import io
         import zipfile
-        from unittest import mock
 
-        from qwen_exo_booster import file_knowledge
         from qwen_exo_booster.file_knowledge import FileKnowledgeError
 
         buffer = io.BytesIO()
@@ -174,19 +174,15 @@ class TestFileKnowledgeIndex(unittest.TestCase):
             archive.writestr("bin.dat", b"\x00\x01\x02")
             archive.writestr("big.log", "x" * 1025)
             archive.writestr("folder/", "")
-        with mock.patch.object(file_knowledge, "MAX_UPLOAD_BYTES", 1024):
-            imported, skipped = self.index.import_archive(
-                buffer.getvalue(), directory="pack/"
-            )
+        imported, skipped = self.index.import_archive(buffer.getvalue(), directory="pack/")
         self.assertEqual(
-            [row["relative_path"] for row in imported], ["pack/a.md", "pack/b.txt"]
+            [row["relative_path"] for row in imported],
+            ["pack/a.md", "pack/b.txt", "pack/big.log"],
         )
-        self.assertEqual(
-            sorted(item["path"] for item in skipped), ["pack/big.log", "pack/bin.dat"]
-        )
+        self.assertEqual(sorted(item["path"] for item in skipped), ["pack/bin.dat"])
         self.assertEqual(
             [row["relative_path"] for row in self.index.metadata()],
-            ["pack/a.md", "pack/b.txt"],
+            ["pack/a.md", "pack/b.txt", "pack/big.log"],
         )
         with self.assertRaises(FileKnowledgeError):
             self.index.import_archive(b"not a zip")
@@ -246,10 +242,10 @@ class TestFileKnowledgeIndex(unittest.TestCase):
             "qwen_exo_memory_search", {"pattern": "nginx", "context": 0, "max_results": 2}
         )
         self.assertTrue(ok)
-        self.assertIn("a.md (10 match(es))", text)
+        self.assertIn("a.md [note] nginx (10 match(es))", text)
         self.assertIn("… 9 more match(es) in a.md", text)
         self.assertIn("2 more matching file(s) not expanded", text)
-        self.assertIn("  d.md (1 match(es))", text)
+        self.assertIn("  d.md [note] d.md nginx (1 match(es))", text)
 
     def test_read_lines_offset_limit_boundaries(self):
         (self.root / "a.md").write_text(
@@ -282,8 +278,9 @@ class TestFileKnowledgeIndex(unittest.TestCase):
         self.assertEqual(self.index.refresh()["reused"], 1)
         with self.assertRaises(StaleFileError):
             self.index.read_lines("a.md")
-        # Search skips the stale file instead of failing the whole query.
-        self.assertEqual(self.index.grep("two")["count"], 0)
+        # Search trusts stat identity (no re-hash per query) and sees the
+        # current bytes; anything returned by read is still digest-verified.
+        self.assertEqual(self.index.grep("two")["count"], 1)
 
 
 if __name__ == "__main__":

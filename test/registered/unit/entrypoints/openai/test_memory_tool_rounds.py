@@ -361,8 +361,8 @@ class MemoryToolRoundsTestCase(CustomTestCase):
         self.assertTrue(
             tail.startswith(
                 "\n<|im_start|>user\n<tool_response>\n"
-                "1 matching line(s) in 1 file(s); showing up to 3 per file:\n--\n"
-                "ops.md (1 match(es))\nops.md-1- intro\n"
+                "1 match(es) in 1 file(s); ranked, showing up to 3 per file:\n--\n"
+                "ops.md [note] intro (1 match(es))\nops.md-1- intro\n"
                 "ops.md:2: reload nginx after edits\n</tool_response>"
             ),
             tail,

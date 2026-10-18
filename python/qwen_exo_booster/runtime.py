@@ -53,6 +53,7 @@ from qwen_exo_booster.document_ingest import (
 )
 from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
 from qwen_exo_booster.memory_hints import MemoryHintIndex, render_memory_block
+from qwen_exo_booster.memory_summaries import MemorySummaryService
 from qwen_exo_booster.memory_tool_log import MemoryToolLog
 from qwen_exo_booster.fingerprint import ModelIdentity
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
@@ -412,6 +413,8 @@ class QwenExoRuntime:
         self.capsules: ExecutionCapsuleService | None = None
         self.mid_think_questions: MidThinkQuestionService | None = None
         self.reflection_memory_service: ReflectionMemoryService | None = None
+        self.memory_summaries: MemorySummaryService | None = None
+        self._memory_summary_task: asyncio.Task[None] | None = None
         self.reasoning_planner: DynamicReasoningPlanner | None = None
         self.compaction_service: ResponseCompactionService | None = None
         self._compaction_summaries: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -1315,6 +1318,17 @@ class QwenExoRuntime:
                         # the output tight to minimise the added boundary latency.
                         max_output_tokens=max(160, 40 * cutoff_count),
                     )
+                if tokenizer is not None:
+                    self.memory_summaries = MemorySummaryService(
+                        runner=self.internal_jobs,
+                        tokenizer=tokenizer,
+                        index=self.file_knowledge,
+                        telemetry=self.telemetry,
+                        wait_until_quiet=self._wait_for_foreground_quiet,
+                    )
+                    self._memory_summary_task = asyncio.create_task(
+                        self._run_memory_summaries(), name="qwen-exo-memory-summaries"
+                    )
                 if (
                     self.config.reflection_memory_mode != "off"
                     and tokenizer is not None
@@ -1482,6 +1496,10 @@ class QwenExoRuntime:
             hints_task = self._memory_hints_refresh
             if hints_task is not None and not hints_task.done():
                 hints_task.cancel()
+            summary_task = self._memory_summary_task
+            if summary_task is not None and not summary_task.done():
+                summary_task.cancel()
+            self._memory_summary_task = None
             with self._session_initial_gdn_value_lock:
                 self._session_initial_gdn_pins.clear()
             self._session_initial_gdn_refresh_task = None
@@ -6838,7 +6856,14 @@ class QwenExoRuntime:
         task = self._memory_hints_refresh
         if task is not None and not task.done():
             return
-        rows = self.file_knowledge.metadata()
+        rows = self.file_knowledge.metadata() + [
+            {
+                "relative_path": row["relative_path"] + ".summary.md",
+                "sha256": stable_digest(row["summary"]),
+                "text": row["summary"],
+            }
+            for row in self.file_knowledge.summary_rows()
+        ]
         fingerprint = stable_digest(
             *(f"{row['relative_path']}:{row['sha256']}" for row in rows)
         )
@@ -6857,6 +6882,24 @@ class QwenExoRuntime:
         self._memory_hints_refresh = asyncio.create_task(
             refresh(), name="qwen-exo-memory-hints"
         )
+
+    @internal_task_scope("maintenance")
+    async def _run_memory_summaries(self) -> None:
+        await self.memory_summaries.run_forever()
+
+    def memory_summary_status(self) -> dict[str, Any]:
+        service = self.memory_summaries
+        if service is None:
+            return {"available": False}
+        return {"available": True, **service.status()}
+
+    def queue_memory_summaries(self, paths: list[str], *, force: bool) -> dict[str, Any]:
+        """Queue summaries for ``paths``, or for every file still missing one."""
+        service = self.memory_summaries
+        if service is None:
+            raise RuntimeError("memory summaries need the served model's tokenizer")
+        service.enqueue(list(paths) or service.missing_paths(), force=force)
+        return self.memory_summary_status()
 
     def _count_memory_search(self, request_id: str) -> None:
         conversation_key = self._request_conversation_keys.get(request_id)

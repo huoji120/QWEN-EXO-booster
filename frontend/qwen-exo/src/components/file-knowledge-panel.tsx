@@ -1,503 +1,317 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  FileText,
-  FolderOpen,
-  FolderUp,
-  LoaderCircle,
-  RefreshCw,
-  Search,
-  Trash2,
-  Upload,
-} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FileText, FolderPlus, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { EmptyState } from "@/components/empty-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import {
+  createKnowledgeFolder,
   deleteKnowledgeFile,
-  listKnowledgeFiles,
-  readKnowledge,
-  searchKnowledge,
-  uploadKnowledgeArchiveRaw,
-  uploadKnowledgeFileRaw,
+  deleteKnowledgeFolder,
+  generateKnowledgeSummaries,
+  getKnowledgeTree,
+  getSummaryStatus,
+  moveKnowledgeEntry,
 } from "@/lib/api";
 import { translate as t } from "@/lib/i18n";
-import type { KnowledgeFile, KnowledgeSearchResponse } from "@/lib/types";
-import { cn, formatBytes, formatNumber, formatTime, shortHash } from "@/lib/utils";
+import type { KnowledgeFile, KnowledgeSummaryStatus, KnowledgeTree } from "@/lib/types";
+import { formatBytes, formatNumber } from "@/lib/utils";
+import {
+  KnowledgeDeleteDialog,
+  KnowledgeEntryDialog,
+  type DeleteRequest,
+  type EntryRequest,
+} from "@/components/knowledge/knowledge-entry-dialogs";
+import { KnowledgeFileTable, type FileAction } from "@/components/knowledge/knowledge-file-table";
+import {
+  KnowledgeFolderTree,
+  type FolderAction,
+} from "@/components/knowledge/knowledge-folder-tree";
+import { KnowledgeSearchCard } from "@/components/knowledge/knowledge-search-card";
+import { KnowledgeSummaryDialog } from "@/components/knowledge/knowledge-summary-dialog";
+import { KnowledgeSummaryToolbar } from "@/components/knowledge/knowledge-summary-toolbar";
+import { KnowledgeUploadCard } from "@/components/knowledge/knowledge-upload-card";
+import { useKnowledgeViewer } from "@/components/knowledge/knowledge-viewer-dialog";
+import {
+  buildFolderTree,
+  errorText,
+  isWithin,
+  parentOf,
+  rebasePath,
+  summaryView,
+  type SummaryView,
+} from "@/components/knowledge/knowledge-utils";
 
-const VIEWER_WINDOW = 262_144;
-const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
-const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
-
-type PendingFile = { file: File; relativePath: string };
-
-const isZip = (item: PendingFile) => /\.zip$/i.test(item.file.name);
-
-type ViewerState = {
-  path: string;
-  text: string;
-  endOffset: number;
-  totalBytes: number;
-  eof: boolean;
-};
-
-/** Folder-relative path for picked/dropped files; bare name otherwise. */
-function pickedPath(file: File) {
-  const relative = (file as File & { webkitRelativePath?: string })
-    .webkitRelativePath;
-  return (relative || file.name).replace(/\\/g, "/").replace(/^\/+/, "");
-}
-
-function joinPath(directory: string, path: string) {
-  const prefix = directory.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-  return prefix ? `${prefix}/${path}` : path;
-}
-
-/** Expand dropped items, walking dropped folders and keeping their paths. */
-async function collectDropped(items: DataTransferItemList): Promise<PendingFile[]> {
-  const out: PendingFile[] = [];
-  const walk = async (entry: FileSystemEntry): Promise<void> => {
-    if (entry.isFile) {
-      const file = await new Promise<File>((resolve, reject) =>
-        (entry as FileSystemFileEntry).file(resolve, reject),
-      );
-      out.push({ file, relativePath: entry.fullPath.replace(/^\/+/, "") });
-    } else if (entry.isDirectory) {
-      const reader = (entry as FileSystemDirectoryEntry).createReader();
-      // readEntries returns batches; an empty batch means done.
-      for (;;) {
-        const batch = await new Promise<FileSystemEntry[]>((resolve, reject) =>
-          reader.readEntries(resolve, reject),
-        );
-        if (!batch.length) break;
-        for (const child of batch) await walk(child);
-      }
-    }
-  };
-  const entries = Array.from(items)
-    .map((item) => item.webkitGetAsEntry())
-    .filter((entry): entry is FileSystemEntry => entry !== null);
-  for (const entry of entries) await walk(entry);
-  return out;
-}
+const BUSY_POLL_MS = 5_000;
+const IDLE_POLL_MS = 30_000;
 
 export function FileKnowledgePanel() {
-  const [files, setFiles] = useState<KnowledgeFile[]>([]);
+  const [tree, setTree] = useState<KnowledgeTree>({ directories: [], files: [] });
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const [pending, setPending] = useState<PendingFile[]>([]);
-  const [targetDirectory, setTargetDirectory] = useState("");
-  const [importing, setImporting] = useState(false);
-  const [dragging, setDragging] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const folderInputRef = useRef<HTMLInputElement>(null);
+  const [folder, setFolder] = useState("");
+  const [nested, setNested] = useState(true);
+  const [nameFilter, setNameFilter] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
 
-  const [deleting, setDeleting] = useState<string | null>(null);
-  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [status, setStatus] = useState<KnowledgeSummaryStatus | null>(null);
+  const [generating, setGenerating] = useState(false);
 
-  const [viewer, setViewer] = useState<ViewerState | null>(null);
-  const [viewerLoading, setViewerLoading] = useState(false);
+  const [entryRequest, setEntryRequest] = useState<EntryRequest | null>(null);
+  const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(null);
+  const [summaryPath, setSummaryPath] = useState<string | null>(null);
+  const [searchResetKey, setSearchResetKey] = useState(0);
 
-  const [pattern, setPattern] = useState("");
-  const [pathGlob, setPathGlob] = useState("**/*");
-  const [caseSensitive, setCaseSensitive] = useState(false);
-  const [regex, setRegex] = useState(false);
-  const [searching, setSearching] = useState(false);
-  const [searchResult, setSearchResult] =
-    useState<KnowledgeSearchResponse | null>(null);
+  const viewer = useKnowledgeViewer();
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setLoadError(null);
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
-      setFiles((await listKnowledgeFiles()).files);
+      setTree(await getKnowledgeTree());
+      setLoadError(null);
     } catch (error) {
-      setLoadError(error instanceof Error ? error.message : t("未知错误"));
+      if (!silent) setLoadError(errorText(error, t("未知错误")));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
+
+  // Summary worker status; reload the tree whenever a file finishes.
+  const lastRun = useRef<{ current: string | null; completed: number; failed: number } | null>(
+    null,
+  );
+  const refreshStatus = useCallback(async () => {
+    try {
+      const next = await getSummaryStatus();
+      setStatus(next);
+      const run = {
+        current: next.current?.path ?? null,
+        completed: next.completed ?? 0,
+        failed: next.failed?.length ?? 0,
+      };
+      const previous = lastRun.current;
+      lastRun.current = run;
+      if (
+        previous &&
+        ((previous.current && previous.current !== run.current) ||
+          previous.completed !== run.completed ||
+          previous.failed !== run.failed)
+      ) {
+        void load(true);
+      }
+    } catch {
+      // Keep the last known status; the next poll retries.
+    }
+  }, [load]);
 
   useEffect(() => {
     void load();
-  }, [load]);
+    void refreshStatus();
+  }, [load, refreshStatus]);
 
-  const openFile = useCallback(async (path: string) => {
-    setViewerLoading(true);
-    try {
-      const result = await readKnowledge(path, 0, VIEWER_WINDOW);
-      setViewer({
-        path: result.path,
-        text: result.text,
-        endOffset: result.end_offset,
-        totalBytes: result.total_bytes,
-        eof: result.eof,
-      });
-    } catch (error) {
-      toast.error(t("文件读取失败"), {
-        description: error instanceof Error ? error.message : t("未知错误"),
-      });
-    } finally {
-      setViewerLoading(false);
-    }
-  }, []);
+  const summaryBusy = Boolean(status?.current) || Boolean(status?.queued?.length);
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => void refreshStatus(),
+      summaryBusy ? BUSY_POLL_MS : IDLE_POLL_MS,
+    );
+    const onFocus = () => void refreshStatus();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [refreshStatus, summaryBusy]);
 
-  const loadMore = async () => {
-    if (!viewer || viewer.eof || viewerLoading) return;
-    setViewerLoading(true);
-    try {
-      const result = await readKnowledge(viewer.path, viewer.endOffset, VIEWER_WINDOW);
-      setViewer({
-        ...viewer,
-        text: viewer.text + result.text,
-        endOffset: result.end_offset,
-        eof: result.eof,
-      });
-    } catch (error) {
-      toast.error(t("文件读取失败"), {
-        description: error instanceof Error ? error.message : t("未知错误"),
-      });
-    } finally {
-      setViewerLoading(false);
-    }
-  };
+  const { root, folders } = useMemo(
+    () => buildFolderTree(tree.directories, tree.files),
+    [tree],
+  );
 
-  const queue = (picked: PendingFile[]) => {
-    const fits = (item: PendingFile) =>
-      item.file.size <= (isZip(item) ? MAX_ARCHIVE_BYTES : MAX_UPLOAD_BYTES);
-    const tooLarge = picked.filter((item) => !fits(item));
-    if (tooLarge.length) {
-      toast.error(
-        t("已跳过 {count} 个超过 100 MiB 的文件", {
-          count: tooLarge.length,
-        }),
+  // Drop a selected folder / checked files that no longer exist.
+  // Runs on tree changes only, so a just-renamed selection survives until reload.
+  useEffect(() => {
+    const known = new Set(folders);
+    setFolder((current) => {
+      let next = current;
+      while (next && !known.has(next)) next = parentOf(next);
+      return next;
+    });
+  }, [folders]);
+  useEffect(() => {
+    setSelected((previous) => {
+      if (!previous.size) return previous;
+      const existing = new Set(tree.files.map((file) => file.relative_path));
+      const next = new Set(Array.from(previous).filter((path) => existing.has(path)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [tree.files]);
+
+  const visibleFiles = useMemo(() => {
+    const needle = nameFilter.trim().toLowerCase();
+    return tree.files.filter((file) => {
+      const path = file.relative_path;
+      if (nested ? !isWithin(path, folder) : parentOf(path) !== folder) return false;
+      if (!needle) return true;
+      return (
+        path.toLowerCase().includes(needle) || file.title.toLowerCase().includes(needle)
       );
+    });
+  }, [tree.files, folder, nested, nameFilter]);
+
+  const views = useMemo(() => {
+    const failures = new Map((status?.failed ?? []).map((item) => [item.path, item.error]));
+    const queued = new Set(status?.queued ?? []);
+    const map = new Map<string, SummaryView>();
+    for (const file of tree.files) {
+      map.set(file.relative_path, summaryView(file, status, failures, queued));
     }
-    setPending(picked.filter(fits));
+    return map;
+  }, [tree.files, status]);
+
+  const totalBytes = tree.files.reduce((sum, file) => sum + file.byte_count, 0);
+  const folderBytes = visibleFiles.reduce((sum, file) => sum + file.byte_count, 0);
+
+  const reportError = (title: string, error: unknown): never => {
+    toast.error(title, { description: errorText(error, t("未知错误")) });
+    throw error;
   };
 
-  const importFiles = async () => {
-    if (!pending.length || importing) return;
-    setImporting(true);
-    let succeeded = 0;
+  const generate = async (paths: string[], force = false) => {
+    if (generating) return;
+    setGenerating(true);
     try {
-      for (const item of pending) {
-        const relativePath = joinPath(targetDirectory, item.relativePath);
-        try {
-          if (isZip(item)) {
-            // The server unpacks the archive; each text member is one file.
-            const directory = relativePath.replace(/\/?[^/]*$/, "");
-            const result = await uploadKnowledgeArchiveRaw(item.file, directory);
-            succeeded += result.files.length;
-            if (result.skipped.length) {
-              toast.warning(
-                t("{name} 中有 {count} 个文件未导入", {
-                  name: item.file.name,
-                  count: result.skipped.length,
-                }),
-                {
-                  description: result.skipped
-                    .slice(0, 5)
-                    .map((entry) => `${entry.path}：${entry.reason}`)
-                    .join("；"),
-                },
-              );
-            }
-          } else {
-            await uploadKnowledgeFileRaw(relativePath, item.file);
-            succeeded += 1;
-          }
-        } catch (error) {
-          toast.error(t("导入失败"), {
-            description: `${relativePath}：${error instanceof Error ? error.message : t("未知错误")}`,
-          });
-        }
-      }
-      if (succeeded) {
-        toast.success(t("已导入 {count} 个知识库文件", { count: succeeded }));
-        setPending([]);
-        if (fileInputRef.current) fileInputRef.current.value = "";
-        if (folderInputRef.current) folderInputRef.current.value = "";
-        setSearchResult(null);
-        await load();
-      }
-    } finally {
-      setImporting(false);
-    }
-  };
-
-  const confirmDelete = async () => {
-    if (!deleting || deleteBusy) return;
-    setDeleteBusy(true);
-    try {
-      await deleteKnowledgeFile(deleting);
-      toast.success(t("知识库文件已删除"));
-      setDeleting(null);
-      await load();
-    } catch (error) {
-      toast.error(t("删除失败"), {
-        description: error instanceof Error ? error.message : t("未知错误"),
-      });
-    } finally {
-      setDeleteBusy(false);
-    }
-  };
-
-  const runSearch = async () => {
-    if (!pattern.trim() || searching) return;
-    setSearching(true);
-    try {
-      setSearchResult(
-        await searchKnowledge({
-          pattern: pattern.trim(),
-          pathGlob: pathGlob.trim() || "**/*",
-          caseSensitive,
-          regex,
-        }),
+      const next = await generateKnowledgeSummaries(paths, force);
+      setStatus(next);
+      toast.success(
+        paths.length
+          ? t("已将 {count} 个文件加入总结队列", { count: paths.length })
+          : t("已开始生成缺失的总结"),
       );
     } catch (error) {
-      toast.error(t("搜索失败"), {
-        description: error instanceof Error ? error.message : t("未知错误"),
-      });
+      toast.error(t("生成总结失败"), { description: errorText(error, t("未知错误")) });
     } finally {
-      setSearching(false);
+      setGenerating(false);
     }
   };
 
-  const totalBytes = files.reduce((sum, file) => sum + file.byte_count, 0);
+  const submitEntry = async (request: EntryRequest, destination: string) => {
+    if (request.kind === "create") {
+      try {
+        const result = await createKnowledgeFolder(destination);
+        toast.success(t("文件夹已创建"));
+        await load(true);
+        setFolder(result.path || destination);
+      } catch (error) {
+        reportError(t("创建文件夹失败"), error);
+      }
+      return;
+    }
+    try {
+      const result = await moveKnowledgeEntry(request.path, destination);
+      const target = result.to || destination;
+      toast.success(
+        request.kind === "rename" ? t("已重命名") : t("已移动"),
+        {
+          description: request.isFolder
+            ? t("{to}（{count} 个文件）", { to: target, count: result.files })
+            : target,
+        },
+      );
+      setFolder((current) => rebasePath(current, request.path, target));
+      setSelected(
+        (previous) =>
+          new Set(Array.from(previous).map((path) => rebasePath(path, request.path, target))),
+      );
+      setSummaryPath((current) => (current ? rebasePath(current, request.path, target) : current));
+      await load(true);
+    } catch (error) {
+      reportError(request.kind === "rename" ? t("重命名失败") : t("移动失败"), error);
+    }
+  };
+
+  const confirmDelete = async (request: DeleteRequest) => {
+    try {
+      if (request.kind === "folder") {
+        const result = await deleteKnowledgeFolder(request.path);
+        toast.success(t("文件夹已删除"), {
+          description: t("共删除 {count} 个文件", { count: result.files }),
+        });
+        if (isWithin(folder, request.path)) setFolder(parentOf(request.path));
+      } else {
+        await deleteKnowledgeFile(request.path);
+        toast.success(t("知识库文件已删除"));
+      }
+      await load(true);
+      void refreshStatus();
+    } catch (error) {
+      reportError(t("删除失败"), error);
+    }
+  };
+
+  const onFolderAction = (action: FolderAction, path: string) => {
+    if (action === "create") {
+      setEntryRequest({ kind: "create", path, isFolder: true });
+    } else if (action === "delete") {
+      setDeleteRequest({
+        kind: "folder",
+        path,
+        fileCount: tree.files.filter((file) => isWithin(file.relative_path, path)).length,
+        folderCount: folders.filter((item) => item.startsWith(`${path}/`)).length,
+      });
+    } else {
+      setEntryRequest({ kind: action, path, isFolder: true });
+    }
+  };
+
+  const onFileAction = (action: FileAction, file: KnowledgeFile) => {
+    const path = file.relative_path;
+    if (action === "view") void viewer.open(path);
+    else if (action === "summary") setSummaryPath(path);
+    else if (action === "generate") void generate([path], true);
+    else if (action === "delete") setDeleteRequest({ kind: "file", path });
+    else setEntryRequest({ kind: action, path, isFolder: false });
+  };
 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="secondary">
-            {t("{count} 个文件", { count: formatNumber(files.length) })}
+            {t("{count} 个文件", { count: formatNumber(tree.files.length) })}
           </Badge>
           <Badge variant="secondary">{formatBytes(totalBytes)}</Badge>
+          <Badge variant="secondary">
+            {t("{count} 个文件夹", { count: formatNumber(folders.length) })}
+          </Badge>
         </div>
-        <Button variant="outline" size="sm" onClick={() => void load()}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            void load();
+            void refreshStatus();
+          }}
+        >
           <RefreshCw />
           {t("刷新")}
         </Button>
       </div>
 
-      <Card
-        className={cn(dragging && "border-primary ring-1 ring-primary")}
-        onDragOver={(event) => {
-          event.preventDefault();
-          setDragging(true);
+      <KnowledgeUploadCard
+        targetDirectory={folder}
+        onImported={async () => {
+          setSearchResetKey((key) => key + 1);
+          await load(true);
+          void refreshStatus();
         }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={(event) => {
-          event.preventDefault();
-          setDragging(false);
-          void collectDropped(event.dataTransfer.items).then((picked) => {
-            if (picked.length) queue(picked);
-          });
-        }}
-      >
-        <CardContent className="flex flex-col gap-3 pt-6">
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            hidden
-            onChange={(event) =>
-              queue(
-                Array.from(event.target.files ?? []).map((file) => ({
-                  file,
-                  relativePath: pickedPath(file),
-                })),
-              )
-            }
-          />
-          <input
-            ref={folderInputRef}
-            type="file"
-            multiple
-            hidden
-            {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
-            onChange={(event) =>
-              queue(
-                Array.from(event.target.files ?? []).map((file) => ({
-                  file,
-                  relativePath: pickedPath(file),
-                })),
-              )
-            }
-          />
-          <div className="grid gap-3 sm:grid-cols-[auto_auto_minmax(0,1fr)_auto] sm:items-end">
-            <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
-              <Upload />
-              {t("选择文件")}
-            </Button>
-            <Button variant="outline" onClick={() => folderInputRef.current?.click()}>
-              <FolderUp />
-              {t("选择文件夹")}
-            </Button>
-            <div className="space-y-2">
-              <Label htmlFor="knowledge-target-dir">{t("目标目录（可选）")}</Label>
-              <Input
-                id="knowledge-target-dir"
-                value={targetDirectory}
-                placeholder={t("例如 docs/ops")}
-                onChange={(event) => setTargetDirectory(event.target.value)}
-              />
-            </div>
-            <Button disabled={!pending.length || importing} onClick={() => void importFiles()}>
-              {importing ? <LoaderCircle className="animate-spin" /> : <Upload />}
-              {importing
-                ? t("导入中")
-                : t("导入 {count} 个文件", { count: pending.length })}
-            </Button>
-          </div>
-          {pending.length ? (
-            <div className="max-h-32 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-xs">
-              {pending.map((item) => (
-                <div key={item.relativePath} className="truncate">
-                  {joinPath(targetDirectory, item.relativePath)}
-                  <span className="ml-2 text-muted-foreground">
-                    {formatBytes(item.file.size)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : null}
-          <p className="text-xs text-muted-foreground">
-            {t(
-              "可拖拽文件、文件夹或 ZIP 到这里。支持任意 UTF-8 文本（文档、代码、日志、配置），单个文件不超过 100 MiB；ZIP（不超过 100 MiB）会在服务端解压，每个文本文件各存一份。同路径文件会被覆盖。",
-            )}
-          </p>
-        </CardContent>
-      </Card>
+      />
 
-      <Card>
-        <CardContent className="flex flex-col gap-3 pt-6">
-          <div className="grid gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_auto]">
-            <div className="space-y-2">
-              <Label htmlFor="knowledge-pattern">{t("搜索原文")}</Label>
-              <Input
-                id="knowledge-pattern"
-                value={pattern}
-                placeholder={t("输入要检索的文本")}
-                onChange={(event) => setPattern(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") void runSearch();
-                }}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="knowledge-glob">{t("路径过滤")}</Label>
-              <Input
-                id="knowledge-glob"
-                value={pathGlob}
-                placeholder="**/*"
-                onChange={(event) => setPathGlob(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") void runSearch();
-                }}
-              />
-            </div>
-            <div className="flex items-end gap-4">
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={caseSensitive}
-                  onChange={(event) => setCaseSensitive(event.target.checked)}
-                  className="h-4 w-4 accent-primary"
-                />
-                {t("区分大小写")}
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={regex}
-                  onChange={(event) => setRegex(event.target.checked)}
-                  className="h-4 w-4 accent-primary"
-                />
-                {t("正则表达式")}
-              </label>
-              <Button disabled={!pattern.trim() || searching} onClick={() => void runSearch()}>
-                {searching ? <LoaderCircle className="animate-spin" /> : <Search />}
-                {t("搜索")}
-              </Button>
-            </div>
-          </div>
-          {searchResult ? (
-            searchResult.results.length ? (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <span>
-                    {t("{count} 条结果", { count: formatNumber(searchResult.count) })}
-                  </span>
-                  {searchResult.truncated ? (
-                    <Badge variant="outline">{t("结果已截断")}</Badge>
-                  ) : null}
-                </div>
-                <div className="max-h-[420px] overflow-auto rounded-md border">
-                  <ul className="divide-y">
-                    {searchResult.results.map((result, index) => (
-                      <li key={`${result.path}:${result.line}:${index}`}>
-                        <button
-                          type="button"
-                          className="w-full px-3 py-2 text-left hover:bg-muted"
-                          onClick={() => void openFile(result.path)}
-                        >
-                          <div className="font-mono text-xs text-muted-foreground">
-                            {result.path}:{result.line}
-                          </div>
-                          {result.before.map((line, beforeIndex) => (
-                            <div
-                              key={`before-${beforeIndex}`}
-                              className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground"
-                            >
-                              {line}
-                            </div>
-                          ))}
-                          <div className="mt-1 whitespace-pre-wrap break-words font-mono text-xs">
-                            {result.line_text ?? result.text}
-                          </div>
-                          {result.after.map((line, afterIndex) => (
-                            <div
-                              key={`after-${afterIndex}`}
-                              className="whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground"
-                            >
-                              {line}
-                            </div>
-                          ))}
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">{t("没有匹配结果")}</p>
-            )
-          ) : null}
-        </CardContent>
-      </Card>
+      <KnowledgeSearchCard resetKey={searchResetKey} onOpen={(path) => void viewer.open(path)} />
 
       <Card>
         <CardContent className="p-0">
@@ -516,141 +330,141 @@ export function FileKnowledgePanel() {
                 {t("重试")}
               </Button>
             </div>
-          ) : files.length ? (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>{t("路径")}</TableHead>
-                  <TableHead className="w-24">{t("大小")}</TableHead>
-                  <TableHead className="w-24">{t("行数")}</TableHead>
-                  <TableHead className="w-32">{t("SHA-256")}</TableHead>
-                  <TableHead className="w-40">{t("索引时间")}</TableHead>
-                  <TableHead className="w-32 text-right">{t("操作")}</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {files.map((file) => (
-                  <TableRow key={file.relative_path}>
-                    <TableCell className="break-all font-mono text-xs">
-                      {file.relative_path}
-                      {file.encoding !== "utf-8" ? (
-                        <Badge variant="outline" className="ml-2">
-                          {t("非 UTF-8，不可检索")}
-                        </Badge>
-                      ) : null}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs">
-                      {formatBytes(file.byte_count)}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs">
-                      {formatNumber(file.line_count)}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">
-                      {shortHash(file.sha256)}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">
-                      {formatTime(file.indexed_ns / 1_000_000_000)}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <div className="flex justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          disabled={viewerLoading || file.encoding !== "utf-8"}
-                          onClick={() => void openFile(file.relative_path)}
-                        >
-                          <FolderOpen />
-                          {t("查看")}
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="text-destructive hover:text-destructive"
-                          onClick={() => setDeleting(file.relative_path)}
-                        >
-                          <Trash2 />
-                          {t("删除")}
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
           ) : (
-            <EmptyState
-              icon={FileText}
-              title={t("知识库还是空的")}
-              description={t(
-                "导入文本文件后，模型会通过服务端工具 qwen_exo_memory_search / qwen_exo_memory_read 按需搜索和读取原文。",
-              )}
-            />
+            <div className="grid lg:grid-cols-[17rem_minmax(0,1fr)]">
+              <aside className="border-b p-3 lg:border-b-0 lg:border-r">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">
+                    {t("文件夹")}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setEntryRequest({ kind: "create", path: folder, isFolder: true })}
+                  >
+                    <FolderPlus />
+                    {t("新建文件夹")}
+                  </Button>
+                </div>
+                <div className="max-h-[60vh] overflow-auto">
+                  <KnowledgeFolderTree
+                    root={root}
+                    selected={folder}
+                    onSelect={setFolder}
+                    onAction={onFolderAction}
+                  />
+                </div>
+              </aside>
+              <section className="min-w-0 space-y-3 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span
+                    className="min-w-0 truncate font-mono text-sm"
+                    title={folder || t("全部记忆")}
+                  >
+                    {folder ? `${folder}/` : t("全部记忆")}
+                  </span>
+                  <Badge variant="outline">
+                    {t("{count} 个文件", { count: formatNumber(visibleFiles.length) })}
+                    {" · "}
+                    {formatBytes(folderBytes)}
+                  </Badge>
+                  <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={nested}
+                      onChange={(event) => setNested(event.target.checked)}
+                      className="h-4 w-4 accent-primary"
+                    />
+                    {t("包含子文件夹")}
+                  </label>
+                  <Input
+                    className="ml-auto h-8 w-full sm:w-56"
+                    value={nameFilter}
+                    placeholder={t("按名称或标题筛选")}
+                    onChange={(event) => setNameFilter(event.target.value)}
+                  />
+                </div>
+                <KnowledgeSummaryToolbar
+                  status={status}
+                  selectedCount={selected.size}
+                  busy={generating}
+                  onGenerateMissing={() => void generate([])}
+                  onGenerateSelected={() => void generate(Array.from(selected))}
+                  onClearSelection={() => setSelected(new Set())}
+                />
+                {visibleFiles.length ? (
+                  <div className="rounded-md border">
+                    <KnowledgeFileTable
+                      files={visibleFiles}
+                      folder={folder}
+                      views={views}
+                      selected={selected}
+                      viewerLoading={viewer.loading}
+                      onToggle={(path, checked) =>
+                        setSelected((previous) => {
+                          const next = new Set(previous);
+                          if (checked) next.add(path);
+                          else next.delete(path);
+                          return next;
+                        })
+                      }
+                      onToggleAll={(checked) =>
+                        setSelected((previous) => {
+                          const next = new Set(previous);
+                          for (const file of visibleFiles) {
+                            if (checked) next.add(file.relative_path);
+                            else next.delete(file.relative_path);
+                          }
+                          return next;
+                        })
+                      }
+                      onAction={onFileAction}
+                    />
+                  </div>
+                ) : tree.files.length ? (
+                  <p className="py-8 text-center text-sm text-muted-foreground">
+                    {nameFilter.trim() ? t("没有匹配的文件") : t("这个文件夹里还没有文件")}
+                  </p>
+                ) : (
+                  <EmptyState
+                    icon={FileText}
+                    title={t("知识库还是空的")}
+                    description={t(
+                      "导入文本文件后，模型会通过服务端工具 qwen_exo_memory_search / qwen_exo_memory_read 按需搜索和读取原文。",
+                    )}
+                  />
+                )}
+              </section>
+            </div>
           )}
         </CardContent>
       </Card>
 
-      <Dialog open={Boolean(viewer)} onOpenChange={(open) => !open && setViewer(null)}>
-        <DialogContent className="max-w-3xl">
-          <DialogHeader>
-            <DialogTitle className="break-all font-mono text-sm">{viewer?.path}</DialogTitle>
-            <DialogDescription>
-              {viewer
-                ? viewer.eof
-                  ? t("完整内容，共 {total} 字节", {
-                      total: formatNumber(viewer.totalBytes),
-                    })
-                  : t("已显示前 {end} 字节，共 {total} 字节", {
-                      end: formatNumber(viewer.endOffset),
-                      total: formatNumber(viewer.totalBytes),
-                    })
-                : null}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="max-h-[60vh] overflow-auto rounded-md border bg-muted/40 p-3">
-            <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-5">
-              {viewer?.text}
-            </pre>
-          </div>
-          {viewer && !viewer.eof ? (
-            <DialogFooter>
-              <Button variant="outline" disabled={viewerLoading} onClick={() => void loadMore()}>
-                {viewerLoading ? <LoaderCircle className="animate-spin" /> : null}
-                {t("继续加载")}
-              </Button>
-            </DialogFooter>
-          ) : null}
-        </DialogContent>
-      </Dialog>
+      {viewer.dialog}
 
-      <Dialog
-        open={Boolean(deleting)}
-        onOpenChange={(open) => !open && !deleteBusy && setDeleting(null)}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t("删除知识库文件")}</DialogTitle>
-            <DialogDescription>
-              {t("删除后文件与索引记录一并移除，模型将无法再检索该文件。")}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="break-all rounded-md border bg-muted/40 p-3 font-mono text-xs">
-            {deleting}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleting(null)}>
-              {t("取消")}
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={deleteBusy}
-              onClick={() => void confirmDelete()}
-            >
-              {deleteBusy ? <LoaderCircle className="animate-spin" /> : <Trash2 />}
-              {t("确认删除")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <KnowledgeSummaryDialog
+        path={summaryPath}
+        view={summaryPath ? views.get(summaryPath) ?? null : null}
+        onClose={() => setSummaryPath(null)}
+        onChanged={() => {
+          void load(true);
+          void refreshStatus();
+        }}
+      />
+
+      <KnowledgeEntryDialog
+        key={entryRequest ? `${entryRequest.kind}:${entryRequest.path}` : "closed"}
+        request={entryRequest}
+        folders={folders}
+        onClose={() => setEntryRequest(null)}
+        onSubmit={submitEntry}
+      />
+
+      <KnowledgeDeleteDialog
+        request={deleteRequest}
+        onClose={() => setDeleteRequest(null)}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }

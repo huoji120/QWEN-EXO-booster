@@ -528,6 +528,68 @@ export type KnowledgeFile = {
   encoding: string;
   line_count: number;
   indexed_ns: number;
+  schema_version?: number;
+  kind: KnowledgeFileKind;
+  /** Auto-detected title (or the summary title once one exists). */
+  title: string;
+  summary: KnowledgeFileSummaryInfo | null;
+};
+
+export type KnowledgeFileKind =
+  | "summary"
+  | "note"
+  | "code"
+  | "other"
+  | "data"
+  | "log"
+  | "session"
+  | "trajectory";
+
+/** Summary metadata attached to each knowledge file row. */
+export type KnowledgeFileSummaryInfo = {
+  title: string;
+  origin: "auto" | "manual";
+  sampled: boolean;
+  updated_ns: number;
+  /** The file changed after the summary was written. */
+  stale: boolean;
+};
+
+export type KnowledgeTree = {
+  /** Every folder (including empty ones), relative POSIX paths, sorted. */
+  directories: string[];
+  files: KnowledgeFile[];
+};
+
+export type KnowledgeMoveResult = {
+  from: string;
+  to: string;
+  files: number;
+};
+
+/** Background summary worker state; only ``available`` exists when it is off. */
+export type KnowledgeSummaryStatus = {
+  available: boolean;
+  queued?: string[];
+  current?: {
+    path: string;
+    chunks: number;
+    done: number;
+    sampled: boolean;
+  } | null;
+  missing?: number;
+  completed?: number;
+  failed?: { path: string; error: string }[];
+};
+
+export type KnowledgeSummaryRecord = {
+  relative_path: string;
+  sha256: string;
+  title: string;
+  summary: string;
+  sampled: boolean;
+  origin: "auto" | "manual";
+  updated_ns: number;
 };
 
 export type KnowledgeSearchResult = {

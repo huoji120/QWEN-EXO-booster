@@ -11,8 +11,12 @@ import type {
   DocumentCategory,
   KnowledgeDraft,
   KnowledgeFile,
+  KnowledgeMoveResult,
   KnowledgeReadResponse,
   KnowledgeSearchResponse,
+  KnowledgeSummaryRecord,
+  KnowledgeSummaryStatus,
+  KnowledgeTree,
   RequestTraceListing,
   MemoryToolCall,
   PendingReflectionMemory,
@@ -417,7 +421,8 @@ export async function uploadKnowledgeFile(
   ).json()) as { file: KnowledgeFile };
 }
 
-/** Raw-byte upload of one text file (no base64; up to 100 MiB). */
+/** Raw-byte upload of one text file (no base64, no client-side size limit;
+ * the server answers 507 only when its disk would run low). */
 export async function uploadKnowledgeFileRaw(relativePath: string, file: Blob) {
   return (await (
     await apiFetch(`/knowledge/upload?${new URLSearchParams({ path: relativePath })}`, {
@@ -447,6 +452,86 @@ export async function deleteKnowledgeFile(relativePath: string) {
   await apiFetch(`/knowledge/files/${encodeSourcePath(relativePath)}`, {
     method: "DELETE",
   });
+}
+
+export async function getKnowledgeTree(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/knowledge/tree", { signal })
+  ).json()) as KnowledgeTree;
+}
+
+export async function createKnowledgeFolder(path: string) {
+  return (await (
+    await apiFetch("/knowledge/folders", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    })
+  ).json()) as { path: string };
+}
+
+/** Removes a folder and everything inside it. */
+export async function deleteKnowledgeFolder(path: string) {
+  return (await (
+    await apiFetch(`/knowledge/folders/${encodeSourcePath(path)}`, {
+      method: "DELETE",
+    })
+  ).json()) as { deleted: boolean; path?: string; files: number };
+}
+
+/** Renames or moves a file or folder; summaries follow it. */
+export async function moveKnowledgeEntry(source: string, destination: string) {
+  return (await (
+    await apiFetch("/knowledge/move", {
+      method: "POST",
+      body: JSON.stringify({ source, destination }),
+    })
+  ).json()) as KnowledgeMoveResult;
+}
+
+export async function getSummaryStatus(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/knowledge/summaries", { signal })
+  ).json()) as KnowledgeSummaryStatus;
+}
+
+/** Returns ``null`` when the file has no summary yet. */
+export async function getKnowledgeSummary(path: string) {
+  try {
+    return (await (
+      await apiFetch(`/knowledge/summary?${new URLSearchParams({ path })}`)
+    ).json()) as KnowledgeSummaryRecord;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+/** Stores a hand-edited summary (origin manual; never auto-overwritten). */
+export async function saveKnowledgeSummary(path: string, summary: string) {
+  return (await (
+    await apiFetch("/knowledge/summary", {
+      method: "PUT",
+      body: JSON.stringify({ path, summary }),
+    })
+  ).json()) as KnowledgeSummaryRecord;
+}
+
+export async function deleteKnowledgeSummary(path: string) {
+  return (await (
+    await apiFetch(`/knowledge/summary?${new URLSearchParams({ path })}`, {
+      method: "DELETE",
+    })
+  ).json()) as { deleted: boolean };
+}
+
+/** Queues summaries for ``paths`` (empty = every file still missing one). */
+export async function generateKnowledgeSummaries(paths: string[], force = false) {
+  return (await (
+    await apiFetch("/knowledge/summaries/generate", {
+      method: "POST",
+      body: JSON.stringify({ paths, force }),
+    })
+  ).json()) as KnowledgeSummaryStatus;
 }
 
 export async function searchKnowledge(options: {
