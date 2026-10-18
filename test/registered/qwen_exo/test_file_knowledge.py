@@ -225,6 +225,32 @@ class TestFileKnowledgeIndex(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.index.grep("**")
 
+    def test_grep_spreads_hits_across_files_with_omission_counts(self):
+        """One file full of matches must not crowd out the others: hits are
+        capped per file and the budget is shared round-robin across files."""
+        from qwen_exo_booster.memory_tools import MemoryToolExecutor
+
+        (self.root / "a.md").write_text("nginx\n" * 10, encoding="utf-8")
+        for name in ("b.md", "c.md", "d.md"):
+            (self.root / name).write_text(f"{name} nginx\n", encoding="utf-8")
+
+        result = self.index.grep("nginx", context=0, max_results=5, per_file=3)
+        self.assertEqual(
+            [(entry["path"], entry["match_count"], entry["shown"]) for entry in result["files"]],
+            [("a.md", 10, 2), ("b.md", 1, 1), ("c.md", 1, 1), ("d.md", 1, 1)],
+        )
+        self.assertEqual((result["count"], result["total_matches"]), (5, 13))
+        self.assertTrue(result["truncated"])
+
+        ok, text = MemoryToolExecutor(self.index).run_sync(
+            "qwen_exo_memory_search", {"pattern": "nginx", "context": 0, "max_results": 2}
+        )
+        self.assertTrue(ok)
+        self.assertIn("a.md (10 match(es))", text)
+        self.assertIn("… 9 more match(es) in a.md", text)
+        self.assertIn("2 more matching file(s) not expanded", text)
+        self.assertIn("  d.md (1 match(es))", text)
+
     def test_read_lines_offset_limit_boundaries(self):
         (self.root / "a.md").write_text(
             "".join(f"line {n}\n" for n in range(1, 6)), encoding="utf-8"

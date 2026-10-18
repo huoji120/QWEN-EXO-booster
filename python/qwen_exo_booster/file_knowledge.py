@@ -627,14 +627,23 @@ class FileKnowledgeIndex:
         *,
         path: str | None = None,
         context: int = 2,
-        max_results: int = 50,
+        max_results: int = 60,
+        per_file: int = 3,
     ) -> dict[str, Any]:
-        """Line-oriented grep over UTF-8 files: one hit per matching line with
-        numbered context lines, ready for :meth:`read_lines` follow-ups."""
+        """Line-oriented grep over UTF-8 files, spread across files.
+
+        Each file contributes at most ``per_file`` shown hits (the rest are
+        counted as omitted), and the ``max_results`` budget is handed out
+        round-robin across matching files, so one heavily matching file cannot
+        crowd every other file out. ``files`` lists every matching file with
+        its total and shown match counts.
+        """
         if not isinstance(max_results, int) or isinstance(max_results, bool):
             raise FileKnowledgeError("max_results must be an integer")
         if not 1 <= max_results <= MAX_SEARCH_RESULTS:
             raise FileKnowledgeError(f"max_results must be within 1..{MAX_SEARCH_RESULTS}")
+        if not isinstance(per_file, int) or isinstance(per_file, bool) or per_file < 1:
+            raise FileKnowledgeError("per_file must be a positive integer")
         if not isinstance(context, int) or isinstance(context, bool):
             raise FileKnowledgeError("context must be an integer")
         if not 0 <= context <= MAX_CONTEXT_LINES:
@@ -647,9 +656,8 @@ class FileKnowledgeIndex:
             rows = connection.execute(
                 f"SELECT * FROM {self.table_name} WHERE encoding = 'utf-8' ORDER BY relative_path"
             ).fetchall()
-        hits: list[dict[str, Any]] = []
-        matched_files: set[str] = set()
-        truncated = False
+        # Per matching file: total count and up to ``per_file`` hit candidates.
+        files: list[dict[str, Any]] = []
         for row in rows:
             relative = str(row["relative_path"])
             if not self._path_filter_matches(relative, path):
@@ -659,15 +667,16 @@ class FileKnowledgeIndex:
                 lines = self._read_checked(safe_path, row).decode("utf-8").splitlines()
             except StaleFileError:
                 continue
+            candidates: list[dict[str, Any]] = []
+            match_count = 0
             for index, line in enumerate(lines):
                 if not compiled.search(line):
                     continue
-                if len(hits) >= max_results:
-                    truncated = True
-                    break
-                matched_files.add(relative)
+                match_count += 1
+                if len(candidates) >= per_file:
+                    continue
                 first = max(0, index - context)
-                hits.append(
+                candidates.append(
                     {
                         "path": relative,
                         "line": index + 1,
@@ -679,13 +688,38 @@ class FileKnowledgeIndex:
                         ],
                     }
                 )
-            if truncated:
-                break
+            if match_count:
+                files.append(
+                    {"path": relative, "match_count": match_count, "candidates": candidates}
+                )
+        shown = {entry["path"]: 0 for entry in files}
+        budget = max_results
+        for depth in range(per_file):
+            for entry in files:
+                if budget and depth < len(entry["candidates"]):
+                    shown[entry["path"]] += 1
+                    budget -= 1
+        hits = [
+            hit
+            for entry in files
+            for hit in entry["candidates"][: shown[entry["path"]]]
+        ]
+        total = sum(entry["match_count"] for entry in files)
         return {
             "hits": hits,
             "count": len(hits),
-            "file_count": len(matched_files),
-            "truncated": truncated,
+            "total_matches": total,
+            "file_count": len(files),
+            "files": [
+                {
+                    "path": entry["path"],
+                    "match_count": entry["match_count"],
+                    "shown": shown[entry["path"]],
+                }
+                for entry in files
+            ],
+            "per_file": per_file,
+            "truncated": len(hits) < total,
         }
 
     def read_lines(self, path: str, *, offset: int = 1, limit: int = 200) -> dict[str, Any]:
