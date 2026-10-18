@@ -1942,36 +1942,8 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
             return validation_error
         raw_request.state.qwen_exo_original_instructions = request.instructions
         raw_request.state.qwen_exo_original_extra_key = request.extra_key
-        # Server-internal channel for the retrieved-memory block: never trust a
-        # client-supplied value.
-        request.qwen_exo_memory_attachment = None
-        async def decision_history(prepared_request):
-            previous = None
-            if prepared_request.previous_response_id:
-                async with serving.response_store_lock:
-                    previous = serving.response_store.get(prepared_request.previous_response_id)
-                if previous is None:
-                    raise ValueError("Decision context previous response is unavailable")
-            return serving._construct_input_messages(
-                prepared_request, previous, memory_attachment=None
-            )
-        # Authentication has already run; isolate private KV by credential as
-        # well as resolved conversation, never by a client label alone.
-        from hashlib import sha256
-        decision_credential = raw_request.headers.get("authorization", "")
-        decision_scope = (
-            sha256(decision_credential.encode()).hexdigest()
-            if decision_credential else None
-        )
         try:
-            request, memory_state = await qwen_exo_runtime.prepare_responses_request(
-                request, history_resolver=decision_history,
-                decision_cache_scope=decision_scope,
-            )
-            raw_request.state.qwen_exo_memory = (
-                memory_state.public_dict() if memory_state is not None else None
-            )
-            raw_request.state.qwen_exo_memory_state = memory_state
+            request = await qwen_exo_runtime.prepare_responses_request(request)
         except asyncio.CancelledError:
             cancelled_response = await serving.register_cancelled_response(request)
             await qwen_exo_runtime.cancel_request(request.request_id)
@@ -2000,13 +1972,8 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
                 )
                 response.headers["Retry-After"] = "1"
                 return response
-            # Memory is optional evidence. Preparation always fails closed.
-            raw_request.state.qwen_exo_memory = {
-                "status": "failed_closed",
-                "error_type": type(exc).__name__,
-            }
-            raw_request.state.qwen_exo_memory_state = None
-            logger.exception("QWEN-EXO memory preparation failed closed")
+            # Private context is optional; serve the original request.
+            logger.exception("QWEN-EXO request preparation failed closed")
 
     result = await serving.create_responses(request, raw_request)
     if qwen_exo_runtime is not None:

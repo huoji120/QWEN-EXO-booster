@@ -134,8 +134,7 @@ def main() -> int:
     token_ids = all_token_ids[: args.max_tokens]
     source_digest = source_sha256(raw_source)
     status = _get_json(f"{args.url}/qwen-exo/status", args.timeout)
-    tensor_bank = status.get("tensor_bank") or {}
-    model_fingerprint = str(tensor_bank.get("model_fingerprint") or "")
+    model_fingerprint = str((status.get("model") or {}).get("fingerprint") or "")
     if not model_fingerprint:
         raise RuntimeError("running service did not report a model fingerprint")
     run_id = uuid.uuid4().hex[:12]

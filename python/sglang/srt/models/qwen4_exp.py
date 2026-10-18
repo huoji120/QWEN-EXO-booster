@@ -1607,7 +1607,6 @@ class Qwen4ExpAttentionDecoderLayer(
             forward_batch=forward_batch,
         )
         self._observe_qwen_exo_attention(q, k, positions, forward_batch)
-        self._capture_qwen_exo_probe_queries(q, positions, forward_batch)
 
         if overlap_indexer:
             current_stream.wait_stream(self.alt_stream)

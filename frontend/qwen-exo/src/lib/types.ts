@@ -35,14 +35,12 @@ export type RuntimeStatus = {
     always_on?: boolean;
     route?: string;
   };
-  tensor_bank?: Record<string, unknown> | null;
   internal_services?: Record<string, boolean>;
   telemetry?: {
     event_count?: number;
     observer_mode?: string;
     persistence?: { status?: string; [key: string]: unknown };
   };
-  adaptive_retrieval?: Record<string, unknown> | null;
   [key: string]: unknown;
 };
 
@@ -109,27 +107,6 @@ export type TelemetryEvent = {
   [key: string]: unknown;
 };
 
-export type RecallTurn = {
-  turn_id?: string;
-  request_id?: string;
-  outcome?: string;
-  strategy?: string;
-  source?: string;
-  knowledge_admitted?: boolean;
-  policy_data_active?: boolean;
-  self_ask_seconds?: number;
-  exact_replay_seconds?: number;
-  total_seconds?: number;
-  [key: string]: unknown;
-};
-
-export type RecallTrace = {
-  schema?: string;
-  bank?: Record<string, unknown>;
-  turns: RecallTurn[];
-  [key: string]: unknown;
-};
-
 export type SourceDocument = {
   relative_path: string;
   byte_count?: number;
@@ -142,9 +119,6 @@ export type SourceDocument = {
   retrieval_diversity_bucket?: string;
   canonical?: boolean;
   quality?: number;
-  compiled?: boolean;
-  compile_status?: "compiled" | "uncompiled";
-  compiled_at?: number | null;
   ingested_at?: number | null;
   updated_at?: number | null;
   [key: string]: unknown;
@@ -317,8 +291,8 @@ export type ReflectionRegenerationJobStatus = {
     | "idle"
     | "queued"
     | "loading_source"
+    | "similar_retrieval"
     | "evidence_extraction"
-    | "qk_retrieval"
     | "causal_review"
     | "model_review"
     | "publishing"
@@ -582,14 +556,6 @@ export type KnowledgeReadResponse = {
   eof: boolean;
 };
 
-export type TraceCandidate = {
-  relative_path: string;
-  lane: string;
-  tensor_score: number | null;
-  lexical_score: number | null;
-  excerpt: string;
-};
-
 export type RequestTrace = {
   request_id: string;
   started_at: number | null;
@@ -597,28 +563,26 @@ export type RequestTrace = {
   input_text: string;
   output_text: string;
   reasoning_text?: string;
-  prompt_tokens?: number | null;
-  query_tokens?: number | null;
-  retrieval_seconds?: number | null;
-  judge_seconds?: number | null;
-  selected_document_ids?: string[];
   output_tokens: number | null;
-  candidates: TraceCandidate[];
-  native_restore: {
-    lane: string;
-    tokens: number;
-    selection_reason: string;
-  } | null;
-  cognition_active: boolean;
-  attached_tokens: number | null;
-  self_ask: {
-    event_type: string;
-    question: string;
-    answer: string;
-    status: string;
-  }[];
-  latent_transplant: { artifact: string; strength: number | null } | null;
+  /** Server-executed memory tool calls (qwen_exo_memory_search/read). */
+  memory_tool_calls: number;
+  memory_tool_failures: number;
+  memory_tools: string[];
   event_types: string[];
+};
+
+/** One server-executed memory tool call, from the tool-call journal. */
+export type MemoryToolCall = {
+  request_id: string;
+  round: number;
+  call_id: string;
+  name: string;
+  arguments: string;
+  ok: boolean;
+  output?: string;
+  output_chars: number;
+  duration_ms: number;
+  created_at: number;
 };
 
 export type RequestTraceListing = {

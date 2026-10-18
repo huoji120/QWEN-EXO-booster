@@ -48,9 +48,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
 from openai_harmony import Message as OpenAIMessage
 from openai_harmony import Role
 from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
-from qwen_exo_booster.memory_span import locate_memory_span
 from qwen_exo_booster.memory_tools import MEMORY_TOOL_NAMES
-from qwen_exo_booster.pipeline import response_memory_metadata
 
 from sglang.srt.entrypoints.context import (
     ConversationContext,
@@ -124,7 +122,6 @@ _QWEN_EXO_DFLASH_THINK_PHASE = "qwen_exo_dflash_think_phase"
 _DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 _CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
 # Identifies the synthetic tool message that carries retrieved QWEN-EXO memory.
-_MEMORY_ATTACHMENT_TOOL_CALL_ID = "qwen_exo_memory"
 
 
 _STORED_RESPONSE_MAX_ENTRIES = 4096
@@ -565,7 +562,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             return request
         try:
             messages = self._construct_input_messages(
-                request, prev_response, memory_attachment=None
+                request, prev_response
             )
         except (ValueError, TypeError) as exc:
             raise _ResponsesInputError(str(exc)) from exc
@@ -679,24 +676,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
         qwen_exo_observe = (
-            qwen_exo_runtime is not None
-            and (
-                qwen_exo_runtime.observer.mode != "off"
-                or bool(getattr(
-                    getattr(qwen_exo_runtime, "config", None),
-                    "feature_flags",
-                    None,
-                ) and qwen_exo_runtime.config.feature_flags.external_memory)
-            )
+            qwen_exo_runtime is not None and qwen_exo_runtime.observer.mode != "off"
         )
         qwen_exo_score_bias = bool(
             qwen_exo_runtime is not None
             and getattr(qwen_exo_runtime, "score_bias_enabled", False)
-        )
-        memory_state = (
-            getattr(raw_request.state, "qwen_exo_memory_state", None)
-            if raw_request is not None
-            else None
         )
         if qwen_exo_runtime is not None:
             context_len = int(self.tokenizer_manager.model_config.context_len)
@@ -731,112 +715,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     current_request, prev_response, tokenizer
                 )
 
-            has_multimodal_input = processed_messages is not None and any(
-                getattr(processed_messages, field, None)
-                for field in ("image_data", "video_data", "audio_data", "modalities")
-            )
-            rendered_prompt_tokens = rendered_length(engine_prompts) + len(
-                getattr(memory_state, "radix_prefix_token_ids", ()) or ()
-            )
-            over_context_budget = (
-                rendered_prompt_tokens + reserved_output_tokens > context_len
-            )
-            if (
-                memory_state is not None
-                and (
-                    memory_state.private_attachment is not None
-                    or memory_state.policy_attachment is not None
-                )
-                and (has_multimodal_input or over_context_budget)
-            ):
-                (
-                    request,
-                    memory_state,
-                ) = await qwen_exo_runtime.drop_memory_attachment_for_context(
-                    request,
-                    rendered_prompt_tokens=rendered_prompt_tokens,
-                    context_length=context_len,
-                    reserved_output_tokens=reserved_output_tokens,
-                    reason=(
-                        "multimodal_post_expansion_unknown"
-                        if has_multimodal_input
-                        else "context_capacity"
-                    ),
-                    include_policy=(
-                        has_multimodal_input or memory_state.private_attachment is None
-                    ),
-                )
-                raw_request.state.qwen_exo_memory_state = memory_state
-                raw_request.state.qwen_exo_memory = (
-                    memory_state.public_dict() if memory_state is not None else None
-                )
-                try:
-                    (
-                        messages,
-                        request_prompts,
-                        engine_prompts,
-                        processed_messages,
-                    ) = await rebuild_without_private_state(request)
-                except (
-                    ValueError,
-                    TypeError,
-                    RuntimeError,
-                    jinja2.TemplateError,
-                ) as exc:
-                    logger.exception("Error rebuilding prompt without QWEN-EXO memory")
-                    return self.create_error_response(f"{exc} {exc.__cause__}")
-
-            has_multimodal_input = processed_messages is not None and any(
-                getattr(processed_messages, field, None)
-                for field in ("image_data", "video_data", "audio_data", "modalities")
-            )
-            rendered_prompt_tokens = rendered_length(engine_prompts) + len(
-                getattr(memory_state, "radix_prefix_token_ids", ()) or ()
-            )
-            over_context_budget = (
-                rendered_prompt_tokens + reserved_output_tokens > context_len
-            )
-            if (
-                memory_state is not None
-                and memory_state.policy_attachment is not None
-                and (has_multimodal_input or over_context_budget)
-            ):
-                (
-                    request,
-                    memory_state,
-                ) = await qwen_exo_runtime.drop_memory_attachment_for_context(
-                    request,
-                    rendered_prompt_tokens=rendered_prompt_tokens,
-                    context_length=context_len,
-                    reserved_output_tokens=reserved_output_tokens,
-                    reason=(
-                        "multimodal_post_expansion_unknown"
-                        if has_multimodal_input
-                        else "context_capacity"
-                    ),
-                    include_policy=True,
-                )
-                raw_request.state.qwen_exo_memory_state = memory_state
-                raw_request.state.qwen_exo_memory = (
-                    memory_state.public_dict() if memory_state is not None else None
-                )
-                try:
-                    (
-                        messages,
-                        request_prompts,
-                        engine_prompts,
-                        processed_messages,
-                    ) = await rebuild_without_private_state(request)
-                except (
-                    ValueError,
-                    TypeError,
-                    RuntimeError,
-                    jinja2.TemplateError,
-                ) as exc:
-                    logger.exception(
-                        "Error rebuilding prompt without QWEN-EXO PolicyData"
-                    )
-                    return self.create_error_response(f"{exc} {exc.__cause__}")
             has_multimodal_input = processed_messages is not None and any(
                 getattr(processed_messages, field, None)
                 for field in (
@@ -948,25 +826,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     return self.create_error_response(f"{exc} {exc.__cause__}")
 
         if qwen_exo_runtime is not None:
-            memory_diagnostics = response_memory_metadata(
-                memory_state,
-                fallback=(
-                    getattr(raw_request.state, "qwen_exo_memory", None)
-                    if raw_request is not None
-                    else None
-                ),
-                observer_mode=qwen_exo_runtime.observer.mode,
-            )
-            response_metadata = self._stringify_response_metadata(request.metadata)
-            encoded_memory_diagnostics = json.dumps(
-                memory_diagnostics,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            response_metadata["memory"] = encoded_memory_diagnostics
-            response_metadata["qwen_exo"] = encoded_memory_diagnostics
-            request = request.model_copy(update={"metadata": response_metadata})
             public_instructions = (
                 getattr(
                     raw_request.state,
@@ -1017,11 +876,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     assert len(tool_list) == 0
                     tool_sessions = {}
                 for i, engine_prompt in enumerate(engine_prompts):
-                    memory_state = (
-                        getattr(raw_request.state, "qwen_exo_memory_state", None)
-                        if raw_request is not None
-                        else None
-                    )
                     # Calculate default max tokens from context length minus prompt length
                     if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
@@ -1087,32 +941,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         # prompt, tools, a forked subagent's inherited context)
                         # are reused across conversations, as in chat/completions.
                         custom_params["qwen_exo_kind"] = "user"
-                        if memory_state is not None:
-                            memory_span = locate_memory_span(
-                                engine_prompt,
-                                tokenizer,
-                                memory_state.private_attachment,
-                            )
-                            if memory_span is not None:
-                                custom_params.update(
-                                    {
-                                        "qwen_exo_memory_start": memory_span[0],
-                                        "qwen_exo_memory_length": memory_span[1],
-                                        "qwen_exo_memory_key": (
-                                            f"{memory_state.attachment_digest}:"
-                                            f"{memory_span[0]}:{memory_span[1]}"
-                                        ),
-                                    }
-                                )
-                            elif memory_state.private_attachment:
-                                qwen_exo_runtime.telemetry.emit(
-                                    request.request_id,
-                                    "observer.memory_span_unresolved",
-                                    {
-                                        "attachment_digest": memory_state.attachment_digest,
-                                        "attached_tokens": memory_state.attached_tokens,
-                                    },
-                                )
                         score_bias_builder = getattr(
                             qwen_exo_runtime, "score_bias_payload", None
                         )
@@ -1399,11 +1227,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         prev_response: Optional[ResponsesResponse],
         tokenizer: Any,
     ):
-        messages = self._construct_input_messages(
-            request,
-            prev_response,
-            memory_attachment=request.qwen_exo_memory_attachment,
-        )
+        messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._chat_tools_for_request(request)
         # Automatic selection controls the hard token budget, not the leading
@@ -2162,16 +1986,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse] = None,
-        *,
-        memory_attachment: Optional[str] = None,
     ) -> list[ChatCompletionMessageParam]:
-        """Render one Responses request as chat messages.
-
-        ``memory_attachment`` is appended as a trailing tool message so that
-        retrieved knowledge lands at the end of the prompt. Callers building the
-        *stored* history pass nothing: the attachment belongs to a single turn
-        and must not accumulate into the conversation transcript.
-        """
+        """Render one Responses request as chat messages."""
         messages: list[ChatCompletionMessageParam] = []
         if request.instructions:
             messages.append(
@@ -2186,21 +2002,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # (message + function_call(s)); collapse them into one chat message
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
-
-        # Retrieved memory goes last, as a ``tool`` message. The Qwen template
-        # rejects a system message anywhere but position 0, and a trailing
-        # *user* message would move ``last_query_index`` to the end and restrip
-        # the reasoning blocks of the whole history; a ``tool`` message renders
-        # inside ``<tool_response>`` and is skipped by that scan, so the history
-        # renders byte-identically with and without the attachment.
-        if memory_attachment:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": _MEMORY_ATTACHMENT_TOOL_CALL_ID,
-                    "content": memory_attachment,
-                }
-            )
 
         # Most chat templates expect a single leading ``system`` message;
         # coalesce any ``instructions`` + interleaved ``developer`` entries.
@@ -4068,9 +3869,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             if limit_reached:
                 call["output"] = ROUND_LIMIT_OUTPUT
             else:
+                started = time.perf_counter()
                 ok, output = await self.tool_server.executor.run(
                     call["name"], call["arguments"]
                 )
+                call["duration_ms"] = (time.perf_counter() - started) * 1000.0
                 call["ok"] = ok
                 call["output"] = neutralize_control_markers(output)
             calls.append(call)
@@ -4229,6 +4032,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 [call["ok"] for call in calls],
                 [len(call["output"]) for call in calls],
             )
+            runtime = (
+                getattr(raw_request.app.state, "qwen_exo_runtime", None)
+                if raw_request is not None
+                else None
+            )
+            if runtime is not None:
+                await runtime.record_memory_tool_round(request_id, round_index, calls)
             context.qwen_exo_memory_rounds.append({"text": pass_text, "calls": calls})
             context.append_output(
                 {

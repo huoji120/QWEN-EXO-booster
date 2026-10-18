@@ -98,7 +98,7 @@ def capture(
         input_ids = input_ids[0]
     token_ids = [int(value) for value in input_ids[:max_tokens]]
     status = get_json(f"{base_url}/qwen-exo/status", timeout)
-    fingerprint = str((status.get("tensor_bank") or {}).get("model_fingerprint") or "")
+    fingerprint = str((status.get("model") or {}).get("fingerprint") or "")
     if not fingerprint:
         raise RuntimeError("service did not report a model fingerprint")
     capture_spec: dict[str, object] = {"mode": "capture"}

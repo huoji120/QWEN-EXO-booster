@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 import pytest
 from qwen_exo_booster.config import PROJECT_NAME, QwenExoConfig
-from qwen_exo_booster.refresh import RefreshRecord
 from qwen_exo_booster.runtime import QwenExoRuntime, QwenExoRuntimeState
 
 
@@ -22,21 +21,12 @@ def server_args(tmp_path, **overrides):
         "qwen_exo_max_internal_fanout": 32,
         "qwen_exo_internal_mamba_reserve": 6,
         "qwen_exo_max_internal_tokens": 4096,
-        "qwen_exo_max_candidates": 8,
-        "qwen_exo_max_memory_tokens": 8192,
         "qwen_exo_max_reasoning_tokens": 3072,
         "qwen_exo_max_output_tokens": 8192,
         "qwen_exo_observer_mode": "shadow",
         "qwen_exo_enable_hybrid_prefix": True,
-        "qwen_exo_enable_external_memory": True,
         "qwen_exo_enable_policy_data": True,
-        "qwen_exo_enable_reference_judge": True,
         "qwen_exo_enable_capsule": True,
-        "qwen_exo_enable_adaptive_refresh": False,
-        "qwen_exo_context_evidence_mode": "off",
-        "qwen_exo_experimental_context_integrity": False,
-        "qwen_exo_context_integrity_mode": "active",
-        "qwen_exo_context_integrity_context_divisor": 3,
         "model_path": "model",
         "tp_size": 2,
         "dtype": "bfloat16",
@@ -179,62 +169,6 @@ def test_experimental_activation_training_defaults_off_and_is_public(tmp_path):
     assert enabled.public_dict()["features"]["activation_training"] is True
 
 
-def test_qk_layer_and_head_selection_are_parsed_validated_and_public(tmp_path):
-    """Layer/head selection defaults to legacy behaviour and rejects MLX.
-
-    The MLX backend captures probe Q on its final layer only, so a configured
-    recall layer would pair Q and K from different layers; it fails at config
-    time instead of silently ranking against mismatched geometry.
-    """
-    default = QwenExoConfig.from_server_args(server_args(tmp_path))
-    assert default.qk_layer_id is None
-    assert default.qk_query_heads == ()
-    assert default.qk_query_pooling == "windows"
-
-    tuned = QwenExoConfig.from_server_args(
-        server_args(
-            tmp_path,
-            qwen_exo_qk_layer=35,
-            qwen_exo_qk_query_heads="7, 3,7,11",
-            qwen_exo_qk_query_pooling="sentence",
-        )
-    )
-    assert tuned.qk_layer_id == 35
-    assert tuned.qk_query_heads == (3, 7, 11)
-    assert tuned.public_dict()["qk_query_heads"] == [3, 7, 11]
-    assert tuned.public_dict()["qk_layer_id"] == 35
-
-    with pytest.raises(ValueError, match="qk_query_pooling"):
-        QwenExoConfig.from_server_args(
-            server_args(tmp_path, qwen_exo_qk_query_pooling="tokens")
-        )
-    with pytest.raises(ValueError, match="MLX"):
-        QwenExoConfig.from_server_args(
-            server_args(tmp_path, qwen_exo_backend="mlx", qwen_exo_qk_layer=35)
-        )
-
-
-def test_experimental_context_integrity_defaults_off_and_can_be_enabled(tmp_path):
-    disabled = QwenExoConfig.from_server_args(
-        server_args(tmp_path, qwen_exo_context_integrity_mode="active")
-    )
-    assert disabled.context_integrity_mode == "off"
-    assert disabled.feature_flags.context_integrity is False
-
-    enabled = QwenExoConfig.from_server_args(
-        server_args(
-            tmp_path,
-            qwen_exo_observer_mode="active",
-            qwen_exo_enable_adaptive_refresh=True,
-            qwen_exo_context_integrity_mode="active",
-            qwen_exo_experimental_context_integrity=True,
-        )
-    )
-    assert enabled.context_integrity_mode == "active"
-    assert enabled.feature_flags.context_integrity is True
-    assert enabled.public_dict()["features"]["context_integrity"] is True
-
-
 def test_response_output_budget_is_public_and_positive(tmp_path):
     config = QwenExoConfig.from_server_args(
         server_args(tmp_path, qwen_exo_max_output_tokens=12288)
@@ -246,111 +180,6 @@ def test_response_output_budget_is_public_and_positive(tmp_path):
         QwenExoConfig.from_server_args(
             server_args(tmp_path, qwen_exo_max_output_tokens=0)
         )
-
-
-def test_document_tensor_bank_contract_is_bounded_and_public(tmp_path):
-    config = QwenExoConfig.from_server_args(
-        server_args(
-            tmp_path,
-            qwen_exo_tensor_bank_max_document_tokens=16384,
-            qwen_exo_tensor_bank_salient_token_budget=1024,
-            qwen_exo_tensor_bank_surprisal_threshold=5.5,
-            qwen_exo_tensor_bank_span_tokens=24,
-        )
-    )
-
-    assert config.tensor_bank_max_document_tokens == 16384
-    assert config.tensor_bank_salient_token_budget == 1024
-    assert config.tensor_bank_surprisal_threshold == 5.5
-    assert config.tensor_bank_span_tokens == 24
-    assert config.public_dict()["tensor_bank_salient_token_budget"] == 1024
-
-    with pytest.raises(ValueError, match="64-token aligned"):
-        QwenExoConfig.from_server_args(
-            server_args(tmp_path, qwen_exo_tensor_bank_salient_token_budget=1000)
-        )
-
-    with pytest.raises(ValueError, match="cannot exceed context_length - 2048"):
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                context_length=16384,
-                qwen_exo_tensor_bank_max_document_tokens=14400,
-                qwen_exo_tensor_bank_salient_token_budget=64,
-            )
-        )
-
-    with pytest.raises(ValueError, match="leave 2048 tokens"):
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                context_length=2048,
-                qwen_exo_tensor_bank_max_document_tokens=64,
-                qwen_exo_tensor_bank_salient_token_budget=64,
-            )
-        )
-
-
-def test_qk_expansion_margin_is_bounded_and_public(tmp_path):
-    config = QwenExoConfig.from_server_args(
-        server_args(tmp_path, qwen_exo_qk_expansion_margin=0.02)
-    )
-
-    assert config.qk_expansion_margin == 0.02
-    assert config.public_dict()["qk_expansion_margin"] == 0.02
-
-    default_config = QwenExoConfig.from_server_args(server_args(tmp_path))
-    assert default_config.qk_expansion_margin == 0.02
-    assert default_config.qk_admission_margin == 0.02
-    assert default_config.qk_admission_gates == (0.0, 0.02)
-
-    broad = QwenExoConfig.from_server_args(
-        server_args(
-            tmp_path,
-            qwen_exo_qk_recall_preset="broad",
-            qwen_exo_qk_expansion_margin=0.0,
-        )
-    )
-    assert broad.qk_admission_margin == 0.0
-    assert (
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                qwen_exo_qk_recall_preset="broad",
-                qwen_exo_qk_expansion_margin=0.0,
-                qwen_exo_qk_only_knowledge=True,
-            )
-        ).qk_admission_margin
-        == 0.005
-    )
-    assert (
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                qwen_exo_qk_recall_preset="strict",
-                qwen_exo_qk_expansion_margin=0.0,
-            )
-        ).qk_admission_margin
-        == 0.02
-    )
-    assert QwenExoConfig.from_server_args(
-        server_args(
-            tmp_path,
-            qwen_exo_qk_recall_preset="strict",
-            qwen_exo_qk_expansion_margin=0.0,
-        )
-    ).qk_admission_gates == (8.0, 0.02)
-    with pytest.raises(ValueError, match="expansion margin"):
-        QwenExoConfig.from_server_args(
-            server_args(tmp_path, qwen_exo_qk_expansion_margin=-0.01)
-        )
-
-
-def test_request_recall_has_no_direct_text_admission_controls(tmp_path):
-    config = QwenExoConfig.from_server_args(server_args(tmp_path))
-
-    assert config.feature_flags.reference_judge is True
-    assert config.public_dict()["features"]["external_memory"] is True
 
 
 def test_trajectory_score_bias_defaults_are_bounded_and_public(tmp_path):
@@ -428,14 +257,6 @@ def test_policy_data_cli_arguments_are_registered():
             "6144",
             "--qwen-exo-max-output-tokens",
             "12288",
-            "--qwen-exo-tensor-bank-max-document-tokens",
-            "16384",
-            "--qwen-exo-tensor-bank-salient-token-budget",
-            "1024",
-            "--qwen-exo-tensor-bank-surprisal-threshold",
-            "5.5",
-            "--qwen-exo-tensor-bank-span-tokens",
-            "24",
         ]
     )
 
@@ -444,10 +265,7 @@ def test_policy_data_cli_arguments_are_registered():
     assert parsed.qwen_exo_max_policy_tokens == 2048
     assert parsed.qwen_exo_max_reasoning_tokens == 6144
     assert parsed.qwen_exo_max_output_tokens == 12288
-    assert parsed.qwen_exo_tensor_bank_max_document_tokens == 16384
-    assert parsed.qwen_exo_tensor_bank_salient_token_budget == 1024
-    assert parsed.qwen_exo_tensor_bank_surprisal_threshold == 5.5
-    assert parsed.qwen_exo_tensor_bank_span_tokens == 24
+    assert not hasattr(parsed, "qwen_exo_tensor_bank_max_document_tokens")
 
 
 def test_immediate_uncertainty_retrieval_cli_argument_is_registered():
@@ -462,20 +280,6 @@ def test_immediate_uncertainty_retrieval_cli_argument_is_registered():
     )
 
     assert parsed.qwen_exo_immediate_uncertainty_retrieval is True
-
-
-def test_context_evidence_cli_argument_is_registered():
-    if sys.platform == "win32":
-        pytest.skip("SGLang ServerArgs imports the POSIX resource module")
-    from sglang.srt.server_args import ServerArgs
-
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    parsed = parser.parse_args(
-        ["--model", "dummy", "--qwen-exo-context-evidence-mode", "active"]
-    )
-
-    assert parsed.qwen_exo_context_evidence_mode == "active"
 
 
 def test_response_compaction_config_is_bounded_and_public(tmp_path):
@@ -500,14 +304,6 @@ def test_response_compaction_config_is_bounded_and_public(tmp_path):
                 qwen_exo_response_compaction_max_output_tokens=2048,
             )
         )
-    with pytest.raises(ValueError, match="requires external memory"):
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                qwen_exo_response_compaction_mode="active",
-                qwen_exo_enable_external_memory=False,
-            )
-        )
     with pytest.raises(ValueError, match="response_compaction_mode"):
         QwenExoConfig.from_server_args(
             server_args(tmp_path, qwen_exo_response_compaction_mode="shadow")
@@ -521,70 +317,10 @@ def test_response_compaction_config_is_bounded_and_public(tmp_path):
         )
 
 
-def test_context_features_require_adaptive_refresh_and_reject_shadow(tmp_path):
-    with pytest.raises(ValueError, match="requires adaptive refresh"):
-        QwenExoConfig.from_server_args(
-            server_args(tmp_path, qwen_exo_context_evidence_mode="active")
-        )
-
-    config = QwenExoConfig.from_server_args(
-        server_args(
-            tmp_path,
-            qwen_exo_observer_mode="active",
-            qwen_exo_enable_adaptive_refresh=True,
-            qwen_exo_context_evidence_mode="active",
-            qwen_exo_context_integrity_mode="active",
-            qwen_exo_experimental_context_integrity=True,
-            context_length=204000,
-            qwen_exo_context_integrity_context_divisor=3,
-        )
-    )
-    assert config.context_evidence_mode == "active"
-    assert config.context_integrity_mode == "active"
-    assert config.context_integrity_max_tokens == 68000
-    assert config.public_dict()["context_integrity_context_divisor"] == 3
-    with pytest.raises(ValueError, match="context_evidence_mode"):
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                qwen_exo_observer_mode="active",
-                qwen_exo_enable_adaptive_refresh=True,
-                qwen_exo_context_evidence_mode="shadow",
-            )
-        )
-    with pytest.raises(ValueError, match="context_integrity_mode"):
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                qwen_exo_observer_mode="active",
-                qwen_exo_enable_adaptive_refresh=True,
-                qwen_exo_context_integrity_mode="shadow",
-                qwen_exo_experimental_context_integrity=True,
-            )
-        )
-
-
-def test_qk_prefilter_and_reflection_memory_reject_shadow(tmp_path):
-    config = QwenExoConfig.from_server_args(server_args(tmp_path))
-    assert config.qk_prefilter_mode == "active"
-    with pytest.raises(ValueError, match="qk_prefilter_mode"):
-        QwenExoConfig.from_server_args(
-            server_args(tmp_path, qwen_exo_qk_prefilter_mode="shadow")
-        )
+def test_reflection_memory_rejects_shadow(tmp_path):
     with pytest.raises(ValueError, match="reflection_memory_mode"):
         QwenExoConfig.from_server_args(
             server_args(tmp_path, qwen_exo_reflection_memory_mode="shadow")
-        )
-
-
-def test_active_refresh_requires_active_observer(tmp_path):
-    with pytest.raises(ValueError, match="requires"):
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                qwen_exo_observer_mode="shadow",
-                qwen_exo_enable_adaptive_refresh=True,
-            )
         )
 
 
@@ -614,22 +350,6 @@ def test_policy_data_flag_follows_server_args(tmp_path):
     )
 
     assert value.feature_flags.policy_data is False
-
-
-@pytest.mark.parametrize(
-    "disabled_flag",
-    ["qwen_exo_enable_reference_judge", "qwen_exo_enable_external_memory"],
-)
-def test_active_refresh_requires_semantic_memory_dependencies(tmp_path, disabled_flag):
-    with pytest.raises(ValueError, match="requires reference judge"):
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                qwen_exo_observer_mode="active",
-                qwen_exo_enable_adaptive_refresh=True,
-                **{disabled_flag: False},
-            )
-        )
 
 
 def test_observer_rejects_unimplemented_multiple_refresh_attempts(tmp_path):
@@ -704,112 +424,24 @@ def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):
         "document_count": 0,
         "always_on": False,
         "route": "text_instructions",
-        "qk_ranked": False,
     }
     assert runtime.status()["policy_data"] == {
         "source_digest": runtime.policy_data.snapshot.source_digest,
         "document_count": 0,
         "enabled": True,
         "always_on": False,
-        "semantic_eligibility_required": False,
-        "qk_relevance_required": False,
-        "reference_judge_required": False,
         "route": "text_instructions",
         "max_tokens": runtime.config.max_policy_tokens,
     }
     assert runtime.status()["internal_services"] == {
-        "reference_judge": True,
         "capsule": True,
-        "memory_pipeline": True,
-        "self_ask_refresh": False,
+        "memory_tools": True,
         "policy_data": True,
-        "tensor_bank": True,
         "cognition": False,
-        "query_probe": False,
-        "causal_replay": False,
-        "adaptive_retrieval": False,
     }
 
     asyncio.run(runtime.close())
     assert runtime.state is QwenExoRuntimeState.STOPPED
-
-
-def test_first_knowledge_reindex_enables_geometry_bound_flash_next_recall():
-    runtime = object.__new__(QwenExoRuntime)
-    runtime.query_probe = None
-    runtime.tokenizer_manager = SimpleNamespace(
-        tokenizer=SimpleNamespace(encode=lambda text, **kwargs: [1]),
-        model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(
-                model_type="qwen4_exp_text",
-                num_attention_heads=16,
-                hidden_size=2560,
-                head_dim=256,
-            )
-        ),
-    )
-    runtime.internal_jobs = SimpleNamespace()
-    runtime.telemetry = SimpleNamespace(emit=lambda *args: None)
-    runtime.config = SimpleNamespace(max_internal_tokens=4096, qk_query_pooling="windows")
-    runtime.refresh_service = SimpleNamespace(query_probe=None)
-
-    async def ensure_ready():
-        return SimpleNamespace(ready=True, public_dict=lambda: {"ready": True})
-
-    runtime.tensor_bank = SimpleNamespace(
-        ensure_ready=ensure_ready, cognition_token_ids=lambda: ()
-    )
-    asyncio.run(runtime._reindex_tensor_bank_unlocked())
-    # Scheduler transport flattens customized_info; Flash-Next's explicit
-    # head_dim is not hidden_size // num_attention_heads (160).
-    raw = [float(index % 31) for index in range(2 * 16 * 256)]
-    heads = runtime.query_probe._query_heads(
-        {"qwen_exo_user_query_full_heads": raw}, expected_states=2
-    )
-    assert heads == tuple(
-        tuple(
-            tuple(raw[(state * 16 + head) * 256:(state * 16 + head + 1) * 256])
-            for head in range(16)
-        )
-        for state in range(2)
-    )
-    assert runtime.refresh_service.query_probe is runtime.query_probe
-
-
-def test_runtime_startup_warmup_records_native_probe_result():
-    calls = []
-    events = []
-
-    class Probe:
-        async def warmup(self):
-            calls.append("warmup")
-            return SimpleNamespace(
-                status="ready",
-                prompt_tokens=264,
-                latency_seconds=0.25,
-                cache_hit=False,
-            )
-
-    runtime = object.__new__(QwenExoRuntime)
-    runtime.query_probe = Probe()
-    runtime.telemetry = SimpleNamespace(
-        emit=lambda request_id, event_type, payload: events.append(
-            (request_id, event_type, payload)
-        )
-    )
-
-    async def generation_warmup():
-        calls.append("generation_warmup")
-
-    runtime._run_startup_generation_warmup = generation_warmup
-
-    asyncio.run(runtime._run_startup_warmup())
-
-    assert calls == ["warmup", "generation_warmup"]
-    assert events[0][0:2] == ("runtime", "runtime.startup_warmup")
-    assert events[0][2]["query_probe_status"] == "ready"
-    assert events[0][2]["query_probe_prompt_tokens"] == 264
-    assert events[0][2]["cache_hit"] is False
 
 
 def test_session_initial_gdn_keeps_target_only_under_replayssm_spec():
@@ -1269,113 +901,6 @@ def test_responses_default_to_high_thinking_without_overriding_explicit_choice()
 
     assert enabled.reasoning.effort == "high"
     assert preserved.reasoning is explicit
-
-
-def test_runtime_builds_think_context_from_real_refresh_record():
-    record = RefreshRecord(
-        parent_request_id="request-real",
-        turn_id="request-real:post_tool:0",
-        status="ready_for_safe_replay",
-        question="Which wrapper is stale?",
-        answer="The generated async wrapper still has the old signature.",
-        selected_document_ids=("document-1",),
-        selected_reference_digests=("digest-1",),
-        decision_ids=("decision-1",),
-        created_monotonic=1.0,
-        purpose="post_tool",
-    )
-
-    injection = QwenExoRuntime._think_context_from_record(record)
-
-    assert injection is not None
-    assert injection.question == "Which wrapper is stale?"
-    assert "generated async wrapper" in injection.answer
-    assert injection.text == (
-        "\n\nSelf-question: Which wrapper is stale?\n"
-        "Self-answer: The generated async wrapper still has the old signature.\n"
-    )
-
-
-def test_runtime_builds_context_evidence_think_context_without_document():
-    record = RefreshRecord(
-        parent_request_id="request-context",
-        turn_id="request-context:post_tool:0",
-        status="context_evidence_ready",
-        question="Which wrapper is stale?",
-        answer="The direct tool result identified the generated async wrapper.",
-        selected_document_ids=(),
-        selected_reference_digests=(),
-        decision_ids=("decision-context",),
-        created_monotonic=1.0,
-        purpose="post_tool",
-        selected_lanes=("context",),
-        context_status="eligible",
-        context_source_digests=("context-digest",),
-        context_decision_ids=("decision-context",),
-    )
-
-    injection = QwenExoRuntime._think_context_from_record(record)
-
-    assert injection is not None
-    assert injection.text == (
-        "\n\nSelf-question: Which wrapper is stale?\n"
-        "Self-answer: The direct tool result identified the generated async wrapper.\n"
-    )
-
-
-def test_runtime_post_tool_recall_queues_admitted_think_context(tmp_path):
-    calls = []
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="ready_for_safe_replay",
-                question="Q?",
-                answer="A",
-                selected_document_ids=("document-1",),
-                decision_ids=("decision-1",),
-                maybe_decision="admit_post_tool",
-                reflection_kind="none",
-            )
-
-    class Telemetry:
-        def __init__(self):
-            self.events = []
-
-        def emit(self, request_id, event_type, payload):
-            self.events.append((request_id, event_type, payload))
-
-    runtime = object.__new__(QwenExoRuntime)
-    runtime._request_tool_calls = {}
-    runtime._request_tool_observations = {}
-    runtime.adaptive_retrieval = None
-    runtime.observer = SimpleNamespace(mode="active")
-    runtime.refresh_service = RefreshService()
-    runtime._request_questions = {"request-1": "Original task"}
-    runtime._request_outputs = {"request-1": "Reasoning so far"}
-    runtime._pending_think_contexts = {}
-    runtime._consumed_think_contexts = set()
-    runtime.telemetry = Telemetry()
-
-    injection = asyncio.run(
-        runtime.recall_after_tool("request-1", "direct tool result", generation_index=2)
-    )
-
-    assert calls[0]["purpose"] == "post_tool"
-    assert calls[0]["turn_id"] == "request-1:post_tool:2"
-    assert calls[0]["partial_output"] == "Reasoning so far"
-    assert calls[0]["latest_tool_observation"] == "direct tool result"
-    assert injection is not None
-    assert injection.question == "Q?"
-    assert injection.answer == "A"
-    assert runtime._pending_think_contexts["request-1"] == injection
-    assert runtime.telemetry.events[0][1] == "post_tool_recall.completed"
-    assert runtime.telemetry.events[0][2]["think_context_ready"] is True
-    assert runtime.telemetry.events[0][2]["text_injected"] is False
 
 
 def test_initial_gdn_uses_active_entries_not_raw_summaries_or_old_versions():

@@ -33,18 +33,12 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   ApiError,
   getModelId,
-  getRecallTrace,
   streamResponse,
   type StreamHandlers,
 } from "@/lib/api";
 import { translate as t, translateFor } from "@/lib/i18n";
 import { createSession, loadSessions, saveSessions } from "@/lib/session-store";
-import type {
-  ChatMessage,
-  ChatSession,
-  RecallTrace,
-  ToolCall,
-} from "@/lib/types";
+import type { ChatMessage, ChatSession, ToolCall } from "@/lib/types";
 import { cn, makeId } from "@/lib/utils";
 
 const CONSOLE_MAX_OUTPUT_TOKENS = 8192;
@@ -195,7 +189,6 @@ export function ChatPage() {
   const [reasoningEffort, setReasoningEffort] = useState("high");
   const [busy, setBusy] = useState(false);
   const [phase, setPhase] = useState("等待输入");
-  const [recall, setRecall] = useState<RecallTrace | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const responseIdRef = useRef<string | null>(null);
   const terminalResponseIdRef = useRef<string | null>(null);
@@ -234,7 +227,6 @@ export function ChatPage() {
       return next;
     });
     setActiveId(session.id);
-    setRecall(null);
   };
 
   const deleteSession = (sessionId: string) => {
@@ -261,30 +253,6 @@ export function ChatPage() {
     });
   };
 
-  const loadRecallForResponse = async (responseId: string) => {
-    for (const delayMs of [0, 350, 900, 1800]) {
-      if (delayMs) {
-        await new Promise<void>((resolve) =>
-          window.setTimeout(resolve, delayMs),
-        );
-      }
-      try {
-        const payload = await getRecallTrace(100);
-        const turn = payload.turns.find(
-          (item) =>
-            item.response_id === responseId || item.turn_id === responseId,
-        );
-        if (turn) {
-          setRecall({ ...payload, turns: [turn] });
-          return;
-        }
-      } catch {
-        // The answer remains valid when observability is temporarily unavailable.
-        return;
-      }
-    }
-  };
-
   const send = async () => {
     const text = prompt.trim();
     if (!text || !active || busy) return;
@@ -302,7 +270,6 @@ export function ChatPage() {
     setPrompt("");
     setBusy(true);
     setPhase("准备记忆与调度");
-    setRecall(null);
 
     const createdAt = new Date().toISOString();
     const userMessage: ChatMessage = {
@@ -453,7 +420,6 @@ export function ChatPage() {
       });
       updateAssistant();
       setPhase(incomplete ? "达到输出上限" : "生成完成");
-      if (finalResponseId) void loadRecallForResponse(finalResponseId);
     } catch (error) {
       if (controller.signal.aborted) {
         const terminalOnServer =
@@ -536,13 +502,6 @@ export function ChatPage() {
             </h1>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            {recall?.turns?.length ? (
-              <span
-                className="mr-1 h-2 w-2 rounded-full bg-emerald-500"
-                title={t("本轮有召回记录")}
-                aria-label={t("本轮有召回记录")}
-              />
-            ) : null}
             <Select
               value={reasoningEffort}
               onValueChange={setReasoningEffort}
@@ -582,10 +541,7 @@ export function ChatPage() {
                 {sessions.map((session) => (
                   <DropdownMenuItem
                     key={session.id}
-                    onSelect={() => {
-                      setActiveId(session.id);
-                      setRecall(null);
-                    }}
+                    onSelect={() => setActiveId(session.id)}
                     className={cn(
                       "truncate",
                       session.id === active.id && "bg-muted font-medium",

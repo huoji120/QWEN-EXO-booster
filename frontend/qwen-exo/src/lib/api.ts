@@ -13,8 +13,8 @@ import type {
   KnowledgeFile,
   KnowledgeReadResponse,
   KnowledgeSearchResponse,
-  RecallTrace,
   RequestTraceListing,
+  MemoryToolCall,
   PendingReflectionMemory,
   ReflectionEvidenceEventResponse,
   ReflectionSourceDetail,
@@ -171,12 +171,6 @@ export async function createDocumentCategory(
   ).json()) as DocumentCategory;
 }
 
-export async function getRecallTrace(limit = 10) {
-  return (await (
-    await apiFetch(`/recall-trace?limit=${limit}`)
-  ).json()) as RecallTrace;
-}
-
 export async function clearTelemetry() {
   return (await (
     await apiFetch("/telemetry/clear", { method: "POST" })
@@ -194,59 +188,6 @@ export async function listSources(
   return (await (
     await apiFetch(`/${lane}${suffix}`, { signal })
   ).json()) as SourceListing;
-}
-
-export type ReflectionOrganizationResult = {
-  status: "merged" | "kept_distinct" | "no_high_qk_pairs" | "not_needed";
-  document_count?: number;
-  document_count_before?: number;
-  document_count_after?: number;
-  high_qk_pair_count: number;
-  review_count?: number;
-  merge_operation_count?: number;
-  merged_document_count?: number;
-  target_document_path?: string;
-  merged_document_paths?: string[];
-  removed_document_paths?: string[];
-  hot_updated?: boolean;
-  restart_required?: boolean;
-};
-
-export type ReflectionOrganizationJobStatus = {
-  job_id: string | null;
-  status: "idle" | "queued" | "running" | "succeeded" | "failed";
-  stage:
-    | "idle"
-    | "queued"
-    | "scanning"
-    | "qk_retrieval"
-    | "model_review"
-    | "publishing"
-    | "completed"
-    | "failed";
-  progress: number;
-  message: string;
-  queued_at?: number | null;
-  started_at?: number | null;
-  updated_at?: number | null;
-  finished_at?: number | null;
-  details?: Record<string, number | string | boolean | null>;
-  result?: ReflectionOrganizationResult | null;
-  error?: string | null;
-};
-
-export async function startReflectionMemoryOrganization() {
-  return (await (
-    await apiFetch("/reflection-memory/organize", { method: "POST" })
-  ).json()) as ReflectionOrganizationJobStatus;
-}
-
-export async function getReflectionMemoryOrganizationStatus(
-  signal?: AbortSignal,
-) {
-  return (await (
-    await apiFetch("/reflection-memory/organize", { signal })
-  ).json()) as ReflectionOrganizationJobStatus;
 }
 
 export async function listReflectionMemories(
@@ -349,18 +290,6 @@ export async function cancelPendingReflections(conversationKeys: string[]) {
   ).json()) as { cancelled: string[]; cancelled_count: number };
 }
 
-export async function compileSourceDocuments(
-  lane: "knowledge" | "policydata",
-  relativePaths: string[],
-) {
-  return await (
-    await apiFetch("/sources/compile", {
-      method: "POST",
-      body: JSON.stringify({ lane, relative_paths: relativePaths }),
-    })
-  ).json();
-}
-
 export async function deleteSourceDocuments(
   lane: "knowledge" | "policydata",
   relativePaths: string[],
@@ -389,7 +318,6 @@ export type KnowledgeIngestResult = {
       changes: string[];
     }[];
   }[];
-  tensor_bank: Record<string, unknown>;
 };
 
 export async function ingestKnowledgeFiles(
@@ -458,14 +386,14 @@ export async function deleteSource(
   await apiFetch(`/${lane}/${encodeSourcePath(path)}`, { method: "DELETE" });
 }
 
-export async function reindexSource(lane: "knowledge" | "policydata") {
-  return await (await apiFetch(`/${lane}/reindex`, { method: "POST" })).json();
-}
-
-export async function reindexTensorBank() {
-  return await (
-    await apiFetch("/tensor-bank/reindex", { method: "POST" })
-  ).json();
+export async function getMemoryToolCalls(
+  requestId: string,
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams({ request_id: requestId });
+  return (await (
+    await apiFetch(`/memory-tool-calls?${params}`, { signal })
+  ).json()) as { calls: MemoryToolCall[] };
 }
 
 export async function listKnowledgeFiles(signal?: AbortSignal) {

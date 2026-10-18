@@ -20,7 +20,6 @@ def _modules(*, mps_available: bool = True):
         "torch": torch,
         "sglang.srt.hardware_backend.mlx.model_runner": object(),
         "sglang.srt.hardware_backend.mlx.qwen_exo": object(),
-        "sglang.srt.hardware_backend.mlx.native_state_bank": object(),
     }
 
     def load(name: str):

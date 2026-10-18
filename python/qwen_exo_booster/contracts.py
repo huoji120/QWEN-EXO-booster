@@ -29,19 +29,12 @@ class HybridStateNamespace(str, Enum):
 
 
 class InternalJobType(str, Enum):
-    REFERENCE_JUDGE = "reference_judge"
     CAPSULE_UPDATE = "capsule_update"
-    RETRIEVAL_REFRESH = "retrieval_refresh"
-    ADMISSION_PROBE = "admission_probe"
-    BANK_INDEX = "bank_index"
     CAUSAL_REPLAY = "causal_replay"
     SELF_ASK = "self_ask"
     SELF_ANSWER = "self_answer"
-    POST_TOOL_RECALL = "post_tool_recall"
-    CONTEXT_INTEGRITY = "context_integrity"
     REFLECTION_MEMORY = "reflection_memory"
     RESPONSE_COMPACTION = "response_compaction"
-    QUERY_PROBE = "query_probe"
     ATTENTION_DIAGNOSTIC = "attention_diagnostic"
     SYSTEM_ONE = "system_one"
 

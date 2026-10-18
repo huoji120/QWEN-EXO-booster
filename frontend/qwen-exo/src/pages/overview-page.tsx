@@ -41,13 +41,6 @@ function modeState(value: string | null): CapabilityState {
   return value === "off" ? "off" : "active";
 }
 
-function combineStates(...states: CapabilityState[]): CapabilityState {
-  if (states.some((state) => state === "loading")) return "loading";
-  if (states.every((state) => state === "active")) return "active";
-  if (states.every((state) => state === "off")) return "off";
-  return "partial";
-}
-
 function runtimeMode(status: RuntimeStatus | null, key: string) {
   const value = status?.[key];
   return typeof value === "string" ? value : null;
@@ -65,20 +58,6 @@ function scoreBiasModeSource(value: string | null) {
   if (value === "trajectory_shadow") return "仅打分";
   if (value === "off") return "关闭";
   return value || "读取中";
-}
-
-function qkPresetSource(value: string | null) {
-  if (value === "broad") return "高召回";
-  if (value === "balanced") return "标准";
-  if (value === "strict") return "高精度";
-  return value || "读取中";
-}
-
-function memoryLaneSource(value: string) {
-  if (value === "knowledge") return "知识";
-  if (value === "policydata") return "人格";
-  if (value === "cognition") return "认知";
-  return value;
 }
 
 function hasEvent(trace: RequestTrace | null, event: string) {
@@ -146,24 +125,8 @@ export function OverviewPage({
   const observerMode =
     runtimeMode(status, "observer_mode") || status?.observer_mode || null;
   const scoreBiasMode = runtimeMode(status, "score_bias_mode");
-  const contextEvidenceMode = runtimeMode(status, "context_evidence_mode");
-  const contextIntegrityMode = runtimeMode(status, "context_integrity_mode");
   const reflectionMode = runtimeMode(status, "reflection_memory_mode");
   const compactionMode = runtimeMode(status, "response_compaction_mode");
-  const qkPreset = runtimeMode(status, "qk_recall_preset");
-  const storageDtype =
-    typeof status?.tensor_bank?.storage_dtype === "string"
-      ? status.tensor_bank.storage_dtype
-      : "—";
-
-  const observerState = combineStates(
-    modeState(observerMode),
-    booleanState(status?.features?.adaptive_refresh),
-  );
-  const toolEvidenceState = combineStates(
-    modeState(contextEvidenceMode),
-    modeState(contextIntegrityMode),
-  );
   const capabilities: Array<{
     label: string;
     detail: string;
@@ -171,10 +134,10 @@ export function OverviewPage({
   }> = [
     {
       label: t("知识记忆"),
-      detail: t("{count} 篇 · Native Tensor Bank", {
+      detail: t("{count} 个文件 · 记忆工具按需读取", {
         count: formatNumber(status?.knowledge?.document_count),
       }),
-      state: booleanState(status?.features?.external_memory),
+      state: booleanState(status?.internal_services?.memory_tools),
     },
     {
       label: t("人格记忆"),
@@ -189,14 +152,9 @@ export function OverviewPage({
       state: booleanState(status?.features?.hybrid_prefix),
     },
     {
-      label: t("语义准入"),
-      detail: `Reference Judge · ${t(qkPresetSource(qkPreset))}`,
-      state: booleanState(status?.features?.reference_judge),
-    },
-    {
       label: t("解码观测"),
-      detail: `${t(observerModeSource(observerMode))} · ${t("自适应刷新")}`,
-      state: observerState,
+      detail: t(observerModeSource(observerMode)),
+      state: modeState(observerMode),
     },
     {
       label: t("轨迹学习"),
@@ -210,11 +168,6 @@ export function OverviewPage({
             : t("实验功能已下线")
       }`,
       state: activationTrainingEnabled ? modeState(scoreBiasMode) : "off",
-    },
-    {
-      label: t("工具后证据"),
-      detail: t("临时证据 · 完整性检查"),
-      state: toolEvidenceState,
     },
     {
       label: t("反思记忆"),
@@ -242,24 +195,21 @@ export function OverviewPage({
       value: ready
         ? "READY"
         : t(runtimeStateSource(status?.runtime_state, "连接中")),
-      detail: ready ? t("调度器与 Native Bank 可用") : t("等待运行时屏障"),
+      detail: ready ? t("调度器与记忆工具可用") : t("等待运行时屏障"),
       icon: Activity,
     },
     {
       label: t("模型拓扑"),
       value: `TP ${formatNumber(status?.tp_size ?? status?.hybrid_state?.tp_size)}`,
-      detail: t("{dtype} 状态 · {storage} Bank", {
+      detail: t("{dtype} 状态", {
         dtype: status?.hybrid_state?.dtype || "—",
-        storage: storageDtype,
       }),
       icon: Layers3,
     },
     {
       label: t("知识文档"),
       value: formatNumber(status?.knowledge?.document_count),
-      detail: t("知识 {count} · Q×K 候选库", {
-        count: formatNumber(status?.knowledge?.document_count || 0),
-      }),
+      detail: t("服务端记忆工具按需搜索与读取"),
       icon: BookOpen,
     },
     {
@@ -319,43 +269,19 @@ export function OverviewPage({
       icon: MessageSquareText,
     },
     {
-      label: "Native QK",
-      detail: latestTrace?.candidates.length
-        ? t("{count} 个 Tensor Bank 候选", {
-            count: formatNumber(latestTrace.candidates.length),
+      label: t("记忆工具"),
+      detail: latestTrace?.memory_tool_calls
+        ? t("{count} 次记忆工具调用", {
+            count: formatNumber(latestTrace.memory_tool_calls),
           })
-        : hasEvent(latestTrace, "tensor.candidates_proposed")
-          ? t("检索完成，无候选")
-          : t("本轮未触发"),
-      status: latestTrace?.candidates.length ? t("已召回") : t("未命中"),
-      variant: latestTrace?.candidates.length ? "success" : "secondary",
-      icon: BrainCircuit,
-    },
-    {
-      label: "Semantic Gate",
-      detail: hasEvent(latestTrace, "semantic_judge.completed")
-        ? t("Reference Judge 已完成")
-        : hasEvent(latestTrace, "qk.prefilter")
-          ? t("QK 预过滤已完成")
-          : t("本轮未触发"),
-      status: hasEvent(latestTrace, "semantic_judge.completed")
-        ? t("已审计")
-        : t("未触发"),
-      variant: hasEvent(latestTrace, "semantic_judge.completed")
-        ? "success"
+        : t("本轮未调用"),
+      status: latestTrace?.memory_tool_calls ? t("已召回") : t("未召回"),
+      variant: latestTrace?.memory_tool_calls
+        ? latestTrace.memory_tool_failures
+          ? "warning"
+          : "success"
         : "secondary",
-      icon: ShieldCheck,
-    },
-    {
-      label: "Full KV + GDN",
-      detail: latestTrace?.native_restore
-        ? `${t(memoryLaneSource(latestTrace.native_restore.lane))} · ${formatNumber(latestTrace.native_restore.tokens)} tokens`
-        : hasEvent(latestTrace, "memory.prepared")
-          ? t("原生状态已准备")
-          : t("本轮未恢复"),
-      status: latestTrace?.native_restore ? t("已恢复") : t("未恢复"),
-      variant: latestTrace?.native_restore ? "success" : "secondary",
-      icon: Layers3,
+      icon: BrainCircuit,
     },
     {
       label: "Observer / Score Bias",
@@ -443,7 +369,7 @@ export function OverviewPage({
             </Badge>
           </div>
         </CardHeader>
-        <CardContent className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-5">
+        <CardContent className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-4">
           {capabilities.map((capability) => {
             const badge =
               capability.state === "active"
@@ -499,7 +425,7 @@ export function OverviewPage({
           </div>
         </CardHeader>
         <CardContent className="p-0">
-          <div className="grid divide-y lg:grid-cols-5 lg:divide-x lg:divide-y-0">
+          <div className="grid divide-y lg:grid-cols-3 lg:divide-x lg:divide-y-0">
             {pathStages.map((stage, index) => {
               const Icon = stage.icon;
               return (

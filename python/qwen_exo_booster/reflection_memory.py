@@ -110,6 +110,28 @@ def reflection_source_digest(
     )
 
 
+_LEXICAL_WORD = re.compile(r"[a-z0-9_]{2,}")
+_LEXICAL_CJK = re.compile(r"[一-鿿]+")
+
+
+def _lexical_terms(text: str) -> frozenset[str]:
+    lowered = str(text or "").lower()
+    terms = set(_LEXICAL_WORD.findall(lowered))
+    for run in _LEXICAL_CJK.findall(lowered):
+        terms.update(run[index : index + 2] for index in range(len(run) - 1))
+        if len(run) == 1:
+            terms.add(run)
+    return frozenset(terms)
+
+
+def lexical_overlap(query: str, content: str) -> float:
+    """Share of the query's words / CJK bigrams that also occur in content."""
+    query_terms = _lexical_terms(query)
+    if not query_terms:
+        return 0.0
+    return len(query_terms & _lexical_terms(content)) / len(query_terms)
+
+
 @dataclass(frozen=True, slots=True)
 class ReflectionMemoryCandidate:
     document_path: str
@@ -1631,10 +1653,10 @@ class ReflectionMemoryService:
                         )
                         continue
                     if stage_callback:
-                        stage_callback("qk_retrieval")
+                        stage_callback("similar_retrieval")
                     candidates = ()
                     if self.retrieve_similar is not None:
-                        qparent = f"{segment_parent}:qk:{issue_index}"
+                        qparent = f"{segment_parent}:similar:{issue_index}"
                         try:
                             candidates = tuple(
                                 await self.retrieve_similar(
@@ -1981,79 +2003,3 @@ class ReflectionMemoryService:
             if name in values:
                 values[name] = tuple(values[name])
         return ReflectionMemory(**values)
-
-    async def organize_candidates(self, *, organization_id, candidates, qk_pairs):
-        """Conservative exact item consolidation, never model-authored document replacement."""
-        if self.mode == "off" or len(candidates) < 2:
-            return None
-        # Legacy narratives have no independently verifiable item boundary; leave them intact.
-        structured = [c for c in candidates if c.causal_entries]
-        for target in structured:
-            for other in structured:
-                if target.document_path == other.document_path:
-                    continue
-                for entry in target.causal_entries:
-                    for duplicate in other.causal_entries:
-                        semantic = (
-                            "scope",
-                            "problem",
-                            "action",
-                            "observation",
-                            "mechanism",
-                            "rule",
-                            "next_check",
-                            "evidence_refs",
-                            "verification",
-                        )
-                        if (
-                            entry.get("admission_status") == "active"
-                            and duplicate.get("admission_status") == "active"
-                            and all(entry.get(k) == duplicate.get(k) for k in semantic)
-                        ):
-                            change = {
-                                "operation": "retire",
-                                "entry_id": duplicate["entry_id"],
-                                "expected_version": duplicate["version"],
-                                "reason": "与保留条目的完整规则、范围及验证证据完全相同；保留 "
-                                + entry["entry_id"],
-                            }
-                            digest = stable_digest(
-                                "causal-exact-consolidation",
-                                organization_id,
-                                other.document_sha256,
-                                entry["entry_id"],
-                            )
-                            return ReflectionMemory(
-                                trajectory_id=organization_id,
-                                conversation_key="reflection-memory-organization",
-                                source_digest=digest,
-                                title="重复因果条目合并",
-                                outcome="uncertain",
-                                reflection="完整条目与证据相同。",
-                                evidence="保留原始证据引用。",
-                                causal_analysis="不引入新的因果推断。",
-                                reusable_experience="",
-                                avoid="",
-                                next_time="",
-                                memory_action="update",
-                                target_document_path=other.document_path,
-                                target_document_sha256=other.document_sha256,
-                                merge_document_paths=(other.document_path,),
-                                merge_document_sha256s=(
-                                    (other.document_path, other.document_sha256),
-                                ),
-                                source_event_count=0,
-                                source_token_count=0,
-                                attempts=0,
-                                created_at=time.time(),
-                                causal_schema=1,
-                                causal_entries=merge_causal_entries(
-                                    other.causal_entries,
-                                    (change,),
-                                    source_digest=digest,
-                                ),
-                                entry_changes=(change,),
-                                coverage={},
-                                analysis_status="complete",
-                            )
-        return None

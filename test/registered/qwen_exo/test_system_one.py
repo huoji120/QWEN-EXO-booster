@@ -4,14 +4,12 @@ import re
 from types import SimpleNamespace
 
 import pytest
-from qwen_exo_booster.decision_context import CanonicalDecisionContext
 from qwen_exo_booster.internal_jobs import InternalJobRunner
 from qwen_exo_booster.system_one import (
     SystemOneError,
     SystemOneEvaluator,
     evaluate_system_one_request,
     parse_system_one_request,
-    render_shared_decision_prompt,
 )
 
 class FakeTokenizer:
@@ -280,27 +278,6 @@ def test_long_state_scores_one_question_first_to_seed_prefix_cache():
     questions = {f"q{i}": {"type": "noul", "instructions": "PREFER:A"} for i in range(5)}
     run(system_one.evaluate({"model": "m", "state": "x" * 600, "questions": questions}))
     assert [len(r.rid) for r in manager.requests] == [1, 4]
-
-
-def test_cross_role_prompts_share_exact_canonical_prefix_tokens():
-    tokenizer = FakeTokenizer()
-    text = '{"input":[{"role":"user","content":"' + ("x" * 2048) + '"}]}'
-    context = CanonicalDecisionContext(
-        text=text,
-        token_ids=tuple(tokenizer.encode(text, add_special_tokens=False)),
-        digest="context-digest",
-        lineage_namespace="request:test",
-    )
-    system = render_shared_decision_prompt(tokenizer, context, "SYSTEM ONE OPTIONS: A/B")
-    judge = render_shared_decision_prompt(tokenizer, context, "REFERENCE JUDGE: candidate")
-    assert system.prefix_token_count == judge.prefix_token_count
-    assert system.token_ids[: system.prefix_token_count] == judge.token_ids[
-        : judge.prefix_token_count
-    ]
-    assert system.token_ids[system.prefix_token_count :] != judge.token_ids[
-        judge.prefix_token_count :
-    ]
-    assert system.prefix_digest == judge.prefix_digest
 
 
 @pytest.mark.parametrize("cancel_kind", ["disconnect", "handler"])

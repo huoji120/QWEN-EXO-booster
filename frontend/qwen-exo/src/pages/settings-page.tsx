@@ -52,7 +52,7 @@ const RESTART_STEPS = [
   "写入原子配置",
   "停止当前进程",
   "Docker 托管拉起",
-  "模型与 Tensor Bank 就绪",
+  "模型就绪",
 ];
 
 const SETTING_UNIT_SOURCES: Record<string, string> = {

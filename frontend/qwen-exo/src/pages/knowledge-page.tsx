@@ -1,13 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpen,
-  CheckCircle2,
-  CircleAlert,
   Database,
   FileText,
   LoaderCircle,
   Plus,
-  RefreshCw,
   Search,
   Trash2,
   Upload,
@@ -48,20 +45,14 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  compileSourceDocuments,
   deleteSource,
   deleteSourceDocuments,
-  getReflectionMemoryOrganizationStatus,
   getSource,
   createDocumentCategory,
   listDocumentCategories,
   listSources,
   previewKnowledgeFiles,
-  reindexSource,
-  reindexTensorBank,
   saveSource,
-  startReflectionMemoryOrganization,
-  type ReflectionOrganizationJobStatus,
 } from "@/lib/api";
 import { translate as t, translateFor, useI18n } from "@/lib/i18n";
 import type {
@@ -85,13 +76,12 @@ type SortOrder =
   | "path-asc"
   | "path-desc"
   | "tokens-desc"
-  | "tokens-asc"
-  | "status";
+  | "tokens-asc";
 
 const LANE_COPY: Record<SourceView, { label: string; description: string }> = {
   knowledge: {
     label: "知识资料",
-    description: "经相关性准入后恢复的事实、SDK 与领域参考。",
+    description: "模型通过记忆工具按需搜索和读取的事实、SDK 与领域参考。",
   },
   policydata: {
     label: "人格文档",
@@ -100,7 +90,7 @@ const LANE_COPY: Record<SourceView, { label: string; description: string }> = {
   reflection_memory: {
     label: "反思记忆",
     description:
-      "由已完成的外部工具轨迹提炼；可直接查看、编辑、删除和重新编译。",
+      "由已完成的外部工具轨迹提炼的文本记忆；可直接查看、编辑和删除。",
   },
 };
 
@@ -160,155 +150,6 @@ function sourceFamilyLabel(sourceKind: string) {
 function markdownSourceFamily(content: string) {
   const match = content.match(/^source_kind:\s*["']?([^\n"']+)["']?\s*$/im);
   return match?.[1]?.trim() || "unclassified";
-}
-
-const ORGANIZATION_STEPS = [
-  "扫描记忆",
-  "Q×K 检索",
-  "模型审查",
-  "写入与编译",
-  "完成",
-];
-
-const INITIAL_ORGANIZATION_STATUS: ReflectionOrganizationJobStatus = {
-  job_id: null,
-  status: "idle",
-  stage: "idle",
-  progress: 0,
-  message: "尚未开始整理",
-  details: {},
-  result: null,
-  error: null,
-};
-
-const ORGANIZATION_STATUS_LABELS: Record<
-  ReflectionOrganizationJobStatus["status"],
-  string
-> = {
-  idle: "未运行",
-  queued: "已排队",
-  running: "后台运行中",
-  succeeded: "已完成",
-  failed: "失败",
-};
-
-function organizationStepIndex(status: ReflectionOrganizationJobStatus) {
-  if (status.status === "succeeded" || status.stage === "completed") return 4;
-  if (status.stage === "publishing") return 3;
-  if (status.stage === "model_review") return 2;
-  if (status.stage === "qk_retrieval") return 1;
-  if (status.stage === "scanning" || status.stage === "queued") return 0;
-  if (status.status === "failed") {
-    return Math.min(3, Math.max(0, Math.floor(status.progress / 25)));
-  }
-  return -1;
-}
-
-function organizationFacts(status: ReflectionOrganizationJobStatus) {
-  const details = status.details || {};
-  const facts: string[] = [];
-  if (details.pass_index)
-    facts.push(
-      t("第 {count} 轮", { count: formatNumber(Number(details.pass_index)) }),
-    );
-  if (details.document_count !== undefined) {
-    facts.push(
-      t("文档 {count}", {
-        count: formatNumber(Number(details.document_count)),
-      }),
-    );
-  }
-  if (details.high_qk_pair_count !== undefined) {
-    facts.push(
-      t("高 Q×K 候选 {count}", {
-        count: formatNumber(Number(details.high_qk_pair_count)),
-      }),
-    );
-  }
-  if (details.review_count !== undefined) {
-    facts.push(
-      t("已审查 {count} 组", {
-        count: formatNumber(Number(details.review_count)),
-      }),
-    );
-  }
-  if (status.result?.merge_operation_count !== undefined) {
-    facts.push(
-      t("合并 {count} 次", {
-        count: formatNumber(status.result.merge_operation_count),
-      }),
-    );
-  }
-  return facts;
-}
-
-function organizationMessage(status: ReflectionOrganizationJobStatus) {
-  const details = status.details || {};
-  const pass = Number(details.pass_index || 0);
-  if (status.status === "succeeded") {
-    if (status.result?.status === "merged") {
-      return t("整理完成，执行 {count} 次合并", {
-        count: formatNumber(status.result.merge_operation_count || 0),
-      });
-    }
-    if (status.result?.status === "kept_distinct") {
-      return t("整理完成，模型判定候选应保持分开");
-    }
-    return t("整理完成，没有需要合并的高 Q×K 记忆");
-  }
-  if (status.status === "failed")
-    return t(status.message || "反思记忆整理失败");
-  if (status.stage === "queued") return t("整理任务已进入后台队列");
-  if (status.stage === "scanning") {
-    if (details.document_count !== undefined) {
-      return t("第 {pass} 轮：发现 {count} 条反思记忆", {
-        pass: formatNumber(pass),
-        count: formatNumber(Number(details.document_count)),
-      });
-    }
-    return pass
-      ? t("第 {pass} 轮：正在扫描反思记忆", {
-          pass: formatNumber(pass),
-        })
-      : t("正在扫描反思记忆");
-  }
-  if (status.stage === "qk_retrieval") {
-    if (Number(details.documents_scanned || 0) > 0) {
-      return t("第 {pass} 轮：Q×K 检索 {current}/{total}", {
-        pass: formatNumber(pass),
-        current: formatNumber(Number(details.documents_scanned)),
-        total: formatNumber(Number(details.document_count)),
-      });
-    }
-    return t("第 {pass} 轮：正在执行严格 Q×K 候选检索", {
-      pass: formatNumber(pass),
-    });
-  }
-  if (status.stage === "model_review") {
-    if (Number(details.review_count || 0) > 0) {
-      return t("第 {pass} 轮：模型正在审查第 {count} 组候选", {
-        pass: formatNumber(pass),
-        count: formatNumber(Number(details.review_count)),
-      });
-    }
-    return t(
-      "第 {pass} 轮：发现 {count} 组高 Q×K 候选，等待模型核对因果经验与冲突",
-      {
-        pass: formatNumber(pass),
-        count: formatNumber(Number(details.high_qk_pair_count)),
-      },
-    );
-  }
-  if (status.stage === "publishing") {
-    return details.merged_document_count !== undefined
-      ? t("第 {pass} 轮：合并已提交，Tensor Bank 热编译完成", {
-          pass: formatNumber(pass),
-        })
-      : t("第 {pass} 轮：模型决定合并，正在原子写入并热编译 Tensor Bank", {
-          pass: formatNumber(pass),
-        });
-  }
-  return t(status.message || "尚未开始整理");
 }
 
 const NEW_DOCUMENT_TEMPLATE =
@@ -386,13 +227,8 @@ function SourceDocumentsPage({
   const [listing, setListing] = useState<SourceListing>({ documents: [] });
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
-  const [compiling, setCompiling] = useState(false);
-  const [batchAction, setBatchAction] = useState<"compile" | "delete" | null>(
-    null,
-  );
-  const [organization, setOrganization] =
-    useState<ReflectionOrganizationJobStatus>(INITIAL_ORGANIZATION_STATUS);
-  const [organizeOpen, setOrganizeOpen] = useState(false);
+  const [listingLoaded, setListingLoaded] = useState(false);
+  const [batchAction, setBatchAction] = useState<"delete" | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorPath, setEditorPath] = useState("");
   const [suggestedPath, setSuggestedPath] = useState("");
@@ -420,15 +256,10 @@ function SourceDocumentsPage({
     [categories],
   );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const activeOrganizationJobRef = useRef<string | null>(null);
-  const notifiedOrganizationJobsRef = useRef(new Set<string>());
   const mountedRef = useRef(false);
   const listRequestRef = useRef<AbortController | null>(null);
-  const organizationRequestRef = useRef<AbortController | null>(null);
   const viewRef = useRef({ lane, query });
   viewRef.current = { lane, query };
-  const organizing =
-    organization.status === "queued" || organization.status === "running";
 
   const load = useCallback(
     async (
@@ -449,6 +280,7 @@ function SourceDocumentsPage({
         );
         if (controller.signal.aborted || !mountedRef.current) return;
         setListing(next);
+        setListingLoaded(true);
         const available = new Set(
           next.documents.map((document) => document.relative_path),
         );
@@ -472,61 +304,6 @@ function SourceDocumentsPage({
     [],
   );
 
-  const refreshOrganizationStatus = useCallback(async () => {
-    if (
-      !mountedRef.current ||
-      document.hidden ||
-      organizationRequestRef.current
-    )
-      return;
-    const controller = new AbortController();
-    organizationRequestRef.current = controller;
-    try {
-      const next = await getReflectionMemoryOrganizationStatus(
-        controller.signal,
-      );
-      if (controller.signal.aborted || !mountedRef.current) return;
-      setOrganization(next);
-      const activeJob = activeOrganizationJobRef.current;
-      if (
-        !activeJob ||
-        next.job_id !== activeJob ||
-        (next.status !== "succeeded" && next.status !== "failed") ||
-        notifiedOrganizationJobsRef.current.has(activeJob)
-      ) {
-        return;
-      }
-      notifiedOrganizationJobsRef.current.add(activeJob);
-      activeOrganizationJobRef.current = null;
-      if (next.status === "failed") {
-        toast.error(t("反思记忆整理失败"), {
-          description: next.error || next.message,
-          duration: 10000,
-        });
-        return;
-      }
-      await load();
-      if (next.result?.status === "merged") {
-        toast.success(t("相似反思记忆已在后台合并"), {
-          description: t("{count} 次合并已提交并热编译。", {
-            count: formatNumber(next.result.merge_operation_count || 0),
-          }),
-          duration: 10000,
-        });
-      } else if (next.result?.status === "kept_distinct") {
-        toast.success(t("后台整理完成，模型判定应保持分开"));
-      } else {
-        toast.success(t("后台整理完成，没有需要合并的高 Q×K 记忆"));
-      }
-    } catch {
-      // 服务重启或短暂断连时保留最近一次可见状态，下一轮继续查询。
-    } finally {
-      if (organizationRequestRef.current === controller) {
-        organizationRequestRef.current = null;
-      }
-    }
-  }, [load]);
-
   useEffect(() => {
     setSelectedTag("");
     setSelectedPaths(new Set());
@@ -545,37 +322,17 @@ function SourceDocumentsPage({
 
   useEffect(() => {
     mountedRef.current = true;
-    let timer: number | undefined;
-    let disposed = false;
-    let generation = 0;
-    const poll = async (epoch = generation) => {
-      await refreshOrganizationStatus();
-      if (!disposed && epoch === generation && !document.hidden) {
-        timer = window.setTimeout(() => void poll(epoch), 1500);
-      }
-    };
     const onVisibilityChange = () => {
-      window.clearTimeout(timer);
-      generation += 1;
-      if (document.hidden) {
-        listRequestRef.current?.abort();
-        organizationRequestRef.current?.abort();
-      } else {
-        void load();
-        void poll();
-      }
+      if (document.hidden) listRequestRef.current?.abort();
+      else void load();
     };
-    void poll();
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
-      disposed = true;
       mountedRef.current = false;
-      window.clearTimeout(timer);
       listRequestRef.current?.abort();
-      organizationRequestRef.current?.abort();
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [load, refreshOrganizationStatus]);
+  }, [load]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void load(lane, query), 250);
@@ -614,7 +371,8 @@ function SourceDocumentsPage({
       const tags = document.tags || [];
       if (lane !== "policydata" && selectedTag && !tags.includes(selectedTag))
         return false;
-      if (document.compile_status !== undefined || !query.trim()) return true;
+      // A server listing already applied the query; filter locally only before it arrives.
+      if (listingLoaded || !query.trim()) return true;
       const needle = query.trim().toLowerCase();
       return [
         document.relative_path,
@@ -637,18 +395,21 @@ function SourceDocumentsPage({
         const result = (left.token_count || 0) - (right.token_count || 0);
         return sortOrder === "tokens-desc" ? -result : result;
       }
-      if (sortOrder === "status") {
-        const result =
-          Number(left.compiled === true) - Number(right.compiled === true);
-        if (result) return result;
-      }
       const result = left.relative_path.localeCompare(
         right.relative_path,
         locale,
       );
       return sortOrder === "path-desc" ? -result : result;
     });
-  }, [lane, locale, query, selectedTag, sortOrder, viewDocuments]);
+  }, [
+    lane,
+    listingLoaded,
+    locale,
+    query,
+    selectedTag,
+    sortOrder,
+    viewDocuments,
+  ]);
 
   const visiblePaths = documents.map((document) => document.relative_path);
   const allVisibleSelected =
@@ -660,17 +421,7 @@ function SourceDocumentsPage({
   const selectedDocuments = viewDocuments.filter((document) =>
     selectedPaths.has(document.relative_path),
   );
-  const documentAdminReady =
-    viewDocuments.length === 0 ||
-    viewDocuments.every((document) => document.compile_status !== undefined);
-  const compiledCount = viewDocuments.filter(
-    (document) => document.compiled === true,
-  ).length;
-  const uncompiledCount = viewDocuments.filter(
-    (document) => document.compiled === false,
-  ).length;
-  const pendingRestartCount =
-    viewDocuments.length - compiledCount - uncompiledCount;
+  const documentAdminReady = listingLoaded || viewDocuments.length === 0;
 
   const toggleAll = () => {
     setSelectedPaths((current) => {
@@ -759,9 +510,6 @@ function SourceDocumentsPage({
       setEditorOpen(false);
       toast.success(
         editorMode === "create" ? t("文档已创建") : t("文档已更新"),
-        {
-          description: t("当前状态：未编译"),
-        },
       );
     } catch (error) {
       toast.error(t("保存失败"), {
@@ -788,56 +536,10 @@ function SourceDocumentsPage({
       await load(lane);
       toast.success(
         t("已删除 {count} 个文档", { count: formatNumber(paths.length) }),
-        {
-          description: t("Tensor Bank 需重新编译。"),
-        },
       );
     } catch (error) {
       toast.error(t("删除失败"), {
         description: error instanceof Error ? error.message : t("未知错误"),
-      });
-    } finally {
-      setBatchAction(null);
-    }
-  };
-
-  const compile = async () => {
-    setCompiling(true);
-    try {
-      await reindexSource(storageLane(lane));
-      await reindexTensorBank();
-      setSelectedPaths(new Set());
-      await load(lane);
-      toast.success(t("全部文档编译完成"));
-    } catch (error) {
-      toast.error(t("编译失败"), {
-        description: error instanceof Error ? error.message : t("未知错误"),
-        duration: 8000,
-      });
-    } finally {
-      setCompiling(false);
-    }
-  };
-
-  const compileSelected = async () => {
-    if (!selectedDocuments.length) return;
-    setBatchAction("compile");
-    try {
-      await compileSourceDocuments(
-        storageLane(lane),
-        selectedDocuments.map((document) => document.relative_path),
-      );
-      setSelectedPaths(new Set());
-      await load(lane);
-      toast.success(
-        t("已编译 {count} 个选中文档", {
-          count: formatNumber(selectedDocuments.length),
-        }),
-      );
-    } catch (error) {
-      toast.error(t("批量编译失败"), {
-        description: error instanceof Error ? error.message : t("未知错误"),
-        duration: 8000,
       });
     } finally {
       setBatchAction(null);
@@ -871,24 +573,6 @@ function SourceDocumentsPage({
     }
   };
 
-  const organizeMemories = async () => {
-    try {
-      const accepted = await startReflectionMemoryOrganization();
-      activeOrganizationJobRef.current = accepted.job_id;
-      setOrganization(accepted);
-      setOrganizeOpen(false);
-      toast.success(t("整理任务已转入后台"), {
-        description: t("可以关闭弹窗或切换页面；返回反思记忆后仍可查看进度。"),
-      });
-    } catch (error) {
-      await refreshOrganizationStatus();
-      toast.error(t("后台整理任务启动失败"), {
-        description: error instanceof Error ? error.message : t("未知错误"),
-        duration: 10000,
-      });
-    }
-  };
-
   const importFile = async (file: File) => {
     if (file.size > MAX_UPLOAD_FILE_BYTES) {
       toast.error(t("{name} 超过单文件上限", { name: file.name }), {
@@ -918,7 +602,7 @@ function SourceDocumentsPage({
       setEditorLoading(false);
       setEditorOpen(true);
       toast.success(t("文件已解析为可编辑草稿，知识库尚未变更"), {
-        description: t("检查路径、标签和正文后保存；保存后需显式编译。"),
+        description: t("检查路径、标签和正文后保存。"),
       });
     } catch (error) {
       toast.error(t("文件解析失败，知识库未变更"), {
@@ -930,34 +614,17 @@ function SourceDocumentsPage({
     }
   };
 
-  const activeOrganizationStep = organizationStepIndex(organization);
-  const organizationDetails = organizationFacts(organization);
-
   return (
     <div className="page-frame">
       <PageHeader
         title={t("知识库")}
         description={
           lane === "policydata"
-            ? t("人格文档只保留一份；保存后重新编译。")
-            : t("文档保存后进入未编译状态；可选择编译或全部编译。")
+            ? t("人格文档只保留一份；保存后立即生效。")
+            : t("文档保存或删除后立即生效。")
         }
         actions={
-          lane === "reflection_memory" ? (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={organizing || viewDocuments.length < 2}
-              onClick={() => setOrganizeOpen(true)}
-            >
-              {organizing ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <RefreshCw />
-              )}
-              {organizing ? t("整理中…") : t("整理记忆")}
-            </Button>
-          ) : lane === "policydata" ? (
+          lane === "reflection_memory" ? null : lane === "policydata" ? (
             <div className="flex items-center gap-2">
               {viewDocuments[0] ? (
                 <Button
@@ -974,20 +641,6 @@ function SourceDocumentsPage({
                   {t("新建")}
                 </Button>
               )}
-              {viewDocuments[0] ? (
-                <Button
-                  size="sm"
-                  disabled={compiling || batchAction !== null}
-                  onClick={() => void compile()}
-                >
-                  {compiling ? (
-                    <LoaderCircle className="animate-spin" />
-                  ) : (
-                    <RefreshCw />
-                  )}
-                  {t("编译")}
-                </Button>
-              ) : null}
             </div>
           ) : (
             <>
@@ -1082,7 +735,6 @@ function SourceDocumentsPage({
                 <SelectItem value="tokens-asc">
                   {t("令牌数：少到多")}
                 </SelectItem>
-                <SelectItem value="status">{t("未编译优先")}</SelectItem>
               </SelectContent>
             </Select>
             <div className="flex flex-wrap gap-2">
@@ -1091,129 +743,17 @@ function SourceDocumentsPage({
                 disabled={
                   !documentAdminReady ||
                   !selectedDocuments.length ||
-                  batchAction !== null ||
-                  compiling
-                }
-                onClick={() => void compileSelected()}
-              >
-                {batchAction === "compile" ? (
-                  <LoaderCircle className="animate-spin" />
-                ) : (
-                  <RefreshCw />
-                )}
-                {t("编译选中")}
-              </Button>
-              <Button
-                variant="outline"
-                disabled={
-                  !documentAdminReady ||
-                  !selectedDocuments.length ||
-                  batchAction !== null ||
-                  compiling
+                  batchAction !== null
                 }
                 onClick={() => setDeleteTargets(selectedDocuments)}
               >
                 <Trash2 />
                 {t("删除选中")}
               </Button>
-              <Button
-                disabled={compiling || batchAction !== null}
-                onClick={() => void compile()}
-              >
-                {compiling ? (
-                  <LoaderCircle className="animate-spin" />
-                ) : (
-                  <RefreshCw />
-                )}
-                {t("全部编译")}
-              </Button>
             </div>
           </div>
         ) : null}
       </div>
-
-      {lane === "reflection_memory" ? (
-        <div className="mb-4 space-y-4 border bg-muted/20 p-4">
-          <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
-            <div className="flex min-w-0 items-start gap-3">
-              {organizing ? (
-                <LoaderCircle className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-primary" />
-              ) : organization.status === "succeeded" ? (
-                <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
-              ) : organization.status === "failed" ? (
-                <CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
-              ) : (
-                <RefreshCw className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
-              )}
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-medium">
-                    {t("反思记忆整理")}
-                  </span>
-                  <Badge
-                    variant={
-                      organization.status === "failed"
-                        ? "destructive"
-                        : "outline"
-                    }
-                  >
-                    {t(ORGANIZATION_STATUS_LABELS[organization.status])}
-                  </Badge>
-                </div>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  {organizationMessage(organization)}
-                </div>
-                {organizationDetails.length ? (
-                  <div className="mt-1 font-mono text-[10px] text-muted-foreground">
-                    {organizationDetails.join(" · ")}
-                  </div>
-                ) : null}
-                {organization.error ? (
-                  <div className="mt-1 text-xs text-destructive">
-                    {organization.error}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-            <div className="shrink-0 text-right">
-              <div className="font-mono text-sm font-semibold">
-                {formatNumber(
-                  Math.max(0, Math.min(100, organization.progress)),
-                )}
-                %
-              </div>
-              <div className="mt-1 text-[10px] text-muted-foreground">
-                {t("服务端后台任务")}
-              </div>
-            </div>
-          </div>
-          <div className="grid grid-cols-5 gap-2">
-            {ORGANIZATION_STEPS.map((step, index) => (
-              <div key={step}>
-                <div
-                  className={cn(
-                    "h-1 bg-muted",
-                    index <= activeOrganizationStep &&
-                      (organization.status === "failed"
-                        ? "bg-destructive"
-                        : "bg-primary"),
-                  )}
-                />
-                <div className="mt-2 hidden text-[9px] text-muted-foreground sm:block">
-                  {t(step)}
-                </div>
-              </div>
-            ))}
-          </div>
-          {organizing ? (
-            <div className="text-[11px] text-muted-foreground">
-              {t(
-                "任务由服务端继续执行；可以切换页面，返回后会自动恢复当前进度。",
-              )}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
 
       {lane !== "policydata" && allTags.length ? (
         <div className="mb-4 flex flex-wrap items-center gap-1.5">
@@ -1266,26 +806,6 @@ function SourceDocumentsPage({
               </strong>
             </div>
             <div>
-              <span className="text-muted-foreground">{t("已编译")}</span>
-              <strong className="ml-2 text-emerald-700 dark:text-emerald-400">
-                {formatNumber(compiledCount)}
-              </strong>
-            </div>
-            <div>
-              <span className="text-muted-foreground">{t("未编译")}</span>
-              <strong className="ml-2 text-amber-700 dark:text-amber-400">
-                {formatNumber(uncompiledCount)}
-              </strong>
-            </div>
-            {pendingRestartCount ? (
-              <div>
-                <span className="text-muted-foreground">{t("待重启")}</span>
-                <strong className="ml-2">
-                  {formatNumber(pendingRestartCount)}
-                </strong>
-              </div>
-            ) : null}
-            <div>
               <span className="text-muted-foreground">{t("摘要")}</span>
               <span className="ml-2 font-mono">
                 {shortHash(listing.source_digest, 14)}
@@ -1319,7 +839,6 @@ function SourceDocumentsPage({
                   ) : null}
                   <TableHead>{t("文档")}</TableHead>
                   <TableHead className="w-40">{t("来源族")}</TableHead>
-                  <TableHead className="w-28">{t("状态")}</TableHead>
                   <TableHead className="w-28">{t("令牌数")}</TableHead>
                   <TableHead className="w-40">{t("入库时间")}</TableHead>
                   <TableHead className="w-24">{t("大小")}</TableHead>
@@ -1393,24 +912,6 @@ function SourceDocumentsPage({
                         {sourceFamilyLabel(sourceFamily(document))}
                       </Badge>
                     </TableCell>
-                    <TableCell>
-                      <Badge
-                        variant="outline"
-                        className={
-                          document.compiled === undefined
-                            ? "text-muted-foreground"
-                            : document.compiled
-                              ? "border-emerald-300 text-emerald-700 dark:border-emerald-800 dark:text-emerald-400"
-                              : "border-amber-300 text-amber-700 dark:border-amber-800 dark:text-amber-400"
-                        }
-                      >
-                        {document.compiled === undefined
-                          ? t("待重启")
-                          : document.compiled
-                            ? t("已编译")
-                            : t("未编译")}
-                      </Badge>
-                    </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">
                       {formatNumber(document.token_count)}
                     </TableCell>
@@ -1460,9 +961,7 @@ function SourceDocumentsPage({
                     ? t("清除搜索条件或换一个关键词。")
                     : lane === "reflection_memory"
                       ? t("完成的外部工具轨迹会在空闲后自动生成反思记忆。")
-                      : t(
-                          "创建或导入 Markdown 文档，然后编译到 Native Tensor Bank。",
-                        )
+                      : t("创建或导入 Markdown 文档。")
               }
               actionLabel={
                 !loading && !query && lane !== "reflection_memory"
@@ -1602,12 +1101,12 @@ function SourceDocumentsPage({
             </DialogTitle>
             <DialogDescription>
               {lane === "policydata"
-                ? t("系统只保存这一份人格文档；保存后需重新编译。")
+                ? t("系统只保存这一份人格文档；保存后立即生效。")
                 : editorMode === "create"
                   ? t(
                       "上传文件只解析为草稿；必须填写自定义路径和标签，确认后才会写入知识库。",
                     )
-                  : t("保存会刷新 {lane} 索引并重建对应的模型原生状态。", {
+                  : t("保存会立即刷新 {lane} 索引。", {
                       lane: t(LANE_COPY[lane].label),
                     })}
             </DialogDescription>
@@ -1722,40 +1221,6 @@ function SourceDocumentsPage({
       </Dialog>
 
       <Dialog
-        open={organizeOpen}
-        onOpenChange={(open) => {
-          if (!organizing) setOrganizeOpen(open);
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t("整理反思记忆")}</DialogTitle>
-            <DialogDescription>
-              {t(
-                "系统先以严格 Q×K 检索高分候选，再由模型核对因果经验与冲突。只有表达同一经验的候选才会原子合并；仅主题相似的记忆会保持分开。启动后任务在服务端后台运行，可以关闭弹窗或切换页面。",
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setOrganizeOpen(false)}
-              disabled={organizing}
-            >
-              {t("取消")}
-            </Button>
-            <Button
-              onClick={() => void organizeMemories()}
-              disabled={organizing}
-            >
-              {organizing ? <LoaderCircle className="animate-spin" /> : null}
-              {organizing ? t("整理中…") : t("开始整理")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
         open={deleteTargets.length > 0}
         onOpenChange={(open) => {
           if (!open && batchAction !== "delete") setDeleteTargets([]);
@@ -1782,7 +1247,7 @@ function SourceDocumentsPage({
                   count: formatNumber(deleteTargets.length),
                 })
               )}
-              {t("删除后需重新编译 Tensor Bank。此操作无法撤销。")}
+              {t("此操作无法撤销。")}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

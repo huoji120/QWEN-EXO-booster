@@ -65,18 +65,6 @@ def test_managed_reasoning_switches_reject_nonbooleans(key, invalid):
     assert error.value.code == "invalid_type"
 
 
-def test_tensor_bank_defaults_reserve_context_and_full_attention_capacity():
-    values = default_values()
-
-    assert values["context_length"] == 131072
-    assert values["qwen_exo_tensor_bank_max_document_tokens"] == 100352
-    assert values["qwen_exo_tensor_bank_salient_token_budget"] == 4096
-
-    values["qwen_exo_tensor_bank_max_document_tokens"] = 129088
-    with pytest.raises(ServiceConfigError, match="上下文长度减 2048"):
-        validate_values(values)
-
-
 def test_score_bias_defaults_enable_anchor_and_positive_relevance_floor():
     values = default_values()
 
@@ -128,7 +116,7 @@ def test_values_round_trip_through_managed_server_args():
         max_prefill_tokens=32768,
         qwen_exo_enable_policy_data=False,
         qwen_exo_telemetry_text_mode="all",
-        qwen_exo_qk_recall_preset="strict",
+        qwen_exo_reasoning_mode="dynamic",
         qwen_exo_console_trace_default_scope="all",
     )
 
@@ -141,8 +129,8 @@ def test_values_round_trip_through_managed_server_args():
             "--qwen-exo-enable-policy-data",
             "--qwen-exo-telemetry-text-mode",
             "off",
-            "--qwen-exo-qk-recall-preset",
-            "broad",
+            "--qwen-exo-reasoning-mode",
+            "fixed",
         ],
         values,
     )
@@ -152,8 +140,8 @@ def test_values_round_trip_through_managed_server_args():
     assert effective_args.count("--context-length") == 1
     assert "--no-qwen-exo-enable-policy-data" in effective_args
     assert "--qwen-exo-telemetry-text-mode" in effective_args
-    assert effective_args.count("--qwen-exo-qk-recall-preset") == 1
-    assert values_from_args(effective_args)["qwen_exo_qk_recall_preset"] == "strict"
+    assert effective_args.count("--qwen-exo-reasoning-mode") == 1
+    assert values_from_args(effective_args)["qwen_exo_reasoning_mode"] == "dynamic"
     assert values_from_args(effective_args)["qwen_exo_max_output_tokens"] == 8192
     assert effective_args.count("--qwen-exo-console-trace-default-scope") == 1
     assert (
@@ -167,18 +155,18 @@ def test_store_persists_revision_and_marks_exact_config_applied(tmp_path: Path):
     initial = store.ensure([])
 
     updated = store.update(
-        {"qwen_exo_max_candidates": 12},
+        {"qwen_exo_max_internal_fanout": 12},
         expected_revision=initial["revision"],
     )
 
     assert updated["pending_restart"] is True
     assert updated["revision"] != initial["revision"]
-    assert updated["values"]["qwen_exo_max_candidates"] == 12
+    assert updated["values"]["qwen_exo_max_internal_fanout"] == 12
 
     applied, effective_args = store.mark_applied([])
 
     assert applied["applied_revision"] == updated["revision"]
-    assert values_from_args(effective_args)["qwen_exo_max_candidates"] == 12
+    assert values_from_args(effective_args)["qwen_exo_max_internal_fanout"] == 12
     persisted = json.loads(store.path.read_text(encoding="utf-8"))
     assert persisted["applied_revision"] == persisted["revision"]
 
@@ -210,18 +198,18 @@ def test_store_rejects_stale_revision_without_overwriting(tmp_path: Path):
     store = ServiceConfigStore(tmp_path / "service-config.json")
     initial = store.ensure([])
     store.update(
-        {"qwen_exo_max_candidates": 10},
+        {"qwen_exo_max_internal_fanout": 10},
         expected_revision=initial["revision"],
     )
 
     with pytest.raises(ServiceConfigError, match="其他会话") as exc_info:
         store.update(
-            {"qwen_exo_max_candidates": 11},
+            {"qwen_exo_max_internal_fanout": 11},
             expected_revision=initial["revision"],
         )
 
     assert exc_info.value.code == "revision_conflict"
-    assert store.public_document()["values"]["qwen_exo_max_candidates"] == 10
+    assert store.public_document()["values"]["qwen_exo_max_internal_fanout"] == 10
 
 
 def test_second_unhealthy_boot_rolls_back_to_last_healthy_revision(tmp_path: Path):
@@ -229,7 +217,7 @@ def test_second_unhealthy_boot_rolls_back_to_last_healthy_revision(tmp_path: Pat
     initial, _ = store.mark_applied([])
     assert store.mark_healthy() is True
     store.update(
-        {"qwen_exo_max_candidates": 12},
+        {"qwen_exo_max_internal_fanout": 12},
         expected_revision=initial["revision"],
     )
 
@@ -239,14 +227,14 @@ def test_second_unhealthy_boot_rolls_back_to_last_healthy_revision(tmp_path: Pat
     assert failed_attempt["revision"] != initial["revision"]
     assert rolled_back["revision"] == initial["revision"]
     assert rolled_back["last_failed_revision"] == failed_attempt["revision"]
-    assert values_from_args(effective_args)["qwen_exo_max_candidates"] == 4
+    assert values_from_args(effective_args)["qwen_exo_max_internal_fanout"] == 8
 
 
 def test_validation_rejects_incompatible_runtime_contract():
     values = default_values()
     values["qwen_exo_observer_mode"] = "shadow"
 
-    with pytest.raises(ServiceConfigError, match="Adaptive refresh") as exc_info:
+    with pytest.raises(ServiceConfigError, match="Immediate uncertainty retrieval") as exc_info:
         validate_values(values)
 
     assert exc_info.value.code == "invalid_contract"
@@ -272,121 +260,6 @@ def test_internal_budget_covers_reflection_retries_and_compaction():
         validate_values(values)
 
 
-def test_experimental_features_are_hidden_from_managed_config():
-    values = default_values()
-
-    assert "qwen_exo_experimental_activation_training" not in values
-    assert "qwen_exo_activation_editor_strength" not in values
-    assert "qwen_exo_activation_editor_enabled" not in values
-    assert "qwen_exo_context_integrity_mode" not in values
-    assert "qwen_exo_context_integrity_context_divisor" not in values
-
-    values["qwen_exo_experimental_activation_training"] = True
-    with pytest.raises(ServiceConfigError, match="未知配置项"):
-        validate_values(values)
-
-
-def test_context_integrity_controls_are_cli_only(tmp_path: Path):
-    values = default_values()
-    args = apply_values_to_args(
-        [
-            "--model-path",
-            "/models/qwen-exo",
-            "--qwen-exo-experimental-context-integrity",
-            "--qwen-exo-context-integrity-mode",
-            "active",
-            "--qwen-exo-context-integrity-context-divisor",
-            "5",
-        ],
-        values,
-    )
-
-    assert "--qwen-exo-experimental-context-integrity" in args
-    assert "--qwen-exo-context-integrity-mode" in args
-    assert "--qwen-exo-context-integrity-context-divisor" in args
-    round_trip = values_from_args(args)
-    assert "qwen_exo_context_integrity_mode" not in round_trip
-    assert "qwen_exo_context_integrity_context_divisor" not in round_trip
-
-    store = ServiceConfigStore(tmp_path / "service-config.json")
-    store.ensure([])
-    public = store.public_document()
-    assert "context_integrity" not in {group["id"] for group in public["groups"]}
-    assert all(
-        setting["group"] != "context_integrity" for setting in public["settings"]
-    )
-
-
-def test_new_runtime_features_default_active_with_distinct_groups():
-    values = default_values()
-
-    assert values["qwen_exo_qk_prefilter_mode"] == "active"
-    assert values["qwen_exo_context_evidence_mode"] == "active"
-    assert values["qwen_exo_reflection_memory_mode"] == "active"
-    assert values["qwen_exo_response_compaction_mode"] == "active"
-
-    settings = {setting.key: setting for setting in SERVICE_SETTINGS}
-    assert settings["qwen_exo_context_evidence_mode"].group == "post_tool_evidence"
-    assert settings["qwen_exo_reflection_memory_mode"].group == "reflection_memory"
-    assert settings["qwen_exo_response_compaction_mode"].group == "compaction"
-    assert settings["qwen_exo_qk_prefilter_mode"].choices == ("off", "active")
-
-
-def test_managed_qk_expansion_margin_defaults_to_production_rank_gate():
-    values = default_values()
-    settings = {setting.key: setting for setting in SERVICE_SETTINGS}
-    margin = settings["qwen_exo_qk_expansion_margin"]
-
-    assert values["qwen_exo_qk_expansion_margin"] == 0.02
-    assert margin.default == 0.02
-    assert "推荐值：0.02" in margin.description
-
-
-def test_ensure_migrates_legacy_modes_to_active_reflection_memory(tmp_path: Path):
-    store = ServiceConfigStore(tmp_path / "service-config.json")
-    initial = store.ensure([])
-    document = json.loads(store.path.read_text(encoding="utf-8"))
-    for key in (
-        "qwen_exo_reflection_memory_mode",
-        "qwen_exo_reflection_memory_idle_seconds",
-        "qwen_exo_reflection_memory_min_events",
-        "qwen_exo_reflection_memory_min_tokens",
-        "qwen_exo_reflection_memory_max_attempts",
-        "qwen_exo_reflection_memory_max_output_tokens",
-        "qwen_exo_reflection_memory_max_history_tokens",
-    ):
-        document["values"].pop(key)
-    document["values"].update(
-        qwen_exo_qk_prefilter_mode="shadow",
-        qwen_exo_context_evidence_mode="off",
-        qwen_exo_context_integrity_mode="shadow",
-        qwen_exo_dream_reflection_mode="off",
-        qwen_exo_dream_reflection_min_events=5,
-        qwen_exo_response_compaction_mode="off",
-    )
-    store.path.write_text(json.dumps(document), encoding="utf-8")
-
-    migrated = store.ensure([])
-
-    assert migrated["revision"] != initial["revision"]
-    assert migrated["values"]["qwen_exo_qk_prefilter_mode"] == "active"
-    assert migrated["values"]["qwen_exo_context_evidence_mode"] == "active"
-    assert "qwen_exo_context_integrity_mode" not in migrated["values"]
-    assert "qwen_exo_context_integrity_context_divisor" not in migrated["values"]
-    assert migrated["values"]["qwen_exo_reflection_memory_mode"] == "active"
-    assert migrated["values"]["qwen_exo_reflection_memory_min_events"] == 5
-    assert migrated["values"]["qwen_exo_response_compaction_mode"] == "active"
-    assert "qwen_exo_dream_reflection_mode" not in migrated["values"]
-
-
-def test_qk_recall_preset_rejects_free_form_thresholds():
-    values = default_values()
-    values["qwen_exo_qk_recall_preset"] = "0.42"
-
-    with pytest.raises(ServiceConfigError, match="必须是以下值之一"):
-        validate_values(values)
-
-
 def test_console_trace_default_scope_rejects_unknown_filter():
     values = default_values()
     values["qwen_exo_console_trace_default_scope"] = "admitted"
@@ -400,7 +273,7 @@ def test_ensure_backfills_new_settings_for_legacy_documents(tmp_path: Path):
     store.ensure([])
     document = json.loads((tmp_path / "service-config.json").read_text("utf-8"))
     document["values"]["qwen_exo_activation_editor_enabled"] = True
-    document["values"].pop("qwen_exo_qk_recall_preset")
+    document["values"].pop("qwen_exo_reasoning_mode")
     document["values"].pop("qwen_exo_console_trace_default_scope")
     document["values"]["qwen_exo_latent_transplant_default"] = "legacy-name"
     (tmp_path / "service-config.json").write_text(
@@ -410,6 +283,30 @@ def test_ensure_backfills_new_settings_for_legacy_documents(tmp_path: Path):
     migrated = store.ensure([])
 
     assert "qwen_exo_activation_editor_enabled" not in migrated["values"]
-    assert migrated["values"]["qwen_exo_qk_recall_preset"] == "balanced"
+    assert migrated["values"]["qwen_exo_reasoning_mode"] == "fixed"
     assert migrated["values"]["qwen_exo_console_trace_default_scope"] == "activity"
     assert "qwen_exo_latent_transplant_default" not in migrated["values"]
+
+
+def test_ensure_drops_retired_qk_recall_settings_and_keeps_the_rest(tmp_path: Path):
+    path = tmp_path / "service-config.json"
+    store = ServiceConfigStore(path)
+    store.ensure([])
+    document = json.loads(path.read_text("utf-8"))
+    kept = dict(document["values"], qwen_exo_max_internal_fanout=12)
+    document["values"] = {
+        **kept,
+        "qwen_exo_enable_external_memory": False,
+        "qwen_exo_enable_reference_judge": True,
+        "qwen_exo_qk_recall_preset": "strict",
+        "qwen_exo_tensor_bank_span_tokens": 16,
+        "qwen_exo_replay_minimum_gain": 0.02,
+        "qwen_exo_context_evidence_mode": "active",
+    }
+    path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+    migrated = store.ensure([])
+
+    assert migrated["values"] == validate_values(kept)
+    assert migrated["previous_values"]["qwen_exo_qk_recall_preset"] == "strict"
+    assert "--qwen-exo-qk-recall-preset" not in store.mark_applied([])[1]

@@ -17,7 +17,6 @@ from qwen_exo_booster.reflection_memory import (
 )
 from qwen_exo_booster.runtime import QwenExoRuntime, QwenExoRuntimeState
 from qwen_exo_booster.service_config import ServiceConfigStore
-from qwen_exo_booster.tensor_bank import TensorBankCompileError
 from qwen_exo_booster.model_catalog import ModelCatalogStore
 
 
@@ -92,7 +91,6 @@ class FakeRuntime:
         self.policy_document_tags = {"policy.md": []}
         self.documents = {"guide.md": "# Guide"}
         self.document_tags = {"guide.md": []}
-        self.tensor_bank = object()
         self.telemetry = SimpleNamespace(emit=lambda *args, **kwargs: None)
         self.reflection_organization_calls = 0
         self._reflection_organization_status = {
@@ -351,7 +349,6 @@ class FakeRuntime:
                     ],
                 }
             ],
-            "tensor_bank": {"document_state_count": 4},
         }
 
     def recall_trace(self, max_turns=100):
@@ -407,21 +404,6 @@ def test_knowledge_content_and_mutations_are_directly_available():
     deleted = api.delete("/qwen-exo/knowledge/new.md")
     assert deleted.status_code == 200
     assert "new.md" not in runtime.documents
-
-
-def test_reflection_memory_organization_is_an_explicit_background_job():
-    runtime = FakeRuntime()
-    api = client(runtime)
-
-    response = api.post("/qwen-exo/reflection-memory/organize")
-    status = api.get("/qwen-exo/reflection-memory/organize")
-
-    assert response.status_code == 202
-    assert response.json()["status"] == "queued"
-    assert response.json()["job_id"] == "reflection-organization-test"
-    assert status.status_code == 200
-    assert status.json()["stage"] == "queued"
-    assert runtime.reflection_organization_calls == 1
 
 
 def test_reflection_regeneration_exposes_source_and_background_status():
@@ -589,31 +571,6 @@ def test_pending_reflection_management_supports_list_start_and_cancel():
     assert started.json()["started_count"] == 1
     assert cancelled.status_code == 200
     assert runtime.pending_reflections == {}
-
-
-def test_source_listing_searches_content_and_batch_actions_are_explicit():
-    runtime = FakeRuntime()
-    runtime.documents["other.md"] = "# Other\nneedle in body"
-    api = client(runtime)
-
-    listing = api.get("/qwen-exo/knowledge", params={"q": "needle in body"})
-    compiled = api.post(
-        "/qwen-exo/sources/compile",
-        json={"lane": "knowledge", "relative_paths": ["other.md"]},
-    )
-    deleted = api.post(
-        "/qwen-exo/sources/delete",
-        json={"lane": "knowledge", "relative_paths": ["other.md"]},
-    )
-
-    assert [item["relative_path"] for item in listing.json()["documents"]] == [
-        "other.md"
-    ]
-    assert compiled.status_code == 200
-    assert compiled.json()["requested_paths"] == ["other.md"]
-    assert deleted.status_code == 200
-    assert deleted.json()["deleted_count"] == 1
-    assert "other.md" not in runtime.documents
 
 
 def test_policy_data_surface_is_singleton_and_has_no_tags():
@@ -941,21 +898,6 @@ def test_source_reindex_is_direct_and_verification_route_is_removed():
     assert policy.json()["source_digest"] == "policy-digest"
 
 
-def test_recall_trace_contract_and_compatibility_page_are_served():
-    api = client(FakeRuntime())
-
-    trace = api.get("/qwen-exo/recall-trace")
-    page = api.get("/recall-trace")
-    cleared = api.delete("/qwen-exo/recall-trace")
-
-    assert trace.status_code == 200
-    assert trace.json()["schema"] == "inflight-memory-visualization-v2"
-    assert trace.json()["turns"] == [{"turn_id": "request-1"}]
-    assert page.status_code == 200
-    assert "飞行中召回轨迹" in page.text
-    assert cleared.json() == {"status": "cleared", "turns": 0}
-
-
 def test_single_page_console_and_hashed_assets_are_served():
     api = client(FakeRuntime())
 
@@ -998,14 +940,14 @@ def test_service_config_update_is_revisioned_and_requests_managed_restart(
     response = api.put(
         "/qwen-exo/service-config",
         json={
-            "values": {"qwen_exo_max_candidates": 12},
             "expected_revision": initial["revision"],
+            "values": {"qwen_exo_max_internal_fanout": 12},
         },
     )
 
     assert response.status_code == 202
     assert response.json()["restart_requested"] is True
-    assert response.json()["values"]["qwen_exo_max_candidates"] == 12
+    assert response.json()["values"]["qwen_exo_max_internal_fanout"] == 12
     assert response.json()["pending_restart"] is True
     assert restart_calls == [True]
 
@@ -1019,8 +961,8 @@ def test_service_config_update_refuses_unmanaged_process(tmp_path: Path, monkeyp
     response = client(FakeRuntime()).put(
         "/qwen-exo/service-config",
         json={
-            "values": {"qwen_exo_max_candidates": 12},
             "expected_revision": initial["revision"],
+            "values": {"qwen_exo_max_internal_fanout": 12},
         },
     )
 
@@ -1168,42 +1110,6 @@ def test_model_catalog_route_rejects_stale_revision_without_restart(
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "revision_conflict"
     assert restart_calls == []
-
-
-def test_tensor_bank_reindex_is_model_native():
-    response = client(FakeRuntime()).post("/qwen-exo/tensor-bank/reindex")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "document_state_count": 3,
-        "model_native_documents": 3,
-        "complete_gdn_document_states": 3,
-    }
-
-
-def test_tensor_bank_reindex_returns_actionable_compile_failure():
-    runtime = FakeRuntime()
-
-    async def fail_reindex():
-        raise TensorBankCompileError(
-            "salient_span_budget_exceeded",
-            "dense.md",
-            "merged spans require 2112 tokens",
-            details={"salient_tokens": 2112, "salient_token_budget": 2048},
-            hint="Split or simplify the document at a semantic boundary.",
-        )
-
-    runtime.reindex_tensor_bank = fail_reindex
-    response = client(runtime).post("/qwen-exo/tensor-bank/reindex")
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == {
-        "code": "salient_span_budget_exceeded",
-        "relative_path": "dense.md",
-        "message": "merged spans require 2112 tokens",
-        "details": {"salient_tokens": 2112, "salient_token_budget": 2048},
-        "hint": "Split or simplify the document at a semantic boundary.",
-    }
 
 
 def test_knowledge_ingest_hot_updates_without_restart():

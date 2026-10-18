@@ -1107,7 +1107,6 @@ def dflash_request_needs_target_logprobs(req: Req) -> bool:
     return (
         bool(req.return_logprob)
         or custom_params.get("qwen_exo_kind") == "user"
-        or (custom_params.get("qwen_exo_job_type") == "query_probe")
     )
 
 

@@ -6,68 +6,6 @@ import torch
 from qwen_exo_booster.attention_diagnostic_capture import capture_attention_diagnostic
 
 
-@pytest.mark.parametrize("kind", ["attention", "full_attention", "qwen_sparse_attention", "sparse_attention"])
-@pytest.mark.parametrize("observer", ["off", "active"])
-@pytest.mark.parametrize("selected_layer", [None, 0])
-def test_retrieval_query_capture_is_independent_of_observer(
-    monkeypatch, kind, observer, selected_layer
-):
-    from sglang.srt.models import qwen3_5
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-    args = SimpleNamespace(
-        enable_qwen_exo=True, qwen_exo_observer_mode=observer,
-        qwen_exo_qk_layer=selected_layer,
-    )
-    monkeypatch.setattr(qwen3_5, "get_server_args", lambda: args)
-    monkeypatch.setattr(qwen3_5, "get_parallel", lambda: SimpleNamespace(attn_tp_rank=0, attn_tp_size=1))
-    monkeypatch.setattr(qwen3_5, "get_rope_config", lambda config: (10000, None))
-    monkeypatch.setattr(qwen3_5, "get_is_capture_mode", lambda: False)
-
-    # Stop immediately before weight allocation: this exercises the real model's
-    # tracker configuration without initializing unrelated projection/MoE state.
-    class BeforeWeights(Exception):
-        pass
-
-    def stop_before_weights(**kwargs):
-        raise BeforeWeights
-
-    monkeypatch.setattr(qwen3_5, "get_rope", stop_before_weights)
-    config = SimpleNamespace(
-        hidden_size=4, num_attention_heads=2, num_key_value_heads=1,
-        head_dim=2, layers_block_type=[kind, "linear_attention", kind],
-    )
-    layers = []
-    for layer_id in (0, 2):
-        layer = qwen3_5.Qwen3_5AttentionDecoderLayer.__new__(qwen3_5.Qwen3_5AttentionDecoderLayer)
-        with pytest.raises(BeforeWeights):
-            layer.__init__(config, layer_id)
-        layer.rotary_emb = SimpleNamespace(
-            rotary_dim=2, cos_sin_cache=torch.tensor([[1., 0.], [1., 0.]]),
-            is_neox_style=True,
-        )
-        layers.append(layer)
-
-    batch = SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND,
-        qwen_exo_full_query_capture=(True,), qwen_exo_observe=(False,),
-        extend_seq_lens_cpu=[2], extend_prefix_lens_cpu=[0],
-        contains_last_prefill_chunk=True, rids=["query"],
-        qwen_exo_final_prefill=(True,), qwen_exo_user_query_spans=(((0, 2),),),
-        qwen_exo_customized_info=None,
-    )
-    query = torch.tensor([[[1., 2.], [3., 4.]], [[5., 6.], [7., 8.]]])
-    for layer in layers:
-        layer._capture_qwen_exo_probe_queries(query + layer.layer_id, torch.arange(2), batch)
-    expected_layer = 2 if selected_layer is None else selected_layer
-    actual = batch.qwen_exo_customized_info["qwen_exo_user_query_full_heads"][0, 0]
-    torch.testing.assert_close(actual, query.mean(0) + expected_layer)
-    assert sum(layer.qwen_exo_probe_tracker is not None for layer in layers) == 1
-    for layer in layers:
-        if layer.qwen_exo_signal_tracker is not None:
-            assert not layer.qwen_exo_signal_tracker.capture_full_queries
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA diagnostic capture required")
 @pytest.mark.parametrize("cached", [False, True])
 def test_qsa_diagnostic_uses_selected_positions_and_native_key_precision(monkeypatch, cached):

@@ -279,7 +279,6 @@ class MlxQwenExoRuntime:
     def _metadata(req: Any) -> MlxQwenExoRequestMetadata:
         from sglang.srt.model_executor.forward_batch_info import (
             _qwen_exo_activation_editor,
-            _qwen_exo_memory_span,
             _qwen_exo_persisted_user_queries,
             _qwen_exo_score_bias_blocks,
             _qwen_exo_score_bias_phase,
@@ -292,7 +291,7 @@ class MlxQwenExoRuntime:
         return MlxQwenExoRequestMetadata(
             rid=str(req.rid),
             observe=_qwen_exo_should_observe(req),
-            memory_span=_qwen_exo_memory_span(req),
+            memory_span=None,
             trajectory_spans=_qwen_exo_trajectory_spans(req),
             user_query_spans=_qwen_exo_user_query_spans(req),
             persisted_user_queries=_qwen_exo_persisted_user_queries(req),

@@ -65,7 +65,7 @@ const REFRESH_DELAY_MS = 5000;
 
 const REGENERATION_STEPS = [
   "读取轨迹",
-  "Q×K 检索",
+  "相似记忆检索",
   "模型反思",
   "准入与发布",
   "完成",
@@ -126,7 +126,7 @@ function regenerationStepIndex(status: ReflectionRegenerationJobStatus) {
   if (status.status === "succeeded" || status.stage === "completed") return 4;
   if (status.stage === "publishing") return 3;
   if (["causal_review", "model_review"].includes(status.stage)) return 2;
-  if (status.stage === "qk_retrieval") return 1;
+  if (status.stage === "similar_retrieval") return 1;
   if (
     ["loading_source", "evidence_extraction", "queued"].includes(status.stage)
   )

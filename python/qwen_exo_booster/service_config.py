@@ -89,23 +89,13 @@ _GROUPS = (
     },
     {
         "id": "memory",
-        "label": "知识检索与准入",
-        "description": "定义 Attention-Q × K 召回、语义准入及原生状态注入的门限与预算；控制候选产生到实际进入上下文的完整链路。",
-    },
-    {
-        "id": "tensor_bank",
-        "label": "Tensor Bank 编译",
-        "description": "控制文档编译为原生 Full-Attention K/V 与 GDN 状态的长度上限、显著片段提取及片段半径。",
+        "label": "记忆与状态",
+        "description": "混合前缀状态、策略数据与执行胶囊；知识库由服务端记忆工具（qwen_exo_memory_search / qwen_exo_memory_read）按需读取。",
     },
     {
         "id": "observer",
         "label": "运行观测",
-        "description": "解码期间持续监测局部惊奇度与 Attention-Q 漂移；触发条件决定 Self-Ask、候选刷新与回放激活频率。",
-    },
-    {
-        "id": "replay",
-        "label": "因果回放",
-        "description": "以同一未来 token 窗口对基线分支与候选分支评分；仅在损失增益达标且分布差异受控时采纳。",
+        "description": "解码期间持续监测局部惊奇度与 Attention-Q 漂移，供注意力控制使用。",
     },
     {
         "id": "score_bias",
@@ -118,14 +108,9 @@ _GROUPS = (
         "description": "控制遥测原文记录范围与召回轨迹控制台的默认显示范围。",
     },
     {
-        "id": "post_tool_evidence",
-        "label": "工具后证据",
-        "description": "当外部知识均未通过准入时，仅使用最新工具结果中的可验证事实补全当前请求。",
-    },
-    {
         "id": "reflection_memory",
         "label": "反思记忆",
-        "description": "在工具轨迹空闲后提炼可复用经验，热写入知识库并重建原生 Tensor Bank。",
+        "description": "在工具轨迹空闲后提炼可复用经验，作为文本记忆写入知识库 reflection-memory/ 目录，供记忆工具检索。",
     },
     {
         "id": "compaction",
@@ -239,7 +224,7 @@ SERVICE_SETTINGS = (
         "qwen_exo_max_internal_fanout",
         "capacity",
         "内部任务并发",
-        "作用：语义裁判、自我提问等后台任务的并发上限。用途：限制内部推理对主请求的干扰。推荐值：8（过高会在 hybrid 模型上抢占 mamba 状态槽、驱逐用户会话前缀，导致下一轮全量重算）。",
+        "作用：反思、压缩、推理截断自问等后台任务的并发上限。用途：限制内部推理对主请求的干扰。推荐值：8（过高会在 hybrid 模型上抢占 mamba 状态槽、驱逐用户会话前缀，导致下一轮全量重算）。",
         "integer",
         8,
         minimum=1,
@@ -399,26 +384,10 @@ SERVICE_SETTINGS = (
         True,
     ),
     _setting(
-        "qwen_exo_enable_external_memory",
-        "memory",
-        "知识库记忆",
-        "作用：允许请求检索并恢复知识库文档的状态。用途：关闭后回答只依赖当前对话内容。推荐值：开启。",
-        "boolean",
-        True,
-    ),
-    _setting(
         "qwen_exo_enable_policy_data",
         "memory",
         "策略数据",
         "作用：启用执行策略文档的原生状态条件化。用途：让模型遵守既定的工程策略。推荐值：开启。",
-        "boolean",
-        True,
-    ),
-    _setting(
-        "qwen_exo_enable_reference_judge",
-        "memory",
-        "语义裁判",
-        "作用：对候选记忆做语义相关性判定。用途：防止无关内容进入上下文。推荐值：开启。",
         "boolean",
         True,
     ),
@@ -429,43 +398,6 @@ SERVICE_SETTINGS = (
         "作用：保存跨轮次的粗粒度执行状态。用途：长任务中断后恢复进度。推荐值：开启。",
         "boolean",
         True,
-    ),
-    _setting(
-        "qwen_exo_max_candidates",
-        "memory",
-        "最大候选数",
-        "作用：限制初始检索及非 QK 补充候选数量；通过预过滤的 Attention-Q×K 候选全部进入语义准入，首轮全拒绝时再进行一次有界扩张。弱分数候选仍按 fail-closed 规则直接放弃。用途：控制召回范围与裁判耗时（候选越多，每轮起的语义裁判 fan-out 越多，越易在 hybrid 模型上抢 mamba 槽）。推荐值：4。",
-        "integer",
-        4,
-        minimum=1,
-        maximum=64,
-        step=1,
-    ),
-    _setting(
-        "qwen_exo_qk_recall_preset",
-        "memory",
-        "Q×K 召回严格度",
-        "工作原理：控制 Attention-Q 与文档 K 相似度的第一道门槛，并同时约束领先文档与第二名的差距。宽松会交给语义审计更多候选；标准保持当前行为；严格会提前过滤弱相关或难分胜负的文档。推荐：标准。",
-        "string",
-        "balanced",
-        choices=("broad", "balanced", "strict"),
-        choice_labels={
-            "broad": "高召回：尽量不漏，交给审计模型过滤",
-            "balanced": "标准：保持召回与误命中的平衡",
-            "strict": "高精度：只保留高分且领先明确的文档",
-        },
-    ),
-    _setting(
-        "qwen_exo_max_memory_tokens",
-        "memory",
-        "知识库预算",
-        "作用：单次请求允许恢复的知识库内容上限。用途：防止记忆内容挤占对话空间。推荐值：8192。",
-        "integer",
-        8192,
-        minimum=128,
-        maximum=32768,
-        step=128,
-        unit="tokens",
     ),
     _setting(
         "qwen_exo_max_policy_tokens",
@@ -480,114 +412,6 @@ SERVICE_SETTINGS = (
         unit="tokens",
     ),
     _setting(
-        "qwen_exo_qk_expansion_margin",
-        "memory",
-        "检索扩张阈值",
-        "作用：候选进入语义裁判前所需的最小领先幅度，并作为 Tensor Bank 原始排序的初始分差门槛。用途：低于门槛时先扩张检索，仍不满足则在语义裁判前拒绝。推荐值：0.02。",
-        "number",
-        0.02,
-        minimum=0,
-        maximum=1,
-        step=0.001,
-    ),
-    _setting(
-        "qwen_exo_qk_prefilter_mode",
-        "memory",
-        "裁判前预过滤",
-        "作用：最高检索分低于门槛且没有跨轮恢复证据时跳过裁判；多个高分候选分差较小时改由大模型并排比较并只选一个。关闭=始终审计；启用=过滤弱候选并比较歧义候选。推荐值：启用。",
-        "string",
-        "active",
-        choices=("off", "active"),
-        choice_labels={"off": "关闭", "active": "启用"},
-    ),
-    _setting(
-        "qwen_exo_pmi_gate_mode",
-        "memory",
-        "PMI 裁判门",
-        "作用：裁判前用目标模型一次前向为每个候选记忆的规则卡开头打分，比较“在当前问题下”与“在中性问题下”的对数概率差（PMI）。所有候选都不高于阈值时直接跳过裁判且不附着记忆，与裁判全拒的结果一致但省去 1 到 2 轮生成；任何打分失败都回退到裁判。实测无关请求首 token 从约 15 秒降到 3 到 4 秒，相关请求不受影响。推荐值：启用。",
-        "string",
-        "active",
-        choices=("off", "active"),
-        choice_labels={"off": "关闭", "active": "启用"},
-    ),
-    _setting(
-        "qwen_exo_pmi_gate_threshold",
-        "memory",
-        "PMI 裁判门阈值",
-        "作用：候选记忆的 PMI（每 token 平均对数概率增益）不高于此值即视为无关。0 表示只拦“问题没有让任何记忆更可预期”的请求；实测相关记忆 PMI 在 0.09 以上，无关请求多为负值或 0.05 以下，调到 0.05 到 0.06 可拦更多无关请求但风险略增。推荐值：0。",
-        "number",
-        0.0,
-        minimum=-1,
-        maximum=1,
-        step=0.005,
-    ),
-    _setting(
-        "qwen_exo_qk_max_candidates_per_document",
-        "memory",
-        "单文档候选上限",
-        "作用：同一文档最多允许进入语义裁判的不同页面候选数，最佳页面始终优先保留。用途：避免单个文档占满候选名额。推荐值：1。",
-        "integer",
-        1,
-        minimum=1,
-        maximum=4,
-        step=1,
-    ),
-    _setting(
-        "qwen_exo_qk_only_knowledge",
-        "memory",
-        "仅注意力检索",
-        "作用：跳过词法匹配，只用注意力查询信号路由记忆。用途：开启后更精确但可能漏召回。推荐值：关闭。",
-        "boolean",
-        False,
-    ),
-    _setting(
-        "qwen_exo_tensor_bank_max_document_tokens",
-        "tensor_bank",
-        "文档长度上限",
-        "作用：单个文档允许编译入库的最大 token 数；不得超过当前上下文长度减 2048。200K 上下文可按需使用更高值。",
-        "integer",
-        100352,
-        minimum=64,
-        maximum=262144,
-        step=64,
-        unit="tokens",
-    ),
-    _setting(
-        "qwen_exo_tensor_bank_salient_token_budget",
-        "tensor_bank",
-        "显著片段预算",
-        "作用：单个文档预留的精确 Full-Attention K/V token 成本。当前固定预算：4096。",
-        "integer",
-        4096,
-        minimum=64,
-        maximum=32768,
-        step=64,
-        unit="tokens",
-    ),
-    _setting(
-        "qwen_exo_tensor_bank_surprisal_threshold",
-        "tensor_bank",
-        "惊奇度阈值",
-        "作用：选取高惊奇 token 的门槛。用途：调低保留更多片段；智能体轨迹内容惊奇度普遍偏高，需要调高。推荐值：6.0（普通文档）；30（长轨迹）。",
-        "number",
-        6.0,
-        minimum=0,
-        maximum=32,
-        step=0.1,
-    ),
-    _setting(
-        "qwen_exo_tensor_bank_span_tokens",
-        "tensor_bank",
-        "片段半径",
-        "作用：每个高惊奇 token 周围保留的上下文长度。用途：半径越大上下文越完整，但片段合并后容易超预算。推荐值：16。",
-        "integer",
-        16,
-        minimum=1,
-        maximum=2048,
-        step=1,
-        unit="tokens",
-    ),
-    _setting(
         "qwen_exo_observer_mode",
         "observer",
         "观测器模式",
@@ -596,14 +420,6 @@ SERVICE_SETTINGS = (
         "active",
         choices=("off", "shadow", "active"),
         choice_labels={"off": "关闭", "shadow": "仅观测", "active": "主动干预"},
-    ),
-    _setting(
-        "qwen_exo_enable_adaptive_refresh",
-        "observer",
-        "自适应刷新",
-        "作用：持续不确定时自动触发自我提问与候选刷新。用途：让模型在推理中主动补充记忆。推荐值：开启。",
-        "boolean",
-        True,
     ),
     _setting(
         "qwen_exo_immediate_uncertainty_retrieval",
@@ -743,86 +559,6 @@ SERVICE_SETTINGS = (
         maximum=128,
         step=1,
         unit="tokens",
-    ),
-    _setting(
-        "qwen_exo_replay_observation_tokens",
-        "replay",
-        "观测窗口",
-        "作用：各回放分支共同评分的真实未来 token 数。推荐值：8。",
-        "integer",
-        8,
-        minimum=2,
-        maximum=128,
-        step=1,
-        unit="tokens",
-    ),
-    _setting(
-        "qwen_exo_replay_prefix_tokens",
-        "replay",
-        "父前缀长度",
-        "作用：回放分支复用的父请求前缀长度。推荐值：1024。",
-        "integer",
-        1024,
-        minimum=1,
-        maximum=16384,
-        step=128,
-        unit="tokens",
-    ),
-    _setting(
-        "qwen_exo_replay_max_candidates",
-        "replay",
-        "回放候选数",
-        "作用：一次因果回放允许比较的候选分支数。推荐值：2。",
-        "integer",
-        2,
-        minimum=1,
-        maximum=8,
-        step=1,
-    ),
-    _setting(
-        "qwen_exo_replay_reference_tokens",
-        "replay",
-        "参考内容预算",
-        "作用：一个回放候选注入的参考内容 token 上限。推荐值：128。",
-        "integer",
-        128,
-        minimum=1,
-        maximum=4096,
-        step=1,
-        unit="tokens",
-    ),
-    _setting(
-        "qwen_exo_replay_minimum_gain",
-        "replay",
-        "最小增益",
-        "作用：候选分支优于基线所需的最低损失增益。推荐值：0.02。",
-        "number",
-        0.02,
-        minimum=0,
-        maximum=10,
-        step=0.005,
-    ),
-    _setting(
-        "qwen_exo_replay_switch_margin",
-        "replay",
-        "切换增益",
-        "作用：替换当前候选所需的额外损失增益。推荐值：0.05。",
-        "number",
-        0.05,
-        minimum=0,
-        maximum=10,
-        step=0.005,
-    ),
-    _setting(
-        "qwen_exo_replay_maybe_kl_cap",
-        "replay",
-        "分布差异上限",
-        "作用：试探性准入接受的选中 token 分布差异上限。推荐值：4.0。",
-        "number",
-        4.0,
-        minimum=0,
-        maximum=100,
-        step=0.1,
     ),
     _setting(
         "qwen_exo_score_bias_mode",
@@ -1015,7 +751,7 @@ SERVICE_SETTINGS = (
         "qwen_exo_console_trace_default_scope",
         "privacy",
         "召回轨迹默认范围",
-        "召回轨迹控制台的默认显示范围：记忆活动保留知识/策略注入或 Self-Ask 请求，仅实际召回进一步排除仅 Self-Ask 请求，全部请求包含无召回事件。推荐值：记忆活动。",
+        "召回轨迹控制台的默认显示范围：记忆活动保留调用过记忆工具或有内部活动的请求，仅实际召回只保留调用过记忆工具的请求，全部请求包含其余请求。推荐值：记忆活动。",
         "string",
         "activity",
         choices=("activity", "actual", "all"),
@@ -1026,20 +762,10 @@ SERVICE_SETTINGS = (
         },
     ),
     _setting(
-        "qwen_exo_context_evidence_mode",
-        "post_tool_evidence",
-        "工具后上下文证据",
-        "作用：外部知识与 PolicyData 均未通过语义准入时，审查最新工具结果；启用时只把明确回答问题的直接观察作为当前请求的临时证据。默认启用。",
-        "string",
-        "active",
-        choices=("off", "active"),
-        choice_labels={"off": "关闭", "active": "启用"},
-    ),
-    _setting(
         "qwen_exo_reflection_memory_mode",
         "reflection_memory",
         "反思记忆",
-        "作用：工具轨迹空闲达到门限后，先用 Q×K 检索已有反思，再由模型研判是更新同一记忆还是插入新记忆；最终热写入知识库并原地重建 Tensor Bank。聊天和内部任务不会触发。默认启用。",
+        "作用：工具轨迹空闲达到门限后，由模型从轨迹提炼可复用经验，作为文本记忆写入知识库 reflection-memory/ 目录，模型可用记忆工具检索。聊天和内部任务不会触发。默认启用。",
         "string",
         "active",
         choices=("off", "active"),
@@ -1061,7 +787,7 @@ SERVICE_SETTINGS = (
         "qwen_exo_reflection_memory_min_events",
         "reflection_memory",
         "最少工具事件",
-        "作用：防止普通聊天或过短轨迹进入反思；必须有至少这么多外部工具结果。内部 Self-Ask、Judge、压缩和 Bank 任务不计入。默认 3。",
+        "作用：防止普通聊天或过短轨迹进入反思；必须有至少这么多外部工具结果。内部压缩、反思等任务不计入。默认 3。",
         "integer",
         3,
         minimum=2,
@@ -1135,14 +861,6 @@ SERVICE_SETTINGS = (
 
 _SETTINGS_BY_KEY = {setting.key: setting for setting in SERVICE_SETTINGS}
 
-# Context Integrity controls are intentionally CLI-only and experimental; they
-# are preserved in launch arguments but omitted from managed service settings.
-_SHADOW_TO_ACTIVE_KEYS = frozenset(
-    {
-        "qwen_exo_qk_prefilter_mode",
-        "qwen_exo_context_evidence_mode",
-    }
-)
 _DEFAULT_CHAT_TEMPLATE_FLAG = "--default-chat-template-kwargs"
 _DEFAULT_CHAT_TEMPLATE_SETTINGS = {
     "default_enable_thinking": "enable_thinking",
@@ -1214,36 +932,11 @@ def _validate_runtime_contract(values: dict[str, Any]) -> None:
             "Prefill 批量上限不能大于上下文长度",
             field="max_prefill_tokens",
         )
-    max_compilable_document_tokens = values["context_length"] - 2048
-    if max_compilable_document_tokens < 64:
-        raise ServiceConfigError(
-            "invalid_relation",
-            "上下文长度必须至少容纳 2048 token 预留和一个 64-token Radix 页",
-            field="context_length",
-        )
-    if (
-        values["qwen_exo_tensor_bank_max_document_tokens"]
-        > max_compilable_document_tokens
-    ):
-        raise ServiceConfigError(
-            "invalid_relation",
-            "文档长度上限不得大于上下文长度减 2048 token",
-            field="qwen_exo_tensor_bank_max_document_tokens",
-        )
-    if values["qwen_exo_tensor_bank_salient_token_budget"] % 64:
-        raise ServiceConfigError(
-            "invalid_alignment",
-            "显著片段预算必须按 64 token 对齐",
-            field="qwen_exo_tensor_bank_salient_token_budget",
-        )
 
     flags = QwenExoFeatureFlags(
         hybrid_prefix=values["qwen_exo_enable_hybrid_prefix"],
-        external_memory=values["qwen_exo_enable_external_memory"],
-        reference_judge=values["qwen_exo_enable_reference_judge"],
         capsule=values["qwen_exo_enable_capsule"],
         observer=values["qwen_exo_observer_mode"] != "off",
-        adaptive_refresh=values["qwen_exo_enable_adaptive_refresh"],
         policy_data=values["qwen_exo_enable_policy_data"],
         score_bias=values["qwen_exo_score_bias_mode"] != "off",
         activation_training=bool(
@@ -1257,11 +950,8 @@ def _validate_runtime_contract(values: dict[str, Any]) -> None:
     }
     for key in (
         "enable_hybrid_prefix",
-        "enable_external_memory",
         "enable_policy_data",
-        "enable_reference_judge",
         "enable_capsule",
-        "enable_adaptive_refresh",
         "console_trace_default_scope",
     ):
         kwargs.pop(key, None)
@@ -1315,14 +1005,9 @@ def _migrate_persisted_values(raw_values: object) -> dict[str, Any]:
             known[current_key] = source[legacy_key]
     if has_legacy_reflection_memory:
         for key in (
-            "qwen_exo_qk_prefilter_mode",
-            "qwen_exo_context_evidence_mode",
             "qwen_exo_reflection_memory_mode",
             "qwen_exo_response_compaction_mode",
         ):
-            known[key] = "active"
-    for key in _SHADOW_TO_ACTIVE_KEYS:
-        if known.get(key) == "shadow":
             known[key] = "active"
     return validate_values({**default_values(), **known})
 

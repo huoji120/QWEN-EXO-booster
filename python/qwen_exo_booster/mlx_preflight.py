@@ -17,7 +17,6 @@ _REQUIRED_MODULES = (
     "torch",
     "sglang.srt.hardware_backend.mlx.model_runner",
     "sglang.srt.hardware_backend.mlx.qwen_exo",
-    "sglang.srt.hardware_backend.mlx.native_state_bank",
 )
 
 

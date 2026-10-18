@@ -86,8 +86,8 @@ export function CatalogPage({ status }: { status: RuntimeStatus | null }) {
       icon: Cpu,
     },
     {
-      label: "Native Tensor Bank",
-      active: Boolean(status?.internal_services?.tensor_bank),
+      label: t("记忆工具"),
+      active: Boolean(status?.internal_services?.memory_tools),
       icon: Database,
     },
     {

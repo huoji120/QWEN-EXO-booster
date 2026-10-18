@@ -32,7 +32,7 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   ],
   qwen_exo_max_internal_fanout: [
     "内部任务并发",
-    "限制语义准入、Self-Ask 等内部任务的并行度，防止后台负载挤占主请求调度资源；推荐 32。",
+    "限制反思记忆、上下文压缩、推理截断自问等后台任务的并行度，防止内部负载挤占主请求调度资源与 Mamba 状态槽；推荐 8。",
   ],
   qwen_exo_max_internal_tokens: [
     "内部任务 Token 预算",
@@ -82,73 +82,25 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
     "混合前缀状态",
     "同时管理 Full-Attention K/V 与 GDN 线性状态；QWEN-EXO 原生记忆必须开启，纯模型基线可关闭。",
   ],
-  qwen_exo_enable_external_memory: [
-    "知识库记忆",
-    "允许请求检索并恢复知识文档的原生状态；知识增强场景开启，无外部知识基线关闭。",
-  ],
   qwen_exo_enable_policy_data: [
     "策略数据",
     "允许策略文档以原生状态条件化工程行为；需要固定执行边界时开启，排查策略干扰时关闭。",
-  ],
-  qwen_exo_enable_reference_judge: [
-    "语义准入",
-    "对 Q×K 提出的候选执行语义相关性复核；生产建议开启，仅做低延迟检索实验时可关闭。",
   ],
   qwen_exo_enable_capsule: [
     "执行胶囊",
     "跨轮持久化粗粒度执行状态；长任务建议开启，单轮无状态问答可关闭。",
   ],
-  qwen_exo_max_candidates: [
-    "候选数量上限",
-    "定义每次检索进入后续准入的候选文档数；提高增强召回覆盖，降低减少语义审计耗时，推荐 8。",
-  ],
-  qwen_exo_qk_recall_preset: [
-    "Q×K 召回严格度",
-    "固定设置第一道 Q×K 门禁的分数与领先差距要求：高召回偏覆盖，标准保持平衡，高精度优先减少误召回。",
-  ],
-  qwen_exo_max_memory_tokens: [
-    "知识注入预算",
-    "限制单次请求允许准入的知识 token 总量；防止长文档挤占对话上下文，推荐 8192。",
-  ],
   qwen_exo_max_policy_tokens: [
     "策略注入预算",
     "限制策略文档对应的原生状态 token 预算；普通策略推荐 4096，不建议为容纳无关规则扩大。",
   ],
-  qwen_exo_qk_expansion_margin: [
-    "检索扩展边距",
-    "当前二名候选差距低于该值时扩大候选池重新排名；值越小越收敛，推荐 0.01。",
-  ],
-  qwen_exo_qk_only_knowledge: [
-    "仅原生 Q×K 检索",
-    "限制知识候选只能来自 Attention-Q × K 原生检索，关闭词法补充可提高一致性，但可能降低召回。",
-  ],
-  qwen_exo_tensor_bank_max_document_tokens: [
-    "文档编译长度上限",
-    "定义单份文档可编译入 Tensor Bank 的最大 token 数；普通文档推荐 4096，长轨迹实验才提高。",
-  ],
-  qwen_exo_tensor_bank_salient_token_budget: [
-    "显著片段预算",
-    "限制长文档保留为精确 K/V 的高信息 token 总量；提高可增强事实覆盖，降低可减少上下文占用。",
-  ],
-  qwen_exo_tensor_bank_surprisal_threshold: [
-    "显著度阈值",
-    "以模型惊奇度筛选高信息 token；提高只保留更罕见内容，降低会纳入更多普通片段，推荐 6.0。",
-  ],
-  qwen_exo_tensor_bank_span_tokens: [
-    "显著片段半径",
-    "定义每个高信息 token 保留的前后上下文宽度；半径越大语义越完整，但更容易超预算，推荐 16。",
-  ],
   qwen_exo_observer_mode: [
     "观测模式",
-    "定义解码期惊奇度与 Attention-Q 漂移的观测级别；主动干预可触发 Self-Ask，仅观测只记录，关闭最省开销。",
-  ],
-  qwen_exo_enable_adaptive_refresh: [
-    "自适应刷新",
-    "允许持续不确定时重新检索并语义审计候选；复杂代理任务建议开启，误触发较多时先调高观测门槛。",
+    "定义解码期惊奇度与 Attention-Q 漂移的观测级别，观测信号供注意力分数偏置使用；主动干预允许触发自我提问，仅观测只记录，关闭最省开销。",
   ],
   qwen_exo_immediate_uncertainty_retrieval: [
     "即时自我提问",
-    "观测命中后立即启动隐藏 Self-Ask；纠错速度优先时开启，内部请求过多时可关闭。",
+    "观测命中后立即启动隐藏的自我提问；纠错速度优先时开启，内部请求过多时可关闭。",
   ],
   qwen_exo_observer_surprisal_threshold: [
     "局部惊奇度阈值",
@@ -185,34 +137,6 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   qwen_exo_observer_recovery_tokens: [
     "恢复判定窗口",
     "定义触发后观察多少个未来 token 再判定不确定性恢复；较大更谨慎，较小更快进入纠错，推荐 8。",
-  ],
-  qwen_exo_replay_observation_tokens: [
-    "回放观测窗口",
-    "定义基线分支与候选分支共同评分的未来 token 数；越多比较越稳定，推荐 8。",
-  ],
-  qwen_exo_replay_prefix_tokens: [
-    "回放父前缀长度",
-    "定义回放分支复用的原请求前缀 token 数；上下文依赖强时提高，资源受限时降低，推荐 1024。",
-  ],
-  qwen_exo_replay_max_candidates: [
-    "回放候选数量",
-    "定义一次因果回放比较的最大候选分支数；每增加一份都会增加内部评分开销，推荐 2。",
-  ],
-  qwen_exo_replay_reference_tokens: [
-    "回放参考预算",
-    "限制每条回放分支注入的参考 token 数，避免长参考改变输出分布，推荐 128。",
-  ],
-  qwen_exo_replay_minimum_gain: [
-    "最小损失增益",
-    "要求候选分支相对基线的损失改善达到该值才视为有效；调高更保守，推荐 0.02。",
-  ],
-  qwen_exo_replay_switch_margin: [
-    "候选切换边际",
-    "要求新候选在已有胜出者基础上额外领先该幅度，避免微小噪声造成反复切换，推荐 0.05。",
-  ],
-  qwen_exo_replay_maybe_kl_cap: [
-    "分布差异上限",
-    "限制候选分支相对基线的 KL 差异，防止强干预造成分布失真，推荐 4.0。",
   ],
   qwen_exo_score_bias_mode: [
     "注意力控制模式",
@@ -266,10 +190,6 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
     "轨迹相关性边际",
     "要求最佳历史块至少领先后续候选该差值，避免在含糊候选之间强行选择，推荐 0.005。",
   ],
-  qwen_exo_context_evidence_mode: [
-    "工具后上下文证据",
-    "外部知识均未通过准入时，只让最新工具结果中的明确事实作为当前请求的临时证据；不能证实时不注入。",
-  ],
   qwen_exo_score_bias_anchor_bias: [
     "系统/工具锚点偏置",
     "对 system instructions 与工具 schema 的少量 token span 提供有界保护；默认 0.01，设为 0 才关闭。",
@@ -280,7 +200,7 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   ],
   qwen_exo_reflection_memory_mode: [
     "反思记忆",
-    "工具轨迹空闲后提炼可复用经验并热写入知识库；生成失败或证据不足时不写入。",
+    "工具轨迹空闲后提炼可复用经验，作为文本文件写入知识库 reflection-memory/ 目录，供记忆工具检索；生成失败或证据不足时不写入。",
   ],
   qwen_exo_response_compaction_mode: [
     "Responses 上下文压缩",
@@ -288,12 +208,12 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   ],
   qwen_exo_telemetry_text_mode: [
     "遥测原文记录",
-    "定义遥测事件保存请求、输出与 Self-Ask 原文的范围；仅编辑片段兼顾审计与体积，全量记录仅用于短期排障。",
+    "定义遥测事件保存请求与输出原文的范围；仅编辑片段兼顾审计与体积，全量记录仅用于短期排障。",
   ],
 
   qwen_exo_console_trace_default_scope: [
     "召回轨迹默认范围",
-    "定义召回轨迹控制台的默认显示范围：记忆活动保留注入或 Self-Ask 请求，仅实际召回更严格，全部请求用于完整审计。",
+    "定义召回轨迹控制台的默认显示范围：记忆活动保留调用过记忆工具或有内部活动的请求，仅实际召回只保留调用过记忆工具的请求，全部请求用于完整审计。",
   ],
 
   qwen_exo_activation_editor_strength: [

@@ -2952,34 +2952,10 @@ class ServerArgs:
         int,
         "Maximum generation tokens reserved for all internal child jobs of one request.",
     ] = 12288
-    qwen_exo_max_candidates: A[
-        int,
-        "Initial candidates per QWEN-EXO source lane; all non-weak native Attention-Q/K candidates are judged, with one bounded rejection-expansion wave.",
-    ] = 8
-    qwen_exo_max_memory_tokens: A[
-        int,
-        "Maximum fallback private-memory tokens when native state is unavailable.",
-    ] = 8192
     qwen_exo_max_policy_tokens: A[
         int,
         "Maximum semantically eligible PolicyData tokens attached to one user request.",
     ] = 4096
-    qwen_exo_tensor_bank_max_document_tokens: A[
-        int,
-        "Maximum source tokens compiled into one QWEN-EXO document state; must not exceed context length minus 2048.",
-    ] = 100352
-    qwen_exo_tensor_bank_salient_token_budget: A[
-        int,
-        "Hard aligned Full-Attention K/V token reservation for one document's native prefix.",
-    ] = 4096
-    qwen_exo_tensor_bank_surprisal_threshold: A[
-        float,
-        "Teacher-forced token surprisal threshold for native document spans.",
-    ] = 6.0
-    qwen_exo_tensor_bank_span_tokens: A[
-        int,
-        "Context span width retained around each high-surprisal document token.",
-    ] = 16
     qwen_exo_max_output_tokens: A[
         int,
         "Hard per-response output-token budget for QWEN-EXO user requests.",
@@ -3034,13 +3010,6 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
     ] = True
-    qwen_exo_enable_external_memory: A[
-        bool,
-        Arg(
-            help="Enable the isolated QWEN-EXO external knowledge-memory namespace.",
-            action=argparse.BooleanOptionalAction,
-        ),
-    ] = True
     qwen_exo_enable_policy_data: A[
         bool,
         Arg(
@@ -3048,111 +3017,6 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
     ] = True
-    qwen_exo_enable_reference_judge: A[
-        bool,
-        Arg(
-            help="Enable scheduler-native shared-prefix reference judge jobs.",
-            action=argparse.BooleanOptionalAction,
-        ),
-    ] = True
-    qwen_exo_qk_only_knowledge: A[
-        bool,
-        Arg(
-            help=(
-                "Admit Knowledge only from native Attention-Q/K candidates "
-                "without a semantic Judge."
-            ),
-            action=argparse.BooleanOptionalAction,
-        ),
-    ] = False
-    qwen_exo_qk_recall_preset: A[
-        str,
-        Arg(
-            help="QWEN-EXO Attention-Q/K recall strictness preset.",
-            choices=["broad", "balanced", "strict"],
-        ),
-    ] = "balanced"
-    qwen_exo_qk_prefilter_mode: A[
-        str,
-        Arg(
-            help=(
-                "QWEN-EXO Q/K prefilter mode before the Semantic Judge. "
-                "active skips weak candidates with no restoration evidence."
-            ),
-            choices=["off", "active"],
-        ),
-    ] = "active"
-    qwen_exo_qk_prefilter_min_score: A[
-        Optional[float],
-        (
-            "Minimum top Q/K raw score before the Semantic Judge is skipped. "
-            "Defaults to the active qwen_exo_qk_recall_preset score gate."
-        ),
-    ] = None
-    qwen_exo_qk_prefilter_min_margin: A[
-        Optional[float],
-        (
-            "Minimum top1/top2 Q/K raw score margin before the Semantic Judge "
-            "is skipped. Defaults to the recall preset margin and "
-            "qwen_exo_qk_expansion_margin."
-        ),
-    ] = None
-    qwen_exo_qk_max_candidates_per_document: A[
-        int,
-        (
-            "Maximum same-document page candidates admitted to the Semantic "
-            "Judge shortlist; the best page is always kept first."
-        ),
-    ] = 1
-    qwen_exo_qk_layer: A[
-        Optional[int],
-        (
-            "Full-attention layer whose raw Q and K drive QWEN-EXO Q/K recall. "
-            "Defaults to the final full-attention layer. Must name a "
-            "full-attention layer of the served hybrid model; CUDA only."
-        ),
-    ] = None
-    qwen_exo_qk_query_heads: A[
-        Optional[str],
-        (
-            "Comma-separated query head ids restricted to Q/K recall scoring "
-            "(retrieval heads). Defaults to every head."
-        ),
-    ] = None
-    qwen_exo_qk_query_pooling: A[
-        str,
-        Arg(
-            help=(
-                "How the question is turned into attention queries for Q/K "
-                "recall: windows splits each role into short token windows "
-                "(default; measured best with final-layer K); sentence pools "
-                "one query per role over the whole text, for retrieval-layer "
-                "experiments."
-            ),
-            choices=["sentence", "windows"],
-        ),
-    ] = "windows"
-    qwen_exo_pmi_gate_mode: A[
-        str,
-        Arg(
-            help=(
-                "QWEN-EXO pointwise-mutual-information gate before the Semantic "
-                "Judge. active: score each shortlisted memory's rule-card head "
-                "with the target model under the question versus a neutral "
-                "question in one teacher-forced batch, and skip the judge when "
-                "no candidate exceeds --qwen-exo-pmi-gate-threshold. off: always "
-                "run the judge."
-            ),
-            choices=["off", "active"],
-        ),
-    ] = "off"
-    qwen_exo_pmi_gate_threshold: A[
-        float,
-        (
-            "Maximum PMI (mean log-prob gain per token) at which every shortlist "
-            "candidate is considered unrelated and the Semantic Judge is skipped."
-        ),
-    ] = 0.0
     qwen_exo_console_trace_default_scope: A[
         str,
         Arg(
@@ -3160,10 +3024,6 @@ class ServerArgs:
             choices=["activity", "actual", "all"],
         ),
     ] = "activity"
-    qwen_exo_qk_expansion_margin: A[
-        float,
-        "Expand QWEN-EXO Attention-Q/K candidates below this raw score margin.",
-    ] = 0.02
     qwen_exo_enable_capsule: A[
         bool,
         Arg(
@@ -3178,33 +3038,6 @@ class ServerArgs:
             choices=["off", "shadow", "active"],
         ),
     ] = "active"
-    qwen_exo_enable_adaptive_refresh: A[
-        bool,
-        Arg(
-            help="Allow observer triggers to schedule active retrieval refresh jobs.",
-            action=argparse.BooleanOptionalAction,
-        ),
-    ] = True
-    qwen_exo_context_evidence_mode: A[
-        str,
-        Arg(
-            help=(
-                "Check request-local post-tool observations after external "
-                "QWEN-EXO references are rejected."
-            ),
-            choices=["off", "active"],
-        ),
-    ] = "active"
-    qwen_exo_experimental_context_integrity: A[
-        bool,
-        Arg(
-            help=(
-                "Enable experimental QWEN-EXO Context Integrity checks. "
-                "Disabled by default."
-            ),
-            action=argparse.BooleanOptionalAction,
-        ),
-    ] = False
     qwen_exo_engram_path: A[
         Optional[str],
         Arg(
@@ -3217,21 +3050,6 @@ class ServerArgs:
             ),
         ),
     ] = None
-    qwen_exo_context_integrity_mode: A[
-        str,
-        Arg(
-            help=(
-                "Let the model review recent tool context. This experimental "
-                "mode is effective only with "
-                "--qwen-exo-experimental-context-integrity."
-            ),
-            choices=["off", "active"],
-        ),
-    ] = "active"
-    qwen_exo_context_integrity_context_divisor: A[
-        int,
-        "Divide the model context length by this value for Context Integrity Check input.",
-    ] = 3
     qwen_exo_reflection_memory_mode: A[
         str,
         Arg(
@@ -3456,34 +3274,6 @@ class ServerArgs:
         "inject this many short concrete self-check questions before the "
         "stop-and-go boundary. 0 disables the questions (plain cutoff).",
     ] = 3
-    qwen_exo_replay_observation_tokens: A[
-        int,
-        "Real future reasoning tokens scored by causal replay.",
-    ] = 8
-    qwen_exo_replay_prefix_tokens: A[
-        int,
-        "Recent parent prefix tokens replayed in each counterfactual branch.",
-    ] = 1024
-    qwen_exo_replay_max_candidates: A[
-        int,
-        "Maximum semantically eligible replay challengers per event.",
-    ] = 2
-    qwen_exo_replay_reference_tokens: A[
-        int,
-        "Maximum selected source tokens compiled into one replay branch.",
-    ] = 128
-    qwen_exo_replay_minimum_gain: A[
-        float,
-        "Minimum candidate NLL gain over the baseline branch.",
-    ] = 0.02
-    qwen_exo_replay_switch_margin: A[
-        float,
-        "Minimum NLL gain required to switch an active candidate.",
-    ] = 0.05
-    qwen_exo_replay_maybe_kl_cap: A[
-        float,
-        "Maximum selected-token KL accepted by the Maybe gate.",
-    ] = 4.0
     qwen_exo_telemetry_include_text: A[
         bool,
         Arg(
@@ -4164,41 +3954,6 @@ class ServerArgs:
                 "QWEN-EXO MLX requires --device mps on Apple Silicon; "
                 f"received {self.device!r}"
             )
-        if (
-            self.qwen_exo_enable_adaptive_refresh
-            and self.qwen_exo_observer_mode != "active"
-        ):
-            raise ValueError(
-                "--qwen-exo-enable-adaptive-refresh requires "
-                "--qwen-exo-observer-mode active"
-            )
-        if (
-            self.qwen_exo_context_evidence_mode != "off"
-            and not self.qwen_exo_enable_adaptive_refresh
-        ):
-            raise ValueError(
-                "--qwen-exo-context-evidence-mode requires "
-                "--qwen-exo-enable-adaptive-refresh"
-            )
-        if (
-            self.qwen_exo_context_integrity_mode != "off"
-            and not self.qwen_exo_enable_adaptive_refresh
-        ):
-            raise ValueError(
-                "--qwen-exo-context-integrity-mode requires "
-                "--qwen-exo-enable-adaptive-refresh"
-            )
-        if self.qwen_exo_context_integrity_context_divisor < 2:
-            raise ValueError(
-                "--qwen-exo-context-integrity-context-divisor must be at least 2"
-            )
-        if self.qwen_exo_reflection_memory_mode != "off" and not (
-            self.qwen_exo_enable_external_memory
-        ):
-            raise ValueError(
-                "--qwen-exo-reflection-memory-mode requires "
-                "--qwen-exo-enable-external-memory"
-            )
         if self.qwen_exo_reflection_memory_idle_seconds < 60:
             raise ValueError(
                 "--qwen-exo-reflection-memory-idle-seconds must be at least 60"
@@ -4239,13 +3994,6 @@ class ServerArgs:
                 "--qwen-exo-reflection-memory-max-output-tokens multiplied by "
                 "--qwen-exo-reflection-memory-max-attempts cannot exceed "
                 "--qwen-exo-max-internal-tokens"
-            )
-        if self.qwen_exo_response_compaction_mode != "off" and not (
-            self.qwen_exo_enable_external_memory
-        ):
-            raise ValueError(
-                "--qwen-exo-response-compaction-mode requires "
-                "--qwen-exo-enable-external-memory"
             )
         if self.qwen_exo_response_compaction_max_history_tokens < 1024:
             raise ValueError(

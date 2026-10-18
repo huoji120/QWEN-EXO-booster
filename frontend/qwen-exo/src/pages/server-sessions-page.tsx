@@ -213,7 +213,7 @@ export function ServerSessionsPage() {
   }
 
   const scope = t(
-    "删除会移除诊断与重新反思的保存来源证据；不会删除已发布 Knowledge/Reflection、人格、Tensor Bank 或浏览器聊天记录。忙碌会话会被跳过。",
+    "删除会移除诊断与重新反思的保存来源证据；不会删除已发布 Knowledge/Reflection、人格或浏览器聊天记录。忙碌会话会被跳过。",
   );
 
   return (

@@ -169,9 +169,7 @@ def main() -> int:
     args = parser.parse_args()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     status = get_json(f"{args.base_url}/qwen-exo/status", args.timeout)
-    model_fingerprint = str(
-        (status.get("tensor_bank") or {}).get("model_fingerprint") or ""
-    )
+    model_fingerprint = str((status.get("model") or {}).get("fingerprint") or "")
 
     questions = IDENTITY_QUESTIONS + NEUTRAL_QUESTIONS
     pairs: list[dict[str, Any]] = []

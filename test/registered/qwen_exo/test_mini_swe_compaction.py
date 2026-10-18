@@ -397,35 +397,3 @@ def test_stage_unbounded_agent_task_removes_nested_agent_deadlines(tmp_path):
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
 
-
-def test_runtime_reset_waits_for_base_health(monkeypatch, capsys):
-    calls = []
-    health_attempts = 0
-
-    def fake_request(url, method, *, timeout=30):
-        nonlocal health_attempts
-        calls.append((url, method, timeout))
-        if url.endswith("/health"):
-            health_attempts += 1
-            if health_attempts == 1:
-                raise TimeoutError("warmup still running")
-            return ""
-        if url.endswith("/flush_cache"):
-            return "Cache flushed."
-        return '{"status":"cleared"}'
-
-    monkeypatch.setattr(runner, "_request", fake_request)
-    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
-
-    runner._reset_runtime("http://runtime/")
-
-    assert calls == [
-        ("http://runtime/health", "GET", 10),
-        ("http://runtime/health", "GET", 10),
-        ("http://runtime/flush_cache", "POST", 120),
-        ("http://runtime/qwen-exo/recall-trace", "DELETE", 30),
-    ]
-    assert capsys.readouterr().out.splitlines() == [
-        "Cache flushed.",
-        '{"status":"cleared"}',
-    ]

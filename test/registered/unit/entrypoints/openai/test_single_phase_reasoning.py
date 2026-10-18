@@ -154,11 +154,11 @@ def run_generation(outputs, rid, *, runtime=None, response_request=None, output_
 def tier_config(**overrides):
     return QwenExoConfig(
         state_directory=Path("."), knowledge_directory=Path("."),
-        max_internal_fanout=8, max_internal_tokens=4096, max_candidates=8,
-        max_memory_tokens=256, observer_mode="off",
+        max_internal_fanout=8, max_internal_tokens=4096,
+        observer_mode="off",
         feature_flags=QwenExoFeatureFlags(
-            hybrid_prefix=True, external_memory=False, reference_judge=False,
-            capsule=False, observer=False, adaptive_refresh=False,
+            hybrid_prefix=True,
+            capsule=False, observer=False,
         ),
         model_path="model", tp_size=1, **overrides,
     )

@@ -130,18 +130,6 @@ class TestExperimentalActivationTrainingArgs(CustomTestCase):
         self.assertTrue(enabled.qwen_exo_experimental_activation_training)
 
 
-class TestExperimentalContextIntegrityArgs(CustomTestCase):
-    def test_experimental_context_integrity_defaults_off_and_can_be_enabled(self):
-        default_args = ServerArgs(model_path="dummy")
-        self.assertFalse(default_args.qwen_exo_experimental_context_integrity)
-
-        enabled = ServerArgs(
-            model_path="dummy",
-            qwen_exo_experimental_context_integrity=True,
-        )
-        self.assertTrue(enabled.qwen_exo_experimental_context_integrity)
-
-
 class TestMultimodalFeatureTransport(CustomTestCase):
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):

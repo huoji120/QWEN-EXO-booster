@@ -1030,19 +1030,11 @@ class Scheduler(
             BackgroundPrefillFairness() if self.server_args.enable_qwen_exo else None
         )
         self._install_qwen_exo_cache_lifecycle()
-        if self.server_args.enable_qwen_exo:
-            if use_mlx():
-                from sglang.srt.hardware_backend.mlx.native_state_bank import (
-                    MlxNativeStateBankManager,
-                )
-
-                self.qwen_exo_native_state_bank = (
-                    MlxNativeStateBankManager.from_scheduler(self)
-                )
-            else:
-                self.qwen_exo_native_state_bank = NativeStateBankManager.from_scheduler(
-                    self
-                )
+        # The native bank holds session-initial GDN state (CUDA only).
+        if self.server_args.enable_qwen_exo and not use_mlx():
+            self.qwen_exo_native_state_bank = NativeStateBankManager.from_scheduler(
+                self
+            )
         else:
             self.qwen_exo_native_state_bank = None
         self.forward_sleep_time = None

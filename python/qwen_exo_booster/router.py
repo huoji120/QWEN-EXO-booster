@@ -11,7 +11,6 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
-    HTMLResponse,
     JSONResponse,
     StreamingResponse,
 )
@@ -37,7 +36,6 @@ from qwen_exo_booster.server_sessions import ServerSessionStore
 from qwen_exo_booster.config import PROJECT_NAME
 from qwen_exo_booster.contracts import ATTENTION_DIAGNOSTIC_MAX_LAYERS
 from qwen_exo_booster.model_catalog import ModelCatalogError, ModelCatalogStore
-from qwen_exo_booster.recall_visualization import render_recall_trace_html
 from qwen_exo_booster.runtime import QwenExoRuntimeState
 from qwen_exo_booster.service_config import (
     ServiceConfigError,
@@ -45,7 +43,6 @@ from qwen_exo_booster.service_config import (
     request_managed_restart,
 )
 from qwen_exo_booster.tags import TagValidationError, normalize_tags
-from qwen_exo_booster.tensor_bank import TensorBankCompileError
 from qwen_exo_booster.trajectory_store import (
     TrajectoryStore,
     TrajectoryStoreError,
@@ -151,10 +148,6 @@ class ServerSessionDeleteRequest(BaseModel):
         return self
 
 
-class QKRankPreviewRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=8192)
-    limit: int = Field(default=8, ge=1, le=64)
-    pooling: Literal["sentence", "windows"] | None = None
 
 
 class AttentionPreviewRequest(BaseModel):
@@ -210,16 +203,6 @@ async def workspace_asset(asset_path: str):
         raise HTTPException(status_code=404, detail="未找到控制台资源")
     return FileResponse(
         candidate, headers={"Cache-Control": "public, max-age=31536000, immutable"}
-    )
-
-
-@compat_router.get("/recall-trace", include_in_schema=False)
-async def recall_trace_console(request: Request):
-    payload = await asyncio.to_thread(_runtime(request).recall_trace, max_turns=10)
-    html = await asyncio.to_thread(render_recall_trace_html, payload)
-    return HTMLResponse(
-        html,
-        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -425,18 +408,6 @@ async def request_traces(
     return await asyncio.to_thread(runtime.request_traces, limit=limit, query=q)
 
 
-@router.get("/recall-trace")
-async def recall_trace(request: Request, limit: int = Query(default=10, ge=1, le=100)):
-    return await asyncio.to_thread(_runtime(request).recall_trace, max_turns=limit)
-
-
-@compat_router.get("/v1/recall-trace", include_in_schema=False)
-async def recall_trace_compat(
-    request: Request, limit: int = Query(default=10, ge=1, le=100)
-):
-    return await asyncio.to_thread(_runtime(request).recall_trace, max_turns=limit)
-
-
 @router.get("/server-sessions")
 async def list_server_sessions(
     request: Request,
@@ -456,12 +427,6 @@ async def delete_server_sessions(payload: ServerSessionDeleteRequest, request: R
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@compat_router.delete("/v1/recall-trace", include_in_schema=False)
-@router.delete("/recall-trace")
-async def clear_recall_trace(request: Request):
-    return await _runtime(request).clear_recall_trace()
 
 
 @router.get("/attention-diagnostics/conversations")
@@ -738,6 +703,19 @@ async def read_knowledge_file(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/memory-tool-calls")
+async def memory_tool_calls(
+    request: Request,
+    request_id: str | None = Query(default=None, max_length=256),
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    """Server-executed memory tool calls: full text for one request, or the
+    most recent calls (without output) when no request id is given."""
+    return await asyncio.to_thread(
+        _runtime(request).memory_tool_calls, request_id, limit
+    )
+
+
 @router.get("/knowledge/index")
 async def knowledge_index(request: Request):
     runtime = _runtime(request)
@@ -763,10 +741,7 @@ async def list_policy_data(
             runtime.config.feature_flags.policy_data
             and getattr(runtime.policy_data.snapshot, "documents", ())
         ),
-        "semantic_eligibility_required": False,
-        "qk_relevance_required": False,
-        "reference_judge_required": False,
-        "route": "attention_q_native_tensor_bank",
+        "route": "text_instructions",
         "max_tokens": runtime.config.max_policy_tokens,
     }
 
@@ -1208,19 +1183,6 @@ async def regenerate_reflection_memory(
         raise HTTPException(status_code=409, detail=str(exc))
 
 
-@router.get("/reflection-memory/organize")
-async def reflection_memory_organization_status(request: Request):
-    return _runtime(request).reflection_memory_organization_status()
-
-
-@router.post("/reflection-memory/organize", status_code=202)
-async def start_reflection_memory_organization(request: Request):
-    try:
-        return _runtime(request).start_reflection_memory_organization()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-
-
 @router.get("/reflection-memory/pending")
 async def list_pending_reflection_memories(request: Request):
     return {"pending": _runtime(request).pending_reflection_memories()}
@@ -1271,37 +1233,9 @@ async def delete_source_documents(payload: SourceSelectionRequest, request: Requ
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@router.post("/sources/compile")
-async def compile_source_documents(payload: SourceSelectionRequest, request: Request):
-    try:
-        return await _runtime(request).compile_source_documents(
-            payload.lane, payload.relative_paths
-        )
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="选中的文档不存在")
-    except TensorBankCompileError as exc:
-        return JSONResponse(status_code=422, content={"detail": exc.public_dict()})
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-
-
 @router.post("/policydata/reindex")
 async def reindex_policy_data(request: Request):
     return _runtime(request).reindex_policy_data()
-
-
-@router.post("/tensor-bank/reindex")
-async def reindex_tensor_bank(request: Request):
-    runtime = _runtime(request)
-    if runtime.tensor_bank is None:
-        raise HTTPException(status_code=409, detail="Native Tensor Bank is disabled")
-    try:
-        return await runtime.reindex_tensor_bank()
-    except TensorBankCompileError as error:
-        return JSONResponse(
-            status_code=422,
-            content={"detail": error.public_dict()},
-        )
 
 
 @router.get("/policydata/{relative_path:path}")
@@ -1311,22 +1245,6 @@ async def get_policy_data(relative_path: str, request: Request):
         return runtime.policy_data_document(relative_path)
     except KeyError:
         raise HTTPException(status_code=404, detail="未找到 PolicyData 文档")
-
-
-@router.post("/tensor-bank/rank-preview")
-async def preview_qk_rank(payload: QKRankPreviewRequest, request: Request):
-    """Run the query probe and Q/K ranking for one question (evaluation)."""
-    runtime = _runtime(request)
-    try:
-        return await runtime.preview_qk_rank(
-            payload.question, limit=payload.limit, pooling=payload.pooling
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-
-
 
 
 @router.put("/policydata/{relative_path:path}")

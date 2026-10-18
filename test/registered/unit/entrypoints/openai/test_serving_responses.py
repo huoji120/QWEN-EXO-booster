@@ -393,48 +393,6 @@ class InputItemNormalizationTestCase(unittest.TestCase):
             },
         )
 
-    def test_memory_attachment_renders_last_and_stays_out_of_stored_history(self):
-        """Retrieved memory is a trailing tool message, and only for this turn.
-
-        Position matters twice over: the Qwen template refuses a system message
-        anywhere but position 0, and a leading system message is the prompt's
-        cached prefix, so knowledge placed there re-prefills the whole
-        conversation whenever retrieval changes its mind. It must also stay out
-        of the stored history, or a ``previous_response_id`` chain replays it
-        forever and the context accumulates every document ever retrieved.
-        """
-        serving = make_serving()
-        request = ResponsesRequest(
-            model="x",
-            instructions="Be terse.",
-            input=[
-                {"role": "user", "content": "what broke?"},
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_1",
-                    "output": "exit 1",
-                },
-            ],
-            store=False,
-        )
-
-        with_memory = serving._construct_input_messages(
-            request, memory_attachment="<memory>rule card</memory>"
-        )
-        without_memory = serving._construct_input_messages(request)
-
-        self.assertEqual(
-            with_memory[-1],
-            {
-                "role": "tool",
-                "tool_call_id": "qwen_exo_memory",
-                "content": "<memory>rule card</memory>",
-            },
-        )
-        # Everything before the attachment renders identically, so the prompt
-        # prefix that precedes it stays reusable.
-        self.assertEqual(with_memory[:-1], without_memory)
-
     def test_developer_role_becomes_system(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {"role": "developer", "content": "Be terse."}

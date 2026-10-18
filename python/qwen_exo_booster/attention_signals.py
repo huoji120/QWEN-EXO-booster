@@ -86,7 +86,6 @@ class AttentionBatchMetadata:
     user_query_spans: tuple[tuple[TrajectorySpan, ...] | None, ...] = ()
     anchor_spans: tuple[tuple[TrajectorySpan, ...] | None, ...] = ()
     persisted_user_queries: tuple[tuple[tuple[float, ...], ...] | None, ...] = ()
-    full_query_capture: tuple[bool, ...] = ()
     final_prefill_mask: tuple[bool, ...] | None = None
     extend_lens: tuple[int, ...] | None = None
     prefix_lens: tuple[int, ...] | None = None
@@ -144,7 +143,6 @@ class AttentionSignalTracker:
         score_bias_anchor_bias: float = 0.0,
         score_bias_anchor_drift_threshold: float = 0.35,
         score_bias_anchor_max_blocks: int = 2,
-        capture_full_queries: bool = True,
     ):
         self.num_heads = int(num_heads)
         self.num_kv_heads = int(num_kv_heads)
@@ -159,7 +157,6 @@ class AttentionSignalTracker:
         self.max_requests = int(max_requests)
         # False when a dedicated probe tracker on another layer owns the full
         # Q-head capture; the final-layer tracker then leaves that key alone.
-        self.capture_full_queries = bool(capture_full_queries)
         self.max_memory_anchors = int(max_memory_anchors)
         if sketch_dimensions < 1:
             raise ValueError("Q sketch dimensions must be positive")
@@ -204,9 +201,6 @@ class AttentionSignalTracker:
         ] = OrderedDict()
         self._user_queries: OrderedDict[str, tuple[torch.Tensor, ...]] = OrderedDict()
         self._user_query_sums: OrderedDict[
-            tuple[str, int], tuple[torch.Tensor, int]
-        ] = OrderedDict()
-        self._full_user_query_sums: OrderedDict[
             tuple[str, int], tuple[torch.Tensor, int]
         ] = OrderedDict()
         self._trajectory_shortlists: OrderedDict[
@@ -920,7 +914,6 @@ class AttentionSignalTracker:
         selected_rows: list[int] = []
         q_indices: list[int] = []
         prefill_key_sketches: dict[int, torch.Tensor] = {}
-        full_user_queries = None
         if metadata.is_decode:
             selected_rows = list(range(min(len(metadata.rids), q_view.shape[0])))
             q_indices = selected_rows[:]
@@ -936,11 +929,6 @@ class AttentionSignalTracker:
             )
             prefill_key_sketches = self._capture_prefill_keys(k, metadata, final_mask)
             user_query_sketches = self._capture_user_queries(q, metadata, final_mask)
-            full_user_queries = (
-                self._capture_full_user_queries(q, metadata, final_mask)
-                if self.capture_full_queries
-                else None
-            )
             offset = 0
             for row, extend_len in enumerate(
                 metadata.extend_lens[: len(metadata.rids)]
@@ -1019,8 +1007,6 @@ class AttentionSignalTracker:
             result["qwen_exo_trajectory_k_sketch"] = trajectory_key_sketches
         if metadata.is_extend and user_query_sketches is not None:
             result["qwen_exo_user_query_sketch"] = user_query_sketches
-        if metadata.is_extend and full_user_queries is not None:
-            result["qwen_exo_user_query_full_heads"] = full_user_queries
         return result
 
     def _capture_prefill_keys(
@@ -1235,110 +1221,6 @@ class AttentionSignalTracker:
         while len(self._user_queries) > self.max_requests:
             stale, _queries = self._user_queries.popitem(last=False)
             self._trajectory_shortlists.pop(stale, None)
-        return output
-
-    def capture_full_user_queries(
-        self,
-        q: torch.Tensor,
-        metadata: AttentionBatchMetadata,
-    ) -> dict[str, torch.Tensor] | None:
-        """Probe-only entry: mean-pooled full Q heads per query span.
-
-        Used by a tracker on the configured Q/K recall layer, including the
-        final layer when observation is disabled. It performs none of the
-        observer or score-bias work of :meth:`observe`.
-        """
-        if not metadata.is_extend or not metadata.rids or not metadata.extend_lens:
-            return None
-        final_mask = metadata.final_prefill_mask or tuple(
-            metadata.contains_last_prefill_chunk for _ in metadata.rids
-        )
-        captured = self._capture_full_user_queries(q, metadata, final_mask)
-        if captured is None:
-            return None
-        return {"qwen_exo_user_query_full_heads": captured}
-
-    def _capture_full_user_queries(
-        self,
-        q: torch.Tensor,
-        metadata: AttentionBatchMetadata,
-        final_mask: tuple[bool, ...],
-    ) -> torch.Tensor | None:
-        if (
-            not metadata.extend_lens
-            or metadata.prefix_lens is None
-            or not any(metadata.full_query_capture)
-        ):
-            return None
-        max_spans = min(
-            8,
-            max((len(spans or ()) for spans in metadata.user_query_spans), default=0),
-        )
-        if max_spans < 1:
-            return None
-        row_count = len(metadata.rids)
-        output = q.new_full(
-            (row_count, max_spans, self.total_num_heads, self.head_dim),
-            float("nan"),
-            dtype=torch.float32,
-        )
-        q_view = q.reshape(-1, self.num_heads, self.head_dim)
-        offset = 0
-        for row, extend_len in enumerate(metadata.extend_lens[:row_count]):
-            extend_len = int(extend_len)
-            if (
-                row >= len(metadata.full_query_capture)
-                or not metadata.full_query_capture[row]
-            ):
-                offset += extend_len
-                continue
-            prefix_len = int(metadata.prefix_lens[row])
-            spans = (
-                metadata.user_query_spans[row]
-                if row < len(metadata.user_query_spans)
-                else None
-            )
-            for span_index, span in enumerate((spans or ())[:max_spans]):
-                span_start, span_end = int(span[0]), int(span[1])
-                overlap_start = max(span_start, prefix_len)
-                overlap_end = min(span_end, prefix_len + extend_len)
-                key = (metadata.rids[row], span_index)
-                if overlap_start < overlap_end:
-                    local_start = offset + overlap_start - prefix_len
-                    local_end = offset + overlap_end - prefix_len
-                    chunk_sum = q_view[local_start:local_end].sum(
-                        dim=0, dtype=torch.float32
-                    )
-                    previous = self._full_user_query_sums.get(key)
-                    total_sum = (
-                        chunk_sum if previous is None else previous[0] + chunk_sum
-                    )
-                    total_tokens = (
-                        overlap_end - overlap_start
-                        if previous is None
-                        else previous[1] + overlap_end - overlap_start
-                    )
-                    self._full_user_query_sums[key] = (
-                        total_sum.detach(),
-                        total_tokens,
-                    )
-                if row < len(final_mask) and final_mask[row]:
-                    captured = self._full_user_query_sums.pop(key, None)
-                    if captured is not None and captured[1] == span_end - span_start:
-                        heads = captured[0] / max(captured[1], 1)
-                        if self.gather_heads_across_tp is not None:
-                            heads = self.gather_heads_across_tp(heads.contiguous())
-                        if tuple(heads.shape) != (
-                            self.total_num_heads,
-                            self.head_dim,
-                        ):
-                            raise RuntimeError(
-                                "Full Q-head capture returned an invalid TP shape"
-                            )
-                        output[row, span_index].copy_(heads)
-            offset += extend_len
-        while len(self._full_user_query_sums) > self.max_requests * max_spans:
-            self._full_user_query_sums.popitem(last=False)
         return output
 
     def user_query_count(self, request_id: str) -> int:

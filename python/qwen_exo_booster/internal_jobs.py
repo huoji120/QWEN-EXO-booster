@@ -339,9 +339,7 @@ class InternalJobRunner:
                 sampling_params=[
                     {
                         **base_sampling,
-                        "max_new_tokens": (
-                            0 if job.job_type is InternalJobType.BANK_INDEX else 1
-                        ),
+                        "max_new_tokens": 1,
                         "custom_params": _internal_custom_params(
                             job,
                             base_sampling.get("custom_params") or {},

@@ -610,53 +610,6 @@ def test_complete_tool_example_in_reasoning_is_never_executed(tmp_path):
     assert result.active_entries[0]["verification"]["method"] == "controlled_comparison"
 
 
-def test_legacy_narrative_remains_visible_but_is_not_merged(tmp_path):
-    record = ReflectionMemory(
-        trajectory_id="legacy",
-        conversation_key="conversation",
-        source_digest="legacy-source",
-        title="历史缓存经验",
-        outcome="uncertain",
-        reflection="旧轨迹尚未形成逐条因果验证。",
-        evidence="旧工具输出摘要。",
-        causal_analysis="未知原因。",
-        reusable_experience="旧版本保留的限定规则。",
-        avoid="不要扩大结论。",
-        next_time="重新取得证据。",
-        memory_action="insert",
-        target_document_path=None,
-        target_document_sha256=None,
-        source_event_count=1,
-        source_token_count=100,
-        attempts=1,
-        created_at=1.0,
-    )
-    service = _service(tmp_path, _Runner(_standard_response))
-    service.store.append(record)
-    candidates = tuple(
-        ReflectionMemoryCandidate(
-            f"reflection-memory/{name}.md", name, record.title, record.markdown(), 0.99
-        )
-        for name in ("left", "right")
-    )
-    result = asyncio.run(
-        service.organize_candidates(
-            organization_id="organize",
-            candidates=candidates,
-            qk_pairs=(
-                (candidates[0].document_path, candidates[1].document_path, 0.99),
-            ),
-        )
-    )
-    assert result is None
-    restored = ReflectionMemoryStore(tmp_path / "memories.json").get(
-        record.source_digest
-    )
-    assert restored["reflection"] == record.reflection
-    assert restored["analysis_status"] == "legacy"
-    assert service.runner.payloads == []
-
-
 def test_reflection_jobs_pass_real_internal_admission(tmp_path):
     class Manager:
         async def generate_request(self, request, raw_request):

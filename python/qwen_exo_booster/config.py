@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -14,73 +13,23 @@ from qwen_exo_booster.hybrid_state import (
 PROJECT_NAME = "QWEN-EXO-booster"
 PROJECT_API_VERSION = "1"
 _OBSERVER_MODES = frozenset({"off", "shadow", "active"})
-_CONTEXT_EVIDENCE_MODES = frozenset({"off", "active"})
-_CONTEXT_INTEGRITY_MODES = frozenset({"off", "active"})
 _REFLECTION_MEMORY_MODES = frozenset({"off", "active"})
 _RESPONSE_COMPACTION_MODES = frozenset({"off", "active"})
-_QK_PREFILTER_MODES = frozenset({"off", "active"})
-TENSOR_BANK_CONTEXT_RESERVE_TOKENS = 2048
-DEFAULT_TENSOR_BANK_MAX_DOCUMENT_TOKENS = 100352
-DEFAULT_TENSOR_BANK_SALIENT_TOKEN_BUDGET = 4096
 
 
 _SCORE_BIAS_MODES = frozenset({"off", "trajectory_shadow", "trajectory_active"})
 LATENT_TRANSPLANT_MAX_STRENGTH = 0.5
 
-QK_RECALL_PRESETS: dict[str, tuple[float, float]] = {
-    "broad": (-0.05, 0.0),
-    "balanced": (0.0, 0.0),
-    "strict": (8.0, 0.02),
-}
-
-
-_QK_QUERY_POOLINGS = frozenset({"sentence", "windows"})
-
-
-def parse_qk_query_heads(value: object) -> tuple[int, ...]:
-    """Parse a comma-separated retrieval-head list into sorted unique ids."""
-    if value is None:
-        return ()
-    if isinstance(value, (list, tuple)):
-        items = [str(item) for item in value]
-    else:
-        items = str(value).split(",")
-    heads = sorted({int(item.strip()) for item in items if item.strip()})
-    return tuple(heads)
-
-
-def qk_recall_gates(preset: str) -> tuple[float, float]:
-    try:
-        return QK_RECALL_PRESETS[str(preset)]
-    except KeyError as exc:
-        raise ValueError(
-            f"qwen_exo_qk_recall_preset must be one of {sorted(QK_RECALL_PRESETS)}"
-        ) from exc
-
-
-def qk_admission_margin(
-    preset: str, expansion_margin: float, *, qk_only_knowledge: bool
-) -> float:
-    _min_score, preset_margin = qk_recall_gates(preset)
-    return max(
-        float(preset_margin),
-        float(expansion_margin),
-        0.005 if qk_only_knowledge else 0.0,
-    )
 
 
 @dataclass(frozen=True, slots=True)
 class QwenExoFeatureFlags:
     hybrid_prefix: bool
-    external_memory: bool
-    reference_judge: bool
     capsule: bool
     observer: bool
-    adaptive_refresh: bool
     policy_data: bool = True
     score_bias: bool = False
     activation_training: bool = False
-    context_integrity: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +38,6 @@ class QwenExoConfig:
     knowledge_directory: Path
     max_internal_fanout: int
     max_internal_tokens: int
-    max_candidates: int
-    max_memory_tokens: int
     observer_mode: str
     feature_flags: QwenExoFeatureFlags
     model_path: str
@@ -105,15 +52,8 @@ class QwenExoConfig:
     policy_data_directory: Path | None = None
     cognition_directory: Path | None = None
     max_policy_tokens: int = 4096
-    tensor_bank_max_document_tokens: int = DEFAULT_TENSOR_BANK_MAX_DOCUMENT_TOKENS
-    tensor_bank_salient_token_budget: int = DEFAULT_TENSOR_BANK_SALIENT_TOKEN_BUDGET
-    tensor_bank_surprisal_threshold: float = 6.0
-    tensor_bank_span_tokens: int = 16
     telemetry_include_text: bool = False
     telemetry_text_mode: str = "off"
-    context_evidence_mode: str = "off"
-    context_integrity_mode: str = "off"
-    context_integrity_context_divisor: int = 3
     reflection_memory_mode: str = "off"
     reflection_memory_idle_seconds: float = 600.0
     reflection_memory_min_events: int = 3
@@ -173,42 +113,7 @@ class QwenExoConfig:
     # so the model reconsiders before committing. ``0`` disables the questions and
     # keeps the plain reasoning-budget cutoff.
     reasoning_cutoff_question_count: int = 3
-    replay_observation_tokens: int = 8
-    replay_prefix_tokens: int = 1024
-    replay_max_candidates: int = 2
-    replay_reference_tokens: int = 128
-    replay_minimum_gain: float = 0.02
-    replay_switch_margin: float = 0.05
-    replay_maybe_kl_cap: float = 4.0
-    qk_expansion_margin: float = 0.02
     knowledge_retrieval_mode: Literal["file"] = "file"
-    qk_only_knowledge: bool = False
-    qk_recall_preset: str = "balanced"
-    qk_prefilter_mode: str = "active"
-    qk_prefilter_min_score: float | None = None
-    qk_prefilter_min_margin: float | None = None
-    qk_max_candidates_per_document: int = 1
-    qk_layer_id: int | None = None
-    qk_query_heads: tuple[int, ...] = ()
-    qk_query_pooling: str = "windows"
-    pmi_gate_mode: str = "off"
-    pmi_gate_threshold: float = 0.0
-
-    @property
-    def qk_admission_gates(self) -> tuple[float, float]:
-        min_tensor_score, _preset_margin = qk_recall_gates(self.qk_recall_preset)
-        return (
-            float(min_tensor_score),
-            qk_admission_margin(
-                self.qk_recall_preset,
-                self.qk_expansion_margin,
-                qk_only_knowledge=self.qk_only_knowledge,
-            ),
-        )
-
-    @property
-    def qk_admission_margin(self) -> float:
-        return self.qk_admission_gates[1]
 
     def __post_init__(self) -> None:
         if self.policy_data_directory is None:
@@ -229,41 +134,8 @@ class QwenExoConfig:
             raise ValueError("qwen_exo_internal_mamba_reserve must be non-negative")
         if self.max_internal_tokens < 1:
             raise ValueError("qwen_exo_max_internal_tokens must be positive")
-        if self.max_candidates < 1:
-            raise ValueError("qwen_exo_max_candidates must be positive")
         if self.max_policy_tokens < 1:
             raise ValueError("qwen_exo_max_policy_tokens must be positive")
-        max_compilable_document_tokens = (
-            self.context_length - TENSOR_BANK_CONTEXT_RESERVE_TOKENS
-        )
-        if max_compilable_document_tokens < 64:
-            raise ValueError(
-                "context_length must leave 2048 tokens plus one 64-token radix "
-                "page for Tensor Bank compilation"
-            )
-        if self.tensor_bank_max_document_tokens < 64:
-            raise ValueError("tensor_bank_max_document_tokens must be at least 64")
-        if self.tensor_bank_max_document_tokens > max_compilable_document_tokens:
-            raise ValueError(
-                "tensor_bank_max_document_tokens cannot exceed context_length - "
-                "2048 tokens"
-            )
-        if (
-            self.tensor_bank_salient_token_budget < 64
-            or self.tensor_bank_salient_token_budget % 64
-            or self.tensor_bank_salient_token_budget
-            > self.tensor_bank_max_document_tokens
-        ):
-            raise ValueError(
-                "tensor_bank_salient_token_budget must be 64-token aligned and "
-                "no larger than tensor_bank_max_document_tokens"
-            )
-        if (
-            self.tensor_bank_surprisal_threshold < 0
-            or self.tensor_bank_span_tokens < 1
-            or self.tensor_bank_span_tokens > self.tensor_bank_salient_token_budget
-        ):
-            raise ValueError("Tensor Bank surprisal and span settings are invalid")
         if self.max_output_tokens < 1:
             raise ValueError("qwen_exo_max_output_tokens must be positive")
         if self.max_reasoning_tokens < 1:
@@ -295,48 +167,11 @@ class QwenExoConfig:
             raise ValueError("tp_size must be positive")
         if self.max_running_requests < 1:
             raise ValueError("max_running_requests must be positive")
-        if self.feature_flags.adaptive_refresh and self.observer_mode != "active":
-            raise ValueError("Adaptive refresh requires qwen_exo_observer_mode=active")
-        if self.feature_flags.adaptive_refresh and not (
-            self.feature_flags.reference_judge and self.feature_flags.external_memory
-        ):
-            raise ValueError(
-                "Adaptive refresh requires reference judge and external memory"
-            )
-        if self.context_evidence_mode not in _CONTEXT_EVIDENCE_MODES:
-            raise ValueError(
-                "qwen_exo_context_evidence_mode must be one of "
-                f"{sorted(_CONTEXT_EVIDENCE_MODES)}"
-            )
-        if (
-            self.context_evidence_mode != "off"
-            and not self.feature_flags.adaptive_refresh
-        ):
-            raise ValueError("Context Evidence Check requires adaptive refresh")
-        if self.context_integrity_mode not in _CONTEXT_INTEGRITY_MODES:
-            raise ValueError(
-                "qwen_exo_context_integrity_mode must be one of "
-                f"{sorted(_CONTEXT_INTEGRITY_MODES)}"
-            )
-        if self.context_integrity_context_divisor < 2:
-            raise ValueError(
-                "qwen_exo_context_integrity_context_divisor must be at least 2"
-            )
-        if (
-            self.context_integrity_mode != "off"
-            and not self.feature_flags.adaptive_refresh
-        ):
-            raise ValueError("Context Integrity Check requires adaptive refresh")
         if self.reflection_memory_mode not in _REFLECTION_MEMORY_MODES:
             raise ValueError(
                 "qwen_exo_reflection_memory_mode must be one of "
                 f"{sorted(_REFLECTION_MEMORY_MODES)}"
             )
-        if (
-            self.reflection_memory_mode != "off"
-            and not self.feature_flags.external_memory
-        ):
-            raise ValueError("Reflection memory requires external memory")
         if self.reflection_memory_idle_seconds < 60:
             raise ValueError("Reflection memory idle time must be at least 60 seconds")
         if self.reflection_memory_min_events < 2:
@@ -368,10 +203,6 @@ class QwenExoConfig:
                 "qwen_exo_response_compaction_mode must be one of "
                 f"{sorted(_RESPONSE_COMPACTION_MODES)}"
             )
-        if self.response_compaction_mode != "off" and not (
-            self.feature_flags.external_memory
-        ):
-            raise ValueError("Response compaction requires external memory")
         if (
             self.response_compaction_mode == "active"
             and self.response_compaction_max_output_tokens > self.max_internal_tokens
@@ -402,10 +233,6 @@ class QwenExoConfig:
             raise ValueError("Score Bias feature flag and mode disagree")
         if self.feature_flags.observer != (self.observer_mode != "off"):
             raise ValueError("Observer feature flag and observer mode disagree")
-        if self.feature_flags.context_integrity != (
-            self.context_integrity_mode != "off"
-        ):
-            raise ValueError("Context Integrity feature flag and mode disagree")
         if self.immediate_uncertainty_retrieval and self.observer_mode != "active":
             raise ValueError(
                 "Immediate uncertainty retrieval requires qwen_exo_observer_mode=active"
@@ -426,55 +253,6 @@ class QwenExoConfig:
             or self.observer_recovery_tokens < 1
         ):
             raise ValueError("Observer trigger limits are invalid")
-        if (
-            self.replay_observation_tokens < 2
-            or self.replay_prefix_tokens < 1
-            or self.replay_max_candidates < 1
-            or self.replay_reference_tokens < 1
-            or self.replay_minimum_gain < 0
-            or self.replay_switch_margin < 0
-            or self.replay_maybe_kl_cap < 0
-        ):
-            raise ValueError("Causal replay limits are invalid")
-        if self.qk_expansion_margin < 0:
-            raise ValueError("Q/K expansion margin must be non-negative")
-        qk_recall_gates(self.qk_recall_preset)
-        if self.qk_prefilter_mode not in _QK_PREFILTER_MODES:
-            raise ValueError(
-                "qwen_exo_qk_prefilter_mode must be one of "
-                f"{sorted(_QK_PREFILTER_MODES)}"
-            )
-        if self.qk_prefilter_min_score is not None and not math.isfinite(
-            self.qk_prefilter_min_score
-        ):
-            raise ValueError("Q/K prefilter minimum score must be finite")
-        if (
-            self.qk_prefilter_min_margin is not None
-            and self.qk_prefilter_min_margin < 0
-        ):
-            raise ValueError("Q/K prefilter minimum margin must be non-negative")
-        if self.qk_max_candidates_per_document < 1:
-            raise ValueError("Q/K per-document candidate limit must be positive")
-        if self.qk_layer_id is not None and self.qk_layer_id < 0:
-            raise ValueError("Q/K layer id must be non-negative")
-        if any(head < 0 for head in self.qk_query_heads) or len(
-            set(self.qk_query_heads)
-        ) != len(self.qk_query_heads):
-            raise ValueError("Q/K query head ids must be unique and non-negative")
-        if self.qk_query_pooling not in _QK_QUERY_POOLINGS:
-            raise ValueError(
-                f"qk_query_pooling must be one of {sorted(_QK_QUERY_POOLINGS)}"
-            )
-        if self.pmi_gate_mode not in {"off", "active"}:
-            raise ValueError("pmi_gate_mode must be off/active")
-        if not math.isfinite(self.pmi_gate_threshold):
-            raise ValueError("pmi_gate_threshold must be finite")
-        if self.backend == "mlx" and (
-            self.qk_layer_id is not None or self.qk_query_heads
-        ):
-            raise ValueError(
-                "Q/K layer and head selection are not supported on the MLX backend"
-            )
 
         if self.score_bias_mode != "off" and self.observer_mode == "off":
             raise ValueError("Score Bias requires an active or shadow observer")
@@ -535,16 +313,6 @@ class QwenExoConfig:
                 raise ValueError(
                     "QWEN-EXO CUDA Score Bias requires the Triton attention backend"
                 )
-        configured_context_integrity_mode = str(
-            getattr(server_args, "qwen_exo_context_integrity_mode", "off")
-        )
-        context_integrity_enabled = (
-            bool(getattr(server_args, "qwen_exo_experimental_context_integrity", False))
-            and configured_context_integrity_mode != "off"
-        )
-        context_integrity_mode = (
-            configured_context_integrity_mode if context_integrity_enabled else "off"
-        )
         return cls(
             state_directory=Path(server_args.qwen_exo_state_dir).expanduser(),
             knowledge_directory=Path(server_args.qwen_exo_knowledge_dir).expanduser(),
@@ -565,30 +333,8 @@ class QwenExoConfig:
             max_internal_fanout=int(server_args.qwen_exo_max_internal_fanout),
             internal_mamba_reserve=int(server_args.qwen_exo_internal_mamba_reserve),
             max_internal_tokens=int(server_args.qwen_exo_max_internal_tokens),
-            max_candidates=int(server_args.qwen_exo_max_candidates),
-            max_memory_tokens=int(server_args.qwen_exo_max_memory_tokens),
             max_policy_tokens=int(
                 getattr(server_args, "qwen_exo_max_policy_tokens", 4096)
-            ),
-            tensor_bank_max_document_tokens=int(
-                getattr(
-                    server_args,
-                    "qwen_exo_tensor_bank_max_document_tokens",
-                    DEFAULT_TENSOR_BANK_MAX_DOCUMENT_TOKENS,
-                )
-            ),
-            tensor_bank_salient_token_budget=int(
-                getattr(
-                    server_args,
-                    "qwen_exo_tensor_bank_salient_token_budget",
-                    DEFAULT_TENSOR_BANK_SALIENT_TOKEN_BUDGET,
-                )
-            ),
-            tensor_bank_surprisal_threshold=float(
-                getattr(server_args, "qwen_exo_tensor_bank_surprisal_threshold", 6.0)
-            ),
-            tensor_bank_span_tokens=int(
-                getattr(server_args, "qwen_exo_tensor_bank_span_tokens", 16)
             ),
             max_output_tokens=int(
                 getattr(server_args, "qwen_exo_max_output_tokens", 8192)
@@ -616,11 +362,8 @@ class QwenExoConfig:
             observer_mode=observer_mode,
             feature_flags=QwenExoFeatureFlags(
                 hybrid_prefix=bool(server_args.qwen_exo_enable_hybrid_prefix),
-                external_memory=bool(server_args.qwen_exo_enable_external_memory),
-                reference_judge=bool(server_args.qwen_exo_enable_reference_judge),
                 capsule=bool(server_args.qwen_exo_enable_capsule),
                 observer=observer_mode != "off",
-                adaptive_refresh=bool(server_args.qwen_exo_enable_adaptive_refresh),
                 policy_data=bool(
                     getattr(server_args, "qwen_exo_enable_policy_data", False)
                 ),
@@ -630,7 +373,6 @@ class QwenExoConfig:
                         server_args, "qwen_exo_experimental_activation_training", False
                     )
                 ),
-                context_integrity=context_integrity_enabled,
             ),
             max_running_requests=int(
                 getattr(server_args, "max_running_requests", 10) or 10
@@ -642,46 +384,7 @@ class QwenExoConfig:
             dtype=str(getattr(server_args, "dtype", None) or "auto"),
             quantization=str(getattr(server_args, "quantization", None) or "none"),
             kv_cache_dtype=str(getattr(server_args, "kv_cache_dtype", None) or "auto"),
-            qk_expansion_margin=float(
-                getattr(server_args, "qwen_exo_qk_expansion_margin", 0.02)
-            ),
             knowledge_retrieval_mode="file",
-            qk_only_knowledge=False,
-            qk_recall_preset=str(
-                getattr(server_args, "qwen_exo_qk_recall_preset", "balanced")
-            ),
-            qk_prefilter_mode=str(
-                getattr(server_args, "qwen_exo_qk_prefilter_mode", "active")
-            ),
-            qk_prefilter_min_score=(
-                None
-                if getattr(server_args, "qwen_exo_qk_prefilter_min_score", None) is None
-                else float(server_args.qwen_exo_qk_prefilter_min_score)
-            ),
-            qk_prefilter_min_margin=(
-                None
-                if getattr(server_args, "qwen_exo_qk_prefilter_min_margin", None)
-                is None
-                else float(server_args.qwen_exo_qk_prefilter_min_margin)
-            ),
-            qk_max_candidates_per_document=int(
-                getattr(server_args, "qwen_exo_qk_max_candidates_per_document", 1)
-            ),
-            qk_layer_id=(
-                None
-                if getattr(server_args, "qwen_exo_qk_layer", None) is None
-                else int(server_args.qwen_exo_qk_layer)
-            ),
-            qk_query_heads=parse_qk_query_heads(
-                getattr(server_args, "qwen_exo_qk_query_heads", None)
-            ),
-            qk_query_pooling=str(
-                getattr(server_args, "qwen_exo_qk_query_pooling", "windows")
-            ),
-            pmi_gate_mode=str(getattr(server_args, "qwen_exo_pmi_gate_mode", "off")),
-            pmi_gate_threshold=float(
-                getattr(server_args, "qwen_exo_pmi_gate_threshold", 0.0)
-            ),
             telemetry_include_text=bool(
                 getattr(server_args, "qwen_exo_telemetry_include_text", False)
             ),
@@ -694,13 +397,6 @@ class QwenExoConfig:
                     )
                     else "off"
                 )
-            ),
-            context_evidence_mode=str(
-                getattr(server_args, "qwen_exo_context_evidence_mode", "off")
-            ),
-            context_integrity_mode=context_integrity_mode,
-            context_integrity_context_divisor=int(
-                getattr(server_args, "qwen_exo_context_integrity_context_divisor", 3)
             ),
             reflection_memory_mode=str(
                 getattr(server_args, "qwen_exo_reflection_memory_mode", "off")
@@ -836,32 +532,7 @@ class QwenExoConfig:
                     server_args, "qwen_exo_reasoning_cutoff_question_count", 3
                 )
             ),
-            replay_observation_tokens=int(
-                getattr(server_args, "qwen_exo_replay_observation_tokens", 8)
-            ),
-            replay_prefix_tokens=int(
-                getattr(server_args, "qwen_exo_replay_prefix_tokens", 1024)
-            ),
-            replay_max_candidates=int(
-                getattr(server_args, "qwen_exo_replay_max_candidates", 2)
-            ),
-            replay_reference_tokens=int(
-                getattr(server_args, "qwen_exo_replay_reference_tokens", 128)
-            ),
-            replay_minimum_gain=float(
-                getattr(server_args, "qwen_exo_replay_minimum_gain", 0.02)
-            ),
-            replay_switch_margin=float(
-                getattr(server_args, "qwen_exo_replay_switch_margin", 0.05)
-            ),
-            replay_maybe_kl_cap=float(
-                getattr(server_args, "qwen_exo_replay_maybe_kl_cap", 4.0)
-            ),
         )
-
-    @property
-    def context_integrity_max_tokens(self) -> int:
-        return self.context_length // self.context_integrity_context_divisor
 
     @property
     def topology_key(self) -> str:
@@ -901,13 +572,7 @@ class QwenExoConfig:
             "max_internal_fanout": self.max_internal_fanout,
             "internal_mamba_reserve": self.internal_mamba_reserve,
             "max_internal_tokens": self.max_internal_tokens,
-            "max_candidates": self.max_candidates,
-            "max_memory_tokens": self.max_memory_tokens,
             "max_policy_tokens": self.max_policy_tokens,
-            "tensor_bank_max_document_tokens": self.tensor_bank_max_document_tokens,
-            "tensor_bank_salient_token_budget": self.tensor_bank_salient_token_budget,
-            "tensor_bank_surprisal_threshold": self.tensor_bank_surprisal_threshold,
-            "tensor_bank_span_tokens": self.tensor_bank_span_tokens,
             "max_output_tokens": self.max_output_tokens,
             "max_reasoning_tokens": self.max_reasoning_tokens,
             "reasoning_budget_min": self.reasoning_budget_min,
@@ -921,27 +586,9 @@ class QwenExoConfig:
             "reasoning_dynamic_context_tokens": self.reasoning_dynamic_context_tokens,
             "max_running_requests": self.max_running_requests,
             "context_length": self.context_length,
-            "qk_expansion_margin": self.qk_expansion_margin,
             "knowledge_retrieval_mode": self.knowledge_retrieval_mode,
-            "qk_only_knowledge": self.qk_only_knowledge,
-            "qk_recall_preset": self.qk_recall_preset,
-            "qk_prefilter_mode": self.qk_prefilter_mode,
-            "qk_prefilter_min_score": self.qk_prefilter_min_score,
-            "qk_prefilter_min_margin": self.qk_prefilter_min_margin,
-            "qk_max_candidates_per_document": self.qk_max_candidates_per_document,
-            "qk_layer_id": self.qk_layer_id,
-            "qk_query_heads": list(self.qk_query_heads),
-            "qk_query_pooling": self.qk_query_pooling,
-            "pmi_gate_mode": self.pmi_gate_mode,
-            "pmi_gate_threshold": self.pmi_gate_threshold,
             "observer_mode": self.observer_mode,
             "telemetry_include_text": self.telemetry_include_text,
-            "context_evidence_mode": self.context_evidence_mode,
-            "context_integrity_mode": self.context_integrity_mode,
-            "context_integrity_max_tokens": self.context_integrity_max_tokens,
-            "context_integrity_context_divisor": (
-                self.context_integrity_context_divisor
-            ),
             "reflection_memory_mode": self.reflection_memory_mode,
             "reflection_memory_max_attempts": self.reflection_memory_max_attempts,
             "reflection_memory_idle_seconds": self.reflection_memory_idle_seconds,
@@ -974,13 +621,6 @@ class QwenExoConfig:
             "observer_recovery_tokens": self.observer_recovery_tokens,
             "immediate_uncertainty_retrieval": self.immediate_uncertainty_retrieval,
             "reasoning_cutoff_question_count": self.reasoning_cutoff_question_count,
-            "replay_observation_tokens": self.replay_observation_tokens,
-            "replay_prefix_tokens": self.replay_prefix_tokens,
-            "replay_max_candidates": self.replay_max_candidates,
-            "replay_reference_tokens": self.replay_reference_tokens,
-            "replay_minimum_gain": self.replay_minimum_gain,
-            "replay_switch_margin": self.replay_switch_margin,
-            "replay_maybe_kl_cap": self.replay_maybe_kl_cap,
             "features": flags,
             "model_path": self.model_path,
             "tp_size": self.tp_size,

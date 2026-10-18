@@ -29,7 +29,6 @@ fi
 : "${QWEN_EXO_QUANTIZATION:=}"
 : "${QWEN_EXO_KV_CACHE_DTYPE:=fp8_e4m3}"
 : "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:=0}"
-: "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY:=0}"
 : "${QWEN_EXO_ENGRAM_PATH:=}"
 : "${QWEN_EXO_SPECULATIVE_ALGORITHM:=}"
 : "${QWEN_EXO_SPECULATIVE_DRAFT_MODEL_PATH:=}"
@@ -91,10 +90,6 @@ fi
 : "${QWEN_EXO_FORCE_AUTO_REASONING:=1}"
 : "${QWEN_EXO_REASONING_SESSION_ONCE:=1}"
 : "${QWEN_EXO_REASONING_DYNAMIC_CONTEXT_TOKENS:=2048}"
-: "${QWEN_EXO_TENSOR_BANK_MAX_DOCUMENT_TOKENS:=$((QWEN_EXO_CONTEXT_LENGTH - 2048))}"
-: "${QWEN_EXO_TENSOR_BANK_SALIENT_TOKEN_BUDGET:=4096}"
-: "${QWEN_EXO_TENSOR_BANK_SURPRISAL_THRESHOLD:=6.0}"
-: "${QWEN_EXO_TENSOR_BANK_SPAN_TOKENS:=16}"
 : "${QWEN_EXO_MAMBA_STRATEGY:=extra_buffer}"
 # GDN state pool size relative to the full-attention KV pool (sglang default 0.9),
 # or an explicit slot count; with speculative decoding an explicit count also
@@ -111,28 +106,11 @@ fi
 : "${QWEN_EXO_Q_PRE_TOKENS:=8}"
 : "${QWEN_EXO_Q_POST_TOKENS:=4}"
 : "${QWEN_EXO_RECOVERY_TOKENS:=8}"
-: "${QWEN_EXO_REPLAY_OBSERVATION_TOKENS:=8}"
-: "${QWEN_EXO_REPLAY_PREFIX_TOKENS:=1024}"
-: "${QWEN_EXO_REPLAY_MAX_CANDIDATES:=2}"
-: "${QWEN_EXO_REPLAY_REFERENCE_TOKENS:=128}"
-: "${QWEN_EXO_REPLAY_MINIMUM_GAIN:=0.02}"
-: "${QWEN_EXO_REPLAY_SWITCH_MARGIN:=0.05}"
-: "${QWEN_EXO_REPLAY_MAYBE_KL_CAP:=4.0}"
 : "${QWEN_EXO_IMMEDIATE_UNCERTAINTY_RETRIEVAL:=1}"
-: "${QWEN_EXO_ENABLE_ADAPTIVE_REFRESH:=1}"
-: "${QWEN_EXO_QK_ONLY_KNOWLEDGE:=0}"
-: "${QWEN_EXO_QK_EXPANSION_MARGIN:=0.02}"
-: "${QWEN_EXO_QK_RECALL_PRESET:=balanced}"
-: "${QWEN_EXO_QK_PREFILTER_MODE:=active}"
 : "${QWEN_EXO_MOE_TOP_K:=}"
 : "${QWEN_EXO_MOE_EXTRA_EXPERTS:=0}"
 : "${QWEN_EXO_ENABLE_RETURN_ROUTED_EXPERTS:=0}"
 : "${QWEN_EXO_CONSOLE_TRACE_DEFAULT_SCOPE:=activity}"
-: "${QWEN_EXO_CONTEXT_EVIDENCE_MODE:=active}"
-# Context Integrity is CLI-only; the active mode is latent until the
-# experimental startup flag is explicitly supplied.
-: "${QWEN_EXO_CONTEXT_INTEGRITY_MODE:=active}"
-: "${QWEN_EXO_CONTEXT_INTEGRITY_CONTEXT_DIVISOR:=3}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MODE:=active}"
 : "${QWEN_EXO_REFLECTION_MEMORY_IDLE_SECONDS:=600}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MIN_EVENTS:=3}"
@@ -376,7 +354,6 @@ runtime_env=(
   "QWEN_EXO_API_KEY_STORE=${runtime_api_key_store}"
   QWEN_EXO_MANAGED_RESTART=1
   "QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING=${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:-0}"
-  "QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY=${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY}"
   "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR:-}"
   "QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH=${QWEN_EXO_DEFAULT_ACTIVATION_EDITOR_STRENGTH:-}"
   "QWEN_EXO_MODEL_CATALOG_ROOTS=${QWEN_EXO_MODEL_CATALOG_ROOTS}"
@@ -535,9 +512,6 @@ fi
 if [[ "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING}" == "1" ]]; then
   server_args+=( --qwen-exo-experimental-activation-training )
 fi
-if [[ "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY}" == "1" ]]; then
-  server_args+=( --qwen-exo-experimental-context-integrity )
-fi
 # Engram's 52 GB table is pinned from host files the manifest points at, so it
 # runs natively only.
 if [[ -n "${QWEN_EXO_ENGRAM_PATH}" ]]; then
@@ -576,12 +550,7 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-reasoning-budget-xhigh "${QWEN_EXO_REASONING_BUDGET_XHIGH}"
     --qwen-exo-reasoning-mode "${QWEN_EXO_REASONING_MODE}"
     --qwen-exo-reasoning-dynamic-context-tokens "${QWEN_EXO_REASONING_DYNAMIC_CONTEXT_TOKENS}"
-    --qwen-exo-tensor-bank-max-document-tokens "${QWEN_EXO_TENSOR_BANK_MAX_DOCUMENT_TOKENS}"
-    --qwen-exo-tensor-bank-salient-token-budget "${QWEN_EXO_TENSOR_BANK_SALIENT_TOKEN_BUDGET}"
-    --qwen-exo-tensor-bank-surprisal-threshold "${QWEN_EXO_TENSOR_BANK_SURPRISAL_THRESHOLD}"
-    --qwen-exo-tensor-bank-span-tokens "${QWEN_EXO_TENSOR_BANK_SPAN_TOKENS}"
     --qwen-exo-observer-mode "${QWEN_EXO_OBSERVER_MODE}"
-    --qwen-exo-context-evidence-mode "${QWEN_EXO_CONTEXT_EVIDENCE_MODE}"
     --qwen-exo-observer-surprisal-threshold "${QWEN_EXO_SURPRISAL_THRESHOLD}"
     --qwen-exo-observer-surprisal-window "${QWEN_EXO_SURPRISAL_WINDOW}"
     --qwen-exo-observer-surprisal-margin "${QWEN_EXO_SURPRISAL_MARGIN}"
@@ -589,19 +558,7 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-observer-q-pre-tokens "${QWEN_EXO_Q_PRE_TOKENS}"
     --qwen-exo-observer-q-post-tokens "${QWEN_EXO_Q_POST_TOKENS}"
     --qwen-exo-observer-recovery-tokens "${QWEN_EXO_RECOVERY_TOKENS}"
-    --qwen-exo-replay-observation-tokens "${QWEN_EXO_REPLAY_OBSERVATION_TOKENS}"
-    --qwen-exo-replay-prefix-tokens "${QWEN_EXO_REPLAY_PREFIX_TOKENS}"
-    --qwen-exo-replay-max-candidates "${QWEN_EXO_REPLAY_MAX_CANDIDATES}"
-    --qwen-exo-replay-reference-tokens "${QWEN_EXO_REPLAY_REFERENCE_TOKENS}"
-    --qwen-exo-replay-minimum-gain "${QWEN_EXO_REPLAY_MINIMUM_GAIN}"
-    --qwen-exo-replay-switch-margin "${QWEN_EXO_REPLAY_SWITCH_MARGIN}"
-    --qwen-exo-replay-maybe-kl-cap "${QWEN_EXO_REPLAY_MAYBE_KL_CAP}"
-    --qwen-exo-qk-expansion-margin "${QWEN_EXO_QK_EXPANSION_MARGIN}"
-    --qwen-exo-qk-recall-preset "${QWEN_EXO_QK_RECALL_PRESET}"
     --qwen-exo-console-trace-default-scope "${QWEN_EXO_CONSOLE_TRACE_DEFAULT_SCOPE}"
-    --qwen-exo-qk-prefilter-mode "${QWEN_EXO_QK_PREFILTER_MODE}"
-    --qwen-exo-context-integrity-mode "${QWEN_EXO_CONTEXT_INTEGRITY_MODE}"
-    --qwen-exo-context-integrity-context-divisor "${QWEN_EXO_CONTEXT_INTEGRITY_CONTEXT_DIVISOR}"
     --qwen-exo-reflection-memory-mode "${QWEN_EXO_REFLECTION_MEMORY_MODE}"
     --qwen-exo-reflection-memory-idle-seconds "${QWEN_EXO_REFLECTION_MEMORY_IDLE_SECONDS}"
     --qwen-exo-reflection-memory-min-events "${QWEN_EXO_REFLECTION_MEMORY_MIN_EVENTS}"
@@ -634,16 +591,6 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
   fi
   if [[ "${QWEN_EXO_TELEMETRY_INCLUDE_TEXT}" == "1" ]]; then
     server_args+=( --qwen-exo-telemetry-include-text )
-  fi
-  if [[ "${QWEN_EXO_ENABLE_ADAPTIVE_REFRESH}" == "1" ]]; then
-    if [[ "${QWEN_EXO_OBSERVER_MODE}" != "active" ]]; then
-      echo "Adaptive refresh requires QWEN_EXO_OBSERVER_MODE=active" >&2
-      exit 1
-    fi
-    server_args+=( --qwen-exo-enable-adaptive-refresh )
-  fi
-  if [[ "${QWEN_EXO_QK_ONLY_KNOWLEDGE}" == "1" ]]; then
-    server_args+=( --qwen-exo-qk-only-knowledge )
   fi
   server_args+=( --qwen-exo-score-bias-mode "${QWEN_EXO_SCORE_BIAS_MODE}" )
   if [[ "${QWEN_EXO_SCORE_BIAS_MODE}" != "off" ]]; then

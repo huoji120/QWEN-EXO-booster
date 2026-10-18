@@ -44,7 +44,7 @@ def _reset_runtime(runtime_url: str) -> None:
         flush=True,
     )
     print(
-        _request(f"{base}/qwen-exo/recall-trace", "DELETE").strip(),
+        _request(f"{base}/qwen-exo/telemetry/clear", "POST").strip(),
         flush=True,
     )
 

@@ -88,7 +88,7 @@ def test_internal_job_rejects_recursion_and_honors_cancellation():
         "parent_request_id": "request-1",
         "turn_id": "turn-1",
         "job_id": "job-1",
-        "job_type": InternalJobType.REFERENCE_JUDGE,
+        "job_type": InternalJobType.CAPSULE_UPDATE,
         "priority": -1,
         "shared_prefix_key": "prefix-1",
         "token_budget": 16,

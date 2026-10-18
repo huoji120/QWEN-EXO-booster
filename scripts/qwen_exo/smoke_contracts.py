@@ -7,7 +7,6 @@ import concurrent.futures
 import json
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -174,21 +173,12 @@ def main() -> int:
     cleanup_urls: list[str] = []
 
     def cleanup_fixtures() -> None:
-        changed = False
-        for cleanup_url in tuple(cleanup_urls):
-            cleanup_status, _cleanup_result = http_json(
-                cleanup_url,
-                method="DELETE",
-                timeout=min(args.timeout, 30.0),
-            )
-            changed = changed or cleanup_status == 200
         # PolicyData is operator-managed identity state. Smoke tests never mutate it;
         # a process or server crash therefore cannot replace the live personality.
-        if changed:
+        for cleanup_url in tuple(cleanup_urls):
             http_json(
-                f"{base_url}/qwen-exo/tensor-bank/reindex",
-                method="POST",
-                payload={},
+                cleanup_url,
+                method="DELETE",
                 timeout=min(args.timeout, 30.0),
             )
 
@@ -234,27 +224,6 @@ def main() -> int:
         )
     )
 
-    bank_status, bank_result = http_json(
-        f"{base_url}/qwen-exo/tensor-bank/reindex",
-        method="POST",
-        payload={},
-        timeout=args.timeout,
-    )
-    bank_documents = int(bank_result.get("document_state_count") or 0)
-    report["stages"].append(
-        stage(
-            "native_tensor_bank_reindex",
-            bank_status == 200
-            and bank_documents > 0
-            and bank_result.get("model_native_documents") == bank_documents
-            and bank_result.get("complete_gdn_document_states") == bank_documents
-            and bank_result.get("document_level") is True
-            and bank_result.get("storage_dtype") == "float8_e4m3fn",
-            status_code=bank_status,
-            response=bank_result,
-        )
-    )
-
     memory_request_id = f"resp_{uuid.uuid4().hex}"
     memory_status, memory_response = retrying_http_json(
         f"{base_url}/v1/responses",
@@ -272,42 +241,24 @@ def main() -> int:
         },
         timeout=args.timeout,
     )
-    telemetry_status, telemetry = http_json(
-        f"{base_url}/qwen-exo/telemetry?"
-        + urllib.parse.urlencode({"request_id": memory_request_id}),
-        timeout=args.timeout,
-    )
-    memory_events = [
-        event
-        for event in telemetry.get("events") or ()
-        if event.get("event_type") == "memory.prepared"
-    ]
-    memory_payload = memory_events[-1].get("payload", {}) if memory_events else {}
+
     memory_text = response_text(memory_response).strip()
-    memory_native_restore = memory_payload.get("native_prefix_restore") or {}
+    memory_calls = [
+        item
+        for item in memory_response.get("output") or ()
+        if item.get("type") == "mcp_call"
+        and str(item.get("name") or "").startswith("qwen_exo_memory_")
+    ]
     report["stages"].append(
         stage(
-            "memory_judge_and_attachment",
+            "memory_tool_recall",
             memory_status == 200
-            and memory_text == marker
-            and telemetry_status == 200
-            and memory_payload.get("knowledge_admission_mode")
-            in {"semantic_eligibility", "comparative_semantic_selection"}
-            and memory_native_restore.get("active") is True
-            and memory_native_restore.get("lane") == "knowledge"
-            and memory_native_restore.get("tokens", 0) > 0
-            and any(
-                decision.get("status") in {"true", "eligible"}
-                for decision in memory_payload.get("semantic_decisions") or ()
-            )
-            and any(
-                candidate.get("lane") == "knowledge"
-                for candidate in memory_payload.get("proposed_candidates") or ()
-            ),
+            and marker in memory_text
+            and any(call.get("name") == "qwen_exo_memory_search" for call in memory_calls),
             status_code=memory_status,
             response_id=memory_response.get("id"),
             output_text=memory_text,
-            memory=memory_payload,
+            memory_calls=memory_calls,
         )
     )
 
@@ -328,45 +279,16 @@ def main() -> int:
         },
         timeout=args.timeout,
     )
-    policy_telemetry_status, policy_telemetry = http_json(
-        f"{base_url}/qwen-exo/telemetry?"
-        + urllib.parse.urlencode({"request_id": policy_request_id}),
-        timeout=args.timeout,
-    )
-    policy_events = [
-        event
-        for event in policy_telemetry.get("events") or ()
-        if event.get("event_type") == "memory.prepared"
-    ]
-    policy_query_events = [
-        event
-        for event in policy_telemetry.get("events") or ()
-        if event.get("event_type") == "query_probe.started"
-    ]
-    policy_payload = policy_events[-1].get("payload", {}) if policy_events else {}
-    policy_query_payload = (
-        policy_query_events[-1].get("payload", {}) if policy_query_events else {}
-    )
     policy_text = response_text(policy_response).strip()
-    policy_native_restore = policy_payload.get("native_prefix_restore", {})
     report["stages"].append(
         stage(
-            "policy_data_always_on_native_identity",
+            "policy_data_always_on_identity",
             policy_document_ready
             and policy_status == 200
-            and policy_identity in policy_text
-            and policy_telemetry_status == 200
-            and policy_native_restore.get("active") is True
-            and policy_native_restore.get("lane") == "policydata"
-            and policy_native_restore.get("selection_reason")
-            in {"policydata_always_on", "query_qk"}
-            and policy_native_restore.get("tokens", 0) > 0
-            and policy_query_payload.get("cognition_tokens", 0) > 0,
+            and policy_identity in policy_text,
             status_code=policy_status,
             response_id=policy_response.get("id"),
             output_text=policy_text,
-            memory=policy_payload,
-            query_probe=policy_query_payload,
         )
     )
 
@@ -491,23 +413,6 @@ def main() -> int:
             status_code=policy_after_status,
             before_sha256=(policy_document or {}).get("sha256"),
             after_sha256=policy_after.get("sha256"),
-        )
-    )
-
-    cleanup_bank_status, cleanup_bank_result = http_json(
-        f"{base_url}/qwen-exo/tensor-bank/reindex",
-        method="POST",
-        payload={},
-        timeout=args.timeout,
-    )
-    report["stages"].append(
-        stage(
-            "native_tensor_bank_cleanup_reindex",
-            cleanup_bank_status == 200
-            and cleanup_bank_result.get("source_digest")
-            != bank_result.get("source_digest"),
-            status_code=cleanup_bank_status,
-            response=cleanup_bank_result,
         )
     )
 

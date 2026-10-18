@@ -217,9 +217,6 @@ def test_dflash_target_logprob_need_is_request_scoped():
 
     assert dflash_request_needs_target_logprobs(request(kind="user"))
     assert dflash_request_needs_target_logprobs(
-        request(kind="internal", job_type="query_probe")
-    )
-    assert dflash_request_needs_target_logprobs(
         request(kind="internal", return_logprob=True)
     )
     assert not dflash_request_needs_target_logprobs(

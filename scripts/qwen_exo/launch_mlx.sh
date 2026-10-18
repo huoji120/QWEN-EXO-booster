@@ -8,7 +8,6 @@ set -euo pipefail
 : "${QWEN_EXO_DTYPE:=float16}"
 : "${QWEN_EXO_QUANTIZATION:=mlx_q4}"
 : "${QWEN_EXO_KV_CACHE_DTYPE:=mxfp8}"
-: "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY:=0}"
 : "${QWEN_EXO_STATE_DIRECTORY_NAME:=state-mlx-tp1-${QWEN_EXO_QUANTIZATION}-${QWEN_EXO_KV_CACHE_DTYPE}}"
 : "${QWEN_EXO_MEM_FRACTION_STATIC:=0.80}"
 : "${QWEN_EXO_MAX_RUNNING_REQUESTS:=64}"
@@ -20,23 +19,10 @@ set -euo pipefail
 : "${QWEN_EXO_MAX_INTERNAL_TOKENS:=12288}"
 : "${QWEN_EXO_MAX_OUTPUT_TOKENS:=8192}"
 : "${QWEN_EXO_MAX_REASONING_TOKENS:=3072}"
-: "${QWEN_EXO_TENSOR_BANK_MAX_DOCUMENT_TOKENS:=$((QWEN_EXO_CONTEXT_LENGTH - 2048))}"
-: "${QWEN_EXO_TENSOR_BANK_SALIENT_TOKEN_BUDGET:=4096}"
-: "${QWEN_EXO_TENSOR_BANK_SURPRISAL_THRESHOLD:=6.0}"
-: "${QWEN_EXO_TENSOR_BANK_SPAN_TOKENS:=16}"
 : "${QWEN_EXO_OBSERVER_MODE:=active}"
-: "${QWEN_EXO_ENABLE_ADAPTIVE_REFRESH:=1}"
-: "${QWEN_EXO_CONTEXT_EVIDENCE_MODE:=active}"
-# Context Integrity is CLI-only; the active mode is latent until the
-# experimental startup flag is explicitly supplied.
-: "${QWEN_EXO_CONTEXT_INTEGRITY_MODE:=active}"
-: "${QWEN_EXO_CONTEXT_INTEGRITY_CONTEXT_DIVISOR:=3}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MODE:=active}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MAX_HISTORY_TOKENS:=92160}"
 : "${QWEN_EXO_RESPONSE_COMPACTION_MODE:=active}"
-: "${QWEN_EXO_QK_RECALL_PRESET:=balanced}"
-: "${QWEN_EXO_QK_PREFILTER_MODE:=active}"
-: "${QWEN_EXO_QK_EXPANSION_MARGIN:=0.02}"
 : "${QWEN_EXO_SCORE_BIAS_MODE:=trajectory_active}"
 : "${QWEN_EXO_CONSOLE_TRACE_DEFAULT_SCOPE:=activity}"
 : "${QWEN_EXO_PORT:=30000}"
@@ -183,9 +169,6 @@ server_args=(
 if [[ "${QWEN_EXO_QUANTIZATION}" != "none" ]]; then
   server_args+=( --quantization "${QWEN_EXO_QUANTIZATION}" )
 fi
-if [[ "${QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY}" == "1" ]]; then
-  server_args+=( --qwen-exo-experimental-context-integrity )
-fi
 if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
   server_args+=(
     --enable-qwen-exo
@@ -197,30 +180,13 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-max-internal-tokens "${QWEN_EXO_MAX_INTERNAL_TOKENS}"
     --qwen-exo-max-output-tokens "${QWEN_EXO_MAX_OUTPUT_TOKENS}"
     --qwen-exo-max-reasoning-tokens "${QWEN_EXO_MAX_REASONING_TOKENS}"
-    --qwen-exo-tensor-bank-max-document-tokens "${QWEN_EXO_TENSOR_BANK_MAX_DOCUMENT_TOKENS}"
-    --qwen-exo-tensor-bank-salient-token-budget "${QWEN_EXO_TENSOR_BANK_SALIENT_TOKEN_BUDGET}"
-    --qwen-exo-tensor-bank-surprisal-threshold "${QWEN_EXO_TENSOR_BANK_SURPRISAL_THRESHOLD}"
-    --qwen-exo-tensor-bank-span-tokens "${QWEN_EXO_TENSOR_BANK_SPAN_TOKENS}"
     --qwen-exo-observer-mode "${QWEN_EXO_OBSERVER_MODE}"
-    --qwen-exo-qk-recall-preset "${QWEN_EXO_QK_RECALL_PRESET}"
-    --qwen-exo-qk-prefilter-mode "${QWEN_EXO_QK_PREFILTER_MODE}"
-    --qwen-exo-qk-expansion-margin "${QWEN_EXO_QK_EXPANSION_MARGIN}"
     --qwen-exo-console-trace-default-scope "${QWEN_EXO_CONSOLE_TRACE_DEFAULT_SCOPE}"
-    --qwen-exo-context-evidence-mode "${QWEN_EXO_CONTEXT_EVIDENCE_MODE}"
-    --qwen-exo-context-integrity-mode "${QWEN_EXO_CONTEXT_INTEGRITY_MODE}"
-    --qwen-exo-context-integrity-context-divisor "${QWEN_EXO_CONTEXT_INTEGRITY_CONTEXT_DIVISOR}"
     --qwen-exo-reflection-memory-mode "${QWEN_EXO_REFLECTION_MEMORY_MODE}"
     --qwen-exo-reflection-memory-max-history-tokens "${QWEN_EXO_REFLECTION_MEMORY_MAX_HISTORY_TOKENS}"
     --qwen-exo-response-compaction-mode "${QWEN_EXO_RESPONSE_COMPACTION_MODE}"
     --qwen-exo-score-bias-mode "${QWEN_EXO_SCORE_BIAS_MODE}"
   )
-  if [[ "${QWEN_EXO_ENABLE_ADAPTIVE_REFRESH}" == "1" ]]; then
-    if [[ "${QWEN_EXO_OBSERVER_MODE}" != "active" ]]; then
-      echo "Adaptive refresh requires QWEN_EXO_OBSERVER_MODE=active" >&2
-      exit 1
-    fi
-    server_args+=( --qwen-exo-enable-adaptive-refresh )
-  fi
 fi
 
 if [[ "${QWEN_EXO_DRY_RUN}" == "1" ]]; then

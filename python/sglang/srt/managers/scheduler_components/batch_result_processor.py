@@ -220,13 +220,10 @@ class SchedulerBatchResultProcessor:
         try:
             self.native_state_bank.maybe_export(req)
         except Exception as exc:
-            req.qwen_exo_bank_export_status = f"failed:{type(exc).__name__}"
-            custom_params = getattr(req.sampling_params, "custom_params", None) or {}
-            if isinstance(
-                custom_params.get("qwen_exo_session_initial_gdn_export"), dict
-            ):
-                req.qwen_exo_session_initial_gdn_status = f"failed:{type(exc).__name__}"
-            logger.exception("QWEN-EXO native Bank export failed for %s", req.rid)
+            req.qwen_exo_session_initial_gdn_status = f"failed:{type(exc).__name__}"
+            logger.exception(
+                "QWEN-EXO session-initial GDN export failed for %s", req.rid
+            )
 
     def _maybe_collect_customized_info(
         self,
@@ -237,28 +234,13 @@ class SchedulerBatchResultProcessor:
         num_accept_tokens: int = 1,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
-        bank_cache_status = getattr(req, "qwen_exo_bank_cache_status", None)
-        bank_export_status = getattr(req, "qwen_exo_bank_export_status", None)
         session_gdn_status = getattr(req, "qwen_exo_session_initial_gdn_status", None)
-        if (
-            bank_cache_status is not None
-            or bank_export_status is not None
-            or session_gdn_status is not None
-        ):
+        if session_gdn_status is not None:
             if req.customized_info is None:
                 req.customized_info = {}
-            if bank_cache_status is not None:
-                req.customized_info.setdefault("qwen_exo_bank_cache_status", []).append(
-                    bank_cache_status
-                )
-            if bank_export_status is not None:
-                req.customized_info.setdefault(
-                    "qwen_exo_bank_export_status", []
-                ).append(bank_export_status)
-            if session_gdn_status is not None:
-                req.customized_info.setdefault(
-                    "qwen_exo_session_initial_gdn_status", []
-                ).append(session_gdn_status)
+            req.customized_info.setdefault(
+                "qwen_exo_session_initial_gdn_status", []
+            ).append(session_gdn_status)
         if logits_output is not None and logits_output.customized_info is not None:
             if req.customized_info is None:
                 req.customized_info = {}

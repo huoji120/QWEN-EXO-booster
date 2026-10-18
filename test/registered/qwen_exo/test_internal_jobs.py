@@ -42,7 +42,7 @@ def job(index=0, **overrides):
         "parent_request_id": "parent-1",
         "turn_id": "turn-1",
         "job_id": f"job-{index}",
-        "job_type": InternalJobType.REFERENCE_JUDGE,
+        "job_type": InternalJobType.CAPSULE_UPDATE,
         "priority": -10,
         "shared_prefix_key": "qwen-exo:v1:test:prefix-key",
         "token_budget": 16,
@@ -58,44 +58,6 @@ def job(index=0, **overrides):
 
 def request_factory(**kwargs):
     return SimpleNamespace(**kwargs)
-
-
-def test_internal_batch_uses_one_scheduler_request():
-    manager = FakeTokenizerManager(
-        outputs=[
-            {"text": '{"supported":true}', "meta_info": {"completion_tokens": 4}},
-            {"text": '{"supported":false}', "meta_info": {"completion_tokens": 4}},
-        ]
-    )
-    runner = InternalJobRunner(
-        manager, max_fanout=4, max_tokens_per_parent=64, request_factory=request_factory
-    )
-
-    results = asyncio.run(
-        runner.run_batch(
-            [job(0), job(1)],
-            ["shared prefix A", "shared prefix B"],
-            {"temperature": 0},
-        )
-    )
-
-    assert [result.text for result in results] == [
-        '{"supported":true}',
-        '{"supported":false}',
-    ]
-    assert len(manager.requests) == 1
-    request = manager.requests[0]
-    assert request.rid == ["job-0", "job-1"]
-    assert request.priority == 0
-    assert request.no_logs is True
-    assert request.custom_labels["qwen_exo_visibility"] == "internal"
-    assert request.sampling_params[0]["custom_params"] == {
-        "qwen_exo_kind": "internal",
-        "qwen_exo_job_type": "reference_judge",
-        "qwen_exo_parent_request_id": "parent-1",
-        "qwen_exo_state_budget_bytes": 1024,
-        "qwen_exo_work_class": "foreground",
-    }
 
 
 def test_plain_long_internal_generation_marks_dflash_eligible():
@@ -300,91 +262,6 @@ def test_expired_job_never_reaches_scheduler():
     assert manager.requests == []
 
 
-def test_replay_score_batch_returns_label_nll_and_stays_internal():
-    manager = FakeTokenizerManager(
-        outputs=[
-            {
-                "text": "x",
-                "meta_info": {
-                    "input_token_logprobs": [
-                        (None, 1),
-                        (-1.0, 2),
-                        (-3.0, 3),
-                    ],
-                    "prompt_tokens": 3,
-                    "finish_reason": {"type": "stop"},
-                },
-            }
-        ]
-    )
-    runner = InternalJobRunner(
-        manager,
-        max_fanout=4,
-        max_tokens_per_parent=64,
-        request_factory=request_factory,
-    )
-    replay_job = job(
-        0,
-        job_type=InternalJobType.CAUSAL_REPLAY,
-        token_budget=1,
-        state_budget_bytes=0,
-    )
-
-    result = asyncio.run(
-        runner.run_score_batch(
-            (replay_job,),
-            ((1, 2, 3),),
-            (1,),
-            {"temperature": 0},
-        )
-    )[0]
-
-    assert result.token_logprobs == (-1.0, -3.0)
-    assert result.mean_nll == 2.0
-    request = manager.requests[0]
-    assert request.return_logprob is True
-    assert request.logprob_start_len == [1]
-    assert request.no_logs is True
-    assert request.sampling_params[0]["custom_params"]["qwen_exo_job_type"] == (
-        "causal_replay"
-    )
-    assert request.sampling_params[0]["max_new_tokens"] == 1
-
-
-def test_bank_score_export_generates_no_token_after_document_boundary():
-    manager = FakeTokenizerManager(
-        outputs=[
-            {
-                "text": "",
-                "meta_info": {
-                    "input_token_logprobs": [(None, 1), (-2.0, 2)],
-                    "prompt_tokens": 2,
-                    "finish_reason": {"type": "length", "length": 0},
-                },
-            }
-        ]
-    )
-    runner = InternalJobRunner(
-        manager,
-        max_fanout=4,
-        max_tokens_per_parent=64,
-        request_factory=request_factory,
-    )
-    bank_job = job(
-        0,
-        job_type=InternalJobType.BANK_INDEX,
-        token_budget=1,
-        state_budget_bytes=0,
-    )
-
-    result = asyncio.run(
-        runner.run_score_batch((bank_job,), ((1, 2),), (1,), {"temperature": 0})
-    )[0]
-
-    assert result.token_logprobs == (-2.0,)
-    assert manager.requests[0].sampling_params[0]["max_new_tokens"] == 0
-
-
 def test_internal_job_cannot_use_user_cache_namespace():
     manager = FakeTokenizerManager()
     runner = InternalJobRunner(
@@ -557,7 +434,7 @@ def test_single_job_probe_is_admitted_while_a_sibling_job_runs():
             [
                 job(
                     job_id="probe",
-                    job_type=InternalJobType.QUERY_PROBE,
+                    job_type=InternalJobType.SYSTEM_ONE,
                     token_budget=1,
                     max_fanout=1,
                 )
@@ -855,11 +732,11 @@ def test_scopes_follow_spawned_children_without_leaking_or_promotion():
         @internal_task_scope("foreground")
         async def descendant():
             await release.wait()
-            return current_internal_work_class(InternalJobType.QUERY_PROBE)
+            return current_internal_work_class(InternalJobType.SYSTEM_ONE)
 
         with internal_task_scope("reflection"):
             task = asyncio.create_task(descendant())
-        assert current_internal_work_class(InternalJobType.QUERY_PROBE) == "foreground"
+        assert current_internal_work_class(InternalJobType.SYSTEM_ONE) == "foreground"
         release.set()
         assert await task == "reflection"
         assert await descendant() == "foreground"

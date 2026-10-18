@@ -15,7 +15,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Iterable
+from typing import Any, AsyncGenerator, Iterable
 from qwen_exo_booster.server_sessions import (
     retained_source_producer,
     require_source_admission,
@@ -32,13 +32,12 @@ from qwen_exo_booster.capsule import (
     ExecutionCapsuleService,
     ExecutionCapsuleStore,
 )
-from qwen_exo_booster.causal_replay import CausalReplayService
 from qwen_exo_booster.cognition import CognitionRepository
 from qwen_exo_booster.compaction import (
     ResponseCompactionError,
     ResponseCompactionService,
 )
-from qwen_exo_booster.config import PROJECT_NAME, QwenExoConfig, qk_recall_gates
+from qwen_exo_booster.config import PROJECT_NAME, QwenExoConfig
 from qwen_exo_booster.contracts import (
     CancellationToken,
     HybridStateNamespace,
@@ -49,18 +48,14 @@ from qwen_exo_booster.contracts import (
 from qwen_exo_booster.document_categories import DocumentCategoryStore
 from qwen_exo_booster.document_ingest import (
     KnowledgeIngestError,
-    is_supported_knowledge_filename,
-    prepare_knowledge_bytes,
-    prepare_knowledge_upload,
     validate_knowledge_source_bytes,
-    validate_prepared_batch,
     validate_upload_batch,
 )
 from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
+from qwen_exo_booster.memory_tool_log import MemoryToolLog
 from qwen_exo_booster.fingerprint import ModelIdentity
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.internal_jobs import InternalJobRunner
-from qwen_exo_booster.judge import ReferenceJudge
 from qwen_exo_booster.knowledge import (
     KnowledgeDocument,
     KnowledgeRepository,
@@ -78,21 +73,14 @@ from qwen_exo_booster.latent_transplant import (
     validate_artifact_name,
 )
 from qwen_exo_booster.mid_think_questions import MidThinkQuestionService
-from qwen_exo_booster.memory_refresh import AdaptiveMemoryRefreshGate
 from qwen_exo_booster.observer import (
-    AdaptiveRetrievalPhase,
-    AdaptiveRetrievalStateMachine,
     InFlightObserver,
     ObserverResult,
 )
-from qwen_exo_booster.pipeline import MemoryPipeline, MemoryPreparationState
-from qwen_exo_booster.pmi_gate import PmiJudgeGate
 from qwen_exo_booster.policy_data import PolicyDataRepository
-from qwen_exo_booster.query_probe import QueryProbePlan, QueryProbeService
+from qwen_exo_booster import request_text
 from qwen_exo_booster.reasoning_planner import DynamicReasoningPlanner
-from qwen_exo_booster.decision_context import build_decision_context
 from qwen_exo_booster.system_one import SystemOneEvaluator
-from qwen_exo_booster.recall_trace import recall_trace_payload
 from qwen_exo_booster.reflection_evidence import (
     ReflectionEvidenceStore,
     merge_causal_entries,
@@ -105,11 +93,8 @@ from qwen_exo_booster.reflection_memory import (
     ReflectionMemoryStore,
     ReflectionSourceSnapshot,
     ReflectionSourceStore,
+    lexical_overlap,
     reflection_source_digest,
-)
-from qwen_exo_booster.refresh import (
-    RefreshRecord,
-    SelfAskRefreshService,
 )
 from qwen_exo_booster.score_bias import (
     SCORE_BIAS_BLOCK_SIZE,
@@ -122,24 +107,19 @@ from qwen_exo_booster.score_bias import (
 )
 from qwen_exo_booster.service_config import ServiceConfigStore
 from qwen_exo_booster.telemetry import TelemetryStore
-from qwen_exo_booster.tensor_bank import TensorBank
 from qwen_exo_booster.task_scheduling import internal_task_scope
 
 logger = logging.getLogger(__name__)
 
-_REFLECTION_ORGANIZATION_COMPLETED_LIMIT = 32
+# Existing reflection memories offered to the model as update targets.
+_REFLECTION_SIMILAR_LIMIT = 4
+_REFLECTION_SIMILAR_MIN_OVERLAP = 0.2
 # Background maintenance (reflection, session-initial GDN consolidation) decodes
 # thousands of tokens on the same GPU as user turns. It starts only once no user
 # request is in flight and none finished within this window, so agent loops
 # with short tool gaps are not interleaved with maintenance work.
 _FOREGROUND_QUIET_SECONDS = 30.0
 _FOREGROUND_POLL_SECONDS = 2.0
-
-
-def _query_probe_timeout_seconds(tokenizer_manager: Any) -> float:
-    server_args = getattr(tokenizer_manager, "server_args", None)
-    algorithm = str(getattr(server_args, "speculative_algorithm", "") or "").upper()
-    return 120.0 if algorithm == "DFLASH" else 8.0
 
 
 _STARTUP_GENERATION_WARMUP_PARENT_ID = "runtime"
@@ -378,19 +358,12 @@ class QwenExoRuntime:
         self.config = config
         self.tokenizer_manager = tokenizer_manager
         self.hybrid_policy = hybrid_policy
-        if bool(
-            getattr(
-                getattr(tokenizer_manager, "server_args", None),
-                "qwen_exo_qk_only_knowledge",
-                False,
-            )
-        ):
-            logger.warning(
-                "qwen_exo_qk_only_knowledge is deprecated; ordinary Knowledge uses file retrieval"
-            )
         self.knowledge = KnowledgeRepository(config.knowledge_directory)
         self.file_knowledge = FileKnowledgeIndex(
             config.knowledge_directory, config.state_directory
+        )
+        self.memory_tool_log = MemoryToolLog(
+            config.state_directory / "memory-tool-calls.sqlite3"
         )
         self.document_categories = DocumentCategoryStore(
             config.state_directory / "document-categories.sqlite3"
@@ -429,13 +402,9 @@ class QwenExoRuntime:
         self.reflection_evidence_store = ReflectionEvidenceStore(
             config.state_directory / "reflection-evidence.sqlite3"
         )
-        self.reference_judge: ReferenceJudge | None = None
         self.capsules: ExecutionCapsuleService | None = None
-        self.refresh_service: SelfAskRefreshService | None = None
         self.mid_think_questions: MidThinkQuestionService | None = None
         self.reflection_memory_service: ReflectionMemoryService | None = None
-        self.memory_pipeline: MemoryPipeline | None = None
-        self.query_probe: QueryProbeService | None = None
         self.reasoning_planner: DynamicReasoningPlanner | None = None
         self.compaction_service: ResponseCompactionService | None = None
         self._compaction_summaries: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -446,8 +415,6 @@ class QwenExoRuntime:
             CompactionReflectionCheckpoint
         ] = asyncio.Queue(maxsize=max(1, config.max_running_requests))
         self._compaction_reflection_worker: asyncio.Task[None] | None = None
-        self.tensor_bank: TensorBank | None = None
-        self.causal_replay: CausalReplayService | None = None
 
         self.telemetry = TelemetryStore(
             config.state_directory / "trace.jsonl",
@@ -469,18 +436,9 @@ class QwenExoRuntime:
             recovery_tokens=config.observer_recovery_tokens,
             immediate_uncertainty_retrieval=config.immediate_uncertainty_retrieval,
         )
-        self.adaptive_retrieval = (
-            AdaptiveRetrievalStateMachine(self.telemetry)
-            if config.feature_flags.adaptive_refresh
-            else None
-        )
-        self._pending_pre_complete_sources: tuple[Path, ...] = ()
-        self._pending_pre_complete_payload: dict[str, object] | None = None
         self.state = QwenExoRuntimeState.CREATED
-        self._pre_complete_directory = self._resolve_pre_complete_directory()
-        self._tensor_bank_admin_lock = asyncio.Lock()
-        self._reflection_memory_organize_lock = asyncio.Lock()
         self._session_initial_gdn_refresh_lock = asyncio.Lock()
+        self._reflection_publish_lock = asyncio.Lock()
         self._session_initial_gdn_refresh_task: asyncio.Task[None] | None = None
         self._session_initial_gdn_refresh_requested: str | None = None
         self._session_initial_gdn_value_lock = threading.RLock()
@@ -498,11 +456,6 @@ class QwenExoRuntime:
             "memory_count": 0,
             "updated_at": None,
         }
-        self._reflection_memory_organization_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._reflection_memory_organization_worker: asyncio.Task[None] | None = None
-        self._reflection_memory_organization_states: OrderedDict[
-            str, dict[str, Any]
-        ] = OrderedDict()
         self._reflection_memory_regeneration_task: asyncio.Task[None] | None = None
         self._reflection_memory_regeneration_state: dict[str, Any] = {
             "job_id": None,
@@ -520,9 +473,6 @@ class QwenExoRuntime:
         }
         self._lifecycle_lock = asyncio.Lock()
         self._request_questions: dict[str, str] = {}
-        self._decision_contexts: dict[str, Any] = {}
-        self._refresh_tasks: dict[str, asyncio.Task[Any]] = {}
-        self._replay_tasks: dict[str, asyncio.Task[Any]] = {}
         self._capsule_tasks: dict[str, asyncio.Task[Any]] = {}
         self._finalize_tasks: dict[str, asyncio.Task[None]] = {}
         self._pending_background_requests: set[str] = set()
@@ -567,15 +517,7 @@ class QwenExoRuntime:
         self._conversation_keys_by_call_association: OrderedDict[
             str, tuple[str, ...]
         ] = OrderedDict()
-        self._memory_parents_by_conversation: OrderedDict[str, str] = OrderedDict()
         self._max_conversation_keys = self.capsule_store.max_records
-        self.memory_refresh_gate = AdaptiveMemoryRefreshGate(
-            max_conversations=self._max_conversation_keys,
-            surprisal_threshold=config.observer_surprisal_threshold,
-            surprisal_margin=config.observer_surprisal_margin,
-            window_tokens=config.observer_surprisal_window,
-        )
-        self._request_memory_gate_keys: dict[str, str] = {}
         self._reasoning_task_selections: OrderedDict[
             tuple[str, str, str], ReasoningTaskSelection
         ] = OrderedDict()
@@ -605,7 +547,6 @@ class QwenExoRuntime:
         self._request_latent_transplants: dict[str, dict[str, object]] = {}
         self._request_latent_transplant_layers: dict[str, tuple[int, ...]] = {}
         self._latent_transplant_applied_requests: set[str] = set()
-        self._bank_cache_status_emitted: set[str] = set()
         self._session_initial_gdn_status_emitted: set[str] = set()
         self._request_tool_event_marks: dict[str, list[dict[str, Any]]] = {}
         self._request_trajectory_capture_blocks: dict[
@@ -645,151 +586,6 @@ class QwenExoRuntime:
             tokenizer_manager,
             HybridRuntimePolicy.from_server_args(server_args),
         )
-
-    def _resolve_pre_complete_directory(self) -> Path | None:
-        configured = os.getenv("QWEN_EXO_PRE_COMPLETE_KNOWLEDGE_DIR", "").strip()
-        if configured:
-            return Path(configured).expanduser().resolve()
-        data_root = os.getenv("QWEN_EXO_MODEL_DATA_ROOT", "").strip()
-        if not data_root:
-            return None
-        return (Path(data_root).expanduser().resolve() / "pre-complete").resolve()
-
-    def _pre_complete_sources(self) -> tuple[Path, ...]:
-        root = self._pre_complete_directory
-        if root is None:
-            return ()
-        root.mkdir(parents=True, exist_ok=True)
-        sources = []
-        for path in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
-            if (
-                path.is_file()
-                and not path.is_symlink()
-                and is_supported_knowledge_filename(path.name)
-            ):
-                sources.append(path)
-        return tuple(sources)
-
-    def _stage_pre_complete_knowledge(self, tokenizer: Any) -> dict[str, object] | None:
-        sources = self._pre_complete_sources()
-        if not sources:
-            return None
-        if self.tensor_bank is None:
-            raise RuntimeError(
-                "Pre-complete Knowledge requires an initialized Native Tensor Bank"
-            )
-        max_source_tokens = self.config.tensor_bank_max_document_tokens - len(
-            self.tensor_bank.cognition_token_ids()
-        )
-        prepared_by_source = tuple(
-            (
-                source,
-                prepare_knowledge_bytes(
-                    source.name,
-                    source.read_bytes(),
-                    tokenizer=tokenizer,
-                    max_source_tokens=max_source_tokens,
-                    relative_path_prefix="pre-complete",
-                    document_group_prefix="pre_complete",
-                ),
-            )
-            for source in sources
-        )
-        prepared = tuple(
-            document for _, documents in prepared_by_source for document in documents
-        )
-        validate_prepared_batch(prepared)
-        relative_paths = [document.relative_path for document in prepared]
-        if len(set(relative_paths)) != len(relative_paths):
-            raise KnowledgeIngestError(
-                "duplicate_document_path",
-                "Pre-complete 文件清洗后生成了重复文档路径，请调整文件名",
-            )
-        existing_paths = {
-            document.relative_path for document in self.knowledge.snapshot.documents
-        }
-        conflicts = sorted(existing_paths.intersection(relative_paths))
-        if conflicts:
-            raise KnowledgeIngestError(
-                "path_conflict",
-                f"Pre-complete 目标路径已存在：{conflicts[0]}",
-            )
-
-        written_paths = []
-        try:
-            for document in prepared:
-                self.knowledge.upsert(document.relative_path, document.content)
-                written_paths.append(document.relative_path)
-        except BaseException:
-            for relative_path in reversed(written_paths):
-                self.knowledge.delete(relative_path)
-            raise
-
-        payload: dict[str, object] = {
-            "source_files": [source.name for source in sources],
-            "document_paths": relative_paths,
-            "document_count": len(prepared),
-            "split_document_count": sum(
-                len(documents) > 1 for _, documents in prepared_by_source
-            ),
-        }
-        self._pending_pre_complete_sources = sources
-        self._pending_pre_complete_payload = payload
-        return payload
-
-    def _rollback_staged_pre_complete_knowledge(self) -> None:
-        payload = self._pending_pre_complete_payload
-        if payload is None:
-            return
-        for relative_path in reversed(tuple(payload["document_paths"])):
-            try:
-                self.knowledge.delete(str(relative_path))
-            except FileNotFoundError:
-                pass
-        self._pending_pre_complete_sources = ()
-        self._pending_pre_complete_payload = None
-
-    def _commit_pre_complete_knowledge(self) -> dict[str, object] | None:
-        payload = self._pending_pre_complete_payload
-        if payload is None:
-            return None
-        for source in self._pending_pre_complete_sources:
-            source.unlink()
-        self._pending_pre_complete_sources = ()
-        self._pending_pre_complete_payload = None
-        self.telemetry.emit("runtime", "knowledge.pre_complete_consumed", payload)
-        return payload
-
-    async def _run_startup_warmup(self) -> None:
-        if self.query_probe is not None:
-            started = time.perf_counter()
-            result = await self.query_probe.warmup()
-            elapsed = time.perf_counter() - started
-            self.telemetry.emit(
-                "runtime",
-                "runtime.startup_warmup",
-                {
-                    "query_probe_status": result.status,
-                    "query_probe_prompt_tokens": result.prompt_tokens,
-                    "query_probe_latency_seconds": result.latency_seconds,
-                    "elapsed_seconds": elapsed,
-                    "cache_hit": result.cache_hit,
-                },
-            )
-            if result.status == "failed_closed":
-                logger.warning(
-                    "QWEN_EXO_STARTUP_WARMUP failed closed status=%s elapsed=%.3fs",
-                    result.status,
-                    elapsed,
-                )
-            else:
-                logger.info(
-                    "QWEN_EXO_STARTUP_WARMUP status=%s prompt_tokens=%d elapsed=%.3fs",
-                    result.status,
-                    result.prompt_tokens,
-                    elapsed,
-                )
-        await self._run_startup_generation_warmup()
 
     @staticmethod
     def _session_initial_gdn_memory_record(record: dict[str, Any], index: int) -> str:
@@ -1021,8 +817,7 @@ class QwenExoRuntime:
             shared_prefix_key="qwen-exo:v1:startup:warmup",
             token_budget=_STARTUP_GENERATION_WARMUP_TOKENS,
             state_budget_bytes=0,
-            deadline_monotonic=time.monotonic()
-            + max(300.0, _query_probe_timeout_seconds(self.tokenizer_manager)),
+            deadline_monotonic=time.monotonic() + 300.0,
             cancellation_token=CancellationToken(
                 f"cancel:{parent_id}:startup-generation-warmup"
             ),
@@ -1356,7 +1151,7 @@ class QwenExoRuntime:
         """Refresh in the background, coalescing bursts of stored memories.
 
         Consolidation prefills every memory and decodes a full reflection, so
-        it must not block the reflection or organization job that stored the
+        it must not block the reflection job that stored the
         memory. While one refresh runs, later requests fold into a single
         follow-up pass that sees the complete store.
         """
@@ -1462,8 +1257,7 @@ class QwenExoRuntime:
                 self.model_identity.validate_qwen_exo_model()
                 tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
                 if tokenizer is None and (
-                    self.config.feature_flags.reference_judge
-                    or self.config.feature_flags.capsule
+                    self.config.feature_flags.capsule
                     or self.config.feature_flags.policy_data
                     or self.config.reasoning_mode == "dynamic"
                     or self.config.force_auto_reasoning
@@ -1486,136 +1280,11 @@ class QwenExoRuntime:
                 self._reasoning_end_token_id = (
                     int(convert_token("</think>")) if callable(convert_token) else None
                 )
-                if self.config.feature_flags.reference_judge:
-                    self.reference_judge = ReferenceJudge(
-                        self.internal_jobs,
-                        self.knowledge,
-                        tokenizer,
-                        model_fingerprint=self.model_identity.fingerprint,
-                        max_prompt_tokens=self.config.context_length - 1,
-                        timeout_seconds=120.0,
-                    )
                 if self.config.feature_flags.capsule:
                     self.capsules = ExecutionCapsuleService(
                         self.internal_jobs,
                         self.capsule_store,
                         tokenizer,
-                    )
-                if (
-                    self.config.feature_flags.external_memory
-                    or self.config.feature_flags.policy_data
-                    or self.cognition.snapshot.documents
-                ):
-                    self.memory_pipeline = MemoryPipeline(
-                        self.config,
-                        self.knowledge,
-                        tokenizer,
-                        policy_data=self.policy_data,
-                        reference_judge=self.reference_judge,
-                        telemetry=self.telemetry,
-                        pmi_gate=(
-                            PmiJudgeGate(
-                                self.internal_jobs,
-                                tokenizer,
-                                threshold=self.config.pmi_gate_threshold,
-                            )
-                            if self.config.pmi_gate_mode == "active"
-                            and tokenizer is not None
-                            else None
-                        ),
-                    )
-                if tokenizer is not None and (
-                    self.config.feature_flags.external_memory
-                    or self.config.feature_flags.policy_data
-                    or self.cognition.snapshot.documents
-                ):
-                    self.tensor_bank = TensorBank(
-                        self.config.model_state_directory / "tensor-bank.pt",
-                        self.internal_jobs,
-                        tokenizer,
-                        {
-                            "cognition": self.cognition,
-                            "knowledge": None,
-                            "policydata": (
-                                self.policy_data
-                                if self.config.feature_flags.policy_data
-                                else None
-                            ),
-                        },
-                        model_fingerprint=self.model_identity.fingerprint,
-                        tp_size=self.config.tp_size,
-                        compression_ratio=int(
-                            getattr(
-                                getattr(
-                                    getattr(self.tokenizer_manager, "model_config", None),
-                                    "hf_text_config", None,
-                                ),
-                                "indexer_compress_ratio", 1,
-                            ) or 1
-                        ),
-                        max_document_tokens=(
-                            self.config.tensor_bank_max_document_tokens
-                        ),
-                        salient_token_budget=(
-                            self.config.tensor_bank_salient_token_budget
-                        ),
-                        surprisal_threshold=(
-                            self.config.tensor_bank_surprisal_threshold
-                        ),
-                        span_tokens=self.config.tensor_bank_span_tokens,
-                        qk_layer_id=self.config.qk_layer_id,
-                        qk_query_heads=self.config.qk_query_heads,
-                    )
-                    if self.config.knowledge_retrieval_mode != "file":
-                        self._stage_pre_complete_knowledge(tokenizer)
-                    if self.memory_pipeline is not None:
-                        self.memory_pipeline.tensor_bank = self.tensor_bank
-                    bank_sources_present = (
-                        bool(self.cognition.snapshot.documents)
-                        or bool(
-                            self.config.feature_flags.policy_data
-                            and self.policy_data.snapshot.documents
-                        )
-                    )
-                    if bank_sources_present:
-                        bank_snapshot = await self.tensor_bank.ensure_ready()
-                        if not bank_snapshot.ready:
-                            raise RuntimeError(
-                                "QWEN-EXO native Tensor Bank failed to build any pages"
-                            )
-                        self.telemetry.emit(
-                            "runtime", "tensor_bank.ready", bank_snapshot.public_dict()
-                        )
-                        if self.config.knowledge_retrieval_mode != "file":
-                            self._commit_pre_complete_knowledge()
-                        self._ensure_query_probe()
-                if (
-                    self.config.feature_flags.adaptive_refresh
-                    and self.reference_judge is not None
-                    and self.memory_pipeline is not None
-                ):
-                    self.refresh_service = SelfAskRefreshService(
-                        self.internal_jobs,
-                        self.knowledge,
-                        self.reference_judge,
-                        self.telemetry,
-                        max_candidates=self.config.max_candidates,
-                        policy_data=(
-                            self.policy_data
-                            if self.config.feature_flags.policy_data
-                            else None
-                        ),
-                        tensor_bank=self.tensor_bank,
-                        tokenizer=tokenizer,
-                        query_probe=self.query_probe,
-                        context_evidence_mode=self.config.context_evidence_mode,
-                        context_integrity_mode=self.config.context_integrity_mode,
-                        context_integrity_max_tokens=(
-                            self.config.context_integrity_max_tokens
-                        ),
-                        knowledge_qk_only=self.config.qk_only_knowledge,
-                        qk_admission_margin=self.config.qk_admission_margin,
-                        qk_min_tensor_score=self.config.qk_admission_gates[0],
                     )
                 if (
                     self.config.reasoning_cutoff_question_count > 0
@@ -1670,7 +1339,7 @@ class QwenExoRuntime:
                         ),
                     )
                 if run_startup_warmup:
-                    await self._run_startup_warmup()
+                    await self._run_startup_generation_warmup()
                 self.state = QwenExoRuntimeState.READY
                 self.telemetry.emit(
                     "runtime",
@@ -1698,7 +1367,6 @@ class QwenExoRuntime:
                 if self.reflection_memory_service is not None:
                     self._ensure_compaction_reflection_worker()
             except Exception:
-                self._rollback_staged_pre_complete_knowledge()
                 self.state = QwenExoRuntimeState.FAILED
                 raise
 
@@ -1734,7 +1402,6 @@ class QwenExoRuntime:
             while not self._compaction_reflection_queue.empty():
                 self._compaction_reflection_queue.get_nowait()
                 self._compaction_reflection_queue.task_done()
-            await self._stop_reflection_memory_organization()
             regeneration_task = self._reflection_memory_regeneration_task
             if regeneration_task is not None and not regeneration_task.done():
                 regeneration_task.cancel()
@@ -1753,13 +1420,9 @@ class QwenExoRuntime:
             self._compaction_summaries.clear()
             self._document_token_counts.clear()
             self._finalize_tasks.clear()
-            self._refresh_tasks.clear()
             self._capsule_tasks.clear()
-            self._replay_tasks.clear()
-            self._bank_cache_status_emitted.clear()
             self._session_initial_gdn_status_emitted.clear()
             self._request_questions.clear()
-            self._decision_contexts.clear()
             self._pending_background_requests.clear()
             self._cancelled_request_ids.clear()
             self._request_outputs.clear()
@@ -1783,10 +1446,7 @@ class QwenExoRuntime:
             self._conversation_keys_by_response_id.clear()
             self._canonical_payload_digests.clear()
             self._conversation_keys_by_call_association.clear()
-            self._memory_parents_by_conversation.clear()
             self._request_conversation_keys.clear()
-            self.memory_refresh_gate.clear()
-            self._request_memory_gate_keys.clear()
             self._response_head_crc32.clear()
             self._request_tool_event_marks.clear()
             self._request_score_bias_steps.clear()
@@ -1820,8 +1480,6 @@ class QwenExoRuntime:
                 }
             self.observer.clear()
             self.telemetry.emit("runtime", "runtime.stopping", {})
-            if self.adaptive_retrieval is not None:
-                self.adaptive_retrieval.clear()
             self.state = QwenExoRuntimeState.STOPPED
 
     def initial_gdn_selection(
@@ -1950,10 +1608,7 @@ class QwenExoRuntime:
         return "\n\n".join(parts) or None
 
     @retained_source_producer
-    async def prepare_responses_request(
-        self, request: Any, *, history_resolver: Any = None,
-        decision_cache_scope: str | None = None,
-    ) -> tuple[Any, MemoryPreparationState | None]:
+    async def prepare_responses_request(self, request: Any) -> Any:
         request = self._enable_default_response_thinking(request)
         request = self._attach_cognition_text(request)
         api_previous_response_id = getattr(request, "previous_response_id", None)
@@ -1984,14 +1639,14 @@ class QwenExoRuntime:
             if compaction_envelope is not None
             else None
         )
-        first_user = MemoryPipeline._first_user_text(request.input)
-        current_user = MemoryPipeline._latest_user_text(request.input)
-        current_request_question = MemoryPipeline._request_question(request.input)
+        first_user = request_text.first_user_text(request.input)
+        current_user = request_text.latest_user_text(request.input)
+        current_request_question = request_text.request_question(request.input)
         provisional_task = (
             first_user
             or current_user
             or (
-                MemoryPipeline._request_question(
+                request_text.request_question(
                     request.input, compaction_context=compaction_context
                 )
                 if compaction_context
@@ -2010,8 +1665,6 @@ class QwenExoRuntime:
                 raise QwenExoCapacityConflict(
                     "QWEN-EXO concurrent request capacity is exhausted"
                 )
-            if self.adaptive_retrieval is not None:
-                self.adaptive_retrieval.begin(request.request_id)
             self._request_questions[request.request_id] = provisional_task
             self._foreground_last_activity = time.monotonic()
             if bool(getattr(request, "background", False)):
@@ -2061,24 +1714,15 @@ class QwenExoRuntime:
             # waiter re-arms instead of reflecting mid-conversation.
             self._reflection_memory_last_activity[conversation_key] = time.monotonic()
             self._reflection_memory_last_activity.move_to_end(conversation_key)
-        effective_memory_previous_response_id = previous_response_id or (
-            self._memory_parents_by_conversation.get(conversation_key)
-        )
-        if effective_memory_previous_response_id:
-            parent_id = str(effective_memory_previous_response_id)
-            if previous_response_id:
-                # The parent capsule seeds this turn's capsule lineage.
-                parent_finalization = self._finalize_tasks.get(parent_id)
-                if parent_finalization is not None:
-                    await asyncio.shield(parent_finalization)
-            else:
-                parent_memory = self._memory_finalized.get(parent_id)
-                if parent_memory is not None:
-                    await asyncio.shield(parent_memory.wait())
+        if previous_response_id and self.capsules is not None:
+            # The parent capsule seeds this turn's capsule lineage.
+            parent_finalization = self._finalize_tasks.get(str(previous_response_id))
+            if parent_finalization is not None:
+                await asyncio.shield(parent_finalization)
         if head_changed:
             checkpoint = self._build_compaction_reflection_checkpoint(
                 response_id=str(request.request_id),
-                previous_response_id=effective_memory_previous_response_id,
+                previous_response_id=previous_response_id,
                 conversation_key=conversation_key,
                 original_items=[],
                 tokenizer=getattr(self.tokenizer_manager, "tokenizer", None),
@@ -2124,33 +1768,13 @@ class QwenExoRuntime:
         else:
             original_task = first_user or current_user
 
-        query_plan = MemoryPipeline._request_query_plan(
+        task_question = request_text.request_question(
             request.input,
             original_task=original_task or None,
             compaction_context=compaction_context or None,
         )
-        retrieval_question = MemoryPipeline._request_question(
-            request.input,
-            original_task=original_task or None,
-            compaction_context=compaction_context or None,
-        )
-        decision_context = None
-        if self.memory_pipeline is not None:
-            effective_history = (
-                await history_resolver(request) if history_resolver is not None else request.input
-            )
-            decision_context = build_decision_context(
-                request, self.tokenizer_manager.tokenizer,
-                input_items=effective_history,
-                compaction_context=compaction_context or None,
-                lineage_namespace=(
-                    stable_digest(decision_cache_scope, conversation_key)
-                    if decision_cache_scope else None
-                ),
-            )
-            self._decision_contexts[request.request_id] = decision_context
         self._request_questions[request.request_id] = (
-            original_task or current_user or retrieval_question
+            original_task or current_user or task_question
         )
         if original_task:
             self._original_tasks[request.request_id] = original_task
@@ -2172,17 +1796,11 @@ class QwenExoRuntime:
             "request.started",
             {
                 "input": provisional_task,
-                "retrieval_query_digest": stable_digest(retrieval_question),
-                "retrieval_role_plan_digest": query_plan.identity,
                 "parent_response_id": previous_response_id,
                 "background": bool(getattr(request, "background", False)),
             },
         )
         self._raise_if_cancelled(request.request_id)
-        trajectory_context = self._response_trajectory_context(
-            request.input,
-            max_tokens=self.config.context_integrity_max_tokens,
-        )
         if self.config.reflection_memory_mode != "off":
             self._cancel_reflection_memory_task(conversation_key)
             self._record_reflection_memory_rows(
@@ -2214,186 +1832,39 @@ class QwenExoRuntime:
                     "skipped_count": skipped_tool_events,
                 },
             )
-        for generation_offset, (tool_call, observation) in enumerate(
-            unseen_tool_events
-        ):
-            if self.observer.mode == "active" and self.refresh_service is not None:
-                await self.recall_after_tool(
-                    request.request_id,
-                    observation,
-                    generation_index=-(generation_offset + 1),
-                    tool_call=tool_call,
-                    trajectory_context=trajectory_context,
-                )
-            else:
-                self.record_tool_event(
-                    request.request_id, observation, tool_call=tool_call
-                )
+        for tool_call, observation in unseen_tool_events:
+            self.record_tool_event(request.request_id, observation, tool_call=tool_call)
         if previous_response_id:
             request = self._restore_execution_capsule(request, previous_response_id)
-
-        restoration = None
-        record_reader = (
-            getattr(self.refresh_service, "record", None)
-            if self.observer.mode == "active" and self.refresh_service is not None
-            else None
-        )
-        if callable(record_reader):
-            restoration = record_reader(effective_memory_previous_response_id)
-        if (
-            restoration is not None
-            and restoration.status
-            in {"context_evidence_ready", "context_integrity_ready"}
-            and request.request_id not in self._pending_think_contexts
-        ):
-            restored = self._think_context_from_record(restoration)
-            if restored is not None:
-                restored = ThinkContextInjection(
-                    turn_id=(
-                        f"{request.request_id}:next_turn:"
-                        f"{stable_digest(restored.identity)[:16]}"
-                    ),
-                    event_id=restored.event_id,
-                    purpose="next_turn_correction",
-                    question=restored.question,
-                    answer=restored.answer,
-                    text=restored.text,
-                )
-                self._pending_think_contexts[request.request_id] = restored
-                self.telemetry.emit(
-                    request.request_id,
-                    "self_ask.next_turn_context_restored",
-                    {
-                        "previous_response_id": previous_response_id,
-                        "effective_memory_previous_response_id": (
-                            effective_memory_previous_response_id
-                        ),
-                        "source_turn_id": restoration.turn_id,
-                        "question_digest": stable_digest(restored.question),
-                        "answer_digest": stable_digest(restored.answer),
-                        "text_injected": False,
-                    },
-                )
-        if self.memory_pipeline is None:
-            return request, None
-        (
-            prepared_request,
-            memory_state,
-        ) = await self._prepare_gated_memory_request(
-            request,
-            conversation_key=conversation_key,
-            decision_cache_scope=decision_cache_scope,
-            query_plan=query_plan,
-            restoration=restoration,
-            retrieval_question=retrieval_question,
-            original_task=original_task or None,
-            memory_previous_response_id=effective_memory_previous_response_id,
-            published_previous_response_id=previous_response_id,
-            decision_context=decision_context,
-        )
-        # The global initial GDN namespace is prefixed onto the radix key by the
-        # Responses entrypoint together with the selection itself, so internal
-        # jobs (which start from a zero recurrent state) keep the pipeline's
-        # own memory namespace and never share cached state with bound requests.
-        selection = self.initial_gdn_selection(
-            previous_response_id=getattr(request, "previous_response_id", None)
-        )
         self._raise_if_cancelled(request.request_id)
-        self.telemetry.emit(
-            request.request_id,
-            "memory.prepared",
-            memory_state.public_dict(),
-        )
-        policy_attachment = memory_state.policy_attachment
-        logger.info(
-            "QWEN_EXO_MEMORY_PREPARED request_id=%s previous_response_id=%s "
-            "policy_active=%s policy_tokens=%d knowledge_tokens=%d "
-            "policy_documents=%s knowledge_documents=%s session_initial_gdn=%s "
-            "restoration_status=%s",
-            request.request_id,
-            memory_state.previous_response_id,
-            bool(policy_attachment is not None and policy_attachment.active),
-            int(memory_state.policy_attached_tokens),
-            int(memory_state.attached_tokens),
-            memory_state.policy_document_ids,
-            tuple(getattr(memory_state, "selected_document_ids", ()) or ()),
-            selection["state_identity"] if selection is not None else None,
-            memory_state.restoration_status,
-        )
-        if (
-            self.adaptive_retrieval is not None
-            and memory_state.restoration_status == "restored"
-        ):
-            self._adaptive_transition(
-                request.request_id,
-                AdaptiveRetrievalPhase.RESTORED,
-                decision="semantic_rejudge_passed",
-            )
-        return prepared_request, memory_state
+        return self._attach_policy_data(request)
 
-    async def _prepare_gated_memory_request(
-        self, request: Any, *, conversation_key: str,
-        decision_cache_scope: str | None, query_plan: QueryProbePlan,
-        restoration: Any, retrieval_question: str, original_task: str | None,
-        memory_previous_response_id: str | None,
-        published_previous_response_id: str | None, decision_context: Any,
-    ) -> tuple[Any, MemoryPreparationState]:
-        # Credential scope prevents otherwise identical stateless histories from
-        # sharing an attachment across authenticated clients.
-        gate_key = stable_digest(decision_cache_scope or "local", conversation_key)
-        self._request_memory_gate_keys[request.request_id] = gate_key
-        async with self.memory_refresh_gate.conversation(gate_key) as gate_state:
-            self._raise_if_cancelled(request.request_id)
-            revision = stable_digest(
-                self.knowledge.snapshot.source_digest,
-                self.policy_data.snapshot.source_digest,
-                str(self.config.feature_flags.external_memory),
-                str(self.config.feature_flags.policy_data),
-                str(self.config.max_memory_tokens),
-                str(self.config.max_policy_tokens),
-            )
-            decision = self.memory_refresh_gate.decide(
-                gate_state, request_id=request.request_id, revision=revision,
-            )
-            self.telemetry.emit(request.request_id, "memory.refresh_gate", {
-                "conversation_key": conversation_key,
-                **decision.public_dict(),
-            })
-            if not decision.retrieve:
-                return await self.memory_pipeline.reuse_responses_request(
-                    request, gate_state.memory,
-                    retrieval_question=retrieval_question,
-                    memory_previous_response_id=memory_previous_response_id,
-                    published_previous_response_id=published_previous_response_id,
-                    decision_context=decision_context,
-                )
-            query_heads = ()
-            query_states = ()
-            query_role_plan_digest = query_plan.identity
-            query_probe_status = "unavailable"
-            query_probe_prompt_tokens = 0
-            if self.query_probe is not None:
-                probe = await self.query_probe.probe(request.request_id, query_plan)
-                query_heads = probe.query_heads
-                query_states = probe.query_states
-                query_role_plan_digest = probe.role_plan_digest
-                query_probe_status = probe.status
-                query_probe_prompt_tokens = probe.prompt_tokens
-            prepared, memory = await self.memory_pipeline.prepare_responses_request(
-                request, restoration=restoration,
-                retrieval_question=retrieval_question, original_task=original_task,
-                query_heads=query_heads, query_states=query_states,
-                query_role_plan_digest=query_role_plan_digest,
-                query_probe_status=query_probe_status,
-                query_probe_prompt_tokens=query_probe_prompt_tokens,
-                memory_previous_response_id=memory_previous_response_id,
-                published_previous_response_id=published_previous_response_id,
-                judge_reuse_scope=self._judge_reuse_scope(request.request_id, original_task),
-                decision_context=decision_context,
-            )
-            self._raise_if_cancelled(request.request_id)
-            self.memory_refresh_gate.commit(gate_state, memory, revision=revision)
-            return prepared, memory
+    def _attach_policy_data(self, request: Any) -> Any:
+        """Append the PolicyData (persona/execution policy) document to the
+        instructions when enabled. It is stable for a given document set, so
+        it stays byte-identical across turns and keeps the prefix cache hot;
+        its own radix namespace keeps it apart from policy-free prefixes."""
+        if not self.config.feature_flags.policy_data:
+            return request
+        policy = self.policy_data.compile_text_attachment(
+            self.tokenizer_manager.tokenizer,
+            max_tokens=self.config.max_policy_tokens,
+        )
+        if policy is None or not policy.active or not policy.instructions:
+            return request
+        original_instructions = str(getattr(request, "instructions", None) or "").strip()
+        original_extra_key = getattr(request, "extra_key", None)
+        return request.model_copy(
+            update={
+                "instructions": "\n\n".join(
+                    part for part in (original_instructions, policy.instructions) if part
+                ),
+                "extra_key": HybridRuntimePolicy.namespace_key(
+                    HybridStateNamespace.EXTERNAL_MEMORY,
+                    stable_digest(policy.attachment_digest, original_extra_key or ""),
+                ),
+            }
+        )
 
     def _ensure_compaction_reflection_worker(self) -> None:
         if getattr(self, "reflection_memory_service", None) is None:
@@ -2578,8 +2049,8 @@ class QwenExoRuntime:
         ).strip()
         if not original_task:
             original_task = (
-                MemoryPipeline._first_user_text(original_items)
-                or MemoryPipeline._latest_user_text(original_items)
+                request_text.first_user_text(original_items)
+                or request_text.latest_user_text(original_items)
                 or "Continue the compacted task."
             )
         encoded_history = json.dumps(
@@ -2727,12 +2198,9 @@ class QwenExoRuntime:
             canonical_identity=canonical_identity,
             call_ids=call_ids,
         )
-        effective_memory_previous_response_id = lineage_previous_response_id or (
-            getattr(self, "_memory_parents_by_conversation", {}).get(conversation_key)
-        )
-        if effective_memory_previous_response_id:
+        if lineage_previous_response_id:
             finalization = getattr(self, "_finalize_tasks", {}).get(
-                str(effective_memory_previous_response_id)
+                str(lineage_previous_response_id)
             )
             if finalization is not None:
                 await asyncio.shield(finalization)
@@ -2749,8 +2217,8 @@ class QwenExoRuntime:
             compaction_original_task = (
                 canonical_identity.original_task
                 if canonical_identity is not None
-                else MemoryPipeline._first_user_text(original_items)
-                or MemoryPipeline._latest_user_text(original_items)
+                else request_text.first_user_text(original_items)
+                or request_text.latest_user_text(original_items)
             )
         if canonical_identity is not None:
             associated_tasks = getattr(self, "_original_tasks_by_association", None)
@@ -2775,12 +2243,7 @@ class QwenExoRuntime:
             original_items=original_items,
             tokenizer=tokenizer,
         )
-        memory_state = None
-        if self.memory_pipeline is not None and effective_memory_previous_response_id:
-            memory_state = await self.memory_pipeline.get_state(
-                str(effective_memory_previous_response_id)
-            )
-        memory_payload = self._compaction_memory_payload(memory_state)
+        memory_payload = self._compaction_memory_payload()
         summary = await self.compaction_service.summarize(
             parent_request_id=compact_id,
             source_digest=source_digest,
@@ -2788,25 +2251,6 @@ class QwenExoRuntime:
             memory=memory_payload,
             dropped_items=dropped_items,
         )
-        if (
-            memory_state is not None
-            and self.config.response_compaction_mode == "active"
-        ):
-            state_updates: dict[str, Any] = {"request_id": response_id}
-            if hasattr(memory_state, "previous_response_id"):
-                state_updates["previous_response_id"] = (
-                    str(lineage_previous_response_id)
-                    if lineage_previous_response_id
-                    else None
-                )
-            if hasattr(memory_state, "effective_memory_previous_response_id"):
-                state_updates["effective_memory_previous_response_id"] = str(
-                    effective_memory_previous_response_id
-                )
-            await self.memory_pipeline._store_state(
-                replace(memory_state, **state_updates)
-            )
-            self._remember_memory_parent(conversation_key, response_id)
         encrypted_content = summary.encrypted_content(
             response_id=response_id,
             memory=memory_payload,
@@ -2860,10 +2304,7 @@ class QwenExoRuntime:
                 ),
                 "response_id": response_id,
                 "source_digest": source_digest,
-                "native_state_source": (
-                    "previous_response" if memory_state is not None else "unavailable"
-                ),
-                "query_probe_used": False,
+                "native_state_source": "unavailable",
                 "summary_digest": stable_digest(summary.summary),
                 "input_tokens": summary.input_tokens,
                 "output_tokens": summary.output_tokens,
@@ -2929,7 +2370,7 @@ class QwenExoRuntime:
         max_tokens = self.config.response_compaction_max_history_tokens
         max_dropped = self.config.response_compaction_max_dropped_items
         while True:
-            source_text = MemoryPipeline._trajectory_context(
+            source_text = request_text.trajectory_context(
                 kept, max_chars=max_tokens * 4
             )
             if not source_text:
@@ -2993,63 +2434,14 @@ class QwenExoRuntime:
         )
 
     @staticmethod
-    def _compaction_memory_payload(memory_state: Any) -> dict[str, Any]:
-        if memory_state is None:
-            return {
-                "status": "unavailable",
-                "selected_document_ids": [],
-                "selected_lanes": [],
-                "native_prefix_restore": None,
-                "hybrid_restoration_mode": None,
-            }
-        public = memory_state.public_dict()
-        policy_public = public.get("policy_data") or {}
-        selected_document_ids = list(
-            dict.fromkeys(
-                [
-                    *(public.get("selected_document_ids") or []),
-                    *(policy_public.get("document_ids") or []),
-                ]
-            )
-        )
-        selected_reference_digests = list(
-            dict.fromkeys(
-                [
-                    *(public.get("selected_reference_digests") or []),
-                    *(policy_public.get("document_digests") or []),
-                ]
-            )
-        )
-        native_prefix = public.get("native_prefix_restore") or {}
-        position_map = public.get("memory_position_map") or []
-        selected_lanes = list(
-            dict.fromkeys(
-                str(row.get("lane"))
-                for row in position_map
-                if isinstance(row, dict) and row.get("lane")
-            )
-        )
-        if native_prefix.get("lane") and native_prefix["lane"] not in selected_lanes:
-            selected_lanes.append(str(native_prefix["lane"]))
-        if policy_public.get("document_ids") and "policydata" not in selected_lanes:
-            selected_lanes.append("policydata")
-        next_restoration = public.get("next_turn_restoration") or {}
-        hybrid_mode = getattr(memory_state, "hybrid_restoration_mode", None) or (
-            next_restoration.get("hybrid_state_mode")
-        )
-        section_delta_mode = getattr(memory_state, "section_delta_mode", "none")
+    def _compaction_memory_payload() -> dict[str, Any]:
+        # Retrieved memory no longer rides in the prompt (memory tools serve it).
         return {
-            "status": "ready",
-            "source_digest": public.get("source_digest"),
-            "selected_document_ids": selected_document_ids,
-            "selected_reference_digests": selected_reference_digests,
-            "selected_lanes": selected_lanes,
-            "native_prefix_restore": native_prefix,
-            "hybrid_restoration_mode": hybrid_mode,
-            "high_surprisal_kv": (
-                section_delta_mode == "complete_document_gdn_state_plus_salient_raw_kv"
-            ),
-            "high_surprisal_kv_mode": section_delta_mode,
+            "status": "unavailable",
+            "selected_document_ids": [],
+            "selected_lanes": [],
+            "native_prefix_restore": None,
+            "hybrid_restoration_mode": None,
         }
 
     def _raise_if_cancelled(self, request_id: str) -> None:
@@ -3085,65 +2477,6 @@ class QwenExoRuntime:
     def acknowledge_request_cancellation(self, request_id: str) -> None:
         self._pending_background_requests.discard(request_id)
         self._cancelled_request_ids.discard(request_id)
-
-    async def drop_memory_attachment_for_context(
-        self,
-        request: Any,
-        *,
-        rendered_prompt_tokens: int,
-        context_length: int,
-        reserved_output_tokens: int,
-        reason: str = "context_capacity",
-        include_policy: bool = False,
-    ) -> tuple[Any, MemoryPreparationState | None]:
-        if self.memory_pipeline is None:
-            return request, None
-        state = await self.memory_pipeline.get_state(request.request_id)
-        if state is None or (
-            state.private_attachment is None
-            and (not include_policy or state.policy_attachment is None)
-        ):
-            return request, state
-        dropped = await self.memory_pipeline.drop_attachment(
-            request.request_id, include_policy=include_policy
-        )
-        restored = request.model_copy(
-            update={
-                "instructions": (
-                    state.original_instructions
-                    if include_policy
-                    else state.policy_instructions
-                ),
-                "extra_key": (
-                    state.original_extra_key
-                    if include_policy
-                    else state.policy_cache_namespace
-                ),
-                # Knowledge lives in the trailing attachment, so dropping it for
-                # context budget means clearing the field, never the leading
-                # instructions.
-                "qwen_exo_memory_attachment": None,
-            }
-        )
-        self.telemetry.emit(
-            request.request_id,
-            "memory.dropped_context_budget",
-            {
-                "attachment_digest": state.attachment_digest,
-                "dropped_tokens": state.attached_tokens,
-                "policy_attachment_digest": (
-                    state.policy_attachment_digest if include_policy else None
-                ),
-                "dropped_policy_tokens": (
-                    state.policy_attached_tokens if include_policy else 0
-                ),
-                "rendered_prompt_tokens": rendered_prompt_tokens,
-                "context_length": context_length,
-                "reserved_output_tokens": reserved_output_tokens,
-                "reason": reason,
-            },
-        )
-        return restored, dropped
 
     def has_restored_capsule(self, request_id: str) -> bool:
         return request_id in self._capsule_restorations
@@ -3325,21 +2658,6 @@ class QwenExoRuntime:
             )
             self._request_outputs[request_id] = prefix + generation_text
 
-        bank_statuses = (result.get("meta_info") or {}).get(
-            "qwen_exo_bank_cache_status"
-        ) or ()
-        if bank_statuses and request_id not in self._bank_cache_status_emitted:
-            status = str(bank_statuses[-1])
-            self._bank_cache_status_emitted.add(request_id)
-            self.telemetry.emit(
-                request_id,
-                "tensor_bank.prefix_cache",
-                {
-                    "status": status,
-                    "hit": status == "hit",
-                    "loaded": status == "loaded",
-                },
-            )
         session_gdn_statuses = (result.get("meta_info") or {}).get(
             "qwen_exo_session_initial_gdn_status"
         ) or ()
@@ -3371,9 +2689,6 @@ class QwenExoRuntime:
             reasoning_end_token_id=observer_reasoning_end_token_id,
             thinking_enabled=thinking_enabled,
         )
-        gate_key = self._request_memory_gate_keys.get(request_id)
-        if gate_key is not None:
-            self.memory_refresh_gate.observe(gate_key, observation)
         for resolved_event in observation.events:
             if resolved_event.uncertainty_state == "resolved_by_continuation":
                 self.telemetry.emit(
@@ -4030,8 +3345,8 @@ class QwenExoRuntime:
             return {}
         prompt = tuple(int(token) for token in prompt_ids)
         input_value = getattr(request, "input", None)
-        first_text = MemoryPipeline._first_user_text(input_value)
-        latest_text = MemoryPipeline._latest_user_text(input_value)
+        first_text = request_text.first_user_text(input_value)
+        latest_text = request_text.latest_user_text(input_value)
         text_specs = (("original", first_text, False), ("latest", latest_text, True))
         spans: list[dict[str, int | str]] = []
         seen_spans: set[tuple[int, int]] = set()
@@ -4764,7 +4079,7 @@ class QwenExoRuntime:
         if not isinstance(value, list) or max_tokens < 1:
             return ""
         serialized = json.dumps(value, ensure_ascii=False, default=str)
-        context = MemoryPipeline._trajectory_context(
+        context = request_text.trajectory_context(
             value, max_chars=max(1, len(serialized))
         )
         tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
@@ -4808,7 +4123,7 @@ class QwenExoRuntime:
                         "kind": "tool_action",
                         "tool_name": str(item.get("name") or item_type),
                         "call_id": str(item.get("call_id") or item.get("id") or ""),
-                        "content": MemoryPipeline._response_item_text(
+                        "content": request_text.response_item_text(
                             item.get("arguments")
                         ),
                     }
@@ -4822,7 +4137,7 @@ class QwenExoRuntime:
                         "kind": "tool_observation",
                         "tool_name": str(matched.get("name") or item_type),
                         "call_id": call_id,
-                        "content": MemoryPipeline._response_item_text(
+                        "content": request_text.response_item_text(
                             item.get("output", item.get("content"))
                         ),
                     }
@@ -4832,7 +4147,7 @@ class QwenExoRuntime:
                 rows.append(
                     {
                         "kind": role + "_context",
-                        "content": MemoryPipeline._response_item_text(
+                        "content": request_text.response_item_text(
                             item.get("content", item.get("text"))
                         ),
                     }
@@ -4845,7 +4160,7 @@ class QwenExoRuntime:
                 rows.append(
                     {
                         "kind": "assistant_trajectory",
-                        "content": MemoryPipeline._response_item_text(content),
+                        "content": request_text.response_item_text(content),
                     }
                 )
         return tuple(row for row in rows if str(row.get("content") or "").strip())
@@ -4875,7 +4190,7 @@ class QwenExoRuntime:
             content = str(raw.get("content") or "").strip()
             if not content:
                 continue
-            content = MemoryPipeline._bounded_text(content, max_chars)
+            content = request_text.bounded_text(content, max_chars)
             row = {
                 "kind": str(raw.get("kind") or "trajectory"),
                 "request_id": str(request_id),
@@ -4928,11 +4243,11 @@ class QwenExoRuntime:
 
     @staticmethod
     def _response_item_text(value: Any) -> str:
-        return MemoryPipeline._response_item_text(value)
+        return request_text.response_item_text(value)
 
     @staticmethod
     def _canonical_identity_text(value: Any) -> str:
-        return MemoryPipeline._response_item_text(value).replace("\r\n", "\n")
+        return request_text.response_item_text(value).replace("\r\n", "\n")
 
     @classmethod
     def _canonical_response_identity(
@@ -5153,17 +4468,6 @@ class QwenExoRuntime:
             HybridStateNamespace.REQUEST_PREFIX, identity
         )
 
-    def _remember_memory_parent(self, conversation_key: str, response_id: str) -> None:
-        parents = getattr(self, "_memory_parents_by_conversation", None)
-        if parents is None:
-            parents = OrderedDict()
-            self._memory_parents_by_conversation = parents
-        parents[str(conversation_key)] = str(response_id)
-        parents.move_to_end(str(conversation_key))
-        max_conversation_keys = int(getattr(self, "_max_conversation_keys", 512))
-        while len(parents) > max_conversation_keys:
-            parents.popitem(last=False)
-
     def _unseen_response_tool_events(
         self,
         conversation_key: str,
@@ -5352,268 +4656,10 @@ class QwenExoRuntime:
         tool_call: dict[str, Any] | None = None,
         trajectory_context: str | None = None,
     ) -> ThinkContextInjection | None:
-        request_id = str(request_id)
-        self.record_tool_event(request_id, tool_observation, tool_call=tool_call)
-        if (
-            self.observer.mode != "active"
-            or self.refresh_service is None
-            or not self.owns_request(request_id)
-        ):
-            return None
-        observation = str(tool_observation).strip()
-        if not observation:
-            return None
-        conversation_key = getattr(self, "_request_conversation_keys", {}).get(
-            request_id, stable_digest("request", request_id)
-        )
-        turn_id = f"{request_id}:post_tool:{int(generation_index)}"
-        reasoning = str(
-            trajectory_context
-            or getattr(self, "_request_outputs", {}).get(request_id, "")
-        ).strip()
-        integrity_result = None
-        integrity_checker = getattr(
-            self.refresh_service, "context_integrity_check", None
-        )
-        context_integrity_mode = getattr(
-            getattr(self, "config", None), "context_integrity_mode", "off"
-        )
-        if context_integrity_mode != "off" and callable(integrity_checker):
-            try:
-                integrity_result = await integrity_checker(
-                    parent_request_id=request_id,
-                    turn_id=turn_id,
-                    original_task=getattr(self, "_original_tasks", {}).get(
-                        request_id,
-                        getattr(self, "_request_questions", {}).get(request_id, ""),
-                    ),
-                    session_context=trajectory_context or reasoning,
-                    current_tool_observation=observation,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.telemetry.emit(
-                    request_id,
-                    "context_integrity.failed_closed",
-                    {"turn_id": turn_id, "error_type": type(exc).__name__},
-                )
-        if integrity_result is not None and getattr(
-            integrity_result, "injectable", False
-        ):
-            refresh_allowed, conversation_key, refresh_count, refresh_limit = (
-                self._reserve_post_tool_refresh(request_id)
-            )
-            if not refresh_allowed:
-                self.telemetry.emit(
-                    request_id,
-                    "context_integrity.skipped",
-                    {
-                        "turn_id": turn_id,
-                        "reason": "conversation_refresh_budget_exhausted",
-                        "conversation_key": conversation_key,
-                        "refresh_count": refresh_count,
-                        "refresh_limit": refresh_limit,
-                    },
-                )
-                return None
-            adaptive_post_tool = self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.POST_TOOL_REFRESHING,
-                decision=f"context_integrity:{int(generation_index)}",
-            )
-            record = await self.refresh_service.commit_context_integrity(
-                parent_request_id=request_id,
-                turn_id=turn_id,
-                result=integrity_result,
-            )
-        else:
-            current_count = getattr(self, "_post_tool_refresh_counts", {}).get(
-                conversation_key, 0
-            )
-            hard_limit = getattr(self, "_max_post_tool_refreshes_per_conversation", 8)
-            if current_count < hard_limit:
-                cooldown_remaining = self._post_tool_no_eligible_cooldown_turn(
-                    conversation_key
-                )
-                if cooldown_remaining is not None:
-                    self.telemetry.emit(
-                        request_id,
-                        "post_tool_recall.skipped",
-                        {
-                            "reason": "no_eligible_reference_cooldown",
-                            "conversation_key": conversation_key,
-                            "refresh_count": current_count,
-                            "refresh_limit": hard_limit,
-                            "cooldown_remaining": cooldown_remaining,
-                            "generation_index": int(generation_index),
-                        },
-                    )
-                    return None
-            refresh_allowed, conversation_key, refresh_count, refresh_limit = (
-                self._reserve_post_tool_refresh(request_id)
-            )
-            if not refresh_allowed:
-                self.telemetry.emit(
-                    request_id,
-                    "post_tool_recall.skipped",
-                    {
-                        "reason": "conversation_refresh_budget_exhausted",
-                        "conversation_key": conversation_key,
-                        "refresh_count": refresh_count,
-                        "refresh_limit": refresh_limit,
-                        "generation_index": int(generation_index),
-                    },
-                )
-                return None
-            adaptive_post_tool = self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.POST_TOOL_REFRESHING,
-                decision=f"tool_generation:{int(generation_index)}",
-            )
-            record = await self.refresh_service.refresh(
-                parent_request_id=request_id,
-                turn_id=turn_id,
-                user_question=self._request_questions.get(request_id, ""),
-                partial_output=reasoning[-12000:],
-                latest_tool_observation=observation[-8000:],
-                event=None,
-                purpose="post_tool",
-            )
-        injection = self._think_context_from_record(record)
-        evidence_fingerprint = stable_digest(
-            "self-ask-evidence-v1",
-            stable_digest(observation),
-            *getattr(record, "selected_reference_digests", ()),
-            *getattr(record, "context_source_digests", ()),
-            *getattr(record, "candidate_ids", ()),
-            *getattr(record, "decision_ids", ()),
-        )
-        repeated_context = (
-            self._register_self_question(
-                request_id,
-                record.question,
-                record.answer,
-                evidence_fingerprint=evidence_fingerprint,
-            )
-            if record.question is not None
-            else None
-        )
-        if repeated_context is not None:
-            self.telemetry.emit(
-                request_id,
-                (
-                    "self_ask.think_context_skipped"
-                    if injection is not None
-                    else "self_ask.repeat_suppressed"
-                ),
-                {
-                    "reason": (
-                        "repeated_self_question"
-                        if injection is not None
-                        else "repeated_unanswered_question_same_evidence"
-                    ),
-                    "turn_id": record.turn_id,
-                    "question_digest": stable_digest(record.question or ""),
-                    "answer_digest": (
-                        stable_digest(record.answer)
-                        if record.answer is not None
-                        else None
-                    ),
-                    "matched_question_digest": stable_digest(repeated_context.question),
-                    "matched_answer_digest": (
-                        stable_digest(repeated_context.answer)
-                        if repeated_context.answer
-                        else None
-                    ),
-                    "evidence_fingerprint": evidence_fingerprint,
-                    "conversation_key": getattr(
-                        self, "_request_conversation_keys", {}
-                    ).get(request_id),
-                },
-            )
-            injection = None
-        admitted = injection is not None
-        if admitted:
-            self._pending_think_contexts[request_id] = injection
-        self._track_post_tool_no_eligible(
-            conversation_key,
-            reference_status=getattr(record, "reference_status", "not_evaluated"),
-            admitted=admitted,
-        )
-        if adaptive_post_tool is not None:
-            self._adaptive_transition(
-                request_id,
-                (
-                    AdaptiveRetrievalPhase.NEXT_TURN_READY
-                    if admitted
-                    else AdaptiveRetrievalPhase.REJECTED
-                ),
-                decision=(record.maybe_decision if admitted else record.status),
-            )
-        self.telemetry.emit(
-            request_id,
-            "post_tool_recall.completed",
-            {
-                "turn_id": turn_id,
-                "status": record.status,
-                "admitted": admitted,
-                "selected_document_ids": list(record.selected_document_ids),
-                "decision_ids": list(record.decision_ids),
-                "reflection_kind": record.reflection_kind,
-                "reference_status": getattr(
-                    record, "reference_status", "not_evaluated"
-                ),
-                "context_status": getattr(record, "context_status", "not_run"),
-                "context_decision_ids": list(
-                    getattr(record, "context_decision_ids", ())
-                ),
-                "context_integrity_status": getattr(
-                    record, "context_integrity_status", "not_run"
-                ),
-                "context_integrity_correction_digest": (
-                    stable_digest(record.context_integrity_correction)
-                    if getattr(record, "context_integrity_correction", None)
-                    else None
-                ),
-                "think_context_ready": admitted,
-                "text_injected": False,
-                "repeat_suppressed": repeated_context is not None,
-            },
-        )
-        return injection
-
-    @staticmethod
-    def _think_context_from_record(
-        record: RefreshRecord,
-    ) -> ThinkContextInjection | None:
-        reference_ready = record.status == "ready_for_safe_replay" and bool(
-            record.selected_document_ids
-        )
-        context_ready = record.status == "context_evidence_ready" and bool(
-            record.context_source_digests
-        )
-        integrity_ready = record.status == "context_integrity_ready" and bool(
-            getattr(record, "context_integrity_evidence_digest", None)
-        )
-        if not reference_ready and not context_ready and not integrity_ready:
-            return None
-        question = QwenExoRuntime._safe_think_text(record.question)
-        answer = QwenExoRuntime._safe_think_text(record.answer)
-        if not question or not answer:
-            return None
-        return ThinkContextInjection(
-            turn_id=record.turn_id,
-            event_id=record.event_id,
-            purpose=record.purpose,
-            question=question,
-            answer=answer,
-            text=(
-                QwenExoRuntime._safe_think_text(record.semantic_injection)
-                if integrity_ready and record.semantic_injection
-                else (f"\n\nSelf-question: {question}\n" f"Self-answer: {answer}\n")
-            ),
-        )
+        """Record a tool observation for the request (capsule/reflection
+        evidence). Mid-generation retrieval after tools was retired."""
+        self.record_tool_event(str(request_id), tool_observation, tool_call=tool_call)
+        return None
 
     @staticmethod
     def _safe_think_text(value: str) -> str:
@@ -5634,7 +4680,6 @@ class QwenExoRuntime:
     def think_context_enabled(self) -> bool:
         return (
             self.observer.mode == "active"
-            and self.refresh_service is not None
             and self._reasoning_end_token_id is not None
         )
 
@@ -5931,19 +4976,6 @@ class QwenExoRuntime:
         stale = self._pending_think_contexts.pop(request_id, None)
         if stale is not None:
             self._consumed_think_contexts.add(stale.turn_id)
-        tasks = tuple(
-            task
-            for task in (
-                self._refresh_tasks.get(request_id),
-                self._replay_tasks.get(request_id),
-            )
-            if task is not None and not task.done()
-        )
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
         questions = None
         if self.think_context_enabled and self.mid_think_questions is not None:
             try:
@@ -5973,7 +5005,6 @@ class QwenExoRuntime:
                 "generation_index": int(generation_index),
                 "cutoff_questions": questions is not None,
                 "had_pending_context": stale is not None,
-                "cancelled_refresh_tasks": len(tasks),
             },
         )
         if questions is None:
@@ -5996,32 +5027,9 @@ class QwenExoRuntime:
     ) -> ThinkContextInjection | None:
         request_id = str(request_id)
         injection = self._pending_think_contexts.pop(request_id, None)
-        if injection is None:
-            refresh_task = self._refresh_tasks.get(request_id)
-            if refresh_task is not None:
-                try:
-                    record = await asyncio.shield(refresh_task)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self.telemetry.emit(
-                        request_id,
-                        "self_ask.think_context_skipped",
-                        {"error_type": type(exc).__name__},
-                    )
-                    return None
-                # The divergent-questions task stages its injection in
-                # _pending_think_contexts and returns None, so re-check there
-                # before deriving one from a (non-existent) refresh record.
-                injection = self._pending_think_contexts.pop(request_id, None)
-                if injection is None and record is not None:
-                    injection = self._think_context_from_record(record)
         if injection is None or injection.turn_id in self._consumed_think_contexts:
             return None
         self._consumed_think_contexts.add(injection.turn_id)
-        pending = self._pending_think_contexts.get(request_id)
-        if pending is not None and pending.identity == injection.identity:
-            self._pending_think_contexts.pop(request_id, None)
         return injection
 
     def record_reasoning_boundary(
@@ -6059,26 +5067,6 @@ class QwenExoRuntime:
                     "generation_index": int(generation_index),
                 },
             )
-
-    def _adaptive_transition(
-        self,
-        request_id: str,
-        phase: AdaptiveRetrievalPhase,
-        *,
-        event_id: str | None = None,
-        decision: str | None = None,
-    ):
-        if (
-            self.adaptive_retrieval is None
-            or not self.adaptive_retrieval.can_transition(request_id, phase)
-        ):
-            return None
-        return self.adaptive_retrieval.transition(
-            request_id,
-            phase,
-            event_id=event_id,
-            decision=decision,
-        )
 
     def owns_request(self, request_id: str) -> bool:
         return request_id in self._request_questions
@@ -6288,16 +5276,6 @@ class QwenExoRuntime:
                     mapping.pop(key, None)
 
     async def _emit_stage_summary(self, request_id: str) -> None:
-        memory_state = (
-            await self.memory_pipeline.get_state(request_id)
-            if self.memory_pipeline is not None
-            else None
-        )
-        refresh_record = (
-            self.refresh_service.record(request_id)
-            if self.refresh_service is not None
-            else None
-        )
         events = self.telemetry.events(request_id, limit=512)
 
         def latest(event_type: str):
@@ -6310,90 +5288,22 @@ class QwenExoRuntime:
                 None,
             )
 
-        proposed = memory_state.candidates if memory_state is not None else ()
-        decisions = memory_state.decisions if memory_state is not None else ()
-        eligible = tuple(decision for decision in decisions if decision.eligible)
-        adaptive_state = (
-            self.adaptive_retrieval.state(request_id)
-            if self.adaptive_retrieval is not None
-            else None
-        )
-        replay = latest("causal_replay.completed")
+        tool_calls = [
+            event.payload or {}
+            for event in events
+            if event.event_type == "memory_tool.call"
+        ]
         self.telemetry.emit(
             request_id,
             "request.stage_summary",
             {
-                "schema": "qwen-exo-stage-summary-v1",
-                "stages": [
-                    "prefill_retrieval",
-                    "semantic_judge",
-                    "mid_think_observer",
-                    "self_ask_answer",
-                    "causal_replay",
-                    "maybe_gate",
-                    "next_turn_restoration",
-                    "post_tool_recall",
-                    "execution_capsule",
-                ],
-                "prefill": {
-                    "proposed_count": len(proposed),
-                    "eligible_count": len(eligible),
-                    "selected_knowledge_document_ids": list(
-                        memory_state.selected_document_ids
-                        if memory_state is not None
-                        else ()
-                    ),
-                    "selected_policy_document_ids": list(
-                        memory_state.policy_document_ids
-                        if memory_state is not None
-                        else ()
-                    ),
-                    "page_ids": list(
-                        dict.fromkeys(
-                            page_id
-                            for candidate in proposed
-                            for page_id in candidate.page_ids
-                        )
-                    ),
-                    "token_attribution_count": sum(
-                        len(candidate.token_attributions) for candidate in proposed
-                    ),
+                "schema": "qwen-exo-stage-summary-v2",
+                "stages": ["memory_tools", "execution_capsule"],
+                "memory_tools": {
+                    "calls": len(tool_calls),
+                    "failed": sum(1 for call in tool_calls if not call.get("ok")),
                 },
-                "refresh": {
-                    "status": refresh_record.status if refresh_record else "not_run",
-                    "event_id": refresh_record.event_id if refresh_record else None,
-                    "candidate_ids": list(
-                        refresh_record.candidate_ids if refresh_record else ()
-                    ),
-                    "decision_ids": list(
-                        refresh_record.decision_ids if refresh_record else ()
-                    ),
-                },
-                "replay": replay,
-                "maybe": latest("maybe.completed"),
-                "restoration": (
-                    memory_state.public_dict().get("next_turn_restoration")
-                    if memory_state is not None
-                    else None
-                ),
-                "post_tool": latest("post_tool_recall.completed"),
                 "capsule": latest("capsule.updated") or latest("capsule.failed_closed"),
-                "adaptive": (
-                    adaptive_state.public_dict() if adaptive_state is not None else None
-                ),
-                "latency_seconds": {
-                    "prefill_retrieval": (
-                        memory_state.retrieval_latency_seconds
-                        if memory_state is not None
-                        else 0.0
-                    ),
-                    "semantic_judge": (
-                        memory_state.judge_latency_seconds
-                        if memory_state is not None
-                        else 0.0
-                    ),
-                    "causal_replay": float((replay or {}).get("latency_seconds", 0.0)),
-                },
             },
         )
 
@@ -6756,43 +5666,7 @@ class QwenExoRuntime:
         return payload
 
     async def _finish_request(self, request_id: str) -> None:
-        memory_state = None
         try:
-            tasks = tuple(
-                task
-                for task in (
-                    self._refresh_tasks.get(request_id),
-                    self._replay_tasks.get(request_id),
-                )
-                if task is not None
-            )
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            if self.memory_pipeline is not None:
-                try:
-                    memory_state = await self.memory_pipeline.finalize_request_state(
-                        request_id
-                    )
-                    self.telemetry.emit(
-                        request_id,
-                        "memory.request_state_finalized",
-                        {
-                            "status": (
-                                "ready" if memory_state is not None else "unavailable"
-                            ),
-                            "runtime_gdn_route": "global_initial_only",
-                        },
-                    )
-                except Exception as exc:
-                    self.telemetry.emit(
-                        request_id,
-                        "memory.request_state_finalize_failed_closed",
-                        {"error_type": type(exc).__name__},
-                    )
-            if memory_state is not None:
-                conversation_key = self._request_conversation_keys.get(request_id)
-                if conversation_key:
-                    self._remember_memory_parent(conversation_key, request_id)
             memory_finalized = self._memory_finalized.get(request_id)
             if memory_finalized is not None:
                 memory_finalized.set()
@@ -6813,20 +5687,11 @@ class QwenExoRuntime:
                     {"error_type": type(exc).__name__},
                 )
         finally:
-            self._adaptive_transition(
-                request_id,
-                AdaptiveRetrievalPhase.COMPLETED,
-                decision="request_completed",
-            )
-            self._refresh_tasks.pop(request_id, None)
-            self._replay_tasks.pop(request_id, None)
             self._capsule_tasks.pop(request_id, None)
             self._request_questions.pop(request_id, None)
-            self._decision_contexts.pop(request_id, None)
             self._foreground_last_activity = time.monotonic()
             self._request_outputs.pop(request_id, None)
             self._request_output_state.pop(request_id, None)
-            self._bank_cache_status_emitted.discard(request_id)
             self._session_initial_gdn_status_emitted.discard(request_id)
             self._request_tool_calls.pop(request_id, None)
             self._request_tool_observations.pop(request_id, None)
@@ -6845,7 +5710,6 @@ class QwenExoRuntime:
             self._request_score_bias_user_query_prepared.discard(request_id)
             self._request_score_bias_user_query_captured.discard(request_id)
             self._request_conversation_keys.pop(request_id, None)
-            self._request_memory_gate_keys.pop(request_id, None)
             self._parent_response_ids.pop(request_id, None)
             self._request_completion_emitted.discard(request_id)
             self._parent_capsules.pop(request_id, None)
@@ -6861,12 +5725,7 @@ class QwenExoRuntime:
             self.observer.release(request_id)
 
     async def cancel_request(self, request_id: str) -> None:
-        if (
-            not self.owns_request(request_id)
-            and request_id not in self._refresh_tasks
-            and request_id not in self._capsule_tasks
-            and request_id not in self._replay_tasks
-        ):
+        if not self.owns_request(request_id) and request_id not in self._capsule_tasks:
             return
         finalization = self._finalize_tasks.pop(request_id, None)
         if finalization is not None and finalization is not asyncio.current_task():
@@ -6875,11 +5734,7 @@ class QwenExoRuntime:
         await self.internal_jobs.cancel_parent(request_id)
         tasks = tuple(
             task
-            for task in (
-                self._refresh_tasks.pop(request_id, None),
-                self._replay_tasks.pop(request_id, None),
-                self._capsule_tasks.pop(request_id, None),
-            )
+            for task in (self._capsule_tasks.pop(request_id, None),)
             if task is not None
         )
         for task in tasks:
@@ -6887,17 +5742,10 @@ class QwenExoRuntime:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.internal_jobs.finish_parent(request_id)
-        self._adaptive_transition(
-            request_id,
-            AdaptiveRetrievalPhase.CANCELLED,
-            decision="request_cancelled",
-        )
         self._request_questions.pop(request_id, None)
-        self._decision_contexts.pop(request_id, None)
         self._foreground_last_activity = time.monotonic()
         self._request_outputs.pop(request_id, None)
         self._request_output_state.pop(request_id, None)
-        self._bank_cache_status_emitted.discard(request_id)
         self._session_initial_gdn_status_emitted.discard(request_id)
         self._request_tool_calls.pop(request_id, None)
         self._request_tool_observations.pop(request_id, None)
@@ -6913,7 +5761,6 @@ class QwenExoRuntime:
         }
         self._request_score_bias_capture_failure_emitted.discard(request_id)
         self._request_conversation_keys.pop(request_id, None)
-        self._request_memory_gate_keys.pop(request_id, None)
         self._parent_response_ids.pop(request_id, None)
         self._parent_capsules.pop(request_id, None)
         self._capsule_restorations.pop(request_id, None)
@@ -6938,114 +5785,6 @@ class QwenExoRuntime:
             for record in self.capsule_store.lineage(trajectory_id, max_turns=max_turns)
         ]
 
-    def recall_trace(self, *, max_turns: int = 100) -> dict[str, Any]:
-        return recall_trace_payload(
-            policy_snapshot=self.policy_data.snapshot,
-            knowledge_snapshot=self.knowledge.snapshot,
-            events=self.telemetry.events(limit=4096),
-            max_turns=max_turns,
-        )
-
-    async def clear_recall_trace(self) -> dict[str, Any]:
-        self.telemetry.clear()
-        if self.refresh_service is not None:
-            await self.refresh_service.clear()
-        return {"status": "cleared", "turns": 0}
-
-    async def _retrieve_reflection_memory_candidates(
-        self, parent_id: str, query: str
-    ) -> tuple[ReflectionMemoryCandidate, ...]:
-        documents = tuple(
-            document
-            for document in self.knowledge.snapshot.documents
-            if is_compatible_reflection_memory(document)
-        )
-        self.telemetry.emit(
-            parent_id,
-            "reflection_memory.qk_retrieval.started",
-            {
-                "existing_memory_count": len(documents),
-                "query_digest": stable_digest(query),
-            },
-        )
-        if not documents:
-            self.telemetry.emit(
-                parent_id,
-                "reflection_memory.qk_retrieval.completed",
-                {
-                    "status": "no_existing_reflection_memory",
-                    "existing_memory_count": 0,
-                    "candidate_count": 0,
-                    "candidates": [],
-                },
-            )
-            return ()
-        if self.tensor_bank is None or self.query_probe is None:
-            raise RuntimeError("Reflection memory QK retrieval is unavailable")
-        bank_snapshot = await self.tensor_bank.ensure_ready()
-        if not bank_snapshot.ready:
-            raise RuntimeError("Reflection memory QK Tensor Bank is not ready")
-        probe = await self.query_probe.probe(
-            parent_id, QueryProbePlan.current_user(query)
-        )
-        if probe.status != "ready" or not probe.query_heads:
-            raise RuntimeError(
-                f"Reflection memory QK query probe failed: {probe.status}"
-            )
-        eligible_documents = frozenset(
-            ("knowledge", document.document_id) for document in documents
-        )
-        rank_audit: dict[str, Any] = {}
-        ranked = self.tensor_bank.rank(
-            probe.query_heads,
-            query_states=probe.query_states,
-            query_identity=(
-                "reflection-memory-consolidation:"
-                + stable_digest(parent_id, query)[:24]
-            ),
-            limit=min(4, len(documents)),
-            min_document_margin=0.0,
-            audit=rank_audit,
-            eligible_documents=eligible_documents,
-            query_text=query,
-        )
-        by_id = {document.document_id: document for document in documents}
-        candidates = tuple(
-            ReflectionMemoryCandidate(
-                document_path=document.relative_path,
-                document_sha256=document.sha256,
-                title=str(document.title or document.relative_path),
-                content=document.normalized_content,
-                tensor_score=float(candidate.tensor_score or 0.0),
-                causal_entries=self._stored_causal_entries(
-                    document.relative_path, document.sha256
-                ),
-            )
-            for candidate in ranked
-            if (document := by_id.get(candidate.document_id)) is not None
-        )
-        self.telemetry.emit(
-            parent_id,
-            "reflection_memory.qk_retrieval.completed",
-            {
-                "status": "ready",
-                "existing_memory_count": len(documents),
-                "query_probe": probe.public_dict(),
-                "candidate_count": len(candidates),
-                "candidates": [
-                    {
-                        "document_path": candidate.document_path,
-                        "document_sha256": candidate.document_sha256,
-                        "title": candidate.title,
-                        "tensor_score": candidate.tensor_score,
-                    }
-                    for candidate in candidates
-                ],
-                "rank_audit": rank_audit,
-            },
-        )
-        return candidates
-
     def reflection_memory_regeneration_status(self) -> dict[str, Any]:
         return json.loads(
             json.dumps(
@@ -7054,6 +5793,56 @@ class QwenExoRuntime:
                 default=str,
             )
         )
+
+    async def _retrieve_reflection_memory_candidates(
+        self, parent_id: str, query: str
+    ) -> tuple[ReflectionMemoryCandidate, ...]:
+        """Published reflection memories sharing terms with a new issue, so the
+        model can update one instead of inserting a near-duplicate."""
+        documents = tuple(
+            document
+            for document in self.knowledge.snapshot.documents
+            if is_compatible_reflection_memory(document)
+        )
+        scored = sorted(
+            (
+                (lexical_overlap(query, document.normalized_content), document)
+                for document in documents
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        candidates = tuple(
+            ReflectionMemoryCandidate(
+                document_path=document.relative_path,
+                document_sha256=document.sha256,
+                title=str(document.title or document.relative_path),
+                content=document.normalized_content,
+                tensor_score=round(score, 4),
+                causal_entries=self._stored_causal_entries(
+                    document.relative_path, document.sha256
+                ),
+            )
+            for score, document in scored[:_REFLECTION_SIMILAR_LIMIT]
+            if score >= _REFLECTION_SIMILAR_MIN_OVERLAP
+        )
+        self.telemetry.emit(
+            parent_id,
+            "reflection_memory.similar_retrieval.completed",
+            {
+                "existing_memory_count": len(documents),
+                "candidate_count": len(candidates),
+                "candidates": [
+                    {
+                        "document_path": candidate.document_path,
+                        "title": candidate.title,
+                        "overlap": candidate.tensor_score,
+                    }
+                    for candidate in candidates
+                ],
+            },
+        )
+        return candidates
 
     def _stored_causal_entries(
         self, document_path: str, document_sha256: str
@@ -7139,11 +5928,7 @@ class QwenExoRuntime:
         expected_document_sha256: str,
     ) -> dict[str, Any]:
         require_source_admission(self)
-        if (
-            self.reflection_memory_service is None
-            or self.tensor_bank is None
-            or self.query_probe is None
-        ):
+        if self.reflection_memory_service is None:
             raise RuntimeError("Reflection memory regeneration is unavailable")
         current = getattr(self, "_reflection_memory_regeneration_task", None)
         if current is not None and not current.done():
@@ -7264,18 +6049,18 @@ class QwenExoRuntime:
 
         def report(stage: str) -> None:
             progress_by_stage = {
+                "similar_retrieval": 20,
                 "evidence_extraction": 25,
                 "causal_review": 55,
-                "qk_retrieval": 20,
                 "model_review": 40,
                 "publishing": 82,
             }
             message_by_stage = {
+                "similar_retrieval": "正在查找相似的已有反思记忆",
                 "evidence_extraction": "正在分段提取可追溯证据链",
                 "causal_review": "正在检查因果解释、反证与证据强度",
-                "qk_retrieval": "正在检索相关 Reflection Memory",
                 "model_review": "模型正在根据轨迹与 verifier 反馈重新反思",
-                "publishing": "正在按条目合并已准入经验并更新 Tensor Bank",
+                "publishing": "正在把经验写入文本记忆",
             }
             self._update_reflection_memory_regeneration(
                 job_id,
@@ -7370,655 +6155,14 @@ class QwenExoRuntime:
             {"job_id": job_id, "result": result},
         )
 
-    def reflection_memory_organization_status(self) -> dict[str, Any]:
-        states = self._reflection_memory_organization_states
-        active = [
-            state for state in states.values() if state["status"] == "running"
-        ]
-        queued = [
-            state for state in states.values() if state["status"] == "queued"
-        ]
-        latest = dict(
-            active[0]
-            if active
-            else queued[0]
-            if queued
-            else next(
-                reversed(states.values()),
-                {
-                    "job_id": None,
-                    "status": "idle",
-                    "stage": "idle",
-                    "progress": 0,
-                    "message": "尚未开始整理",
-                    "queued_at": None,
-                    "started_at": None,
-                    "updated_at": None,
-                    "finished_at": None,
-                    "details": {},
-                    "result": None,
-                    "error": None,
-                },
-            )
-        )
-        latest["active_count"] = len(active)
-        latest["queued_count"] = len(queued)
-        latest["max_concurrency"] = 1
-        latest["active_jobs"] = [
-            {
-                "job_id": state.get("job_id"),
-                "status": state.get("status"),
-                "stage": state.get("stage"),
-                "progress": state.get("progress"),
-                "message": state.get("message"),
-            }
-            for state in active
-        ]
-        latest["queued_jobs"] = [state["job_id"] for state in queued]
-        return json.loads(json.dumps(latest, ensure_ascii=False, default=str))
-
-    def start_reflection_memory_organization(self) -> dict[str, Any]:
-        require_source_admission(self)
-        if self.state in {QwenExoRuntimeState.STOPPING, QwenExoRuntimeState.STOPPED}:
-            raise RuntimeError("Reflection memory organization is stopped")
-        if (
-            self.reflection_memory_service is None
-            or self.tensor_bank is None
-            or self.query_probe is None
-        ):
-            raise RuntimeError("Reflection memory organization is unavailable")
-        queue = self._reflection_memory_organization_queue
-        queued_at = time.time()
-        job_id = (
-            "reflection-organization-"
-            + stable_digest(
-                time.time_ns(),
-                len(self._reflection_memory_organization_states),
-                self.knowledge.snapshot.source_digest,
-            )[:20]
-        )
-        state = {
-            "job_id": job_id,
-            "status": "queued",
-            "stage": "queued",
-            "progress": 0,
-            "message": "整理任务已进入后台队列",
-            "queued_at": queued_at,
-            "started_at": None,
-            "updated_at": queued_at,
-            "finished_at": None,
-            "details": {},
-            "result": None,
-            "error": None,
-        }
-        self._reflection_memory_organization_states[job_id] = state
-        queue.put_nowait(job_id)
-        worker = self._reflection_memory_organization_worker
-        if worker is None or worker.done():
-            self._reflection_memory_organization_worker = asyncio.create_task(
-                self._run_reflection_memory_organization_queue(),
-                name="qwen-exo-reflection-organization",
-            )
-        self.telemetry.emit(
-            job_id,
-            "reflection_memory.organization.job_queued",
-            {
-                "job_id": job_id,
-                "max_concurrency": 1,
-            },
-        )
-        return {**self.reflection_memory_organization_status(), **state}
-
-    @internal_task_scope("maintenance")
-    async def _run_reflection_memory_organization_queue(self) -> None:
-        queue = self._reflection_memory_organization_queue
-        while not queue.empty():
-            job_id = queue.get_nowait()
-            try:
-                await self._run_reflection_memory_organization(job_id)
-            finally:
-                queue.task_done()
-
-    async def _stop_reflection_memory_organization(self) -> None:
-        worker = self._reflection_memory_organization_worker
-        if worker is not None and not worker.done():
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
-        self._reflection_memory_organization_worker = None
-        queue = self._reflection_memory_organization_queue
-        while not queue.empty():
-            job_id = queue.get_nowait()
-            self._update_reflection_memory_organization(
-                job_id, status="failed", stage="failed",
-                message="服务停止，后台整理任务已中断", error="cancelled",
-                finished_at=time.time(),
-            )
-            queue.task_done()
-
-    def _update_reflection_memory_organization(
-        self, job_id: str, **changes: Any
-    ) -> None:
-        current = self._reflection_memory_organization_states.get(job_id)
-        if current is None:
-            return
-        next_state = dict(current)
-        details = changes.pop("details", None)
-        next_state.update(changes)
-        if "progress" in changes:
-            next_state["progress"] = max(
-                int(current.get("progress", 0)),
-                min(100, max(0, int(changes["progress"]))),
-            )
-        if details is not None:
-            next_state["details"] = {
-                **dict(current.get("details") or {}),
-                **dict(details),
-            }
-        next_state["updated_at"] = time.time()
-        self._reflection_memory_organization_states[job_id] = next_state
-        completed = [
-            key for key, state in self._reflection_memory_organization_states.items()
-            if state["status"] not in {"queued", "running"}
-        ]
-        for key in completed[:-_REFLECTION_ORGANIZATION_COMPLETED_LIMIT]:
-            del self._reflection_memory_organization_states[key]
-        self.telemetry.emit(
-            job_id,
-            "reflection_memory.organization.job_progress",
-            {
-                "job_id": job_id,
-                "status": next_state.get("status"),
-                "stage": next_state.get("stage"),
-                "progress": next_state.get("progress"),
-                "message": next_state.get("message"),
-                "details": next_state.get("details"),
-            },
-        )
-
-    async def _run_reflection_memory_organization(self, job_id: str) -> None:
-        self._update_reflection_memory_organization(
-            job_id,
-            status="running",
-            stage="scanning",
-            progress=2,
-            message="正在扫描反思记忆",
-            started_at=time.time(),
-        )
-
-        def report(
-            stage: str,
-            progress: int,
-            message: str,
-            details: dict[str, Any] | None = None,
-        ) -> None:
-            self._update_reflection_memory_organization(
-                job_id,
-                stage=stage,
-                progress=progress,
-                message=message,
-                details=details or {},
-            )
-
-        try:
-            result = await self.organize_reflection_memories(progress=report)
-        except asyncio.CancelledError:
-            self._update_reflection_memory_organization(
-                job_id,
-                status="failed",
-                stage="failed",
-                message="服务停止，后台整理任务已中断",
-                error="cancelled",
-                finished_at=time.time(),
-            )
-            raise
-        except Exception as exc:
-            error = type(exc).__name__ + ": " + str(exc)[:500]
-            self._update_reflection_memory_organization(
-                job_id,
-                status="failed",
-                stage="failed",
-                message="反思记忆整理失败",
-                error=error,
-                finished_at=time.time(),
-            )
-            self.telemetry.emit(
-                job_id,
-                "reflection_memory.organization.job_failed",
-                {"job_id": job_id, "error": error},
-            )
-            return
-        if result.get("status") == "merged":
-            message = (
-                f"整理完成，执行 {int(result.get('merge_operation_count', 0))} 次合并"
-            )
-        elif result.get("status") == "kept_distinct":
-            message = "整理完成，模型判定候选应保持分开"
-        else:
-            message = "整理完成，没有需要合并的高 Q×K 记忆"
-        self._update_reflection_memory_organization(
-            job_id,
-            status="succeeded",
-            stage="completed",
-            progress=100,
-            message=message,
-            result=result,
-            error=None,
-            finished_at=time.time(),
-        )
-        self.telemetry.emit(
-            job_id,
-            "reflection_memory.organization.job_completed",
-            {"job_id": job_id, "result": result},
-        )
-
-    @internal_task_scope("maintenance")
-    async def organize_reflection_memories(
-        self,
-        *,
-        progress: Callable[[str, int, str, dict[str, Any] | None], None] | None = None,
-    ) -> dict[str, Any]:
-        operations: list[dict[str, Any]] = []
-        total_pair_count = 0
-        total_review_count = 0
-        initial_document_count: int | None = None
-        terminal: dict[str, Any] = {"status": "merge_limit_reached"}
-        for pass_offset in range(16):
-            pass_index = pass_offset + 1
-            if progress is not None:
-                progress(
-                    "scanning",
-                    min(80, 4 + pass_offset * 5),
-                    f"第 {pass_index} 轮：正在扫描反思记忆",
-                    {"pass_index": pass_index},
-                )
-            result = await self._organize_reflection_memories_once(
-                pass_index=pass_index, progress=progress
-            )
-            if initial_document_count is None:
-                initial_document_count = int(
-                    result.get("document_count_before", result.get("document_count", 0))
-                )
-            total_pair_count += int(result.get("high_qk_pair_count", 0))
-            total_review_count += int(result.get("review_count", 0))
-            if result.get("status") != "merged":
-                terminal = result
-                break
-            operations.append(result)
-        if not operations:
-            return terminal
-        merged_paths = list(
-            dict.fromkeys(
-                path
-                for operation in operations
-                for path in operation.get("merged_document_paths", [])
-            )
-        )
-        removed_paths = list(
-            dict.fromkeys(
-                path
-                for operation in operations
-                for path in operation.get("removed_document_paths", [])
-            )
-        )
-        final_document_count = int(
-            terminal.get(
-                "document_count",
-                operations[-1].get("document_count_after", initial_document_count or 0),
-            )
-        )
-        return {
-            "status": "merged",
-            "terminal_status": terminal.get("status"),
-            "continuation_required": terminal.get("status") == "merge_limit_reached",
-            "document_count_before": initial_document_count,
-            "document_count_after": final_document_count,
-            "high_qk_pair_count": total_pair_count,
-            "review_count": total_review_count,
-            "merge_operation_count": len(operations),
-            "merged_document_count": len(merged_paths),
-            "merged_document_paths": merged_paths,
-            "removed_document_paths": removed_paths,
-            "target_document_path": operations[-1].get("target_document_path"),
-            "hot_updated": all(
-                bool(operation.get("hot_updated")) for operation in operations
-            ),
-            "restart_required": any(
-                bool(operation.get("restart_required")) for operation in operations
-            ),
-            "operations": operations,
-        }
-
-    async def _organize_reflection_memories_once(
-        self,
-        *,
-        pass_index: int = 1,
-        progress: Callable[[str, int, str, dict[str, Any] | None], None] | None = None,
-    ) -> dict[str, Any]:
-        if (
-            self.reflection_memory_service is None
-            or self.tensor_bank is None
-            or self.query_probe is None
-        ):
-            raise RuntimeError("Reflection memory organization is unavailable")
-        async with self._reflection_memory_organize_lock:
-            documents = tuple(
-                document
-                for document in self.knowledge.snapshot.documents
-                if is_compatible_reflection_memory(document)
-            )
-            if progress is not None:
-                progress(
-                    "scanning",
-                    min(82, 6 + (pass_index - 1) * 5),
-                    f"第 {pass_index} 轮：发现 {len(documents)} 条反思记忆",
-                    {
-                        "pass_index": pass_index,
-                        "document_count": len(documents),
-                    },
-                )
-            organization_id = stable_digest(
-                "reflection-memory-organization", self.knowledge.snapshot.source_digest
-            )[:24]
-            parent_id = f"reflection-memory-organization:{organization_id}"
-            self.telemetry.emit(
-                parent_id,
-                "reflection_memory.organization.qk_started",
-                {"document_count": len(documents)},
-            )
-            if len(documents) < 2:
-                return {
-                    "status": "not_needed",
-                    "document_count": len(documents),
-                    "high_qk_pair_count": 0,
-                    "merged_document_count": 0,
-                }
-            bank_snapshot = await self.tensor_bank.ensure_ready()
-            if not bank_snapshot.ready:
-                raise RuntimeError(
-                    "Reflection memory organization Tensor Bank is not ready"
-                )
-            minimum_score, _minimum_margin = qk_recall_gates("strict")
-            if progress is not None:
-                progress(
-                    "qk_retrieval",
-                    min(84, 10 + (pass_index - 1) * 5),
-                    f"第 {pass_index} 轮：正在执行严格 Q×K 候选检索",
-                    {
-                        "pass_index": pass_index,
-                        "document_count": len(documents),
-                        "documents_scanned": 0,
-                    },
-                )
-            document_by_id = {document.document_id: document for document in documents}
-            document_by_path = {
-                document.relative_path: document for document in documents
-            }
-            eligible_all = frozenset(
-                ("knowledge", document.document_id) for document in documents
-            )
-            pair_scores: dict[tuple[str, str], float] = {}
-            probe_failures: list[dict[str, str]] = []
-            for document_index, document in enumerate(documents, start=1):
-                if progress is not None:
-                    progress(
-                        "qk_retrieval",
-                        min(
-                            86,
-                            10
-                            + (pass_index - 1) * 5
-                            + int(20 * document_index / max(1, len(documents))),
-                        ),
-                        (
-                            f"第 {pass_index} 轮：Q×K 检索 "
-                            f"{document_index}/{len(documents)}"
-                        ),
-                        {
-                            "pass_index": pass_index,
-                            "document_count": len(documents),
-                            "documents_scanned": document_index,
-                        },
-                    )
-                probe_parent = f"{parent_id}:q:{document.document_id}"
-                probe = await self.query_probe.probe(
-                    probe_parent,
-                    QueryProbePlan.current_user(document.normalized_content),
-                )
-                if probe.status != "ready" or not probe.query_heads:
-                    probe_failures.append(
-                        {
-                            "document_path": document.relative_path,
-                            "status": probe.status,
-                        }
-                    )
-                    continue
-                eligible_documents = frozenset(
-                    item
-                    for item in eligible_all
-                    if item != ("knowledge", document.document_id)
-                )
-                ranked = self.tensor_bank.rank(
-                    probe.query_heads,
-                    query_states=probe.query_states,
-                    query_identity=(
-                        "reflection-memory-organization:"
-                        + stable_digest(document.sha256)[:24]
-                    ),
-                    limit=min(6, len(eligible_documents)),
-                    min_tensor_score=minimum_score,
-                    min_document_margin=0.0,
-                    eligible_documents=eligible_documents,
-                )
-                for candidate in ranked:
-                    other = document_by_id.get(candidate.document_id)
-                    if other is None or candidate.tensor_score is None:
-                        continue
-                    pair = tuple(sorted((document.relative_path, other.relative_path)))
-                    pair_scores[pair] = max(
-                        pair_scores.get(pair, float("-inf")),
-                        float(candidate.tensor_score),
-                    )
-            ranked_pairs = tuple(
-                (left, right, score)
-                for (left, right), score in sorted(
-                    pair_scores.items(), key=lambda item: (-item[1], item[0])
-                )
-            )
-            if progress is not None:
-                progress(
-                    "model_review",
-                    min(90, 34 + (pass_index - 1) * 5),
-                    (
-                        f"第 {pass_index} 轮：发现 {len(ranked_pairs)} 组高 Q×K 候选，"
-                        "等待模型核对因果经验与冲突"
-                    ),
-                    {
-                        "pass_index": pass_index,
-                        "high_qk_pair_count": len(ranked_pairs),
-                        "review_count": 0,
-                    },
-                )
-            self.telemetry.emit(
-                parent_id,
-                "reflection_memory.organization.qk_completed",
-                {
-                    "document_count": len(documents),
-                    "minimum_tensor_score": minimum_score,
-                    "high_qk_pair_count": len(ranked_pairs),
-                    "probe_failures": probe_failures,
-                    "pairs": [
-                        {"left": left, "right": right, "tensor_score": score}
-                        for left, right, score in ranked_pairs[:32]
-                    ],
-                },
-            )
-            if not ranked_pairs:
-                return {
-                    "status": "no_high_qk_pairs",
-                    "document_count": len(documents),
-                    "high_qk_pair_count": 0,
-                    "merged_document_count": 0,
-                    "probe_failures": probe_failures,
-                }
-            reviewed_pairs: set[tuple[str, str]] = set()
-            review_count = 0
-            for seed_left, seed_right, _seed_score in ranked_pairs:
-                seed_pair = (seed_left, seed_right)
-                if seed_pair in reviewed_pairs:
-                    continue
-                related_scores: dict[str, float] = {
-                    seed_left: pair_scores[seed_pair],
-                    seed_right: pair_scores[seed_pair],
-                }
-                for left, right, score in ranked_pairs:
-                    if left in seed_pair or right in seed_pair:
-                        related_scores[left] = max(
-                            related_scores.get(left, -1.0), score
-                        )
-                        related_scores[right] = max(
-                            related_scores.get(right, -1.0), score
-                        )
-                candidate_paths = tuple(
-                    path
-                    for path, _score in sorted(
-                        related_scores.items(), key=lambda item: (-item[1], item[0])
-                    )[:6]
-                )
-                candidate_path_set = set(candidate_paths)
-                candidate_pairs = tuple(
-                    (left, right, score)
-                    for left, right, score in ranked_pairs
-                    if left in candidate_path_set and right in candidate_path_set
-                )
-                reviewed_pairs.update(
-                    (left, right) for left, right, _score in candidate_pairs
-                )
-                candidates = tuple(
-                    ReflectionMemoryCandidate(
-                        document_path=path,
-                        document_sha256=document_by_path[path].sha256,
-                        title=str(document_by_path[path].title or path),
-                        content=document_by_path[path].normalized_content,
-                        tensor_score=related_scores[path],
-                        causal_entries=self._stored_causal_entries(
-                            path, document_by_path[path].sha256
-                        ),
-                    )
-                    for path in candidate_paths
-                )
-                review_count += 1
-                if progress is not None:
-                    progress(
-                        "model_review",
-                        min(
-                            92,
-                            36 + (pass_index - 1) * 5 + review_count * 2,
-                        ),
-                        (f"第 {pass_index} 轮：模型正在审查第 {review_count} 组候选"),
-                        {
-                            "pass_index": pass_index,
-                            "high_qk_pair_count": len(ranked_pairs),
-                            "review_count": review_count,
-                            "candidate_count": len(candidates),
-                        },
-                    )
-                reflection = await self.reflection_memory_service.organize_candidates(
-                    organization_id=f"{organization_id}:{review_count}",
-                    candidates=candidates,
-                    qk_pairs=candidate_pairs,
-                )
-                if reflection is None:
-                    if review_count >= 8:
-                        break
-                    continue
-                if progress is not None:
-                    progress(
-                        "publishing",
-                        min(96, 58 + (pass_index - 1) * 5),
-                        (
-                            f"第 {pass_index} 轮：模型决定合并，正在原子写入并热编译 "
-                            "Tensor Bank"
-                        ),
-                        {
-                            "pass_index": pass_index,
-                            "review_count": review_count,
-                            "merge_candidate_count": len(
-                                reflection.merge_document_paths
-                            ),
-                        },
-                    )
-                publication = await self._publish_reflection_memory(reflection)
-                reflection = replace(
-                    reflection,
-                    document_path=publication.get("document_path"),
-                    document_sha256=publication.get("document_sha256"),
-                    native_source_digest=publication.get("native_source_digest"),
-                    hot_updated=bool(publication.get("hot_updated", False)),
-                    restart_required=bool(publication.get("restart_required", False)),
-                    publication_status=str(
-                        publication.get("publication_status", "published")
-                    ),
-                )
-                self.reflection_memory_store.append(reflection)
-                await self._on_reflection_memory_stored(reflection)
-                if progress is not None:
-                    progress(
-                        "publishing",
-                        min(98, 64 + (pass_index - 1) * 5),
-                        f"第 {pass_index} 轮：合并已提交，Tensor Bank 热编译完成",
-                        {
-                            "pass_index": pass_index,
-                            "review_count": review_count,
-                            "merged_document_count": len(
-                                reflection.merge_document_paths
-                            ),
-                        },
-                    )
-                payload = {
-                    "status": "merged",
-                    "document_count_before": len(documents),
-                    "document_count_after": sum(
-                        is_compatible_reflection_memory(document)
-                        for document in self.knowledge.snapshot.documents
-                    ),
-                    "high_qk_pair_count": len(ranked_pairs),
-                    "review_count": review_count,
-                    "target_document_path": reflection.document_path,
-                    "merged_document_paths": list(reflection.merge_document_paths),
-                    "removed_document_paths": publication.get(
-                        "removed_document_paths", []
-                    ),
-                    "document_sha256": reflection.document_sha256,
-                    "native_source_digest": reflection.native_source_digest,
-                    "hot_updated": reflection.hot_updated,
-                    "restart_required": reflection.restart_required,
-                }
-                self.telemetry.emit(
-                    parent_id,
-                    "reflection_memory.organization.completed",
-                    payload,
-                )
-                return payload
-            payload = {
-                "status": "kept_distinct",
-                "document_count": len(documents),
-                "high_qk_pair_count": len(ranked_pairs),
-                "review_count": review_count,
-                "merged_document_count": 0,
-                "probe_failures": probe_failures,
-            }
-            self.telemetry.emit(
-                parent_id, "reflection_memory.organization.completed", payload
-            )
-            return payload
-
     async def _publish_reflection_memory(
         self, reflection: ReflectionMemory
     ) -> dict[str, Any]:
-        if self.tensor_bank is None:
-            raise RuntimeError("Reflection memory requires a native Tensor Bank")
         if reflection.memory_action not in {"insert", "update"}:
             raise ValueError("Reflection memory publication action is invalid")
-        async with self._tensor_bank_admin_lock:
+        # Published reflections are plain text memory files: the knowledge
+        # directory is what qwen_exo_memory_search/read serve.
+        async with self._reflection_publish_lock:
             snapshot_by_path = {
                 document.relative_path: document
                 for document in self.knowledge.snapshot.documents
@@ -8123,7 +6267,8 @@ class QwenExoRuntime:
                 for merged_path in previous_documents:
                     if merged_path != relative_path:
                         self.knowledge.delete(merged_path)
-                bank = await self._reindex_tensor_bank_unlocked()
+                await asyncio.to_thread(self.file_knowledge.refresh)
+                text_memory_digest = self._file_knowledge_digest()
                 if effective_category:
                     self.document_categories.ensure(
                         effective_category,
@@ -8140,7 +6285,7 @@ class QwenExoRuntime:
                             document_sha256=(
                                 document.sha256 if document is not None else None
                             ),
-                            native_source_digest=bank.get("source_digest"),
+                            native_source_digest=text_memory_digest,
                             hot_updated=True,
                             publication_status=(
                                 "published" if document is not None else "retired"
@@ -8166,7 +6311,7 @@ class QwenExoRuntime:
                                 previous_document.relative_path,
                                 previous_document.content,
                             )
-                    await self._reindex_tensor_bank_unlocked()
+                    await asyncio.to_thread(self.file_knowledge.refresh)
                 except Exception as rollback_error:
                     self.telemetry.emit(
                         "admin",
@@ -8190,7 +6335,7 @@ class QwenExoRuntime:
             "removed_document_paths": [
                 path for path in previous_documents if path != relative_path
             ],
-            "native_source_digest": bank.get("source_digest"),
+            "native_source_digest": text_memory_digest,
             "hot_updated": True,
             "restart_required": False,
             "publication_status": "published" if document is not None else "retired",
@@ -8302,20 +6447,6 @@ class QwenExoRuntime:
             return value
         return ""
 
-    def _candidate_excerpt(self, lane: str, relative_path: str) -> str:
-        repository = {
-            "knowledge": self.knowledge,
-            "policydata": self.policy_data,
-            "cognition": self.cognition,
-        }.get(lane)
-        if repository is None:
-            return ""
-        for document in repository.snapshot.documents:
-            if document.relative_path == relative_path:
-                content = getattr(document, "normalized_content", "") or ""
-                return content[:240]
-        return ""
-
     def request_traces(self, *, limit: int = 50, query: str = "") -> dict[str, Any]:
         grouped: dict[str, list[Any]] = {}
         order: list[str] = []
@@ -8336,7 +6467,6 @@ class QwenExoRuntime:
                         "id": request_id,
                         "input": card.get("input_text"),
                         "output": card.get("output_text"),
-                        "paths": [c.get("relative_path") for c in card["candidates"]],
                     },
                     ensure_ascii=False,
                 )
@@ -8352,6 +6482,8 @@ class QwenExoRuntime:
         }
 
     def _request_trace_card(self, request_id: str, events: list[Any]) -> dict[str, Any]:
+        """One recall-trace list entry: request text plus a summary of the
+        server-executed memory tool calls (full text lives in the tool log)."""
         card: dict[str, Any] = {
             "request_id": request_id,
             "started_at": None,
@@ -8360,22 +6492,13 @@ class QwenExoRuntime:
             "output_text": "",
             "reasoning_text": "",
             "output_tokens": None,
-            "prompt_tokens": None,
-            "query_tokens": None,
-            "retrieval_seconds": None,
-            "judge_seconds": None,
-            "selected_document_ids": [],
-            "candidates": [],
-            "native_restore": None,
-            "cognition_active": False,
-            "attached_tokens": 0,
-            "self_ask": [],
-            "latent_transplant": None,
+            "memory_tool_calls": 0,
+            "memory_tool_failures": 0,
+            "memory_tools": [],
             "event_types": [],
         }
         started_ts = None
         completed_ts = None
-        best_memory_score = -1
         for event in events:
             payload = event.payload or {}
             kind = event.event_type
@@ -8391,58 +6514,13 @@ class QwenExoRuntime:
                     payload.get("reasoning") or payload.get("think")
                 )
                 card["output_tokens"] = payload.get("output_tokens")
-            elif kind == "memory.prepared":
-                selected = payload.get("selected_document_ids") or ()
-                restore = payload.get("native_prefix_restore") or {}
-                candidates = payload.get("proposed_candidates") or ()
-                evidence_score = (
-                    len(selected) * 100
-                    + (50 if restore.get("active") else 0)
-                    + int(payload.get("attached_tokens") or 0)
-                    + len(candidates)
-                )
-                if evidence_score < best_memory_score:
-                    continue
-                best_memory_score = evidence_score
-                card["attached_tokens"] = payload.get("attached_tokens") or 0
-                card["selected_document_ids"] = list(selected)
-                card["prompt_tokens"] = (
-                    payload.get("query_probe", {}).get("prompt_tokens")
-                    if isinstance(payload.get("query_probe"), dict)
-                    else None
-                )
-                card["retrieval_seconds"] = payload.get("retrieval_latency_seconds")
-                card["judge_seconds"] = payload.get("judge_latency_seconds")
-                cognition = payload.get("cognition") or {}
-                card["cognition_active"] = bool(cognition.get("active"))
-                if restore.get("active"):
-                    card["native_restore"] = {
-                        "lane": restore.get("lane"),
-                        "tokens": restore.get("tokens"),
-                        "selection_reason": restore.get("selection_reason"),
-                    }
-                card["candidates"] = [
-                    {
-                        "relative_path": str(candidate.get("relative_path") or ""),
-                        "lane": candidate.get("lane"),
-                        "tensor_score": candidate.get("tensor_score"),
-                        "lexical_score": candidate.get("lexical_score"),
-                        "excerpt": self._candidate_excerpt(
-                            str(candidate.get("lane") or ""),
-                            str(candidate.get("relative_path") or ""),
-                        ),
-                    }
-                    for candidate in candidates
-                ]
-            elif kind.startswith("self_ask") or kind.startswith("refresh"):
-                entry = {
-                    "event_type": kind,
-                    "question": self._trace_text(payload.get("question")),
-                    "answer": self._trace_text(payload.get("answer")),
-                    "status": payload.get("status"),
-                }
-                if entry["question"] or entry["answer"] or entry["status"]:
-                    card["self_ask"].append(entry)
+            elif kind == "memory_tool.call":
+                card["memory_tool_calls"] += 1
+                if not payload.get("ok"):
+                    card["memory_tool_failures"] += 1
+                tool = str(payload.get("tool") or "")
+                if tool and tool not in card["memory_tools"]:
+                    card["memory_tools"].append(tool)
         if started_ts is not None and completed_ts is not None:
             card["duration_seconds"] = round(completed_ts - started_ts, 3)
         return card
@@ -8450,14 +6528,7 @@ class QwenExoRuntime:
     def _document_token_count(
         self,
         document: KnowledgeDocument,
-        *,
-        compiled_page: Any | None,
     ) -> int:
-        if compiled_page is not None:
-            return max(
-                0,
-                int(compiled_page.token_end) - int(compiled_page.cognition_token_count),
-            )
         cache = getattr(self, "_document_token_counts", None)
         if cache is None:
             cache = OrderedDict()
@@ -8503,17 +6574,7 @@ class QwenExoRuntime:
         include_content: bool = False,
         query: str = "",
     ) -> list[dict[str, object]]:
-        tensor_bank = getattr(self, "tensor_bank", None)
-        pages = tuple(getattr(getattr(tensor_bank, "snapshot", None), "pages", ()))
-        compiled_pages = {
-            (str(page.document_id), str(page.reference_digest)): page
-            for page in pages
-            if str(page.lane) == lane
-        }
-        try:
-            compiled_at = float(tensor_bank.path.stat().st_mtime)
-        except (AttributeError, OSError):
-            compiled_at = None
+        del lane
         reflection_created_at = {
             str(record.get("document_path")): float(record["created_at"])
             for record in (
@@ -8537,7 +6598,6 @@ class QwenExoRuntime:
         for document in repository.snapshot.documents:
             if not self._document_matches_query(document, query):
                 continue
-            compiled_page = compiled_pages.get((document.document_id, document.sha256))
             payload = document.public_dict(include_content=include_content)
             payload["retrieval_category_title"] = category_titles.get(
                 str(payload.get("retrieval_category") or payload["source_kind"]),
@@ -8545,14 +6605,7 @@ class QwenExoRuntime:
             )
             payload.update(
                 {
-                    "token_count": self._document_token_count(
-                        document, compiled_page=compiled_page
-                    ),
-                    "compiled": compiled_page is not None,
-                    "compile_status": (
-                        "compiled" if compiled_page is not None else "uncompiled"
-                    ),
-                    "compiled_at": compiled_at if compiled_page is not None else None,
+                    "token_count": self._document_token_count(document),
                     "ingested_at": reflection_created_at.get(
                         document.relative_path, document.modified_ns / 1_000_000_000
                     ),
@@ -8578,7 +6631,6 @@ class QwenExoRuntime:
                 "indexed_ns": int(row["indexed_ns"]),
                 "retrieval_mode": "file",
                 "content_source": "filesystem",
-                "native_tensor_bank": False,
             }
             for row in rows
             if not needle or needle in str(row["relative_path"]).casefold()
@@ -8633,20 +6685,18 @@ class QwenExoRuntime:
         missing = [path for path in paths if path not in documents]
         if missing:
             raise FileNotFoundError(missing[0])
-        async with self._tensor_bank_admin_lock:
-            for path in paths:
-                document = documents[path]
-                self.knowledge.upsert(
-                    path,
-                    set_markdown_retrieval_category(document.content, category_id),
-                )
-            bank_snapshot = await self._reindex_tensor_bank_unlocked()
-            self._sync_document_categories()
+        for path in paths:
+            document = documents[path]
+            self.knowledge.upsert(
+                path,
+                set_markdown_retrieval_category(document.content, category_id),
+            )
+        await asyncio.to_thread(self.file_knowledge.refresh)
+        self._sync_document_categories()
         payload = {
             "category_id": category_id,
             "assigned_count": len(paths),
             "relative_paths": list(paths),
-            "tensor_bank": bank_snapshot,
         }
         self.telemetry.emit("admin", "document_category.assigned", payload)
         return payload
@@ -8671,7 +6721,7 @@ class QwenExoRuntime:
         return {
             "relative_path": row["relative_path"], "sha256": row["sha256"],
             "byte_count": row["byte_count"], "retrieval_mode": "file",
-            "content_source": "filesystem", "native_tensor_bank": False,
+            "content_source": "filesystem",
             "previous_sha256": previous["sha256"] if previous else None,
         }
 
@@ -8682,6 +6732,36 @@ class QwenExoRuntime:
         self.telemetry.emit("admin", "knowledge.deleted", {
             "relative_path": relative_path, "retrieval_mode": "file",
         })
+
+    async def record_memory_tool_round(
+        self, request_id: str, round_index: int, calls: list[dict[str, Any]]
+    ) -> None:
+        """Journal one server-side memory tool round for the recall trace:
+        full text to the tool log, metadata to telemetry (which redacts text)."""
+        try:
+            await asyncio.to_thread(
+                self.memory_tool_log.record, request_id, round_index, calls
+            )
+        except Exception:
+            logger.exception("memory tool log write failed")
+        for call in calls:
+            self.telemetry.emit(
+                request_id,
+                "memory_tool.call",
+                {
+                    "tool": call["name"],
+                    "round": int(round_index),
+                    "ok": bool(call["ok"]),
+                    "duration_ms": round(float(call.get("duration_ms") or 0.0), 1),
+                    "output_chars": len(call.get("output") or ""),
+                    "call_id": call["id"],
+                },
+            )
+
+    def memory_tool_calls(self, request_id: str | None, limit: int = 100) -> dict[str, Any]:
+        if request_id:
+            return {"calls": self.memory_tool_log.for_request(request_id)}
+        return {"calls": self.memory_tool_log.recent(limit)}
 
     def _file_knowledge_digest(self) -> str:
         digest = hashlib.sha256()
@@ -8743,7 +6823,7 @@ class QwenExoRuntime:
             "source_digest": self._file_knowledge_digest(),
             "document_count": len(self.file_knowledge.metadata()),
             "files": written, "retrieval_mode": "file",
-            "content_source": "filesystem", "native_tensor_bank": False,
+            "content_source": "filesystem",
         }
         self.telemetry.emit("admin", "knowledge.ingested", payload)
         return payload
@@ -8846,63 +6926,6 @@ class QwenExoRuntime:
         self.telemetry.emit("admin", "source_documents.deleted", payload)
         return payload
 
-    async def compile_source_documents(
-        self, lane: str, relative_paths: Iterable[str]
-    ) -> dict[str, Any]:
-        if self.tensor_bank is None:
-            raise RuntimeError("QWEN-EXO native Tensor Bank is disabled")
-        repository = {
-            "knowledge": self.knowledge,
-            "policydata": self.policy_data,
-        }.get(str(lane))
-        if repository is None:
-            raise ValueError("Source lane must be knowledge or policydata")
-        paths = tuple(
-            dict.fromkeys(
-                str(path).replace("\\", "/").strip()
-                for path in relative_paths
-                if str(path).strip()
-            )
-        )
-        if not paths:
-            raise ValueError("At least one source document must be selected")
-        current_documents = {
-            (repo_lane, document.relative_path): document
-            for repo_lane, source_repository in self.tensor_bank.repositories.items()
-            if repo_lane != "cognition"
-            for document in source_repository.snapshot.documents
-        }
-        requested = {(str(lane), path) for path in paths}
-        missing = sorted(requested.difference(current_documents))
-        if missing:
-            raise FileNotFoundError(missing[0][1])
-        retained = {
-            (str(page.lane), str(page.relative_path))
-            for page in self.tensor_bank.snapshot.pages
-            if (document := current_documents.get((page.lane, page.relative_path)))
-            is not None
-            and document.document_id == page.document_id
-            and document.sha256 == page.reference_digest
-        }
-        personality_documents = {
-            key for key in current_documents if key[0] == "policydata"
-        }
-        included_documents = retained.union(requested, personality_documents)
-        async with self._tensor_bank_admin_lock:
-            payload = await self._reindex_tensor_bank_unlocked(
-                included_documents=included_documents
-            )
-        result = {
-            **payload,
-            "requested_lane": lane,
-            "requested_paths": list(paths),
-            "requested_count": len(paths),
-            "compiled_document_count": len(included_documents),
-            "partial_compile": True,
-        }
-        self.telemetry.emit("admin", "source_documents.compiled", result)
-        return result
-
     def reindex_policy_data(self) -> dict[str, object]:
         snapshot = self.policy_data.refresh()
         payload: dict[str, object] = {
@@ -8912,164 +6935,6 @@ class QwenExoRuntime:
         }
         self.telemetry.emit("admin", "policy_data.reindexed", payload)
         return payload
-
-    def _ensure_query_probe(self) -> None:
-        if self.query_probe is not None:
-            return
-        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
-        if tokenizer is None or self.tensor_bank is None:
-            raise RuntimeError("QWEN-EXO QK retrieval requires a tokenizer and native Bank")
-        model_config = getattr(self.tokenizer_manager, "model_config", None)
-        text_config = (
-            getattr(model_config, "hf_text_config", None)
-            or getattr(model_config, "hf_config", None)
-        )
-        heads = int(
-            getattr(model_config, "num_attention_heads", 0)
-            or getattr(text_config, "num_attention_heads", 0)
-        )
-        hidden_size = int(
-            getattr(model_config, "hidden_size", 0)
-            or getattr(text_config, "hidden_size", 0)
-        )
-        head_dim = int(
-            getattr(model_config, "head_dim", 0)
-            or getattr(text_config, "head_dim", 0)
-            or (hidden_size // heads if heads else 0)
-        )
-        if heads < 1 or head_dim < 1:
-            raise RuntimeError("QWEN-EXO QueryProbe requires model Attention head geometry")
-        self.query_probe = QueryProbeService(
-            self.internal_jobs,
-            tokenizer,
-            self.telemetry,
-            max_prompt_tokens=self.config.max_internal_tokens,
-            timeout_seconds=_query_probe_timeout_seconds(self.tokenizer_manager),
-            cognition_token_ids=self.tensor_bank.cognition_token_ids(),
-            query_head_count=heads,
-            head_dim=head_dim,
-            query_pooling=self.config.qk_query_pooling,
-        )
-        if self.refresh_service is not None:
-            self.refresh_service.query_probe = self.query_probe
-
-    async def _reindex_tensor_bank_unlocked(
-        self,
-        *,
-        included_documents: set[tuple[str, str]] | None = None,
-    ) -> dict[str, Any]:
-        if self.tensor_bank is None:
-            raise RuntimeError("QWEN-EXO native Tensor Bank is disabled")
-        snapshot = (
-            await self.tensor_bank.ensure_ready()
-            if included_documents is None
-            else await self.tensor_bank.ensure_ready(
-                included_documents=included_documents
-            )
-        )
-        if snapshot.ready:
-            self._ensure_query_probe()
-        payload = snapshot.public_dict()
-        self.telemetry.emit("admin", "tensor_bank.reindexed", payload)
-        return payload
-
-    async def reindex_tensor_bank(self) -> dict[str, Any]:
-        async with self._tensor_bank_admin_lock:
-            return await self._reindex_tensor_bank_unlocked()
-
-    async def preview_qk_rank(
-        self, question: str, *, limit: int = 8, pooling: str | None = None
-    ) -> dict[str, Any]:
-        """Probe ``question`` and rank the Tensor Bank as a user request would.
-
-        Admin-only evaluation surface: it runs the same query probe and
-        ``rank`` call (lexical fusion included) without a judge or any
-        attachment, and returns the audit so layer/head sweeps can measure
-        hit@k offline against a labelled question set.
-        """
-        text = str(question or "").strip()
-        if not text:
-            raise ValueError("question must not be empty")
-        if self.tensor_bank is None or self.query_probe is None:
-            raise RuntimeError("Q/K recall is unavailable on this runtime")
-        snapshot = await self.tensor_bank.ensure_ready()
-        if not snapshot.ready:
-            raise RuntimeError("Tensor Bank is not ready")
-        parent_id = "qk-rank-preview:" + stable_digest(text, str(time.time()))[:24]
-        query_probe = self.query_probe
-        if pooling is not None and pooling != query_probe.query_pooling:
-            query_probe = QueryProbeService(
-                self.internal_jobs,
-                query_probe.tokenizer,
-                self.telemetry,
-                max_prompt_tokens=query_probe.max_prompt_tokens,
-                cognition_token_ids=query_probe.cognition_token_ids,
-                query_head_count=query_probe.query_head_count,
-                head_dim=query_probe.head_dim,
-                timeout_seconds=query_probe.timeout_seconds,
-                query_pooling=pooling,
-            )
-        try:
-            probe = await query_probe.probe(
-                parent_id, QueryProbePlan.current_user(text)
-            )
-            if probe.status != "ready" or not probe.query_heads:
-                return {
-                    "question": text,
-                    "probe_status": probe.status,
-                    "candidates": [],
-                    "rank_audit": {},
-                }
-            min_tensor_score, rank_margin = self.config.qk_admission_gates
-            audit: dict[str, Any] = {}
-            candidates = self.tensor_bank.rank(
-                probe.query_heads,
-                query_states=probe.query_states,
-                query_identity=parent_id,
-                limit=max(1, int(limit)),
-                min_tensor_score=min_tensor_score,
-                min_document_margin=0.0,
-                audit=audit,
-                query_text=text,
-            )
-        finally:
-            await self.internal_jobs.finish_parent(parent_id)
-        return {
-            "question": text,
-            "probe_status": probe.status,
-            "probe_query_count": len(probe.query_heads),
-            "qk_layer_id": self.tensor_bank.qk_layer_id,
-            "qk_query_heads": list(self.tensor_bank.qk_query_heads),
-            "qk_query_pooling": query_probe.query_pooling,
-            "candidates": [
-                {
-                    "rank": index + 1,
-                    "lane": candidate.lane,
-                    "document_id": candidate.document_id,
-                    "relative_path": candidate.relative_path,
-                    "tensor_score": candidate.tensor_score,
-                    "relative_tensor_score": candidate.relative_tensor_score,
-                    "lexical_score": candidate.lexical_score,
-                    "head_group_count": candidate.head_group_count,
-                }
-                for index, candidate in enumerate(candidates)
-            ],
-            "rank_audit": {
-                key: value
-                for key, value in audit.items()
-                if key
-                in {
-                    "status",
-                    "reason",
-                    "considered_documents",
-                    "relative_score_active",
-                    "background_gate_active",
-                    "lexical_fusion",
-                    "query_count",
-                    "scored_documents",
-                }
-            },
-        }
 
     def status(self) -> dict[str, Any]:
         with self._session_initial_gdn_value_lock:
@@ -9109,7 +6974,6 @@ class QwenExoRuntime:
                 "document_count": len(self.cognition.snapshot.documents),
                 "always_on": bool(self.cognition.snapshot.documents),
                 "route": "text_instructions",
-                "qk_ranked": False,
             },
             "policy_data": {
                 "source_digest": self.policy_data.snapshot.source_digest,
@@ -9119,17 +6983,9 @@ class QwenExoRuntime:
                     self.config.feature_flags.policy_data
                     and self.policy_data.snapshot.documents
                 ),
-                "semantic_eligibility_required": False,
-                "qk_relevance_required": False,
-                "reference_judge_required": False,
                 "route": "text_instructions",
                 "max_tokens": self.config.max_policy_tokens,
             },
-            "tensor_bank": (
-                self.tensor_bank.snapshot.public_dict()
-                if self.tensor_bank is not None
-                else None
-            ),
             "latent_transplant": {
                 "mode": (
                     "default_always_on" if self._latent_default else "request_opt_in"
@@ -9149,27 +7005,16 @@ class QwenExoRuntime:
                 else None
             ),
             "internal_services": {
-                "reference_judge": self.reference_judge is not None,
                 "capsule": self.capsules is not None,
-                "memory_pipeline": self.memory_pipeline is not None,
-                "self_ask_refresh": getattr(self, "refresh_service", None) is not None,
-                "policy_data": self.memory_pipeline is not None,
-                "tensor_bank": self.tensor_bank is not None,
+                "memory_tools": True,
+                "policy_data": self.config.feature_flags.policy_data,
                 "cognition": bool(self.cognition.snapshot.documents),
-                "query_probe": self.query_probe is not None,
-                "causal_replay": self.causal_replay is not None,
-                "adaptive_retrieval": self.adaptive_retrieval is not None,
             },
             "telemetry": {
                 "event_count": len(self.telemetry.events(limit=4096)),
                 "observer_mode": self.observer.mode,
                 "persistence": self.telemetry.persistence_status(),
             },
-            "adaptive_retrieval": (
-                self.adaptive_retrieval.public_dict()
-                if self.adaptive_retrieval is not None
-                else None
-            ),
         }
 
     def health(self) -> dict[str, Any]:

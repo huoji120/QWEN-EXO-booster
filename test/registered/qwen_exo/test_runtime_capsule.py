@@ -11,7 +11,6 @@ from qwen_exo_booster.config import QwenExoConfig, QwenExoFeatureFlags
 from qwen_exo_booster.contracts import stable_digest
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
 from qwen_exo_booster.observer import MidThinkEvent, ObserverResult
-from qwen_exo_booster.query_probe import QueryStateSpan
 from qwen_exo_booster.reflection_memory import (
     ReflectionMemory,
     ReflectionSourceSnapshot,
@@ -35,7 +34,6 @@ class FakeRequest:
     user: str | None = None
     session_id: str | None = None
     prompt_cache_key: str | None = None
-    qwen_exo_memory_attachment: str | None = None
 
     def model_copy(self, update):
         return replace(self, **update)
@@ -47,16 +45,12 @@ def config(tmp_path):
         knowledge_directory=tmp_path / "knowledge",
         max_internal_fanout=8,
         max_internal_tokens=1024,
-        max_candidates=8,
-        max_memory_tokens=256,
         observer_mode="shadow",
         feature_flags=QwenExoFeatureFlags(
             hybrid_prefix=True,
-            external_memory=False,
-            reference_judge=False,
             capsule=True,
             observer=True,
-            adaptive_refresh=False,
+            policy_data=False,
         ),
         model_path="model",
         tp_size=2,
@@ -79,69 +73,11 @@ def runtime(tmp_path):
     return value
 
 
-def capture_retrieval_questions(value):
-    captures = {"query_probe": [], "memory_pipeline": [], "role_plans": []}
-
-    class QueryProbe:
-        async def probe(self, request_id, plan):
-            captures["role_plans"].append((request_id, plan))
-            state = QueryStateSpan("original_task", 0, 1, 0, 1)
-            return SimpleNamespace(
-                query_heads=(((0.1, 0.2),),),
-                query_states=(state,),
-                role_plan_digest=plan.identity,
-                status="ready",
-                prompt_tokens=2,
-            )
-
-    class Pipeline:
-        def __init__(self):
-            self.states = {}
-
-        async def prepare_responses_request(self, request, **kwargs):
-            question = kwargs["retrieval_question"]
-            captures["memory_pipeline"].append((request.request_id, question))
-            captures["query_probe"].append((request.request_id, question))
-            state = SimpleNamespace(
-                public_dict=lambda: {
-                    "question_digest": stable_digest(question),
-                    "retrieval_question_digest": stable_digest(question),
-                    "next_native_attractor": {"status": "ready"},
-                },
-                question_digest=stable_digest(question),
-                retrieval_question_digest=stable_digest(question),
-                policy_attachment=None,
-                radix_prefix_identity=None,
-                previous_response_id=kwargs.get("published_previous_response_id"),
-                effective_memory_previous_response_id=kwargs.get(
-                    "memory_previous_response_id"
-                ),
-                policy_attached_tokens=0,
-                attached_tokens=0,
-                policy_document_ids=(),
-                radix_prefix_page_id=None,
-                radix_prefix_token_ids=(),
-                restoration_status="not_requested",
-            )
-            self.states[request.request_id] = state
-            return request, state
-
-        async def finalize_request_state(self, request_id):
-            return self.states.get(request_id)
-
-        async def get_state(self, request_id):
-            return self.states.get(request_id)
-
-    value.query_probe = QueryProbe()
-    value.memory_pipeline = Pipeline()
-    return captures
-
-
 def test_reflection_memory_runs_after_own_request_becomes_idle(tmp_path, monkeypatch):
     value = runtime(tmp_path)
     value.config = replace(
         value.config,
-        feature_flags=replace(value.config.feature_flags, external_memory=True),
+        feature_flags=replace(value.config.feature_flags),
         reflection_memory_mode="active",
         max_internal_tokens=12288,
     )
@@ -192,7 +128,7 @@ def test_reflection_waits_again_after_plain_user_turn(tmp_path, monkeypatch):
     value = runtime(tmp_path)
     value.config = replace(
         value.config,
-        feature_flags=replace(value.config.feature_flags, external_memory=True),
+        feature_flags=replace(value.config.feature_flags),
         reflection_memory_mode="active",
         max_internal_tokens=12288,
     )
@@ -311,8 +247,6 @@ async def test_pending_reflection_can_be_cancelled(tmp_path):
 @pytest.mark.asyncio
 async def test_reflection_regeneration_is_recoverable_and_rejects_duplicates(tmp_path):
     value = runtime(tmp_path)
-    value.tensor_bank = object()
-    value.query_probe = object()
     document = value.knowledge.upsert(
         "reflection-memory/associated.md",
         "---\nsource_kind: trajectory_reflection\n"
@@ -369,7 +303,7 @@ async def test_reflection_regeneration_is_recoverable_and_rejects_duplicates(tmp
     class RegenerationService:
         async def reflect(self, **kwargs):
             captures.append(kwargs)
-            kwargs["stage_callback"]("qk_retrieval")
+            kwargs["stage_callback"]("similar_retrieval")
             kwargs["stage_callback"]("model_review")
             started.set()
             await release.wait()
@@ -546,50 +480,6 @@ def observer_result(*events):
     )
 
 
-def test_resolved_observer_event_does_not_schedule_hidden_refresh(tmp_path):
-    value = runtime(tmp_path)
-    resolved = observer_event("resolved_by_continuation", event_id="resolved-event")
-    value.refresh_service = SimpleNamespace()
-    value.observer.observe_generation_result = lambda *args, **kwargs: (
-        observer_result(resolved)
-    )
-
-    value.observe_generation_result("resp-observer", {"meta_info": {}})
-
-    assert "resp-observer" not in value._refresh_tasks
-    event_types = [
-        event.event_type for event in value.telemetry.events("resp-observer")
-    ]
-    assert "adaptive.resolved_without_refresh" in event_types
-    assert "adaptive.transition" not in event_types
-
-
-def test_persistent_uncertainty_no_longer_schedules_observer_refresh(tmp_path):
-    # Mid-think self-questions moved to the reasoning-budget cutoff, so the
-    # observer must NOT spawn a hidden refresh/self-ask task on drift anymore
-    # (this used to fire Q*K retrieval mid-stream). Guards against re-adding it.
-    value = runtime(tmp_path)
-    resolved = observer_event("resolved_by_continuation", event_id="resolved-event")
-    persistent = observer_event("persistent_uncertainty", event_id="persistent-event")
-    refresh_events = []
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            refresh_events.append(kwargs["event"].event_id)
-            return SimpleNamespace(status="no_eligible_reference")
-
-    value.refresh_service = RefreshService()
-    value._request_questions["resp-observer"] = "question"
-    value.observer.observe_generation_result = lambda *args, **kwargs: (
-        observer_result(resolved, persistent)
-    )
-
-    value.observe_generation_result("resp-observer", {"meta_info": {}})
-
-    assert "resp-observer" not in value._refresh_tasks
-    assert refresh_events == []
-
-
 def test_previous_turn_capsule_is_privately_restored(tmp_path):
     value = runtime(tmp_path)
     original = CapsuleUpdateInput(
@@ -607,7 +497,7 @@ def test_previous_turn_capsule_is_privately_restored(tmp_path):
     value.capsule_store.commit(original, valid_capsule())
     value.capsules = SimpleNamespace()
 
-    prepared, memory_state = asyncio.run(
+    prepared = asyncio.run(
         value.prepare_responses_request(
             FakeRequest(
                 request_id="resp-2",
@@ -618,7 +508,6 @@ def test_previous_turn_capsule_is_privately_restored(tmp_path):
         )
     )
 
-    assert memory_state is None
     assert prepared.instructions.startswith("Answer precisely.")
     assert "private execution capsule" in prepared.instructions
     assert "untrusted JSON data" in prepared.instructions
@@ -686,10 +575,9 @@ def test_immediate_child_waits_for_parent_capsule_finalization(tmp_path):
         assert value.is_finalizing("resp-parent")
 
         release_update.set()
-        prepared, memory_state = await child_preparation
+        prepared = await child_preparation
         await parent_finalization
 
-        assert memory_state is None
         assert "private execution capsule" in prepared.instructions
         assert "Run verification" in prepared.instructions
         assert value._parent_capsules["resp-child"].trajectory_id == "resp-parent"
@@ -699,6 +587,7 @@ def test_immediate_child_waits_for_parent_capsule_finalization(tmp_path):
 
 def test_cancelled_child_waiting_for_parent_does_not_rebuild_state(tmp_path):
     value = runtime(tmp_path)
+    value.capsules = SimpleNamespace()
 
     async def exercise():
         parent_release = asyncio.Event()
@@ -740,16 +629,13 @@ def test_cancelled_child_waiting_for_parent_does_not_rebuild_state(tmp_path):
 
 def test_duplicate_active_request_id_preserves_original_state_and_tasks(tmp_path):
     value = runtime(tmp_path)
-    adaptive_begins = []
-    value.adaptive_retrieval = SimpleNamespace(begin=adaptive_begins.append)
-
     async def exercise():
         await value.prepare_responses_request(
             FakeRequest(request_id="resp-duplicate", input="original question")
         )
         task_release = asyncio.Event()
         original_task = asyncio.create_task(task_release.wait())
-        value._refresh_tasks["resp-duplicate"] = original_task
+        value._capsule_tasks["resp-duplicate"] = original_task
 
         with pytest.raises(
             ValueError,
@@ -764,9 +650,8 @@ def test_duplicate_active_request_id_preserves_original_state_and_tasks(tmp_path
             )
 
         assert value._request_questions["resp-duplicate"] == "original question"
-        assert value._refresh_tasks["resp-duplicate"] is original_task
+        assert value._capsule_tasks["resp-duplicate"] is original_task
         assert not original_task.done()
-        assert adaptive_begins == ["resp-duplicate"]
         assert not value.is_pending_background_request("resp-duplicate")
         assert [
             event["event_type"] for event in value.telemetry_events("resp-duplicate")
@@ -774,7 +659,6 @@ def test_duplicate_active_request_id_preserves_original_state_and_tasks(tmp_path
 
         task_release.set()
         await original_task
-        value.adaptive_retrieval = None
         await value.cancel_request("resp-duplicate")
 
     asyncio.run(exercise())
@@ -825,17 +709,6 @@ def test_completed_response_updates_capsule_once_and_releases_state(tmp_path):
     value.capsules = capsules
     value._request_questions["resp-1"] = "Implement WFP filter"
     value._original_tasks["resp-1"] = "Implement WFP filter"
-    finalize_calls = []
-
-    class FakeMemoryPipeline:
-        async def finalize_request_state(self, request_id):
-            finalize_calls.append(request_id)
-            return SimpleNamespace()
-
-        async def get_state(self, _request_id):
-            return None
-
-    value.memory_pipeline = FakeMemoryPipeline()
 
     async def exercise():
         async def generate():
@@ -870,31 +743,14 @@ def test_completed_response_updates_capsule_once_and_releases_state(tmp_path):
     assert update.trajectory_id == "resp-1"
     assert update.original_task == "Implement WFP filter"
     assert "verified the WFP filter" in update.assistant_reasoning
-    assert finalize_calls == ["resp-1"]
-    finalized_event = next(
-        event
-        for event in value.telemetry_events("resp-1")
-        if event["event_type"] == "memory.request_state_finalized"
-    )
-    assert finalized_event["payload"]["status"] == "ready"
-    assert finalized_event["payload"]["runtime_gdn_route"] == "global_initial_only"
     stage_summary = next(
         event
         for event in value.telemetry_events("resp-1")
         if event["event_type"] == "request.stage_summary"
     )["payload"]
-    assert stage_summary["schema"] == "qwen-exo-stage-summary-v1"
-    assert stage_summary["stages"] == [
-        "prefill_retrieval",
-        "semantic_judge",
-        "mid_think_observer",
-        "self_ask_answer",
-        "causal_replay",
-        "maybe_gate",
-        "next_turn_restoration",
-        "post_tool_recall",
-        "execution_capsule",
-    ]
+    assert stage_summary["schema"] == "qwen-exo-stage-summary-v2"
+    assert stage_summary["stages"] == ["memory_tools", "execution_capsule"]
+    assert stage_summary["memory_tools"] == {"calls": 0, "failed": 0}
     assert stage_summary["capsule"]["valid"] is True
 
 
@@ -973,63 +829,6 @@ def test_response_tool_events_preserve_function_name():
     )
 
 
-def test_function_call_output_queues_native_think_context_before_generation(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    calls = []
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="ready_for_safe_replay",
-                question="Q?",
-                answer="verified",
-                selected_document_ids=("document-1",),
-                decision_ids=("decision-1",),
-                maybe_decision="admit_post_tool",
-                reflection_kind="none",
-            )
-
-    value.refresh_service = RefreshService()
-    prepared, _ = asyncio.run(
-        value.prepare_responses_request(
-            FakeRequest(
-                request_id="resp-tool-output",
-                input=[
-                    {"role": "user", "content": "Continue the task"},
-                    {
-                        "role": "assistant",
-                        "content": "The current hypothesis may miss a wrapper callsite.",
-                    },
-                    {
-                        "type": "function_call_output",
-                        "call_id": "call-7",
-                        "output": "direct result",
-                    },
-                ],
-                instructions="Keep tool calls structured.",
-            )
-        )
-    )
-
-    assert calls[0]["latest_tool_observation"] == "direct result"
-    assert "direct result" in calls[0]["partial_output"]
-    assert "current hypothesis may miss a wrapper" in calls[0]["partial_output"]
-    assert "QWEN-EXO private post-tool reference" not in prepared.instructions
-    injection = asyncio.run(value.await_think_context("resp-tool-output"))
-    assert injection is not None
-    assert injection.question == "Q?"
-    assert injection.answer == "verified"
-    assert injection.text == ("\n\nSelf-question: Q?\n" "Self-answer: verified\n")
-    assert value._request_tool_calls["resp-tool-output"] == [
-        {"type": "function_call_output", "call_id": "call-7"}
-    ]
-
-
 @pytest.mark.asyncio
 async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
     value = runtime(tmp_path)
@@ -1040,15 +839,6 @@ async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
     request_id = "resp-reasoning-budget"
     turn_id = f"{request_id}:post_tool:0"
     value._pending_think_contexts[request_id] = SimpleNamespace(turn_id=turn_id)
-
-    async def blocked():
-        await asyncio.Event().wait()
-
-    refresh_task = asyncio.create_task(blocked())
-    replay_task = asyncio.create_task(blocked())
-    value._refresh_tasks[request_id] = refresh_task
-    value._replay_tasks[request_id] = replay_task
-    await asyncio.sleep(0)
 
     # Budget enforcement must not launch internal generation when the Observer
     # and refresh context lane are inactive, even if the service exists.
@@ -1062,8 +852,6 @@ async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
     assert injection is None
     assert request_id not in value._pending_think_contexts
     assert turn_id in value._consumed_think_contexts
-    assert refresh_task.cancelled()
-    assert replay_task.cancelled()
     events = value.telemetry.events(request_id, limit=10)
     assert [event.event_type for event in events] == ["reasoning.budget_forced"]
     assert events[0].payload == {
@@ -1072,7 +860,6 @@ async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
         "generation_index": 2,
         "cutoff_questions": False,
         "had_pending_context": True,
-        "cancelled_refresh_tasks": 2,
     }
 
 
@@ -1138,643 +925,6 @@ def test_function_call_output_input_is_captured_for_capsule(tmp_path):
     assert update.tool_observation == "focused test passed"
 
 
-def test_full_history_recalls_only_unseen_tool_outputs_and_keeps_eligible_result(
-    tmp_path,
-):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    calls = []
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            observation = kwargs["latest_tool_observation"]
-            calls.append(observation)
-            admitted = observation != "rejected"
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status=(
-                    "ready_for_safe_replay" if admitted else "no_eligible_reference"
-                ),
-                question=("Q?" if admitted else None),
-                answer=(observation if admitted else None),
-                selected_document_ids=(("document-1",) if admitted else ()),
-                decision_ids=(("decision-1",) if admitted else ()),
-                maybe_decision=("admit_post_tool" if admitted else "not_compiled"),
-                reflection_kind="none",
-            )
-
-    value.refresh_service = RefreshService()
-
-    async def exercise():
-        first_input = [
-            {"role": "user", "content": "Implement the requested repository change"},
-            {
-                "role": "user",
-                "content": "eligible",
-                "type": "function_call_output",
-                "call_id": "call-1",
-                "output": "eligible",
-            },
-            {
-                "role": "user",
-                "content": "rejected",
-                "type": "function_call_output",
-                "call_id": "call-2",
-                "output": "rejected",
-            },
-        ]
-        first, _ = await value.prepare_responses_request(
-            FakeRequest(request_id="resp-history-1", input=first_input)
-        )
-        second, _ = await value.prepare_responses_request(
-            FakeRequest(
-                request_id="resp-history-2",
-                previous_response_id="resp-history-1",
-                input=[
-                    *first_input,
-                    {
-                        "role": "user",
-                        "content": "fresh",
-                        "type": "function_call_output",
-                        "call_id": "call-3",
-                        "output": "fresh",
-                    },
-                ],
-            )
-        )
-        first_injection = await value.await_think_context("resp-history-1")
-        second_injection = await value.await_think_context("resp-history-2")
-        return first, second, first_injection, second_injection
-
-    first, second, first_injection, second_injection = asyncio.run(exercise())
-
-    assert calls == ["eligible", "rejected", "fresh"]
-    assert value._request_questions["resp-history-2"] == (
-        "Implement the requested repository change"
-    )
-    assert "Self-answer:" not in str(first.instructions)
-    assert "Self-answer:" not in str(second.instructions)
-    assert first_injection is not None
-    assert first_injection.answer == "eligible"
-    assert second_injection is not None
-    assert second_injection.answer == "fresh"
-    deduplicated = next(
-        event.payload
-        for event in value.telemetry.events()
-        if event.event_type == "post_tool_recall.history_deduplicated"
-    )
-    assert deduplicated == {
-        "discovered_count": 3,
-        "new_count": 1,
-        "skipped_count": 2,
-    }
-
-
-def test_stateless_full_history_recalls_each_tool_output_once(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    calls = []
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            observation = kwargs["latest_tool_observation"]
-            calls.append(observation)
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="no_eligible_reference",
-                question=None,
-                answer=None,
-                selected_document_ids=(),
-                decision_ids=(),
-                maybe_decision="not_compiled",
-                reflection_kind="none",
-            )
-
-    value.refresh_service = RefreshService()
-    task = {"role": "user", "content": "Create the requested Three.js scenes"}
-    first_output = {
-        "type": "function_call_output",
-        "call_id": "call-first",
-        "output": "wrote pinball.html",
-    }
-    second_output = {
-        "type": "function_call_output",
-        "call_id": "call-second",
-        "output": "wrote factory.html",
-    }
-
-    async def exercise():
-        await value.prepare_responses_request(
-            FakeRequest(
-                request_id="resp-stateless-1",
-                input=[task, first_output],
-            )
-        )
-        first_key = value._request_conversation_keys["resp-stateless-1"]
-        await value.prepare_responses_request(
-            FakeRequest(
-                request_id="resp-stateless-2",
-                input=[task, first_output, second_output],
-            )
-        )
-        return first_key, value._request_conversation_keys["resp-stateless-2"]
-
-    first_key, second_key = asyncio.run(exercise())
-
-    assert first_key == second_key
-    assert calls == ["wrote pinball.html", "wrote factory.html"]
-    deduplicated = next(
-        event.payload
-        for event in value.telemetry.events()
-        if event.event_type == "post_tool_recall.history_deduplicated"
-    )
-    assert deduplicated == {
-        "discovered_count": 2,
-        "new_count": 1,
-        "skipped_count": 1,
-    }
-
-
-def test_query_probe_precedes_stateless_post_tool_recall(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    order = []
-    pipeline_kwargs = {}
-
-    class QueryProbe:
-        async def probe(self, request_id, plan):
-            del request_id
-            order.append("query_probe")
-            return SimpleNamespace(
-                query_heads=(((0.1, 0.2),),),
-                query_states=(QueryStateSpan("current_user", 0, 1, 0, 1),),
-                role_plan_digest=plan.identity,
-                status="ready",
-                prompt_tokens=2,
-            )
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            order.append("post_tool_recall")
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="no_eligible_reference",
-                question=None,
-                answer=None,
-                selected_document_ids=(),
-                decision_ids=(),
-                maybe_decision="not_compiled",
-                reflection_kind="none",
-            )
-
-    class Pipeline:
-        async def prepare_responses_request(self, request, **kwargs):
-            order.append("memory_pipeline")
-            pipeline_kwargs.update(kwargs)
-            state = SimpleNamespace(
-                public_dict=lambda: {},
-                policy_attachment=None,
-                radix_prefix_identity=None,
-                previous_response_id=None,
-                policy_attached_tokens=0,
-                attached_tokens=0,
-                policy_document_ids=(),
-                radix_prefix_page_id=None,
-                radix_prefix_token_ids=(),
-                restoration_status="not_requested",
-            )
-            return request, state
-
-    value.query_probe = QueryProbe()
-    value.refresh_service = RefreshService()
-    value.memory_pipeline = Pipeline()
-
-    asyncio.run(
-        value.prepare_responses_request(
-            FakeRequest(
-                request_id="resp-probe-first",
-                input=[
-                    {"role": "user", "content": "Create a Three.js scene"},
-                    {
-                        "type": "function_call_output",
-                        "call_id": "call-write",
-                        "output": "wrote scene.html",
-                    },
-                ],
-            )
-        )
-    )
-
-    assert order == ["query_probe", "post_tool_recall", "memory_pipeline"]
-    assert pipeline_kwargs["query_heads"] == (((0.1, 0.2),),)
-    assert pipeline_kwargs["query_probe_status"] == "ready"
-    assert pipeline_kwargs["query_probe_prompt_tokens"] == 2
-
-
-def test_parent_root_drives_tool_only_query_probe_without_changing_started_input(
-    tmp_path,
-):
-    value = runtime(tmp_path)
-    captures = capture_retrieval_questions(value)
-    root = "Implement the WFP request-start lineage fix"
-    observation = "Script written successfully"
-    value._original_tasks["resp-parent"] = root
-
-    _prepared, state = asyncio.run(
-        value.prepare_responses_request(
-            FakeRequest(
-                request_id="resp-child",
-                previous_response_id="resp-parent",
-                input=[
-                    {
-                        "type": "function_call_output",
-                        "call_id": "call-write",
-                        "output": observation,
-                    }
-                ],
-            )
-        )
-    )
-
-    question = captures["query_probe"][0][1]
-    assert captures["memory_pipeline"] == [("resp-child", question)]
-    assert question.count("ORIGINAL TASK:\n") == 1
-    assert question.count(root) == 1
-    assert question.count("RECENT EXECUTION TRAJECTORY:\n") == 1
-    assert question.count(observation) == 1
-    assert value._request_questions["resp-child"] == root
-    assert state.question_digest == stable_digest(question)
-    assert state.retrieval_question_digest == stable_digest(question)
-    started = next(
-        event
-        for event in value.telemetry.events("resp-child")
-        if event.event_type == "request.started"
-    )
-    expected_started_input = (
-        "RECENT EXECUTION TRAJECTORY:\n" f"TOOL OBSERVATION:\n{observation}"
-    )
-    assert started.payload["input"] == {
-        "redacted": True,
-        "sha256": stable_digest(expected_started_input),
-        "bytes": len(expected_started_input.encode("utf-8")),
-    }
-    assert started.payload["input"]["sha256"] != stable_digest(root)
-    assert started.payload["retrieval_query_digest"] == stable_digest(question)
-
-
-def test_stateless_full_history_drives_root_current_and_trajectory_once(tmp_path):
-    value = runtime(tmp_path)
-    captures = capture_retrieval_questions(value)
-    root = "Implement the stateless QK fix"
-    current = "Run the focused verification"
-    observation = "Source edit completed"
-
-    asyncio.run(
-        value.prepare_responses_request(
-            FakeRequest(
-                request_id="resp-stateless-capture",
-                input=[
-                    {"role": "user", "content": root},
-                    {"role": "assistant", "content": "Editing the runtime."},
-                    {
-                        "type": "function_call_output",
-                        "call_id": "call-stateless",
-                        "output": observation,
-                    },
-                    {"role": "user", "content": current},
-                ],
-            )
-        )
-    )
-
-    question = captures["query_probe"][0][1]
-    assert captures["memory_pipeline"] == [("resp-stateless-capture", question)]
-    assert question.count(root) == 1
-    assert question.count(current) == 1
-    assert question.count(observation) == 1
-    assert question.count("ORIGINAL TASK:\n") == 1
-    assert question.count("CURRENT USER REQUEST:\n") == 1
-    assert question.count("RECENT EXECUTION TRAJECTORY:\n") == 1
-    assert value._request_questions["resp-stateless-capture"] == root
-
-
-def test_stateless_call_association_requires_learned_isolated_root(tmp_path):
-    value = runtime(tmp_path)
-    captures = capture_retrieval_questions(value)
-    root = "Audit the authoritative caller lineage"
-    seed = FakeRequest(
-        request_id="resp-seed",
-        user="caller-a",
-        session_id="session-a",
-        instructions="shared system instructions",
-        input=[
-            {"role": "user", "content": root},
-            {
-                "type": "function_call_output",
-                "call_id": "call-known",
-                "output": "seed observation",
-            },
-        ],
-    )
-    known = FakeRequest(
-        request_id="resp-known",
-        user="caller-a",
-        session_id="session-a",
-        instructions="shared system instructions",
-        input=[
-            {
-                "type": "function_call_output",
-                "call_id": "call-known",
-                "output": "known observation",
-            }
-        ],
-    )
-    unknown = replace(
-        known,
-        request_id="resp-unknown",
-        input=[
-            {
-                "type": "function_call_output",
-                "call_id": "call-unknown",
-                "output": "unknown observation",
-            }
-        ],
-    )
-    isolated = replace(
-        known,
-        request_id="resp-isolated",
-        user="caller-b",
-        session_id="session-b",
-        input=[
-            {
-                "type": "function_call_output",
-                "call_id": "call-known",
-                "output": "isolated observation",
-            }
-        ],
-    )
-
-    async def exercise():
-        for request in (seed, known, unknown, isolated):
-            await value.prepare_responses_request(request)
-
-    asyncio.run(exercise())
-
-    questions = dict(captures["query_probe"])
-    assert questions["resp-known"].count(root) == 1
-    assert "known observation" in questions["resp-known"]
-    assert root not in questions["resp-unknown"]
-    assert questions["resp-unknown"].startswith("RECENT EXECUTION TRAJECTORY:\n")
-    assert root not in questions["resp-isolated"]
-    assert questions["resp-isolated"].startswith("RECENT EXECUTION TRAJECTORY:\n")
-
-
-def test_compaction_query_uses_root_and_summary_once_and_rejects_parent_mismatch(
-    tmp_path,
-):
-    value = runtime(tmp_path)
-    captures = capture_retrieval_questions(value)
-    response_id = "resp_compact_parent"
-    source_digest = "compaction-source"
-    root = "Implement the compaction lineage fix"
-    summary_text = "Runtime ordering was corrected; focused verification remains."
-    current = "Run the compaction regression"
-    observation = "Pipeline question captured"
-    summary = CompactionSummary(
-        summary=summary_text,
-        input_tokens=10,
-        output_tokens=8,
-        reasoning_tokens=1,
-        source_digest=source_digest,
-    )
-    encoded = summary.encrypted_content(response_id=response_id, memory={})
-    value._compaction_summaries[response_id] = {
-        "summary": summary_text,
-        "source_digest": source_digest,
-        "model_fingerprint": None,
-    }
-    value._original_tasks[response_id] = root
-    input_items = [
-        {"type": "compaction", "encrypted_content": encoded},
-        {
-            "type": "function_call_output",
-            "call_id": "call-compact",
-            "output": observation,
-        },
-        {"type": "message", "role": "user", "content": current},
-    ]
-
-    asyncio.run(
-        value.prepare_responses_request(
-            FakeRequest(request_id="resp-after-compact", input=input_items)
-        )
-    )
-
-    question = captures["query_probe"][0][1]
-    assert question.count(summary_text) == 1
-    assert question.count(root) == 1
-    assert question.count(current) == 1
-    assert question.count(observation) == 1
-    assert "<context_compaction>" not in question
-    assert value._request_questions["resp-after-compact"] == root
-
-    with pytest.raises(ValueError, match="does not match verified compaction lineage"):
-        asyncio.run(
-            value.prepare_responses_request(
-                FakeRequest(
-                    request_id="resp-mismatched-compact",
-                    previous_response_id="resp-other-parent",
-                    input=input_items,
-                )
-            )
-        )
-
-
-def test_semantically_repeated_self_question_is_not_reinjected(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    questions = {
-        "first": (
-            "Does predict actually load feature_schema.joblib or recompute the "
-            "schema from input?"
-        ),
-        "second": (
-            "Does predict actually deserialize feature_schema.joblib or recompute "
-            "the schema from input?"
-        ),
-        "third": (
-            "Does evaluate actually deserialize feature_schema.joblib or recompute "
-            "the schema from input?"
-        ),
-    }
-    answers = {
-        "first": "verified predict",
-        "second": "verified predict",
-        "third": "verified evaluate",
-    }
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            observation = kwargs["partial_output"].rsplit("TOOL OBSERVATION:\n", 1)[-1]
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="ready_for_safe_replay",
-                question=questions[observation],
-                answer=answers[observation],
-                selected_document_ids=("document-1",),
-                decision_ids=("decision-1",),
-                maybe_decision="admit_post_tool",
-                reflection_kind="none",
-            )
-
-    value.refresh_service = RefreshService()
-
-    async def exercise():
-        request_id = "resp-repeat"
-        value._request_questions[request_id] = (
-            "Implement the requested repository change"
-        )
-        value._request_conversation_keys[request_id] = "conversation-repeat"
-        injections = []
-        for index, observation in enumerate(("first", "second", "third"), 1):
-            injections.append(
-                await value.recall_after_tool(
-                    request_id,
-                    observation,
-                    generation_index=-index,
-                    trajectory_context=f"TOOL OBSERVATION:\n{observation}",
-                )
-            )
-        return injections
-
-    first, repeated, distinct = asyncio.run(exercise())
-
-    assert first is not None
-    assert repeated is None
-    assert distinct is not None
-    assert distinct.question.startswith("Does evaluate")
-    skipped = [
-        event.payload
-        for event in value.telemetry.events()
-        if event.event_type == "self_ask.think_context_skipped"
-    ]
-    assert [payload["reason"] for payload in skipped] == ["repeated_self_question"]
-    completed = [
-        event.payload
-        for event in value.telemetry.events()
-        if event.event_type == "post_tool_recall.completed"
-    ]
-    assert [payload["repeat_suppressed"] for payload in completed] == [
-        False,
-        True,
-        False,
-    ]
-
-
-def test_unanswered_self_question_deduplicates_only_same_evidence(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="no_eligible_reference",
-                question="Which generated wrapper currently fails?",
-                answer=None,
-                selected_document_ids=(),
-                selected_reference_digests=(),
-                context_source_digests=("same-evidence",),
-                candidate_ids=(),
-                decision_ids=(),
-                maybe_decision="not_compiled",
-                reflection_kind="none",
-            )
-
-    value.refresh_service = RefreshService()
-
-    async def exercise():
-        history = [{"role": "user", "content": "Repair the generated wrapper"}]
-        for index in range(2):
-            history = [
-                *history,
-                {
-                    "type": "function_call_output",
-                    "call_id": f"call-{index}",
-                    "output": "same failing wrapper evidence",
-                },
-            ]
-            await value.prepare_responses_request(
-                FakeRequest(request_id=f"resp-no-answer-{index}", input=history)
-            )
-
-    asyncio.run(exercise())
-
-    suppressed = [
-        event.payload
-        for event in value.telemetry.events()
-        if event.event_type == "self_ask.repeat_suppressed"
-    ]
-    assert len(suppressed) == 1
-    assert suppressed[0]["reason"] == "repeated_unanswered_question_same_evidence"
-
-
-def test_context_correction_is_restored_once_on_next_turn(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    record = SimpleNamespace(
-        status="context_evidence_ready",
-        context_source_digests=("context-digest",),
-        question="Which wrapper is stale?",
-        answer="The generated async wrapper is stale.",
-        turn_id="resp-parent:post_tool:0",
-        event_id=None,
-        purpose="post_tool",
-    )
-
-    class RefreshService:
-        @staticmethod
-        def record(previous_response_id):
-            return record if previous_response_id == "resp-parent" else None
-
-    value.refresh_service = RefreshService()
-
-    async def exercise():
-        await value.prepare_responses_request(
-            FakeRequest(
-                request_id="resp-child",
-                previous_response_id="resp-parent",
-                input=[{"role": "user", "content": "Continue the repair"}],
-            )
-        )
-        first = await value.await_think_context("resp-child")
-        second = await value.await_think_context("resp-child")
-        return first, second
-
-    first, second = asyncio.run(exercise())
-
-    assert first is not None
-    assert first.purpose == "next_turn_correction"
-    assert first.answer == "The generated async wrapper is stale."
-    assert second is None
-    restored = [
-        event.payload
-        for event in value.telemetry.events("resp-child")
-        if event.event_type == "self_ask.next_turn_context_restored"
-    ]
-    assert restored[-1]["previous_response_id"] == "resp-parent"
-
-
 def test_request_completed_is_terminal_and_counts_all_generations(tmp_path):
     value = runtime(tmp_path)
     value._request_questions["resp-terminal"] = "Finish the task"
@@ -1808,257 +958,6 @@ def test_request_completed_is_terminal_and_counts_all_generations(tmp_path):
     assert completed[0].payload["terminal"] is True
     assert completed[0].payload["output_tokens"] == 5
     assert completed[0].payload["generation_count"] == 2
-
-
-def test_post_tool_refresh_budget_bounds_long_conversations(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    calls = []
-
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            observation = kwargs["latest_tool_observation"]
-            calls.append(observation)
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="ready_for_safe_replay",
-                question=f"What does observation {observation} establish?",
-                answer=f"Observation {observation} is resolved.",
-                selected_document_ids=("document-1",),
-                decision_ids=("decision-1",),
-                maybe_decision="admit_post_tool",
-                reflection_kind="none",
-            )
-
-    value.refresh_service = RefreshService()
-
-    async def exercise():
-        injections = []
-        for index in range(9):
-            request_id = f"resp-budget-{index}"
-            value._request_questions[request_id] = "Implement the repository change"
-            value._request_conversation_keys[request_id] = "conversation-1"
-            injections.append(
-                await value.recall_after_tool(
-                    request_id,
-                    f"observation-{index}",
-                    generation_index=index,
-                )
-            )
-        return injections
-
-    injections = asyncio.run(exercise())
-
-    assert calls == [f"observation-{index}" for index in range(8)]
-    assert all(injection is not None for injection in injections[:8])
-    assert injections[8] is None
-    skipped = [
-        event.payload
-        for event in value.telemetry.events()
-        if event.event_type == "post_tool_recall.skipped"
-    ]
-    assert skipped == [
-        {
-            "reason": "conversation_refresh_budget_exhausted",
-            "conversation_key": "conversation-1",
-            "refresh_count": 8,
-            "refresh_limit": 8,
-            "generation_index": 8,
-        }
-    ]
-
-
-def _no_eligible_refresh_service(calls):
-    class RefreshService:
-        async def refresh(self, **kwargs):
-            calls.append(kwargs["turn_id"])
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="no_eligible_reference",
-                reference_status="no_eligible_reference",
-                question=None,
-                answer=None,
-                selected_document_ids=(),
-                decision_ids=(),
-                maybe_decision="reject",
-                reflection_kind="none",
-            )
-
-    return RefreshService()
-
-
-def _prepare_post_tool_request(value, request_id, conversation_key="conversation-1"):
-    value._request_questions[request_id] = "Implement the repository change"
-    value._request_conversation_keys[request_id] = conversation_key
-
-
-def test_post_tool_recall_cools_down_after_consecutive_no_eligible(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    calls = []
-    value.refresh_service = _no_eligible_refresh_service(calls)
-
-    async def exercise():
-        for index in range(7):
-            request_id = f"resp-cooldown-{index}"
-            _prepare_post_tool_request(value, request_id)
-            await value.recall_after_tool(
-                request_id,
-                f"observation-{index}",
-                generation_index=index,
-            )
-
-    asyncio.run(exercise())
-
-    assert calls == [
-        "resp-cooldown-0:post_tool:0",
-        "resp-cooldown-1:post_tool:1",
-        "resp-cooldown-6:post_tool:6",
-    ]
-    skipped = [
-        event.payload
-        for event in value.telemetry.events()
-        if event.event_type == "post_tool_recall.skipped"
-    ]
-    assert skipped == [
-        {
-            "reason": "no_eligible_reference_cooldown",
-            "conversation_key": "conversation-1",
-            "refresh_count": 2,
-            "refresh_limit": 8,
-            "cooldown_remaining": remaining,
-            "generation_index": index,
-        }
-        for remaining, index in zip((3, 2, 1, 0), range(2, 6))
-    ]
-
-
-def test_post_tool_recall_cooldown_resets_on_eligible_result(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    calls = []
-
-    class RefreshService:
-        eligible_next = False
-
-        async def refresh(self, **kwargs):
-            calls.append(kwargs["turn_id"])
-            if RefreshService.eligible_next:
-                RefreshService.eligible_next = False
-                return SimpleNamespace(
-                    turn_id=kwargs["turn_id"],
-                    event_id=None,
-                    purpose=kwargs["purpose"],
-                    status="ready_for_safe_replay",
-                    question="What changed?",
-                    answer="The wrapper is stale.",
-                    selected_document_ids=("document-1",),
-                    decision_ids=("decision-1",),
-                    maybe_decision="admit_post_tool",
-                    reflection_kind="none",
-                )
-            return SimpleNamespace(
-                turn_id=kwargs["turn_id"],
-                event_id=None,
-                purpose=kwargs["purpose"],
-                status="no_eligible_reference",
-                reference_status="no_eligible_reference",
-                question=None,
-                answer=None,
-                selected_document_ids=(),
-                decision_ids=(),
-                maybe_decision="reject",
-                reflection_kind="none",
-            )
-
-    value.refresh_service = RefreshService()
-
-    async def exercise():
-        injections = []
-        for index in range(4):
-            request_id = f"resp-reset-{index}"
-            _prepare_post_tool_request(value, request_id)
-            if index == 1:
-                RefreshService.eligible_next = True
-            injections.append(
-                await value.recall_after_tool(
-                    request_id,
-                    f"observation-{index}",
-                    generation_index=index,
-                )
-            )
-        return injections
-
-    injections = asyncio.run(exercise())
-
-    assert len(calls) == 4
-    assert injections[1] is not None
-    assert not [
-        event
-        for event in value.telemetry.events()
-        if event.event_type == "post_tool_recall.skipped"
-    ]
-    # Without the reset on the eligible turn-1 result, the streak would be 3
-    # after turn 3; the reset makes turns 2-3 a fresh streak of 2, which only
-    # now reaches the arming threshold.
-    assert value._post_tool_no_eligible_streaks["conversation-1"] == 2
-    assert value._post_tool_no_eligible_cooldowns["conversation-1"] == 4
-
-
-def test_post_tool_recall_hard_budget_wins_over_cooldown(tmp_path):
-    value = runtime(tmp_path)
-    value.observer.mode = "active"
-    value._max_post_tool_refreshes_per_conversation = 3
-    value._post_tool_no_eligible_cooldown_turns = 1
-    calls = []
-    value.refresh_service = _no_eligible_refresh_service(calls)
-
-    async def exercise():
-        for index in range(6):
-            request_id = f"resp-hard-{index}"
-            _prepare_post_tool_request(value, request_id)
-            await value.recall_after_tool(
-                request_id,
-                f"observation-{index}",
-                generation_index=index,
-            )
-
-    asyncio.run(exercise())
-
-    assert calls == [
-        "resp-hard-0:post_tool:0",
-        "resp-hard-1:post_tool:1",
-        "resp-hard-3:post_tool:3",
-    ]
-    skipped = [
-        event.payload
-        for event in value.telemetry.events()
-        if event.event_type == "post_tool_recall.skipped"
-    ]
-    assert skipped == [
-        {
-            "reason": "no_eligible_reference_cooldown",
-            "conversation_key": "conversation-1",
-            "refresh_count": 2,
-            "refresh_limit": 3,
-            "cooldown_remaining": 0,
-            "generation_index": 2,
-        },
-        *(
-            {
-                "reason": "conversation_refresh_budget_exhausted",
-                "conversation_key": "conversation-1",
-                "refresh_count": 3,
-                "refresh_limit": 3,
-                "generation_index": index,
-            }
-            for index in range(4, 6)
-        ),
-    ]
 
 
 def test_response_conversation_keys_use_prompt_cache_then_discriminated_fallback(tmp_path):
@@ -2315,45 +1214,11 @@ def test_learned_call_alias_points_to_prompt_cache_conversation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_prompt_cache_restores_only_finalized_internal_memory_parent(tmp_path):
-    value = runtime(tmp_path)
-    capture_retrieval_questions(value)
-
-    async def skip_stage_summary(_request_id):
-        return None
-
-    value._emit_stage_summary = skip_stage_summary
-    first = FakeRequest(
-        request_id="resp-memory-first",
-        prompt_cache_key="memory-session",
-        instructions="system rules",
-        input=[{"role": "user", "content": "implement the task"}],
-    )
-    _prepared, first_state = await value.prepare_responses_request(first)
-    assert first_state.previous_response_id is None
-    assert first_state.effective_memory_previous_response_id is None
-    await value.complete_request(first.request_id)
-
-    second = replace(first, request_id="resp-memory-second")
-    _prepared, second_state = await value.prepare_responses_request(second)
-    assert second_state.previous_response_id is None
-    assert second_state.effective_memory_previous_response_id == first.request_id
-    assert second.request_id not in value._parent_response_ids
-    assert second.request_id not in value._parent_capsules
-    started = next(
-        event
-        for event in value.telemetry.events(second.request_id)
-        if event.event_type == "request.started"
-    )
-    assert started.payload["parent_response_id"] is None
-
-
-@pytest.mark.asyncio
 async def test_prompt_cache_keeps_reflection_rows_and_pending_work_cumulative(tmp_path):
     value = runtime(tmp_path)
     value.config = replace(
         value.config,
-        feature_flags=replace(value.config.feature_flags, external_memory=True),
+        feature_flags=replace(value.config.feature_flags),
         reflection_memory_mode="active",
         reflection_memory_min_events=2,
         reflection_memory_min_tokens=0,
@@ -2407,10 +1272,8 @@ async def test_prompt_cache_keeps_reflection_rows_and_pending_work_cumulative(tm
 
 def reflection_lifecycle_runtime(tmp_path, monkeypatch):
     value = runtime(tmp_path)
-    capture_retrieval_questions(value)
     value.config = replace(
         value.config,
-        feature_flags=replace(value.config.feature_flags, external_memory=True),
         reflection_memory_mode="active",
         reflection_memory_min_events=10,
         reflection_memory_min_tokens=0,
@@ -2815,7 +1678,7 @@ def test_concurrent_capsule_branches_restore_only_their_own_child(tmp_path):
     branch_b_capsule = {**valid_capsule(), "next_action": "Only branch B"}
     value.capsule_store.commit(updates["resp-a"], branch_a_capsule)
     value.capsule_store.commit(updates["resp-b"], branch_b_capsule)
-    prepared, _ = asyncio.run(
+    prepared = asyncio.run(
         value.prepare_responses_request(
             FakeRequest(
                 request_id="resp-a-next",
@@ -2827,44 +1690,6 @@ def test_concurrent_capsule_branches_restore_only_their_own_child(tmp_path):
 
     assert "Only branch A" in prepared.instructions
     assert "Only branch B" not in prepared.instructions
-
-
-def test_pending_background_preparation_can_be_cancelled(tmp_path):
-    value = runtime(tmp_path)
-
-    async def exercise():
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        class BlockingPipeline:
-            async def prepare_responses_request(
-                self, request, restoration=None, **_kwargs
-            ):
-                started.set()
-                await release.wait()
-                return request, SimpleNamespace(public_dict=lambda: {})
-
-        value.memory_pipeline = BlockingPipeline()
-        task = asyncio.create_task(
-            value.prepare_responses_request(
-                FakeRequest(
-                    request_id="resp-pending",
-                    input="question",
-                    background=True,
-                )
-            )
-        )
-        await started.wait()
-        assert value.is_pending_background_request("resp-pending")
-        assert await value.cancel_pending_background_request("resp-pending")
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert not await value.claim_pending_background_request("resp-pending")
-        value.acknowledge_request_cancellation("resp-pending")
-        assert not value.is_pending_background_request("resp-pending")
-
-    asyncio.run(exercise())
 
 
 def test_background_dispatch_claim_prevents_pending_cancel(tmp_path):
@@ -3005,7 +1830,7 @@ def test_reflection_checkpoint_keeps_evidence_evicted_from_hot_window(tmp_path):
         value.config,
         reflection_memory_mode="active",
         reflection_memory_max_history_tokens=1024,
-        feature_flags=replace(value.config.feature_flags, external_memory=True),
+        feature_flags=replace(value.config.feature_flags),
         max_internal_tokens=16384,
     )
     early = "early decisive evidence " + "x" * 5000

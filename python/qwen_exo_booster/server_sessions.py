@@ -149,14 +149,10 @@ class ServerSessionStore:
             for task in getattr(runtime, "_server_session_reflections", ())
         ):
             return True
-        for name in (
-            "_compaction_reflection_queue",
-            "_reflection_memory_organization_queue",
-        ):
-            queue = getattr(runtime, name, None)
-            # Includes the item held by the worker, not just queued items.
-            if queue is not None and getattr(queue, "_unfinished_tasks", 0):
-                return True
+        queue = getattr(runtime, "_compaction_reflection_queue", None)
+        # Includes the item held by the worker, not just queued items.
+        if queue is not None and getattr(queue, "_unfinished_tasks", 0):
+            return True
         return False
 
     def _active(self, key: str) -> bool:
@@ -166,12 +162,7 @@ class ServerSessionStore:
         if key in getattr(runtime, "_request_conversation_keys", {}).values():
             return True
         associations = getattr(runtime, "_conversation_keys_by_response_id", {})
-        for name in (
-            "_refresh_tasks",
-            "_replay_tasks",
-            "_capsule_tasks",
-            "_finalize_tasks",
-        ):
+        for name in ("_capsule_tasks", "_finalize_tasks"):
             for request_id, task in getattr(runtime, name, {}).items():
                 if not task.done() and associations.get(request_id) == key:
                     return True

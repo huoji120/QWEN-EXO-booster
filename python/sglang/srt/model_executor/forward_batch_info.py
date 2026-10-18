@@ -51,7 +51,6 @@ from qwen_exo_booster.activation_editor import (
     resolve_default_activation_editor_spec,
 )
 from qwen_exo_booster.engram import EngramExtendInputs
-from qwen_exo_booster.memory_span import parse_private_memory_span
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
@@ -365,16 +364,6 @@ class NgramEmbeddingInfo:
         )
 
 
-def _qwen_exo_memory_span(req):
-    custom_params = getattr(req.sampling_params, "custom_params", None)
-    prompt_tokens = len(getattr(req, "origin_input_ids", ()) or ())
-    return parse_private_memory_span(
-        custom_params,
-        request_id=str(getattr(req, "rid", "")),
-        prompt_tokens=prompt_tokens,
-    )
-
-
 def _qwen_exo_trajectory_spans(req):
     custom_params = getattr(req.sampling_params, "custom_params", None) or {}
     raw_spans = custom_params.get("qwen_exo_trajectory_spans")
@@ -576,15 +565,7 @@ def _qwen_exo_activation_editor(req) -> dict[str, object] | None:
 
 def _qwen_exo_should_observe(req) -> bool:
     custom_params = getattr(req.sampling_params, "custom_params", None) or {}
-    return (
-        custom_params.get("qwen_exo_kind") == "user"
-        or custom_params.get("qwen_exo_job_type") == "query_probe"
-    )
-
-
-def _qwen_exo_full_query_capture(req) -> bool:
-    custom_params = getattr(req.sampling_params, "custom_params", None) or {}
-    return custom_params.get("qwen_exo_job_type") == "query_probe"
+    return custom_params.get("qwen_exo_kind") == "user"
 
 
 @dataclass
@@ -697,8 +678,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
-    # External-memory and trajectory metadata per request.
-    qwen_exo_memory_spans: Optional[List[Optional[Tuple[int, int, str]]]] = None
+    # Trajectory metadata per request.
     qwen_exo_trajectory_spans: Optional[List[Optional[Tuple[Tuple[int, int], ...]]]] = (
         None
     )
@@ -713,7 +693,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     ] = None
     qwen_exo_observe: Optional[List[bool]] = None
     qwen_exo_observe_mask: Optional[torch.Tensor] = None
-    qwen_exo_full_query_capture: Optional[List[bool]] = None
     qwen_exo_score_bias_blocks: Optional[List[Optional[Tuple[dict, ...]]]] = None
     qwen_exo_score_bias_phases: Optional[List[int]] = None
     qwen_exo_latent_transplants: Optional[List[Optional[dict[str, object]]]] = None
@@ -1008,11 +987,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
-            qwen_exo_memory_spans=(
-                [_qwen_exo_memory_span(req) for req in batch.reqs]
-                if get_server_args().enable_qwen_exo
-                else None
-            ),
             qwen_exo_trajectory_spans=(
                 [_qwen_exo_trajectory_spans(req) for req in batch.reqs]
                 if get_server_args().enable_qwen_exo
@@ -1037,11 +1011,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ),
             qwen_exo_observe=(
                 [_qwen_exo_should_observe(req) for req in batch.reqs]
-                if get_server_args().enable_qwen_exo
-                else None
-            ),
-            qwen_exo_full_query_capture=(
-                [_qwen_exo_full_query_capture(req) for req in batch.reqs]
                 if get_server_args().enable_qwen_exo
                 else None
             ),
