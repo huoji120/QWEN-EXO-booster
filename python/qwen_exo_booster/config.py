@@ -51,7 +51,6 @@ class QwenExoConfig:
     internal_mamba_reserve: int = 6
     policy_data_directory: Path | None = None
     cognition_directory: Path | None = None
-    max_policy_tokens: int = 4096
     telemetry_include_text: bool = False
     telemetry_text_mode: str = "off"
     reflection_memory_mode: str = "off"
@@ -134,8 +133,6 @@ class QwenExoConfig:
             raise ValueError("qwen_exo_internal_mamba_reserve must be non-negative")
         if self.max_internal_tokens < 1:
             raise ValueError("qwen_exo_max_internal_tokens must be positive")
-        if self.max_policy_tokens < 1:
-            raise ValueError("qwen_exo_max_policy_tokens must be positive")
         if self.max_output_tokens < 1:
             raise ValueError("qwen_exo_max_output_tokens must be positive")
         if self.max_reasoning_tokens < 1:
@@ -333,9 +330,6 @@ class QwenExoConfig:
             max_internal_fanout=int(server_args.qwen_exo_max_internal_fanout),
             internal_mamba_reserve=int(server_args.qwen_exo_internal_mamba_reserve),
             max_internal_tokens=int(server_args.qwen_exo_max_internal_tokens),
-            max_policy_tokens=int(
-                getattr(server_args, "qwen_exo_max_policy_tokens", 4096)
-            ),
             max_output_tokens=int(
                 getattr(server_args, "qwen_exo_max_output_tokens", 8192)
             ),
@@ -572,7 +566,6 @@ class QwenExoConfig:
             "max_internal_fanout": self.max_internal_fanout,
             "internal_mamba_reserve": self.internal_mamba_reserve,
             "max_internal_tokens": self.max_internal_tokens,
-            "max_policy_tokens": self.max_policy_tokens,
             "max_output_tokens": self.max_output_tokens,
             "max_reasoning_tokens": self.max_reasoning_tokens,
             "reasoning_budget_min": self.reasoning_budget_min,

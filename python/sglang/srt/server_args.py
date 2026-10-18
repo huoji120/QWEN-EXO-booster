@@ -2952,10 +2952,6 @@ class ServerArgs:
         int,
         "Maximum generation tokens reserved for all internal child jobs of one request.",
     ] = 12288
-    qwen_exo_max_policy_tokens: A[
-        int,
-        "Maximum semantically eligible PolicyData tokens attached to one user request.",
-    ] = 4096
     qwen_exo_max_output_tokens: A[
         int,
         "Hard per-response output-token budget for QWEN-EXO user requests.",

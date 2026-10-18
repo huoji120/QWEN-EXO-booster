@@ -1516,5 +1516,13 @@
   "回收站是空的": "The trash is empty",
   "恢复": "Restore",
   "已恢复": "Restored",
-  "恢复失败": "Restore failed"
+  "恢复失败": "Restore failed",
+  "完整注入": "Injected in full",
+  "注入系统提示词": "Inject into system prompt",
+  "已注入系统提示词": "Injected into system prompt",
+  "人格文档已注入系统提示词，立即生效": "Persona document injected into the system prompt, effective immediately",
+  "已停止注入人格文档，立即生效": "Persona document no longer injected, effective immediately",
+  "切换失败": "Toggle failed",
+  "人格文档注入": "Persona injection",
+  "把人格文档完整加入每个请求的系统提示词（不截断）；在「人格文档」页也能直接开关，立即生效、无需重启。": "Adds the full persona document to every request's system prompt (never truncated); it can also be toggled on the persona page, effective immediately without a restart."
 }

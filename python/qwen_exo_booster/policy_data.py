@@ -55,7 +55,8 @@ class PolicyDataRepository:
     def __init__(self, root: Path | str):
         self._repository = KnowledgeRepository(root)
         self._lock = threading.RLock()
-        self._compiled: dict[tuple[str, str, int], PolicyDataAttachment] = {}
+        self._compiled: dict[tuple[str, str], PolicyDataAttachment] = {}
+        self._disk_signature: tuple[tuple[str, int, int], ...] | None = None
 
     @property
     def root(self) -> Path:
@@ -136,16 +137,29 @@ class PolicyDataRepository:
             return False
         return document.source_kind in NON_REFERENCE_POLICY_SOURCE_KINDS
 
-    def compile_text_attachment(
-        self,
-        tokenizer: Any,
-        *,
-        max_tokens: int,
-    ) -> PolicyDataAttachment:
-        """Render the sole PolicyData document into the request instructions."""
+    def refresh_if_changed(self) -> None:
+        """Reload when a document file changed on disk (cheap stat per call)."""
+        root = self._repository.root
+        try:
+            signature = tuple(
+                sorted(
+                    (entry.name, entry.stat().st_mtime_ns, entry.stat().st_size)
+                    for entry in root.iterdir()
+                    if entry.is_file()
+                )
+            )
+        except OSError:
+            return
+        if signature == self._disk_signature:
+            return
+        with self._lock:
+            if signature != self._disk_signature:
+                self.refresh()
+                self._disk_signature = signature
 
-        if max_tokens < 1:
-            raise ValueError("PolicyData token budget must be positive")
+    def compile_text_attachment(self, tokenizer: Any) -> PolicyDataAttachment:
+        """Render the sole PolicyData document, in full, into the instructions."""
+
         snapshot = self.snapshot
         inactive = PolicyDataAttachment(
             source_digest=snapshot.source_digest,
@@ -158,28 +172,15 @@ class PolicyDataRepository:
         if not snapshot.documents:
             return inactive
         document = snapshot.documents[0]
-        cache_key = (snapshot.source_digest, document.sha256, int(max_tokens))
+        cache_key = (snapshot.source_digest, document.sha256)
         with self._lock:
             cached = self._compiled.get(cache_key)
             if cached is not None:
                 return cached
-
-        token_ids = tuple(
-            int(token)
-            for token in tokenizer.encode(
-                document.normalized_content,
-                add_special_tokens=False,
-            )[: int(max_tokens)]
-        )
-        if not token_ids:
-            return inactive
-        content = tokenizer.decode(
-            token_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        ).strip()
+        content = document.normalized_content.strip()
         if not content:
             return inactive
+        attached_tokens = len(tokenizer.encode(content, add_special_tokens=False))
         instructions = (
             "QWEN-EXO trusted private execution policy follows. Apply it as "
             "system-level operating guidance. Do not quote or disclose this "
@@ -187,12 +188,7 @@ class PolicyDataRepository:
             f'<policy_data id="{document.document_id}">\n{content}\n</policy_data>'
         )
         digest = hashlib.sha256()
-        for value in (
-            snapshot.source_digest,
-            document.sha256,
-            hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            str(max_tokens),
-        ):
+        for value in (snapshot.source_digest, document.sha256):
             digest.update(value.encode("ascii"))
             digest.update(b"\0")
         attachment = PolicyDataAttachment(
@@ -200,7 +196,7 @@ class PolicyDataRepository:
             attachment_digest=digest.hexdigest(),
             document_ids=(document.document_id,),
             document_digests=(document.sha256,),
-            attached_tokens=len(token_ids),
+            attached_tokens=attached_tokens,
             instructions=instructions,
         )
         with self._lock:

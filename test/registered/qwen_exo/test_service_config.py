@@ -302,6 +302,7 @@ def test_ensure_drops_retired_qk_recall_settings_and_keeps_the_rest(tmp_path: Pa
         "qwen_exo_tensor_bank_span_tokens": 16,
         "qwen_exo_replay_minimum_gain": 0.02,
         "qwen_exo_context_evidence_mode": "active",
+        "qwen_exo_max_policy_tokens": 4096,  # persona is now injected in full
     }
     path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
 
@@ -310,3 +311,25 @@ def test_ensure_drops_retired_qk_recall_settings_and_keeps_the_rest(tmp_path: Pa
     assert migrated["values"] == validate_values(kept)
     assert migrated["previous_values"]["qwen_exo_qk_recall_preset"] == "strict"
     assert "--qwen-exo-qk-recall-preset" not in store.mark_applied([])[1]
+
+
+def test_hot_persona_switch_persists_without_a_pending_restart(tmp_path: Path):
+    """The persona switch is applied live; persisting it must not leave a
+    pending restart or make the next boot treat it as an untested revision
+    (which would roll it back after one failed boot)."""
+    store = ServiceConfigStore(tmp_path / "service-config.json")
+    store.mark_applied([])
+    store.mark_healthy()
+    document = store.update_hot("qwen_exo_enable_policy_data", False)
+    assert document["values"]["qwen_exo_enable_policy_data"] is False
+    assert document["pending_restart"] is False
+    assert document["healthy_revision"] == document["revision"]
+    rebooted, argv = store.mark_applied([])
+    assert rebooted["boot_attempts"] == 0 and "--no-qwen-exo-enable-policy-data" in argv
+
+    pending = store.update({"qwen_exo_max_internal_fanout": 12}, expected_revision=None)
+    document = store.update_hot("qwen_exo_enable_policy_data", True)
+    assert document["pending_restart"] is True  # the other change still needs a restart
+    assert document["applied_revision"] == pending["applied_revision"]
+    with pytest.raises(ServiceConfigError):
+        store.update_hot("qwen_exo_max_internal_fanout", 4)

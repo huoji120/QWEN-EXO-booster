@@ -128,6 +128,18 @@ export type SourceListing = {
   source_digest?: string;
   document_count?: number;
   documents: SourceDocument[];
+  /** Persona lane only: injected into every request's instructions (hot switch). */
+  enabled?: boolean;
+  always_on?: boolean;
+  /** Persona lane only: full token size of the injected document. */
+  attached_tokens?: number | null;
+};
+
+export type PolicyDataInjection = {
+  enabled: boolean;
+  always_on: boolean;
+  route: string;
+  attached_tokens: number | null;
 };
 
 export type DocumentCategory = {

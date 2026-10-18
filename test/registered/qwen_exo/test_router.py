@@ -78,7 +78,6 @@ class FakeRuntime:
         self.config = SimpleNamespace(
             telemetry_text_mode="off",
             feature_flags=SimpleNamespace(policy_data=True, activation_training=True),
-            max_policy_tokens=4096,
         )
         self.state = QwenExoRuntimeState.READY
         self.knowledge = SimpleNamespace(
@@ -282,6 +281,9 @@ class FakeRuntime:
             raise FileNotFoundError(relative_path)
         del self.policy_documents[relative_path]
         self.policy_document_tags.pop(relative_path, None)
+
+    def policy_data_injection(self):
+        return {"enabled": True, "always_on": True, "route": "text_instructions", "attached_tokens": 3}
 
     def reindex_policy_data(self):
         return {

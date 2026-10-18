@@ -83,16 +83,12 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
     "同时管理 Full-Attention K/V 与 GDN 线性状态；QWEN-EXO 原生记忆必须开启，纯模型基线可关闭。",
   ],
   qwen_exo_enable_policy_data: [
-    "策略数据",
-    "允许策略文档以原生状态条件化工程行为；需要固定执行边界时开启，排查策略干扰时关闭。",
+    "人格文档注入",
+    "把人格文档完整加入每个请求的系统提示词（不截断）；在「人格文档」页也能直接开关，立即生效、无需重启。",
   ],
   qwen_exo_enable_capsule: [
     "执行胶囊",
     "跨轮持久化粗粒度执行状态；长任务建议开启，单轮无状态问答可关闭。",
-  ],
-  qwen_exo_max_policy_tokens: [
-    "策略注入预算",
-    "限制策略文档对应的原生状态 token 预算；普通策略推荐 4096，不建议为容纳无关规则扩大。",
   ],
   qwen_exo_observer_mode: [
     "观测模式",

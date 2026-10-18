@@ -365,6 +365,24 @@ async def get_service_config():
         )
 
 
+# Settings the running server applies live (restart_required=False).
+_HOT_APPLIERS = {
+    "qwen_exo_enable_policy_data": lambda runtime, value: runtime.set_policy_data_enabled(value),
+}
+
+
+def _hot_only_changes(store: ServiceConfigStore, values: dict) -> dict | None:
+    """The changed settings if every one of them can be applied live."""
+    try:
+        current = store.public_document()["values"]
+    except (ServiceConfigError, KeyError):
+        return None
+    changed = {key: value for key, value in values.items() if current.get(key) != value}
+    if changed and set(changed) <= set(_HOT_APPLIERS):
+        return changed
+    return None
+
+
 @router.put("/service-config", status_code=202)
 async def put_service_config(payload: ServiceConfigWriteRequest, request: Request):
     store = ServiceConfigStore.from_environment()
@@ -378,6 +396,16 @@ async def put_service_config(payload: ServiceConfigWriteRequest, request: Reques
                 }
             },
         )
+    runtime = getattr(request.app.state, "qwen_exo_runtime", None)
+    hot = _hot_only_changes(store, payload.values) if runtime is not None else None
+    if hot:
+        try:
+            for key, value in hot.items():
+                store.update_hot(key, value)
+                _HOT_APPLIERS[key](runtime, value)
+        except ServiceConfigError as exc:
+            return JSONResponse(status_code=422, content={"detail": exc.public_dict()})
+        return {**store.public_document(), "restart_requested": False}
     try:
         document = store.update(
             payload.values,
@@ -937,16 +965,31 @@ async def list_policy_data(
     request: Request, q: str = Query(default="", max_length=256)
 ):
     runtime = _runtime(request)
+    injection = await asyncio.to_thread(runtime.policy_data_injection)
     return {
         "source_digest": runtime.policy_data.snapshot.source_digest,
         "documents": runtime.policy_data_documents(query=q),
-        "always_on": bool(
-            runtime.config.feature_flags.policy_data
-            and getattr(runtime.policy_data.snapshot, "documents", ())
-        ),
-        "route": "text_instructions",
-        "max_tokens": runtime.config.max_policy_tokens,
+        **injection,
     }
+
+
+class PolicyDataEnabledRequest(BaseModel):
+    enabled: bool
+
+
+@router.put("/policydata-injection")
+async def put_policy_data_injection(payload: PolicyDataEnabledRequest, request: Request):
+    """Turn persona injection on/off live (no restart) and persist the choice."""
+    runtime = _runtime(request)
+    store = ServiceConfigStore.from_environment()
+    try:
+        await asyncio.to_thread(
+            store.update_hot, "qwen_exo_enable_policy_data", payload.enabled
+        )
+    except ServiceConfigError as exc:
+        if exc.code != "config_not_initialized":
+            raise HTTPException(status_code=422, detail=exc.public_dict()) from exc
+    return await asyncio.to_thread(runtime.set_policy_data_enabled, payload.enabled)
 
 
 class TrajectoryWriteRequest(BaseModel):

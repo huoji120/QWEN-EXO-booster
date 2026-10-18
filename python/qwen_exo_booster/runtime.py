@@ -380,6 +380,9 @@ class QwenExoRuntime:
         if config.policy_data_directory is None:
             raise ValueError("QWEN-EXO PolicyData directory is required")
         self.policy_data = PolicyDataRepository(config.policy_data_directory)
+        # Hot switch: starts from the service config, flipped live by the
+        # persona page without a restart.
+        self.policy_data_enabled = config.feature_flags.policy_data
         self.cognition = CognitionRepository(config.cognition_directory)
         self.model_identity: ModelIdentity | None = None
         self.internal_jobs = InternalJobRunner(
@@ -1279,7 +1282,7 @@ class QwenExoRuntime:
                 tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
                 if tokenizer is None and (
                     self.config.feature_flags.capsule
-                    or self.config.feature_flags.policy_data
+                    or self.policy_data_enabled
                     or self.config.reasoning_mode == "dynamic"
                     or self.config.force_auto_reasoning
                     or self.cognition.snapshot.documents
@@ -1613,16 +1616,7 @@ class QwenExoRuntime:
         if not documents or tokenizer is None:
             return None
         document = documents[0]
-        token_ids = tokenizer.encode(
-            document.normalized_content, add_special_tokens=False
-        )[: int(self.config.max_policy_tokens)]
-        if not token_ids:
-            return None
-        content = tokenizer.decode(
-            token_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        ).strip()
+        content = document.normalized_content.strip()
         if not content:
             return None
         return (
@@ -1650,10 +1644,10 @@ class QwenExoRuntime:
         the same text into a leading system message instead.
         """
         parts: list[str] = []
-        if self.policy_data is not None and self.config.feature_flags.policy_data:
+        if self.policy_data_enabled:
+            self.policy_data.refresh_if_changed()
             policy = self.policy_data.compile_text_attachment(
-                self.tokenizer_manager.tokenizer,
-                max_tokens=self.config.max_policy_tokens,
+                self.tokenizer_manager.tokenizer
             )
             if policy.active and policy.instructions:
                 parts.append(policy.instructions)
@@ -1899,11 +1893,11 @@ class QwenExoRuntime:
         instructions when enabled. It is stable for a given document set, so
         it stays byte-identical across turns and keeps the prefix cache hot;
         its own radix namespace keeps it apart from policy-free prefixes."""
-        if not self.config.feature_flags.policy_data:
+        if not self.policy_data_enabled:
             return request
+        self.policy_data.refresh_if_changed()
         policy = self.policy_data.compile_text_attachment(
-            self.tokenizer_manager.tokenizer,
-            max_tokens=self.config.max_policy_tokens,
+            self.tokenizer_manager.tokenizer
         )
         if policy is None or not policy.active or not policy.instructions:
             return request
@@ -7124,6 +7118,32 @@ class QwenExoRuntime:
         self.telemetry.emit("admin", "source_documents.deleted", payload)
         return payload
 
+    def policy_data_injection(self) -> dict[str, object]:
+        """Whether the persona document is injected, and its full token size."""
+        self.policy_data.refresh_if_changed()
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        attachment = (
+            self.policy_data.compile_text_attachment(tokenizer)
+            if tokenizer is not None
+            else None
+        )
+        return {
+            "enabled": self.policy_data_enabled,
+            "always_on": bool(
+                self.policy_data_enabled and self.policy_data.snapshot.documents
+            ),
+            "route": "text_instructions",
+            "attached_tokens": attachment.attached_tokens if attachment else None,
+        }
+
+    def set_policy_data_enabled(self, enabled: bool) -> dict[str, object]:
+        """Flip persona injection live; the caller persists it to service config."""
+        self.policy_data_enabled = bool(enabled)
+        self.telemetry.emit(
+            "admin", "policy_data.toggled", {"enabled": self.policy_data_enabled}
+        )
+        return self.policy_data_injection()
+
     def reindex_policy_data(self) -> dict[str, object]:
         snapshot = self.policy_data.refresh()
         payload: dict[str, object] = {
@@ -7176,13 +7196,11 @@ class QwenExoRuntime:
             "policy_data": {
                 "source_digest": self.policy_data.snapshot.source_digest,
                 "document_count": len(self.policy_data.snapshot.documents),
-                "enabled": self.config.feature_flags.policy_data,
+                "enabled": self.policy_data_enabled,
                 "always_on": bool(
-                    self.config.feature_flags.policy_data
-                    and self.policy_data.snapshot.documents
+                    self.policy_data_enabled and self.policy_data.snapshot.documents
                 ),
                 "route": "text_instructions",
-                "max_tokens": self.config.max_policy_tokens,
             },
             "latent_transplant": {
                 "mode": (
@@ -7205,7 +7223,7 @@ class QwenExoRuntime:
             "internal_services": {
                 "capsule": self.capsules is not None,
                 "memory_tools": True,
-                "policy_data": self.config.feature_flags.policy_data,
+                "policy_data": self.policy_data_enabled,
                 "cognition": bool(self.cognition.snapshot.documents),
             },
             "memory_tools": dict(sorted(self._memory_tool_stats.items())),

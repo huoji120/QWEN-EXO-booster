@@ -251,8 +251,6 @@ def test_policy_data_cli_arguments_are_registered():
             "--qwen-exo-policy-data-dir",
             "/data/policydata",
             "--qwen-exo-enable-policy-data",
-            "--qwen-exo-max-policy-tokens",
-            "2048",
             "--qwen-exo-max-reasoning-tokens",
             "6144",
             "--qwen-exo-max-output-tokens",
@@ -262,7 +260,7 @@ def test_policy_data_cli_arguments_are_registered():
 
     assert parsed.qwen_exo_policy_data_dir == "/data/policydata"
     assert parsed.qwen_exo_enable_policy_data is True
-    assert parsed.qwen_exo_max_policy_tokens == 2048
+    assert not hasattr(parsed, "qwen_exo_max_policy_tokens")  # persona is injected in full
     assert parsed.qwen_exo_max_reasoning_tokens == 6144
     assert parsed.qwen_exo_max_output_tokens == 12288
     assert not hasattr(parsed, "qwen_exo_tensor_bank_max_document_tokens")
@@ -431,7 +429,6 @@ def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):
         "enabled": True,
         "always_on": False,
         "route": "text_instructions",
-        "max_tokens": runtime.config.max_policy_tokens,
     }
     assert runtime.status()["internal_services"] == {
         "capsule": True,

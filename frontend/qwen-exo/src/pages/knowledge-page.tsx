@@ -43,6 +43,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
   deleteSource,
@@ -53,6 +54,7 @@ import {
   listSources,
   previewKnowledgeFiles,
   saveSource,
+  setPolicyDataInjection,
 } from "@/lib/api";
 import { translate as t, translateFor, useI18n } from "@/lib/i18n";
 import type {
@@ -251,6 +253,25 @@ function SourceDocumentsPage({
   const [sortOrder, setSortOrder] = useState<SortOrder>("time-desc");
   const [uploading, setUploading] = useState(false);
   const [selectedTag, setSelectedTag] = useState("");
+  const [policyToggleBusy, setPolicyToggleBusy] = useState(false);
+  const togglePolicyInjection = async (enabled: boolean) => {
+    setPolicyToggleBusy(true);
+    try {
+      const injection = await setPolicyDataInjection(enabled);
+      setListing((current) => ({ ...current, ...injection }));
+      toast.success(
+        injection.enabled
+          ? t("人格文档已注入系统提示词，立即生效")
+          : t("已停止注入人格文档，立即生效"),
+      );
+    } catch (error) {
+      toast.error(t("切换失败"), {
+        description: error instanceof Error ? error.message : t("未知错误"),
+      });
+    } finally {
+      setPolicyToggleBusy(false);
+    }
+  };
   const categorySuggestions = useMemo(
     () => categories.map((category) => category.category_id),
     [categories],
@@ -811,6 +832,29 @@ function SourceDocumentsPage({
                 {shortHash(listing.source_digest, 14)}
               </span>
             </div>
+            {lane === "policydata" ? (
+              <>
+                <div>
+                  <span className="text-muted-foreground">{t("完整注入")}</span>
+                  <strong className="ml-2">
+                    {listing.attached_tokens != null
+                      ? `${formatNumber(listing.attached_tokens)} tokens`
+                      : "—"}
+                  </strong>
+                </div>
+                <label className="flex items-center gap-2">
+                  <Switch
+                    checked={Boolean(listing.enabled)}
+                    disabled={policyToggleBusy}
+                    onCheckedChange={(checked) => void togglePolicyInjection(checked)}
+                    aria-label={t("注入系统提示词")}
+                  />
+                  <span>
+                    {listing.enabled ? t("已注入系统提示词") : t("未注入")}
+                  </span>
+                </label>
+              </>
+            ) : null}
           </div>
         </CardContent>
       </Card>

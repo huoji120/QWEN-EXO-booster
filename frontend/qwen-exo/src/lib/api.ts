@@ -30,6 +30,7 @@ import type {
   ReflectionRegenerationJobStatus,
   RuntimeStatus,
   ServiceConfig,
+  PolicyDataInjection,
   SourceListing,
   TelemetryEvent,
   TrajectoryDetail,
@@ -195,6 +196,16 @@ export async function listSources(
   return (await (
     await apiFetch(`/${lane}${suffix}`, { signal })
   ).json()) as SourceListing;
+}
+
+/** Turn persona injection on/off; applies immediately, no restart. */
+export async function setPolicyDataInjection(enabled: boolean) {
+  return (await (
+    await apiFetch("/policydata-injection", {
+      method: "PUT",
+      body: JSON.stringify({ enabled }),
+    })
+  ).json()) as PolicyDataInjection;
 }
 
 export async function listReflectionMemories(

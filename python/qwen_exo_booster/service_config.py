@@ -139,8 +139,10 @@ def _setting(
     choices: tuple[str, ...] = (),
     choice_labels: dict[str, str] | None = None,
     unit: str | None = None,
+    restart_required: bool = True,
 ) -> ServiceSetting:
     return ServiceSetting(
+        restart_required=restart_required,
         key=key,
         flag="--" + key.replace("_", "-"),
         group=group,
@@ -386,10 +388,12 @@ SERVICE_SETTINGS = (
     _setting(
         "qwen_exo_enable_policy_data",
         "memory",
-        "策略数据",
-        "作用：启用执行策略文档的原生状态条件化。用途：让模型遵守既定的工程策略。推荐值：开启。",
+        "人格文档注入",
+        "作用：把人格文档完整加入每个请求的系统提示词（不截断）。用途：让模型遵守既定的人格与工程策略。"
+        "也可以在「人格文档」页直接开关，立即生效、无需重启。推荐值：开启。",
         "boolean",
         True,
+        restart_required=False,
     ),
     _setting(
         "qwen_exo_enable_capsule",
@@ -398,18 +402,6 @@ SERVICE_SETTINGS = (
         "作用：保存跨轮次的粗粒度执行状态。用途：长任务中断后恢复进度。推荐值：开启。",
         "boolean",
         True,
-    ),
-    _setting(
-        "qwen_exo_max_policy_tokens",
-        "memory",
-        "策略预算",
-        "作用：单个策略文档允许恢复的内容上限。推荐值：4096。",
-        "integer",
-        4096,
-        minimum=128,
-        maximum=16384,
-        step=128,
-        unit="tokens",
     ),
     _setting(
         "qwen_exo_observer_mode",
@@ -1240,6 +1232,35 @@ class ServiceConfigStore:
         document["applied_at"] = _utc_now()
         self._write_document(document)
         return document, apply_values_to_args(base_args, document["values"])
+
+    def update_hot(self, key: str, value: Any) -> dict[str, Any]:
+        """Persist a setting the running server already applied live.
+
+        If nothing else is pending, the new revision counts as applied and
+        healthy, so the console shows no pending restart and the next boot does
+        not treat it as an untested change."""
+        setting = _SETTINGS_BY_KEY.get(key)
+        if setting is None or setting.restart_required:
+            raise ServiceConfigError("not_hot", f"{key} 不能热更新", field=key)
+        document = self._read_document()
+        if document is None:
+            raise ServiceConfigError(
+                "config_not_initialized", "服务配置尚未由托管启动器初始化"
+            )
+        values = _migrate_persisted_values(document.get("values"))
+        values[key] = value
+        values = validate_values(values)
+        revision = _revision(values)
+        if revision == document["revision"]:
+            return self.public_document()
+        settled = document.get("applied_revision") == document["revision"] == document.get(
+            "healthy_revision"
+        )
+        document.update(revision=revision, updated_at=_utc_now(), values=values)
+        if settled:
+            document.update(applied_revision=revision, healthy_revision=revision)
+        self._write_document(document)
+        return self.public_document()
 
     def mark_healthy(self) -> bool:
         document = self._read_document()
