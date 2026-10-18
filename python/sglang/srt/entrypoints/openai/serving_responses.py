@@ -48,11 +48,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
 from openai_harmony import Message as OpenAIMessage
 from openai_harmony import Role
 from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
-from qwen_exo_booster.memory_hints import (
-    MemoryTurnContext,
-    is_memory_block,
-    memory_block_hints,
-)
+from qwen_exo_booster.memory_hints import is_memory_block
 from qwen_exo_booster.memory_tools import MEMORY_TOOL_NAMES
 
 from sglang.srt.entrypoints.context import (
@@ -674,7 +670,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 await qwen_exo_runtime.memory_block_for_turn(
                     request.request_id,
                     blocked_reason=self._memory_tools_blocked_reason(request),
-                    turn=self._memory_turn_context(request, prev_response),
+                    query_text=self._memory_query_text(request, prev_response),
                 )
             )
 
@@ -1712,40 +1708,30 @@ class OpenAIServingResponses(OpenAIServingChat):
             return "media"
         return None
 
-    def _memory_turn_context(
+    def _memory_query_text(
         self,
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
-    ) -> MemoryTurnContext:
-        """Read memory state from the conversation itself (chained or replayed):
-        whether it searched, the server blocks already shown and their hints,
-        and the text this turn reacts to (new tool output or user message)."""
+    ) -> str:
+        """What this turn reacts to, for memory hints: the newest tool output
+        or user message, prefixed by the original task to keep it on topic."""
         try:
             messages = self._conversation_messages(request, prev_response)
         except (ValueError, TypeError):
-            return MemoryTurnContext()
-        searched = False
-        blocks = 0
-        shown: set[tuple[str, int]] = set()
+            return ""
         last_assistant = -1
         for index, message in enumerate(messages):
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            content = message.get("content")
-            if is_memory_block(content):
-                blocks += 1
-                shown |= memory_block_hints(content)
-                continue
-            last_assistant = index
-            for call in message.get("tool_calls") or ():
-                if (call.get("function") or {}).get("name") == "qwen_exo_memory_search":
-                    searched = True
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and not is_memory_block(message.get("content"))
+            ):
+                last_assistant = index
         latest = [
             _chat_message_text(message)
             for message in messages[last_assistant + 1 :]
             if isinstance(message, dict) and message.get("role") in ("user", "tool")
         ]
-        # The original task keeps short tool output (a file list) on topic.
         task = next(
             (
                 _chat_message_text(message)
@@ -1755,12 +1741,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             "",
         )
         recent = "\n".join(text for text in latest if text)[-3000:]
-        return MemoryTurnContext(
-            searched=searched,
-            blocks_shown=blocks,
-            shown_hints=frozenset(shown),
-            query_text=recent if task in recent else f"{task[:1000]}\n{recent}".strip(),
-        )
+        return recent if task in recent else f"{task[:1000]}\n{recent}".strip()
 
     @staticmethod
     def _request_has_media(request: ResponsesRequest) -> bool:

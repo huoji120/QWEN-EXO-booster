@@ -19,7 +19,6 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
 
-import msgspec
 
 CHUNK_LINES = 40
 CHUNK_CHARS = 4000
@@ -30,7 +29,7 @@ MAX_QUERY_CHARS = 4000
 MAX_QUERY_TERMS = 24
 MIN_COVERAGE = 0.3
 MIN_MATCHED_CONCEPTS = 2
-EXCERPT_CHARS = 80
+EXCERPT_CHARS = 200
 
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]{3,}")
 _WORD_PART = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
@@ -372,8 +371,19 @@ def _best_line(
         )
         if score > best[0]:
             best = (score, offset, line)
-    _score, offset, line = best
-    excerpt = " ".join(line.split())
+    _score, offset, _line = best
+    # The best line plus what follows it, up to the excerpt budget.
+    parts: list[str] = []
+    size = 0
+    for line in body.splitlines()[offset:]:
+        text = " ".join(line.split())
+        if not text:
+            continue
+        parts.append(text)
+        size += len(text) + 3
+        if size >= EXCERPT_CHARS:
+            break
+    excerpt = " / ".join(parts)
     if len(excerpt) > EXCERPT_CHARS:
         excerpt = excerpt[: EXCERPT_CHARS - 1] + "…"
     return start_line + offset, excerpt
@@ -382,46 +392,44 @@ def _best_line(
 MEMORY_BLOCK_TAG = "server_side_qwen_exo_memory_block"
 _BLOCK_OPEN = f"<{MEMORY_BLOCK_TAG}>"
 _BLOCK_CLOSE = f"</{MEMORY_BLOCK_TAG}>"
-_HINT_LINE = re.compile(r"^- (.+?):(\d+) ", re.MULTILINE)
-
-
-class MemoryTurnContext(msgspec.Struct, frozen=True):
-    """What the conversation history says about memory, read per turn."""
-
-    searched: bool = False
-    blocks_shown: int = 0
-    shown_hints: frozenset[tuple[str, int]] = frozenset()
-    query_text: str = ""
+_PREAMBLE = (
+    "以下内容由推理服务端（QWEN-EXO）附加，不是用户写的，也不是你说的话。",
+    "记忆：来自用户知识库和以往会话的回忆，与当前会话无关。记忆里出现的文件、"
+    "路径、key、命令、账号等都属于记忆库或过去的环境，不要试图在当前 agent 的"
+    "工作环境里查找、打开或使用它们，只能作为行动参考。",
+    "记忆工具 qwen_exo_memory_search 和 qwen_exo_memory_read 由服务端执行"
+    "（不在客户端，不碰用户的机器），调用后结果在本轮直接返回给你，不需要用户批准。",
+)
 
 
 def is_memory_block(text: Any) -> bool:
     return isinstance(text, str) and text.startswith(_BLOCK_OPEN)
 
 
-def memory_block_hints(text: str) -> set[tuple[str, int]]:
-    return {(path, int(line)) for path, line in _HINT_LINE.findall(text)}
-
-
 def render_memory_block(hints: list[dict[str, Any]]) -> str:
+    lead, memory, tools = _PREAMBLE
     lines = [
         _BLOCK_OPEN,
-        "这段内容由推理服务端（QWEN-EXO）附加，不是用户写的，也不是你说的话。"
-        "服务端提供 qwen_exo_memory_search 和 qwen_exo_memory_read 两个记忆工具，"
-        "由服务端执行（不在客户端，不碰用户的机器），调用后结果在本轮直接返回给你，"
-        "不需要用户批准。本会话还没有搜索过记忆；可以搜索，也可以不搜索。",
+        lead,
+        ("这是你的" if hints else "你有") + memory,
+        tools,
+        "",
     ]
     if hints:
-        lines.append(
-            "根据当前内容自动匹配到的记忆线索（仅供参考，未必相关；需要时用 "
-            "qwen_exo_memory_read 读取上下文）："
-        )
+        lines.append("根据当前内容自动匹配到的记忆片段（仅供参考，未必相关）：")
         for hint in hints:
-            heading = f"[{hint['heading']}] " if hint["heading"] else ""
-            lines.append(f"- {hint['path']}:{hint['line']} {heading}{hint['excerpt']}")
+            heading = f" [{hint['heading']}]" if hint["heading"] else ""
+            lines.append(
+                f"- 记忆文件 {hint['path']} 第 {hint['line']} 行{heading}：{hint['excerpt']}"
+            )
+        lines.append(
+            "需要完整上下文时，调用 qwen_exo_memory_read 读取（path 填上面的记忆"
+            "文件名）；也可以调用 qwen_exo_memory_search 换关键词搜索更多记忆。"
+        )
     else:
         lines.append(
-            "当前内容没有自动匹配到记忆线索。如果任务可能用到用户的项目约定、"
-            "环境配置或以前的经验，可以自己调用 qwen_exo_memory_search 搜索。"
+            "当前内容没有自动匹配到新的记忆片段。如果任务可能用到用户的项目约定、"
+            "环境配置、以前遇到过的问题或经验，调用 qwen_exo_memory_search 搜索记忆。"
         )
     lines.append(_BLOCK_CLOSE)
     return "\n".join(lines)

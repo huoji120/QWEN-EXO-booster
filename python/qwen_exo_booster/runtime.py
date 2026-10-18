@@ -52,11 +52,7 @@ from qwen_exo_booster.document_ingest import (
     validate_upload_batch,
 )
 from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
-from qwen_exo_booster.memory_hints import (
-    MemoryHintIndex,
-    MemoryTurnContext,
-    render_memory_block,
-)
+from qwen_exo_booster.memory_hints import MemoryHintIndex, render_memory_block
 from qwen_exo_booster.memory_tool_log import MemoryToolLog
 from qwen_exo_booster.fingerprint import ModelIdentity
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
@@ -116,10 +112,6 @@ from qwen_exo_booster.task_scheduling import internal_task_scope
 
 logger = logging.getLogger(__name__)
 
-# Until a conversation has searched memory, each turn's prompt ends with a
-# server-side memory block (prompt-only, never returned to the client); at most
-# this many per conversation.
-_MEMORY_BLOCK_MAX_TURNS = 8
 # Existing reflection memories offered to the model as update targets.
 _REFLECTION_SIMILAR_LIMIT = 4
 _REFLECTION_SIMILAR_MIN_OVERLAP = 0.2
@@ -533,8 +525,8 @@ class QwenExoRuntime:
             str, tuple[str, ...]
         ] = OrderedDict()
         self._max_conversation_keys = self.capsule_store.max_records
-        # conversation key -> memory blocks shown (None once memory was searched)
-        self._memory_block_turns: OrderedDict[str, int | None] = OrderedDict()
+        # conversation key -> memory blocks shown (for the search counters)
+        self._memory_block_turns: OrderedDict[str, int] = OrderedDict()
         # conversation key -> hints already shown, so blocks bring new ones
         self._memory_block_hints: OrderedDict[str, frozenset[tuple[str, int]]] = (
             OrderedDict()
@@ -6771,7 +6763,7 @@ class QwenExoRuntime:
         except Exception:
             logger.exception("memory tool log write failed")
         if any(call["name"] == "qwen_exo_memory_search" for call in calls):
-            self._mark_memory_searched(request_id)
+            self._count_memory_search(request_id)
         for call in calls:
             self.telemetry.emit(
                 request_id,
@@ -6791,11 +6783,12 @@ class QwenExoRuntime:
         request_id: str,
         *,
         blocked_reason: str | None,
-        turn: MemoryTurnContext,
+        query_text: str,
     ) -> str | None:
-        """Count whether this turn offers the memory tools (metadata only) and
-        return the server-side memory block while its conversation has not
-        searched memory: a note that the tools exist plus BM25 hints."""
+        """Count whether this turn offers the memory tools (metadata only) and,
+        when it does, return the server-side memory block for the prompt: the
+        honest "these are recollections" note, BM25 hits not yet shown in this
+        conversation, and a prompt to search memory."""
         self._memory_tool_stats["turns"] += 1
         if blocked_reason is not None:
             self._memory_tool_stats[f"not_offered:{blocked_reason}"] += 1
@@ -6805,42 +6798,37 @@ class QwenExoRuntime:
             return None
         self._memory_tool_stats["offered"] += 1
         conversation_key = self._request_conversation_keys.get(request_id)
-        if conversation_key is None:
-            return None
-        shown = self._memory_block_turns.get(conversation_key, 0)
-        if turn.searched or shown is None:
-            self._remember_memory_block_turns(conversation_key, None)
-            return None
-        shown = max(shown, turn.blocks_shown)
-        if shown >= _MEMORY_BLOCK_MAX_TURNS:
-            return None
         self._refresh_memory_hints_if_stale()
-        shown_hints = turn.shown_hints | self._memory_block_hints.get(
-            conversation_key, frozenset()
+        shown_hints = (
+            self._memory_block_hints.get(conversation_key, frozenset())
+            if conversation_key is not None
+            else frozenset()
         )
         hints: list[dict[str, Any]] = []
-        if turn.query_text:
+        if query_text:
             try:
                 hints = await asyncio.to_thread(
-                    self.memory_hints.lookup,
-                    turn.query_text,
-                    exclude=shown_hints,
+                    self.memory_hints.lookup, query_text, exclude=shown_hints
                 )
             except Exception:
                 logger.exception("memory hint lookup failed")
-        self._memory_block_hints[conversation_key] = shown_hints | {
-            (hint["path"], hint["line"]) for hint in hints
-        }
-        self._memory_block_hints.move_to_end(conversation_key)
-        while len(self._memory_block_hints) > self._max_conversation_keys:
-            self._memory_block_hints.popitem(last=False)
-        self._remember_memory_block_turns(conversation_key, shown + 1)
+        if conversation_key is not None:
+            self._memory_block_hints[conversation_key] = shown_hints | {
+                (hint["path"], hint["line"]) for hint in hints
+            }
+            self._memory_block_hints.move_to_end(conversation_key)
+            while len(self._memory_block_hints) > self._max_conversation_keys:
+                self._memory_block_hints.popitem(last=False)
+            turns = self._memory_block_turns.get(conversation_key, 0) + 1
+            self._memory_block_turns[conversation_key] = turns
+            self._memory_block_turns.move_to_end(conversation_key)
+            while len(self._memory_block_turns) > self._max_conversation_keys:
+                self._memory_block_turns.popitem(last=False)
         self._memory_tool_stats["blocks_shown"] += 1
+        self._memory_tool_stats["blocks_with_hints" if hints else "blocks_without_hints"] += 1
         self._memory_tool_stats["hints_shown"] += len(hints)
         self.telemetry.emit(
-            request_id,
-            "memory_tools.block_shown",
-            {"turn": shown + 1, "hints": len(hints)},
+            request_id, "memory_tools.block_shown", {"hints": len(hints)}
         )
         return render_memory_block(hints)
 
@@ -6870,25 +6858,15 @@ class QwenExoRuntime:
             refresh(), name="qwen-exo-memory-hints"
         )
 
-    def _remember_memory_block_turns(
-        self, conversation_key: str, turns: int | None
-    ) -> None:
-        self._memory_block_turns[conversation_key] = turns
-        self._memory_block_turns.move_to_end(conversation_key)
-        while len(self._memory_block_turns) > self._max_conversation_keys:
-            self._memory_block_turns.popitem(last=False)
-
-    def _mark_memory_searched(self, request_id: str) -> None:
+    def _count_memory_search(self, request_id: str) -> None:
         conversation_key = self._request_conversation_keys.get(request_id)
-        if conversation_key is None:
-            return
-        shown = self._memory_block_turns.get(conversation_key, 0)
-        if shown is None:
-            return
+        prompted = (
+            conversation_key is not None
+            and self._memory_block_turns.get(conversation_key, 0) > 0
+        )
         self._memory_tool_stats[
-            "searched_after_block" if shown else "searched_unprompted"
+            "searches_after_block" if prompted else "searches_unprompted"
         ] += 1
-        self._remember_memory_block_turns(conversation_key, None)
 
     def memory_tool_calls(self, request_id: str | None, limit: int = 100) -> dict[str, Any]:
         if request_id:
@@ -7142,10 +7120,7 @@ class QwenExoRuntime:
                 "policy_data": self.config.feature_flags.policy_data,
                 "cognition": bool(self.cognition.snapshot.documents),
             },
-            "memory_tools": {
-                **dict(sorted(self._memory_tool_stats.items())),
-                "block_max_turns": _MEMORY_BLOCK_MAX_TURNS,
-            },
+            "memory_tools": dict(sorted(self._memory_tool_stats.items())),
             "telemetry": {
                 "event_count": len(self.telemetry.events(limit=4096)),
                 "observer_mode": self.observer.mode,

@@ -15,7 +15,6 @@ from qwen_exo_booster.reflection_memory import (
     ReflectionMemory,
     ReflectionSourceSnapshot,
 )
-from qwen_exo_booster.memory_hints import MemoryTurnContext
 from qwen_exo_booster.runtime import (
     PendingReflectionMemory,
     QwenExoCapacityConflict,
@@ -1921,28 +1920,21 @@ async def test_compaction_checkpoint_never_blocks_a_user_request(tmp_path):
     await asyncio.gather(value._compaction_reflection_worker, return_exceptions=True)
 
 
-def test_memory_block_shows_until_searched_or_turn_limit(tmp_path):
+def test_memory_block_is_offered_every_turn_even_after_a_search(tmp_path):
     value = runtime(tmp_path)
 
-    def turn(request_id, conversation, **context):
-        value._request_conversation_keys[request_id] = conversation
-        blocked = context.pop("blocked_reason", None)
+    def turn(request_id, blocked_reason=None):
+        value._request_conversation_keys[request_id] = "conv"
         return asyncio.run(
             value.memory_block_for_turn(
-                request_id, blocked_reason=blocked, turn=MemoryTurnContext(**context)
+                request_id, blocked_reason=blocked_reason, query_text="deploy"
             )
         )
 
-    shown = [turn(f"a{index}", "conv-a") for index in range(10)]
-    assert all(block and block.startswith("<server_side_qwen_exo_memory_block>") for block in shown[:8])
-    assert shown[8:] == [None, None]
-    # Blocks replayed in history count too (e.g. after a restart).
-    assert turn("e0", "conv-e", blocks_shown=8) is None
-
-    assert turn("b0", "conv-b") is not None
+    assert all(turn(f"a{index}") for index in range(10))
     asyncio.run(
         value.record_memory_tool_round(
-            "b0",
+            "a9",
             0,
             [
                 {
@@ -1956,10 +1948,8 @@ def test_memory_block_shows_until_searched_or_turn_limit(tmp_path):
             ],
         )
     )
-    assert turn("b1", "conv-b") is None
-    assert turn("c0", "conv-c", searched=True) is None
-    assert turn("d0", "conv-d", blocked_reason="tool_choice") is None
-
+    assert turn("b0") is not None
+    assert turn("c0", blocked_reason="tool_choice") is None
     stats = value.status()["memory_tools"]
-    assert (stats["blocks_shown"], stats["searched_after_block"]) == (9, 1)
-    assert (stats["offered"], stats["not_offered:tool_choice"], stats["turns"]) == (14, 1, 15)
+    assert (stats["blocks_shown"], stats["searches_after_block"]) == (11, 1)
+    assert (stats["offered"], stats["not_offered:tool_choice"]) == (11, 1)

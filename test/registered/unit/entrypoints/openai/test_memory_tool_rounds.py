@@ -266,46 +266,22 @@ class MemoryToolRoundsTestCase(CustomTestCase):
         self.assertEqual(last, {"role": "assistant", "content": block})
         self.assertNotIn(block, json.dumps(serving._conversation_messages(request, None)))
 
-    def test_memory_turn_context_reads_blocks_searches_and_new_text(self):
+    def test_memory_query_is_task_plus_newest_tool_output(self):
         serving = make_serving(self.tool_server)
-        shown_block = render_memory_block(
-            [{"path": "ops.md", "line": 2, "heading": "", "excerpt": "reload nginx"}]
-        )
-        turn = serving._memory_turn_context(
+        query = serving._memory_query_text(
             ResponsesRequest(
                 model="m",
                 input=[
                     {"role": "user", "content": "fix the deploy"},
-                    {"role": "assistant", "content": shown_block},
                     {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"},
-                    {"type": "function_call_output", "call_id": "c1", "output": "nginx: bad gateway"},
+                    {"type": "function_call_output", "call_id": "c1", "output": "old output"},
+                    {"type": "function_call", "call_id": "c2", "name": "bash", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c2", "output": "nginx: bad gateway"},
                 ],
             ),
             None,
         )
-        self.assertEqual(
-            (turn.searched, turn.blocks_shown, turn.shown_hints, turn.query_text),
-            (False, 1, frozenset({("ops.md", 2)}), "fix the deploy\nnginx: bad gateway"),
-        )
-        searched = serving._memory_turn_context(
-            ResponsesRequest(
-                model="m",
-                input=[
-                    {"role": "user", "content": "hi"},
-                    {
-                        "type": "mcp_call",
-                        "id": "mcp_1",
-                        "server_label": "qwen_exo",
-                        "name": "qwen_exo_memory_search",
-                        "arguments": "{}",
-                        "output": "none",
-                        "status": "completed",
-                    },
-                ],
-            ),
-            None,
-        )
-        self.assertTrue(searched.searched)
+        self.assertEqual(query, "fix the deploy\nnginx: bad gateway")
         self.assertEqual(
             serving._memory_tools_blocked_reason(
                 ResponsesRequest(model="m", input="hi", tool_choice="none")

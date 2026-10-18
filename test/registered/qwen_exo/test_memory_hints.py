@@ -4,7 +4,6 @@ from qwen_exo_booster.memory_hints import (
     MemoryHintIndex,
     chunk_text,
     is_memory_block,
-    memory_block_hints,
     render_memory_block,
     text_terms,
 )
@@ -76,12 +75,15 @@ def test_refresh_drops_removed_and_reindexes_changed_files(tmp_path):
     assert set(index.indexed_files()) == {"ops/nginx.md", "notes/frontend.md", "noise/blob.json"}
 
 
-def test_memory_block_round_trips_its_hints():
+def test_memory_block_says_hits_are_unrelated_recollections():
+    """Hits are framed as memory, not as files of the current workspace, and
+    the no-hit block still prompts a memory search."""
     block = render_memory_block(
         [{"path": "ops/release.md", "line": 4, "heading": "发布流程", "excerpt": "回滚由值班表第二位负责。"}]
     )
     assert is_memory_block(block)
-    assert "服务端" in block and "可以搜索，也可以不搜索" in block
-    assert memory_block_hints(block) == {("ops/release.md", 4)}
-    assert is_memory_block(render_memory_block([]))
+    assert "与当前会话无关" in block and "不要试图在当前 agent" in block
+    assert "- 记忆文件 ops/release.md 第 4 行 [发布流程]：回滚由值班表第二位负责。" in block
+    empty = render_memory_block([])
+    assert is_memory_block(empty) and "调用 qwen_exo_memory_search 搜索记忆" in empty
     assert not is_memory_block("plain answer")
