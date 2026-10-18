@@ -26,6 +26,8 @@ export type FolderAction = "create" | "rename" | "move" | "delete";
 
 type FolderTreeProps = {
   root: FolderNode;
+  /** Chinese source label for the root node. */
+  rootLabel: string;
   selected: string;
   onSelect: (path: string) => void;
   onAction: (action: FolderAction, path: string) => void;
@@ -33,6 +35,7 @@ type FolderTreeProps = {
 
 export function KnowledgeFolderTree({
   root,
+  rootLabel,
   selected,
   onSelect,
   onAction,
@@ -49,7 +52,7 @@ export function KnowledgeFolderTree({
     });
 
   const renderNode = (node: FolderNode, depth: number) => {
-    const isRoot = node.path === "";
+    const isRoot = node.path === root.path;
     const open = !collapsed.has(node.path);
     const active = selected === node.path;
     const Icon = active ? FolderOpen : Folder;
@@ -76,11 +79,11 @@ export function KnowledgeFolderTree({
           <button
             type="button"
             className="flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left"
-            title={node.path || t("全部记忆")}
+            title={node.path || t(rootLabel)}
             onClick={() => onSelect(node.path)}
           >
             <Icon className="h-4 w-4 shrink-0" />
-            <span className="truncate">{isRoot ? t("全部记忆") : node.name}</span>
+            <span className="truncate">{isRoot ? t(rootLabel) : node.name}</span>
             <span className="ml-auto shrink-0 pl-1 font-mono text-[11px] text-muted-foreground">
               {formatNumber(node.fileCount)}
             </span>

@@ -543,7 +543,8 @@ export type KnowledgeFileKind =
   | "data"
   | "log"
   | "session"
-  | "trajectory";
+  | "trajectory"
+  | "work";
 
 /** Summary metadata attached to each knowledge file row. */
 export type KnowledgeFileSummaryInfo = {
@@ -674,4 +675,57 @@ export type ServerSessionDeletion = {
   skipped_active: string[];
   missing: string[];
   deleted_count: number;
+};
+
+export type DreamTrigger = "nightly" | "manual";
+
+export type DreamRunStatus = "running" | "completed" | "stopped" | "failed" | "cancelled";
+
+export type DreamActionKind = "write" | "move" | "delete" | "mkdir";
+
+/** One tool action the dream agent applied to the work memory. */
+export type DreamAction = {
+  step: number;
+  action: DreamActionKind | string;
+  target: string;
+  to?: string | null;
+  ok: boolean;
+  message?: string | null;
+};
+
+export type DreamRunSummary = {
+  id: number;
+  trigger: DreamTrigger | string;
+  started_ns: number;
+  finished_ns: number | null;
+  status: DreamRunStatus | string;
+  steps: number;
+  summary: string;
+  action_count: number;
+};
+
+export type DreamRunDetail = Omit<DreamRunSummary, "action_count"> & {
+  action_count?: number;
+  actions: DreamAction[];
+};
+
+/** Nightly work-memory tidy-up agent; only ``available`` exists when it is off. */
+export type DreamStatus = {
+  available: boolean;
+  running?: boolean;
+  current?: {
+    run_id: number;
+    step: number;
+    last_action: DreamAction | null;
+  } | null;
+  next_run_in_seconds?: number;
+  runs?: DreamRunSummary[];
+};
+
+export type WorkTrashEntry = {
+  /** Deletion batch, e.g. ``dream-12``. */
+  batch: string;
+  /** Path relative to the knowledge root, e.g. ``work-memory/ctf/x.md``. */
+  path: string;
+  bytes: number;
 };

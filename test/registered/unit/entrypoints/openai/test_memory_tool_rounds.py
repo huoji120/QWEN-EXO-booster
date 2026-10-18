@@ -214,7 +214,7 @@ class MemoryToolRoundsTestCase(CustomTestCase):
             return [tool.function.name for tool in serving._chat_tools_for_request(request)]
 
         self.assertEqual(
-            names(), ["bash", "qwen_exo_memory_search", "qwen_exo_memory_read"]
+            names(), ["bash", "qwen_exo_memory_search", "qwen_exo_memory_write", "qwen_exo_memory_read"]
         )
         self.assertEqual(names(tool_choice="none"), ["bash"])
         self.assertEqual(names(tool_choice="required"), ["bash"])

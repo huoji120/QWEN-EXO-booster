@@ -406,9 +406,16 @@ _PREAMBLE = (
     "以下内容由推理服务端（QWEN-EXO）附加，不是用户写的，也不是你说的话。",
     "记忆：来自用户知识库和以往会话的回忆，与当前会话无关。记忆里出现的文件、"
     "路径、key、命令、账号等都属于记忆库或过去的环境，不要试图在当前 agent 的"
-    "工作环境里查找、打开或使用它们，只能作为行动参考。",
-    "记忆工具 qwen_exo_memory_search 和 qwen_exo_memory_read 由服务端执行"
+    "工作环境里查找、打开或使用它们，只能作为行动参考。记忆可能混乱、过时或互相"
+    "冲突，只做参考，以你现在观察到的为准。",
+    "记忆工具 qwen_exo_memory_search、qwen_exo_memory_read、qwen_exo_memory_write 由服务端执行"
     "（不在客户端，不碰用户的机器），调用后结果在本轮直接返回给你，不需要用户批准。",
+)
+_STOP_RULE = (
+    "同一个方向最多搜两次（第一次 + 换词或换语言再试一次）。两次都搜不到，就认定"
+    "记忆里没有这方面的内容，别再换着词反复搜，专心用自己的工具和推理把任务做完；"
+    "也不要把“记忆里没有”当成回答。之后遇到新的问题或新的方向再搜。这件事完成或有"
+    "重大发现后，用 qwen_exo_memory_write 写下操作经验永久保存，下次就能搜到。"
 )
 
 
@@ -441,5 +448,6 @@ def render_memory_block(hints: list[dict[str, Any]]) -> str:
             "当前内容没有自动匹配到新的记忆片段。如果任务可能用到用户的项目约定、"
             "环境配置、以前遇到过的问题或经验，调用 qwen_exo_memory_search 搜索记忆。"
         )
+    lines.append(_STOP_RULE)
     lines.append(_BLOCK_CLOSE)
     return "\n".join(lines)

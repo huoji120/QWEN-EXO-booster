@@ -96,7 +96,7 @@ export function KnowledgeEntryDialog({
           <DialogDescription>
             {request.kind === "create"
               ? t("在 {folder} 下创建；可用 / 一次创建多级。", {
-                  folder: request.path || t("全部记忆"),
+                  folder: request.path || t("导入的记忆"),
                 })
               : request.kind === "rename"
                 ? t("只修改名称，位置不变；已有总结会随之保留。")

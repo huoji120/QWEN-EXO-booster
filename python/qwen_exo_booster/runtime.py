@@ -53,6 +53,7 @@ from qwen_exo_booster.document_ingest import (
 )
 from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
 from qwen_exo_booster.memory_hints import MemoryHintIndex, render_memory_block
+from qwen_exo_booster.memory_dream import MemoryDreamService
 from qwen_exo_booster.memory_summaries import MemorySummaryService
 from qwen_exo_booster.memory_tool_log import MemoryToolLog
 from qwen_exo_booster.fingerprint import ModelIdentity
@@ -415,6 +416,8 @@ class QwenExoRuntime:
         self.reflection_memory_service: ReflectionMemoryService | None = None
         self.memory_summaries: MemorySummaryService | None = None
         self._memory_summary_task: asyncio.Task[None] | None = None
+        self.memory_dream: MemoryDreamService | None = None
+        self._memory_dream_schedule: asyncio.Task[None] | None = None
         self.reasoning_planner: DynamicReasoningPlanner | None = None
         self.compaction_service: ResponseCompactionService | None = None
         self._compaction_summaries: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -1329,6 +1332,16 @@ class QwenExoRuntime:
                     self._memory_summary_task = asyncio.create_task(
                         self._run_memory_summaries(), name="qwen-exo-memory-summaries"
                     )
+                    self.memory_dream = MemoryDreamService(
+                        runner=self.internal_jobs,
+                        tokenizer=tokenizer,
+                        index=self.file_knowledge,
+                        telemetry=self.telemetry,
+                        wait_until_quiet=self._wait_for_foreground_quiet,
+                    )
+                    self._memory_dream_schedule = asyncio.create_task(
+                        self._run_memory_dream_schedule(), name="qwen-exo-memory-dream-schedule"
+                    )
                 if (
                     self.config.reflection_memory_mode != "off"
                     and tokenizer is not None
@@ -1500,6 +1513,12 @@ class QwenExoRuntime:
             if summary_task is not None and not summary_task.done():
                 summary_task.cancel()
             self._memory_summary_task = None
+            dream_schedule = self._memory_dream_schedule
+            if dream_schedule is not None and not dream_schedule.done():
+                dream_schedule.cancel()
+            self._memory_dream_schedule = None
+            if self.memory_dream is not None:
+                self.memory_dream.cancel()
             with self._session_initial_gdn_value_lock:
                 self._session_initial_gdn_pins.clear()
             self._session_initial_gdn_refresh_task = None
@@ -6886,6 +6905,32 @@ class QwenExoRuntime:
     @internal_task_scope("maintenance")
     async def _run_memory_summaries(self) -> None:
         await self.memory_summaries.run_forever()
+
+    @internal_task_scope("maintenance")
+    async def _run_memory_dream_schedule(self) -> None:
+        await self.memory_dream.schedule_forever()
+
+    def _dream_service(self) -> MemoryDreamService:
+        if self.memory_dream is None:
+            raise RuntimeError("memory dream needs the served model's tokenizer")
+        return self.memory_dream
+
+    def memory_dream_status(self) -> dict[str, Any]:
+        if self.memory_dream is None:
+            return {"available": False}
+        return {"available": True, **self.memory_dream.status()}
+
+    def start_memory_dream(self) -> dict[str, Any]:
+        return {"available": True, **self._dream_service().request_run("manual")}
+
+    def memory_dream_run(self, run_id: int) -> dict[str, Any] | None:
+        return self._dream_service().log.run(run_id)
+
+    def work_memory_trash(self) -> list[dict[str, Any]]:
+        return self._dream_service().trash.entries()
+
+    def restore_work_memory(self, batch: str, path: str) -> str:
+        return self._dream_service().trash.restore(batch, path)
 
     def memory_summary_status(self) -> dict[str, Any]:
         service = self.memory_summaries

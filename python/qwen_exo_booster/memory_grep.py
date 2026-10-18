@@ -36,6 +36,7 @@ SUMMARY_SUFFIX = ".summary.md"
 KIND_WEIGHT = {
     "summary": 6,
     "note": 5,
+    "work": 5,
     "code": 4,
     "other": 3,
     "data": 2,
@@ -135,6 +136,8 @@ def detect_kind(path: str, head: str) -> str:
     suffix = PurePosixPath(name).suffix
     if name.endswith(SUMMARY_SUFFIX):
         return "summary"
+    if path.startswith("work-memory/"):
+        return "work"
     if "trajectory" in name:
         return "trajectory"
     if suffix in _NOTE_SUFFIXES:
@@ -156,6 +159,9 @@ def detect_title(path: str, kind: str, head: str) -> str:
     if kind in {"session", "trajectory", "data"}:
         match = _JSON_TITLE.search(head)
         return (match.group(1) if match else stem)[:120]
+    title = re.search(r"\A---\n(?:.*\n)*?title:\s*(.+)\n", head)
+    if title:
+        return title.group(1).strip()[:120]
     heading = _HEADING.search(head)
     if heading:
         return heading.group(1)[:120]

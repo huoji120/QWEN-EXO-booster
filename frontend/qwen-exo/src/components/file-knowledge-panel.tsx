@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FileText, FolderPlus, RefreshCw } from "lucide-react";
+import { BookOpen, FileText, FolderPlus, NotebookPen, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { EmptyState } from "@/components/empty-state";
 import { Badge } from "@/components/ui/badge";
@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   createKnowledgeFolder,
   deleteKnowledgeFile,
@@ -34,14 +35,21 @@ import { KnowledgeSearchCard } from "@/components/knowledge/knowledge-search-car
 import { KnowledgeSummaryDialog } from "@/components/knowledge/knowledge-summary-dialog";
 import { KnowledgeSummaryToolbar } from "@/components/knowledge/knowledge-summary-toolbar";
 import { KnowledgeUploadCard } from "@/components/knowledge/knowledge-upload-card";
+import { KnowledgeDreamCard } from "@/components/knowledge/knowledge-dream-card";
+import { KnowledgeWorkTrash } from "@/components/knowledge/knowledge-work-trash";
+import { useDreamStatus } from "@/components/knowledge/use-dream-status";
 import { useKnowledgeViewer } from "@/components/knowledge/knowledge-viewer-dialog";
 import {
+  AREA_LABELS,
+  areaOf,
+  areaRoot,
   buildFolderTree,
   errorText,
   isWithin,
   parentOf,
   rebasePath,
   summaryView,
+  type MemoryArea,
   type SummaryView,
 } from "@/components/knowledge/knowledge-utils";
 
@@ -53,7 +61,13 @@ export function FileKnowledgePanel() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  const [area, setArea] = useState<MemoryArea>("imported");
   const [folder, setFolder] = useState("");
+  // Last selected folder of each area, restored when switching back.
+  const areaFolders = useRef<Record<MemoryArea, string>>({
+    imported: areaRoot("imported"),
+    work: areaRoot("work"),
+  });
   const [nested, setNested] = useState(true);
   const [nameFilter, setNameFilter] = useState("");
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
@@ -65,6 +79,8 @@ export function FileKnowledgePanel() {
   const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(null);
   const [summaryPath, setSummaryPath] = useState<string | null>(null);
   const [searchResetKey, setSearchResetKey] = useState(0);
+
+  const [trashKey, setTrashKey] = useState(0);
 
   const viewer = useKnowledgeViewer();
 
@@ -113,6 +129,13 @@ export function FileKnowledgePanel() {
     void refreshStatus();
   }, [load, refreshStatus]);
 
+  // A finished dream run may have written, moved or deleted work notes.
+  const dream = useDreamStatus(() => {
+    void load(true);
+    void refreshStatus();
+    setTrashKey((key) => key + 1);
+  });
+
   const summaryBusy = Boolean(status?.current) || Boolean(status?.queued?.length);
   useEffect(() => {
     const timer = window.setInterval(
@@ -127,21 +150,53 @@ export function FileKnowledgePanel() {
     };
   }, [refreshStatus, summaryBusy]);
 
+  const rootPath = areaRoot(area);
+  const areaFiles = useMemo(
+    () => tree.files.filter((file) => areaOf(file.relative_path) === area),
+    [tree.files, area],
+  );
+  const areaCounts = useMemo(() => {
+    const work = tree.files.filter((file) => areaOf(file.relative_path) === "work").length;
+    return { imported: tree.files.length - work, work };
+  }, [tree.files]);
   const { root, folders } = useMemo(
-    () => buildFolderTree(tree.directories, tree.files),
+    () =>
+      buildFolderTree(
+        tree.directories.filter((path) => areaOf(path) === area),
+        areaFiles,
+        rootPath,
+      ),
+    [tree.directories, areaFiles, area, rootPath],
+  );
+  // Move targets may lie in either area.
+  const allFolders = useMemo(
+    () => buildFolderTree(tree.directories, tree.files).folders,
     [tree],
   );
+
+  const switchArea = (next: MemoryArea, nextFolder?: string) => {
+    if (next !== area) {
+      areaFolders.current[area] = folder;
+      setArea(next);
+      setSelected(new Set());
+    }
+    setFolder(nextFolder ?? areaFolders.current[next]);
+  };
+
+  /** Select ``path``, switching to the area that owns it. */
+  const focusFolder = (path: string) => switchArea(areaOf(path), path);
 
   // Drop a selected folder / checked files that no longer exist.
   // Runs on tree changes only, so a just-renamed selection survives until reload.
   useEffect(() => {
     const known = new Set(folders);
     setFolder((current) => {
+      if (areaOf(current) !== area) return rootPath;
       let next = current;
-      while (next && !known.has(next)) next = parentOf(next);
+      while (next && next !== rootPath && !known.has(next)) next = parentOf(next);
       return next;
     });
-  }, [folders]);
+  }, [folders, area, rootPath]);
   useEffect(() => {
     setSelected((previous) => {
       if (!previous.size) return previous;
@@ -153,7 +208,7 @@ export function FileKnowledgePanel() {
 
   const visibleFiles = useMemo(() => {
     const needle = nameFilter.trim().toLowerCase();
-    return tree.files.filter((file) => {
+    return areaFiles.filter((file) => {
       const path = file.relative_path;
       if (nested ? !isWithin(path, folder) : parentOf(path) !== folder) return false;
       if (!needle) return true;
@@ -161,7 +216,7 @@ export function FileKnowledgePanel() {
         path.toLowerCase().includes(needle) || file.title.toLowerCase().includes(needle)
       );
     });
-  }, [tree.files, folder, nested, nameFilter]);
+  }, [areaFiles, folder, nested, nameFilter]);
 
   const views = useMemo(() => {
     const failures = new Map((status?.failed ?? []).map((item) => [item.path, item.error]));
@@ -173,7 +228,7 @@ export function FileKnowledgePanel() {
     return map;
   }, [tree.files, status]);
 
-  const totalBytes = tree.files.reduce((sum, file) => sum + file.byte_count, 0);
+  const totalBytes = areaFiles.reduce((sum, file) => sum + file.byte_count, 0);
   const folderBytes = visibleFiles.reduce((sum, file) => sum + file.byte_count, 0);
 
   const reportError = (title: string, error: unknown): never => {
@@ -205,7 +260,7 @@ export function FileKnowledgePanel() {
         const result = await createKnowledgeFolder(destination);
         toast.success(t("文件夹已创建"));
         await load(true);
-        setFolder(result.path || destination);
+        focusFolder(result.path || destination);
       } catch (error) {
         reportError(t("创建文件夹失败"), error);
       }
@@ -222,7 +277,8 @@ export function FileKnowledgePanel() {
             : target,
         },
       );
-      setFolder((current) => rebasePath(current, request.path, target));
+      const rebased = rebasePath(folder, request.path, target);
+      if (rebased !== folder) focusFolder(rebased);
       setSelected(
         (previous) =>
           new Set(Array.from(previous).map((path) => rebasePath(path, request.path, target))),
@@ -241,7 +297,7 @@ export function FileKnowledgePanel() {
         toast.success(t("文件夹已删除"), {
           description: t("共删除 {count} 个文件", { count: result.files }),
         });
-        if (isWithin(folder, request.path)) setFolder(parentOf(request.path));
+        if (isWithin(folder, request.path)) focusFolder(parentOf(request.path));
       } else {
         await deleteKnowledgeFile(request.path);
         toast.success(t("知识库文件已删除"));
@@ -260,7 +316,7 @@ export function FileKnowledgePanel() {
       setDeleteRequest({
         kind: "folder",
         path,
-        fileCount: tree.files.filter((file) => isWithin(file.relative_path, path)).length,
+        fileCount: areaFiles.filter((file) => isWithin(file.relative_path, path)).length,
         folderCount: folders.filter((item) => item.startsWith(`${path}/`)).length,
       });
     } else {
@@ -281,8 +337,26 @@ export function FileKnowledgePanel() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
+          <Tabs value={area} onValueChange={(value) => switchArea(value as MemoryArea)}>
+            <TabsList>
+              <TabsTrigger value="imported" className="gap-1.5">
+                <BookOpen className="h-3.5 w-3.5" />
+                {t(AREA_LABELS.imported)}
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  {formatNumber(areaCounts.imported)}
+                </span>
+              </TabsTrigger>
+              <TabsTrigger value="work" className="gap-1.5">
+                <NotebookPen className="h-3.5 w-3.5" />
+                {t(AREA_LABELS.work)}
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  {formatNumber(areaCounts.work)}
+                </span>
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
           <Badge variant="secondary">
-            {t("{count} 个文件", { count: formatNumber(tree.files.length) })}
+            {t("{count} 个文件", { count: formatNumber(areaFiles.length) })}
           </Badge>
           <Badge variant="secondary">{formatBytes(totalBytes)}</Badge>
           <Badge variant="secondary">
@@ -295,6 +369,8 @@ export function FileKnowledgePanel() {
           onClick={() => {
             void load();
             void refreshStatus();
+            void dream.refresh();
+            setTrashKey((key) => key + 1);
           }}
         >
           <RefreshCw />
@@ -302,14 +378,18 @@ export function FileKnowledgePanel() {
         </Button>
       </div>
 
-      <KnowledgeUploadCard
-        targetDirectory={folder}
-        onImported={async () => {
-          setSearchResetKey((key) => key + 1);
-          await load(true);
-          void refreshStatus();
-        }}
-      />
+      {area === "imported" ? (
+        <KnowledgeUploadCard
+          targetDirectory={areaOf(folder) === "imported" ? folder : ""}
+          onImported={async () => {
+            setSearchResetKey((key) => key + 1);
+            await load(true);
+            void refreshStatus();
+          }}
+        />
+      ) : (
+        <KnowledgeDreamCard state={dream} />
+      )}
 
       <KnowledgeSearchCard resetKey={searchResetKey} onOpen={(path) => void viewer.open(path)} />
 
@@ -348,7 +428,9 @@ export function FileKnowledgePanel() {
                 </div>
                 <div className="max-h-[60vh] overflow-auto">
                   <KnowledgeFolderTree
+                    key={area}
                     root={root}
+                    rootLabel={AREA_LABELS[area]}
                     selected={folder}
                     onSelect={setFolder}
                     onAction={onFolderAction}
@@ -359,9 +441,9 @@ export function FileKnowledgePanel() {
                 <div className="flex flex-wrap items-center gap-2">
                   <span
                     className="min-w-0 truncate font-mono text-sm"
-                    title={folder || t("全部记忆")}
+                    title={folder || t(AREA_LABELS[area])}
                   >
-                    {folder ? `${folder}/` : t("全部记忆")}
+                    {folder !== rootPath ? `${folder}/` : t(AREA_LABELS[area])}
                   </span>
                   <Badge variant="outline">
                     {t("{count} 个文件", { count: formatNumber(visibleFiles.length) })}
@@ -421,10 +503,18 @@ export function FileKnowledgePanel() {
                       onAction={onFileAction}
                     />
                   </div>
-                ) : tree.files.length ? (
+                ) : areaFiles.length ? (
                   <p className="py-8 text-center text-sm text-muted-foreground">
                     {nameFilter.trim() ? t("没有匹配的文件") : t("这个文件夹里还没有文件")}
                   </p>
+                ) : area === "work" ? (
+                  <EmptyState
+                    icon={NotebookPen}
+                    title={t("还没有日常工作记忆")}
+                    description={t(
+                      "模型在对话中通过服务端工具写下的工作笔记会保存在 work-memory/ 下并显示在这里；每晚的记忆整理会归并和清理它们。",
+                    )}
+                  />
                 ) : (
                   <EmptyState
                     icon={FileText}
@@ -439,6 +529,16 @@ export function FileKnowledgePanel() {
           )}
         </CardContent>
       </Card>
+
+      {area === "work" ? (
+        <KnowledgeWorkTrash
+          refreshKey={trashKey}
+          onRestored={async () => {
+            await load(true);
+            void refreshStatus();
+          }}
+        />
+      ) : null}
 
       {viewer.dialog}
 
@@ -455,7 +555,7 @@ export function FileKnowledgePanel() {
       <KnowledgeEntryDialog
         key={entryRequest ? `${entryRequest.kind}:${entryRequest.path}` : "closed"}
         request={entryRequest}
-        folders={folders}
+        folders={allFolders}
         onClose={() => setEntryRequest(null)}
         onSubmit={submitEntry}
       />

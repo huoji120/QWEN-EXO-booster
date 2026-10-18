@@ -38,6 +38,7 @@ class InternalJobType(str, Enum):
     ATTENTION_DIAGNOSTIC = "attention_diagnostic"
     SYSTEM_ONE = "system_one"
     MEMORY_SUMMARY = "memory_summary"
+    MEMORY_DREAM = "memory_dream"
 
 
 class EligibilityStatus(str, Enum):

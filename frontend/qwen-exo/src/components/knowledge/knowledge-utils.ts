@@ -14,7 +14,27 @@ export const KIND_LABELS: Record<KnowledgeFileKind, string> = {
   log: "日志",
   session: "会话记录",
   trajectory: "轨迹",
+  work: "工作记忆",
 };
+
+/** Top-level folder holding the notes the model writes itself. */
+export const WORK_ROOT = "work-memory";
+
+export type MemoryArea = "imported" | "work";
+
+/** Chinese source labels for the two memory areas. */
+export const AREA_LABELS: Record<MemoryArea, string> = {
+  imported: "导入的记忆",
+  work: "日常工作记忆",
+};
+
+export function areaOf(path: string): MemoryArea {
+  return path === WORK_ROOT || path.startsWith(`${WORK_ROOT}/`) ? "work" : "imported";
+}
+
+export function areaRoot(area: MemoryArea) {
+  return area === "work" ? WORK_ROOT : "";
+}
 
 export function kindLabel(kind: string) {
   return KIND_LABELS[kind as KnowledgeFileKind] ?? kind;
@@ -138,12 +158,20 @@ export type FolderNode = {
   fileCount: number;
 };
 
-/** Build the folder tree from the server directory list plus file parents. */
-export function buildFolderTree(directories: string[], files: KnowledgeFile[]) {
+/**
+ * Build the folder tree from the server directory list plus file parents.
+ * Callers pass only the entries of one area; ``rootPath`` is that area's
+ * root folder (``""`` for the knowledge root) and is never listed itself.
+ */
+export function buildFolderTree(
+  directories: string[],
+  files: KnowledgeFile[],
+  rootPath = "",
+) {
   const all = new Set<string>();
   const addWithParents = (path: string) => {
     let current = normalizePath(path);
-    while (current && !all.has(current)) {
+    while (current && current !== rootPath && !all.has(current)) {
       all.add(current);
       current = parentOf(current);
     }
@@ -151,19 +179,24 @@ export function buildFolderTree(directories: string[], files: KnowledgeFile[]) {
   directories.forEach(addWithParents);
   files.forEach((file) => addWithParents(parentOf(file.relative_path)));
 
-  const root: FolderNode = { path: "", name: "", children: [], fileCount: files.length };
-  const nodes = new Map<string, FolderNode>([["", root]]);
+  const root: FolderNode = {
+    path: rootPath,
+    name: baseName(rootPath),
+    children: [],
+    fileCount: files.length,
+  };
+  const nodes = new Map<string, FolderNode>([[rootPath, root]]);
   for (const path of Array.from(all).sort((a, b) => a.localeCompare(b))) {
     const node: FolderNode = { path, name: baseName(path), children: [], fileCount: 0 };
     nodes.set(path, node);
   }
   for (const [path, node] of nodes) {
-    if (!path) continue;
+    if (path === rootPath) continue;
     nodes.get(parentOf(path))?.children.push(node);
   }
   for (const file of files) {
     let folder = parentOf(file.relative_path);
-    while (folder) {
+    while (folder && folder !== rootPath) {
       const node = nodes.get(folder);
       if (node) node.fileCount += 1;
       folder = parentOf(folder);

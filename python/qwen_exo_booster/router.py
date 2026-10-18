@@ -86,6 +86,11 @@ class KnowledgeSummaryWriteRequest(BaseModel):
     summary: str = Field(min_length=1, max_length=200_000)
 
 
+class WorkMemoryRestoreRequest(BaseModel):
+    batch: str = Field(min_length=1, max_length=128)
+    path: str = Field(min_length=1, max_length=1024)
+
+
 class KnowledgeSummaryGenerateRequest(BaseModel):
     paths: list[str] = Field(default_factory=list, max_length=10_000)
     force: bool = False
@@ -790,6 +795,52 @@ async def delete_knowledge_summary(
     except ValueError as exc:
         raise _knowledge_error(exc) from exc
     return {"deleted": deleted}
+
+
+@router.get("/memory/dream")
+async def memory_dream_status(request: Request):
+    return await asyncio.to_thread(_runtime(request).memory_dream_status)
+
+
+@router.post("/memory/dream/run", status_code=202)
+async def run_memory_dream(request: Request):
+    """Start the work-memory dream now (it also runs nightly at 00:00)."""
+    try:
+        return _runtime(request).start_memory_dream()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/memory/dream/runs/{run_id}")
+async def memory_dream_run(run_id: int, request: Request):
+    try:
+        run = await asyncio.to_thread(_runtime(request).memory_dream_run, run_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail="没有这次整理记录")
+    return run
+
+
+@router.get("/memory/work-trash")
+async def work_memory_trash(request: Request):
+    try:
+        return {"entries": await asyncio.to_thread(_runtime(request).work_memory_trash)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/memory/work-trash/restore")
+async def restore_work_memory(payload: WorkMemoryRestoreRequest, request: Request):
+    try:
+        path = await asyncio.to_thread(
+            _runtime(request).restore_work_memory, payload.batch, payload.path
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise _knowledge_error(exc) from exc
+    return {"restored": path}
 
 
 @router.post("/knowledge/summaries/generate", status_code=202)

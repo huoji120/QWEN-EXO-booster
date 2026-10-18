@@ -50,6 +50,11 @@ def current_internal_work_class(job_type) -> str:
     inherited = _internal_work_class.get()
     if inherited is not None:
         return inherited
-    if getattr(job_type, "value", job_type) == "reflection_memory":
+    kind = getattr(job_type, "value", job_type)
+    if kind == "reflection_memory":
         return "reflection"
+    # Memory summaries and the nightly dream never outrank user turns, even
+    # when started from a request handler (e.g. "run now" in the console).
+    if kind in {"memory_summary", "memory_dream"}:
+        return "maintenance"
     return "foreground"

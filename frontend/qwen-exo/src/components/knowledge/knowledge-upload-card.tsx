@@ -142,7 +142,7 @@ export function KnowledgeUploadCard({
             <Folder className="h-4 w-4 shrink-0" />
             {t("导入到")}
             <span className="truncate font-mono text-xs text-foreground">
-              {targetDirectory ? `${targetDirectory}/` : t("全部记忆（根目录）")}
+              {targetDirectory ? `${targetDirectory}/` : t("导入的记忆（根目录）")}
             </span>
           </span>
           <div className="ml-auto flex items-center gap-2">

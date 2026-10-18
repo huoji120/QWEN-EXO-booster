@@ -6,10 +6,9 @@ at least ``MIN_SUMMARY_BYTES`` gets a summary in a fixed template, stored in
 the knowledge index (never written into the user's file) and searched ahead of
 raw files as ``<path>.summary.md``.
 
-Files that do not fit one prompt are read as evenly spaced chunks (at most
-``MAX_CHUNKS``, about 400K tokens), each condensed to notes, then merged; such
-summaries are marked as sampled. Work runs in the background only while no
-user request is active.
+Only the first ``HEAD_BYTES`` of a file are read, in one prompt, so a summary
+costs seconds; summaries of longer files say so. Work runs in the background
+only while no user request is active.
 """
 
 from __future__ import annotations
@@ -33,9 +32,7 @@ from qwen_exo_booster.memory_grep import SUMMARY_SUFFIX
 logger = logging.getLogger(__name__)
 
 MIN_SUMMARY_BYTES = 4096
-CHUNK_CHARS = 60_000
-MAX_CHUNKS = 20
-NOTES_TOKENS = 700
+HEAD_BYTES = 10_000
 SUMMARY_TOKENS = 1600
 _JOB_TIMEOUT_SECONDS = 600.0
 _IDLE_POLL_SECONDS = 30.0
@@ -59,16 +56,56 @@ _SYSTEM = (
 )
 
 
-def plan_chunks(length: int) -> tuple[list[tuple[int, int]], bool]:
-    """Character ranges to read and whether they only sample the file."""
-    if length <= CHUNK_CHARS:
-        return [(0, length)], False
-    count = -(-length // CHUNK_CHARS)
-    if count <= MAX_CHUNKS:
-        return [(start, min(length, start + CHUNK_CHARS)) for start in range(0, length, CHUNK_CHARS)], False
-    step = (length - CHUNK_CHARS) / (MAX_CHUNKS - 1)
-    starts = sorted({int(round(index * step)) for index in range(MAX_CHUNKS)})
-    return [(start, start + CHUNK_CHARS) for start in starts], True
+def head_text(text: str) -> tuple[str, bool]:
+    """The first ``HEAD_BYTES`` of ``text`` (whole characters) and whether it was cut."""
+    raw = text.encode("utf-8")
+    if len(raw) <= HEAD_BYTES:
+        return text, False
+    return raw[:HEAD_BYTES].decode("utf-8", errors="ignore"), True
+
+
+async def generate_internal_text(
+    runner: Any,
+    *,
+    job_type: InternalJobType,
+    label: str,
+    prompt: str,
+    token_budget: int,
+) -> str:
+    """One background generation on the served model (greedy, no thinking text)."""
+    job_id = f"qwen-exo-{label}-" + stable_digest(label, prompt[-200:], time.time_ns())[:24]
+    # One parent per generation: the runner's token reserve is cumulative per
+    # parent and only released by finish_parent.
+    parent_id = job_id
+    job = InternalJob(
+        parent_request_id=parent_id,
+        turn_id=f"{label}:turn",
+        job_id=job_id,
+        job_type=job_type,
+        priority=-30,
+        shared_prefix_key=f"qwen-exo:v1:{label}",
+        token_budget=token_budget,
+        state_budget_bytes=0,
+        deadline_monotonic=time.monotonic() + _JOB_TIMEOUT_SECONDS,
+        cancellation_token=CancellationToken(f"cancel-{job_id}"),
+        telemetry_correlation_id=label,
+        max_fanout=1,
+    )
+    try:
+        (result,) = await runner.run_batch(
+            (job,),
+            (prompt,),
+            {"temperature": 0.0, "top_p": 1.0, "top_k": 1, "skip_special_tokens": True},
+        )
+    finally:
+        await asyncio.shield(runner.finish_parent(parent_id))
+    text = str(result.text or "").strip()
+    closing = text.lower().rfind("</think>")
+    if closing >= 0:
+        text = text[closing + len("</think>") :].strip()
+    if not text:
+        raise FileKnowledgeError(f"empty {label} output")
+    return text
 
 
 class MemorySummaryService:
@@ -169,127 +206,55 @@ class MemorySummaryService:
             and (existing["sha256"] == sha256 or existing["origin"] != "auto")
         ):
             return existing
-        chunks, sampled = plan_chunks(len(text))
-        self._current = {"path": path, "chunks": len(chunks), "done": 0, "sampled": sampled}
+        head, truncated = head_text(text)
+        self._current = {"path": path, "chunks": 1, "done": 0, "sampled": truncated}
         started = time.monotonic()
-        if len(chunks) == 1:
-            summary = await self._generate(
-                path, "summary", self._summary_prompt(path, text, notes=None), SUMMARY_TOKENS
-            )
-        else:
-            notes = []
-            for number, (start, end) in enumerate(chunks, start=1):
-                await self.wait_until_quiet()
-                notes.append(
-                    await self._generate(
-                        path,
-                        f"notes-{number}",
-                        self._notes_prompt(path, text[start:end], number, len(chunks), start, len(text)),
-                        NOTES_TOKENS,
-                    )
-                )
-                self._current["done"] = number
-            await self.wait_until_quiet()
-            summary = await self._generate(
-                path, "merge", self._summary_prompt(path, None, notes=notes, sampled=sampled), SUMMARY_TOKENS
-            )
-        if sampled:
-            summary += f"\n（基于对全文 {len(chunks)} 个均匀采样片段的阅读，未逐字读完）"
+        summary = await generate_internal_text(
+            self.runner,
+            job_type=InternalJobType.MEMORY_SUMMARY,
+            label="memory-summary",
+            prompt=self._prompt(path, head, truncated=truncated, total_bytes=len(text.encode("utf-8"))),
+            token_budget=SUMMARY_TOKENS,
+        )
+        if truncated:
+            summary += f"\n（只根据文件开头 {HEAD_BYTES // 1000}KB 生成，后面的内容未读）"
         stored = await asyncio.to_thread(
             self.index.store_summary,
             path,
             sha256=sha256,
             summary=summary,
-            sampled=sampled,
+            sampled=truncated,
             origin="auto",
         )
         self.telemetry.emit(
             "runtime",
             "memory_summary.generated",
-            {
-                "chunks": len(chunks),
-                "sampled": sampled,
-                "chars": len(text),
-                "seconds": round(time.monotonic() - started, 1),
-            },
+            {"truncated": truncated, "chars": len(head), "seconds": round(time.monotonic() - started, 1)},
         )
         return stored
 
-    # --- prompts and generation --------------------------------------------------------------
-
-    def _render(self, user: str) -> str:
+    def _prompt(self, path: str, head: str, *, truncated: bool, total_bytes: int) -> str:
+        task = (
+            f"下面是这个记忆文件开头的 {HEAD_BYTES // 1000}KB（全文 {total_bytes} 字节），"
+            "按模板写总结，并说明只看了开头。"
+            if truncated
+            else "阅读下面这个记忆文件的全文，按模板写总结。"
+        )
         return self.tokenizer.apply_chat_template(
-            [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": user}],
+            [
+                {"role": "system", "content": _SYSTEM},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"file": path, "task": task, "template": SUMMARY_TEMPLATE, "content": head},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
         )
-
-    def _notes_prompt(
-        self, path: str, chunk: str, number: int, total: int, start: int, length: int
-    ) -> str:
-        return self._render(
-            json.dumps(
-                {
-                    "task": (
-                        f"这是记忆文件 {path} 的第 {number}/{total} 段（字符 {start}-"
-                        f"{start + len(chunk)}，全文 {length} 字符）。提取这一段里与任务、"
-                        "步骤、结论、报错、踩坑和可复用经验有关的要点，用简短的条目列出。"
-                    ),
-                    "content": chunk,
-                },
-                ensure_ascii=False,
-            )
-        )
-
-    def _summary_prompt(
-        self, path: str, text: str | None, *, notes: list[str] | None, sampled: bool = False
-    ) -> str:
-        if notes is None:
-            source = {"content": text}
-            task = "阅读下面这个记忆文件的全文，按模板写总结。"
-        else:
-            source = {"notes_in_file_order": notes}
-            task = (
-                "下面是从这个记忆文件各段提取的要点（按文件顺序"
-                + ("，只覆盖均匀采样的片段" if sampled else "")
-                + "），合并成一份按模板写的总结，去掉重复。"
-            )
-        return self._render(
-            json.dumps(
-                {"file": path, "task": task, "template": SUMMARY_TEMPLATE, **source},
-                ensure_ascii=False,
-            )
-        )
-
-    async def _generate(self, path: str, stage: str, prompt: str, tokens: int) -> str:
-        job_id = "qwen-exo-memory-summary-" + stable_digest(path, stage, time.time_ns())[:24]
-        job = InternalJob(
-            parent_request_id="memory-summary",
-            turn_id=f"memory-summary:{stage}",
-            job_id=job_id,
-            job_type=InternalJobType.MEMORY_SUMMARY,
-            priority=-30,
-            shared_prefix_key="qwen-exo:v1:memory-summary",
-            token_budget=tokens,
-            state_budget_bytes=0,
-            deadline_monotonic=time.monotonic() + _JOB_TIMEOUT_SECONDS,
-            cancellation_token=CancellationToken(f"cancel-{job_id}"),
-            telemetry_correlation_id="memory-summary",
-            max_fanout=1,
-        )
-        (result,) = await self.runner.run_batch(
-            (job,),
-            (prompt,),
-            {"temperature": 0.0, "top_p": 1.0, "top_k": 1, "skip_special_tokens": True},
-        )
-        text = str(result.text or "").strip()
-        closing = text.lower().rfind("</think>")
-        if closing >= 0:
-            text = text[closing + len("</think>") :].strip()
-        if not text:
-            raise FileKnowledgeError(f"empty {stage} output")
-        return text
 
 
 def summary_virtual_path(path: str) -> str:
@@ -297,9 +262,10 @@ def summary_virtual_path(path: str) -> str:
 
 
 __all__ = [
-    "MAX_CHUNKS",
+    "HEAD_BYTES",
     "MIN_SUMMARY_BYTES",
     "MemorySummaryService",
-    "plan_chunks",
+    "generate_internal_text",
+    "head_text",
     "summary_virtual_path",
 ]

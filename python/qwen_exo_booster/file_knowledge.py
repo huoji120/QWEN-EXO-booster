@@ -338,6 +338,10 @@ class FileKnowledgeIndex:
             raise InvalidPathError("path points into the index state directory")
         return normalized, candidate
 
+    def path_of(self, relative_path: str) -> Path:
+        """Filesystem path of a validated relative path (may not exist)."""
+        return self._safe_path(relative_path)[1]
+
     @staticmethod
     def _line_count(data: bytes) -> int:
         if not data:

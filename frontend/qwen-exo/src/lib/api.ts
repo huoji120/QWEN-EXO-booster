@@ -9,6 +9,8 @@ import type {
   HealthStatus,
   ModelCatalog,
   DocumentCategory,
+  DreamRunDetail,
+  DreamStatus,
   KnowledgeDraft,
   KnowledgeFile,
   KnowledgeMoveResult,
@@ -36,6 +38,7 @@ import type {
   TrainingSelectionStatus,
   ServerSessionDeletion,
   ServerSessionListing,
+  WorkTrashEntry,
 } from "@/lib/types";
 import { translate as t } from "@/lib/i18n";
 
@@ -554,6 +557,41 @@ export async function searchKnowledge(options: {
   return (await (
     await apiFetch(`/knowledge/search?${params}`)
   ).json()) as KnowledgeSearchResponse;
+}
+
+export async function getDreamStatus(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/memory/dream", { signal })
+  ).json()) as DreamStatus;
+}
+
+/** Start a manual dream run; 409 when one is running or dream is off. */
+export async function runDream() {
+  return (await (
+    await apiFetch("/memory/dream/run", { method: "POST" })
+  ).json()) as DreamStatus;
+}
+
+export async function getDreamRun(id: number, signal?: AbortSignal) {
+  return (await (
+    await apiFetch(`/memory/dream/runs/${encodeURIComponent(String(id))}`, { signal })
+  ).json()) as DreamRunDetail;
+}
+
+export async function getWorkTrash(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/memory/work-trash", { signal })
+  ).json()) as { entries: WorkTrashEntry[] };
+}
+
+/** Restore one deleted work note; 400 when the original path exists again. */
+export async function restoreWorkTrash(batch: string, path: string) {
+  return (await (
+    await apiFetch("/memory/work-trash/restore", {
+      method: "POST",
+      body: JSON.stringify({ batch, path }),
+    })
+  ).json()) as { restored: string };
 }
 
 export async function readKnowledge(path: string, offset = 0, limit = 262_144) {
