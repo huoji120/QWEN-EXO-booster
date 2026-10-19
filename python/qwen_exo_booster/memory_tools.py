@@ -21,6 +21,7 @@ from qwen_exo_booster.file_knowledge import (
     FileKnowledgeError,
     FileKnowledgeIndex,
 )
+from qwen_exo_booster.memory_grep import MATCH_COUNT_CAP, SEARCH_SECONDS
 
 MEMORY_SEARCH_TOOL = "qwen_exo_memory_search"
 MEMORY_READ_TOOL = "qwen_exo_memory_read"
@@ -34,6 +35,7 @@ MEMORY_SERVER_LABEL = "qwen_exo"
 # Hard cap on what one tool result may add to the prompt.
 MAX_TOOL_OUTPUT_CHARS = 24_000
 MAX_TOOL_RESULTS = 500
+TOOL_TIMEOUT_SECONDS = 30.0
 
 _SEARCH_DESCRIPTION = (
     "Search your long-term memory like grep. Results are grouped by file, "
@@ -321,7 +323,8 @@ _MAX_FILES_MODE = 300
 
 def _file_label(entry: Mapping[str, Any]) -> str:
     title = f" {entry['title']}" if entry.get("title") else ""
-    return f"{entry['path']} [{entry['kind']}]{title} ({entry['match_count']} match(es))"
+    count = f"{entry['match_count']}+" if entry.get("capped") else str(entry["match_count"])
+    return f"{entry['path']} [{entry['kind']}]{title} ({count} match(es))"
 
 
 def _hit_lines(hit: Mapping[str, Any]) -> str:
@@ -346,7 +349,18 @@ def _hit_lines(hit: Mapping[str, Any]) -> str:
 
 
 def _search_header(result: Mapping[str, Any]) -> str:
-    header = f"{result['total_matches']} match(es) in {result['file_count']} file(s)"
+    plus = "+" if result.get("capped") or result.get("stopped") else ""
+    files_plus = "+" if result.get("stopped") else ""
+    header = f"{result['total_matches']}{plus} match(es) in {result['file_count']}{files_plus} file(s)"
+    if result.get("stopped"):
+        header = (
+            f"Search stopped after {SEARCH_SECONDS:g} s because the pattern matches far "
+            "too broadly; the results below are partial. Use 2-4 distinctive words "
+            "(names, error text, identifiers), not common words or single letters.\n"
+            + header
+        )
+    elif result.get("capped"):
+        header += f" (counts marked + stopped at {MATCH_COUNT_CAP} per file)"
     if result["hidden_boilerplate"]:
         header += (
             f"; {result['hidden_boilerplate']} boilerplate match(es) repeated across "
@@ -357,6 +371,12 @@ def _search_header(result: Mapping[str, Any]) -> str:
 
 def _format_search(pattern: str, result: Mapping[str, Any]) -> str:
     files = result["files"]
+    if not files and result.get("stopped"):
+        return (
+            f"Search stopped after {SEARCH_SECONDS:g} s before finding `{pattern}`; this "
+            "does not mean memory has nothing on it. The pattern is too broad or slow: "
+            "retry once with 2-4 distinctive words (names, error text, identifiers)."
+        )
     if not files:
         hidden = (
             f" ({result['hidden_boilerplate']} boilerplate match(es) hidden; "
@@ -616,7 +636,19 @@ class MemoryToolExecutor:
             return False, f"Error: memory storage unavailable ({type(exc).__name__})"
 
     async def run(self, name: str, arguments: Any) -> tuple[bool, str]:
-        return await asyncio.to_thread(self.run_sync, name, arguments)
+        # A stuck call must not stall the model's turn (the stream sends
+        # nothing while it waits, and the client eventually gives up).
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self.run_sync, name, arguments),
+                timeout=TOOL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return False, (
+                f"Error: {name} did not finish within {TOOL_TIMEOUT_SECONDS:g} s. "
+                "Continue the task without it; if you search again, use a few "
+                "distinctive words."
+            )
 
 
 __all__ = [

@@ -165,3 +165,52 @@ def test_text_repeated_inside_one_file_takes_one_hit_slot(index):
     result = index.grep("fingerprint", per_file=3)
     assert result["total_matches"] == 8
     assert [hit["repeats"] for hit in result["hits"]] == [4, 4]
+
+
+def test_broad_or_wildcard_searches_on_huge_lines_finish_quickly(index):
+    """Prod: on a multi-megabyte single-line JSON, `a` (millions of matches) and
+    `error*xyz` (unbounded `.*?` whose tail never matches: quadratic) ran for
+    minutes; the model's turn sent nothing until the client gave up."""
+    import time
+
+    from qwen_exo_booster.memory_grep import MATCH_COUNT_CAP
+
+    blob = json.dumps({"log": "error at step a. " * 200_000})
+    _write(index, "huge.json", blob + "\n")
+    _write(index, "note.md", "error near the end: xyz\n")
+    started = time.monotonic()
+    missing_tail = index.grep("error*qqzzk")
+    common = index.grep("a")
+    assert time.monotonic() - started < 8
+    assert missing_tail["files"] == []
+    huge = next(entry for entry in common["files"] if entry["path"] == "huge.json")
+    assert huge["capped"] and huge["match_count"] == MATCH_COUNT_CAP
+    ok, text = MemoryToolExecutor(index).run_sync("qwen_exo_memory_search", {"pattern": "a"})
+    assert ok and f"{MATCH_COUNT_CAP}+ match(es)" in text
+    # The bounded wildcard still joins nearby words.
+    assert _paths(index.grep("error*xyz")) == ["note.md"]
+
+
+def test_search_returns_partial_results_when_the_time_budget_runs_out(index, monkeypatch):
+    from qwen_exo_booster import memory_grep
+
+    _write(index, "a.md", "alpha\n")
+    _write(index, "b.md", "alpha\n")
+    monkeypatch.setattr(memory_grep, "SEARCH_SECONDS", 0.0)
+    result = index.grep("alpha")
+    assert result["stopped"] is True
+    ok, text = MemoryToolExecutor(index).run_sync("qwen_exo_memory_search", {"pattern": "alpha"})
+    assert ok and "Search stopped" in text and "does not mean memory has nothing" in text
+
+
+def test_a_stuck_memory_tool_call_returns_an_error_instead_of_stalling(index, monkeypatch):
+    import asyncio
+    import time
+
+    from qwen_exo_booster import memory_tools
+
+    tools = MemoryToolExecutor(index)
+    monkeypatch.setattr(memory_tools, "TOOL_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(tools, "run_sync", lambda name, arguments: time.sleep(2) or (True, "late"))
+    ok, text = asyncio.run(tools.run("qwen_exo_memory_search", {"pattern": "x"}))
+    assert not ok and "did not finish" in text

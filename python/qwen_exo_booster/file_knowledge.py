@@ -816,13 +816,15 @@ class FileKnowledgeIndex:
         if path is not None:
             self._validate_glob(path)
         try:
-            query = memory_grep.parse_query(pattern, regex=bool(regex), exclude=exclude or "")
+            query = memory_grep.parse_query(pattern, is_regex=bool(regex), exclude=exclude or "")
         except ValueError as exc:
             raise RegexConstraintError(str(exc)) from exc
+        deadline = time.monotonic() + memory_grep.SEARCH_SECONDS
         self.refresh()
         boilerplate = self.boilerplate_hashes()
         files: list[dict[str, Any]] = []
         hidden = 0
+        stopped = False
         for entry, raw_lines in self._search_documents(path):
             scan = memory_grep.scan_lines(
                 entry["path"],
@@ -832,10 +834,21 @@ class FileKnowledgeIndex:
                 include_boilerplate=bool(include_boilerplate),
                 context=context,
                 per_file=per_file if mode == "content" else 0,
+                deadline=deadline,
             )
             hidden += scan.hidden_boilerplate
             if scan.match_count:
-                files.append({**entry, "match_count": scan.match_count, "candidates": scan.candidates})
+                files.append(
+                    {
+                        **entry,
+                        "match_count": scan.match_count,
+                        "capped": scan.capped,
+                        "candidates": scan.candidates,
+                    }
+                )
+            if scan.stopped:
+                stopped = True
+                break
         files.sort(key=memory_grep.rank_key)
         shown = {entry["path"]: 0 for entry in files}
         budget = max_results if mode == "content" else 0
@@ -865,6 +878,7 @@ class FileKnowledgeIndex:
                     "kind": entry["kind"],
                     "title": entry["title"],
                     "match_count": entry["match_count"],
+                    "capped": entry["capped"],
                     "shown": shown[entry["path"]],
                 }
                 for entry in files
@@ -873,6 +887,9 @@ class FileKnowledgeIndex:
             "hidden_boilerplate": hidden,
             "per_file": per_file,
             "truncated": sum(shown.values()) < total,
+            # The time budget ran out: later files were not searched.
+            "stopped": stopped,
+            "capped": any(entry["capped"] for entry in files),
         }
 
     def _summary_lines(self, relative: str) -> list[bytes] | None:
