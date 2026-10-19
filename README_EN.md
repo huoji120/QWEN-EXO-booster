@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="QWEN-EXO" width="76">
   <h1>QWEN-EXO booster</h1>
   <p><strong>Make Qwen actually remember knowledge, reflect on mistakes, and run fast on long tasks.</strong></p>
-  <p>Model-native knowledge · Reflection Memory · Semantic gating · Full observability</p>
+  <p>Server-side memory tools · Reflection Memory · Work memory · Full observability</p>
   <p>
     <img src="https://img.shields.io/badge/license-Apache--2.0-2ee6ff?style=flat-square" alt="License">
     <img src="https://img.shields.io/badge/models-Qwen3.5--3.8%20·%20MoE-8b7cff?style=flat-square" alt="Models">
@@ -16,45 +16,53 @@
 
 <br>
 
-QWEN-EXO is a hybrid-attention inference backend for Qwen. Knowledge is wired into model attention instead of stuffed into the prompt. Lessons are distilled by the server after each success or failure instead of written by hand. Every recall, review, and injection is inspectable.
+QWEN-EXO is a hybrid-attention inference backend for Qwen. Memory stays as files on the server and is fetched on demand by server-executed tools instead of shipping matched documents back into the prompt. Lessons are distilled by the server after each success or failure and written back by the model itself. Every search, read, write, and admission decision is traceable.
 
 > Runs on macOS and Linux (use WSL on Windows). Supports Qwen3.5 through Qwen3.8, compatible derivative checkpoints, and MoE models. Qwen3.8-27B is recommended.
 
 ## Why not RAG
 
-Classic RAG pastes whatever it hits back into the prompt—the bigger the store, the dirtier the context. QWEN-EXO is not another vector database strapped onto the prompt; it wires knowledge, identity, reflection, and inference control into Qwen's native forward path.
+Classic RAG pastes whatever it hits back into the prompt: the more hits and the more turns, the more text you re-ship every time. QWEN-EXO keeps the raw files in a server-side knowledge base and lets the model grep them on demand, so only the passages the model itself chose to read enter the context.
 
 | | Classic RAG | QWEN-EXO |
 |---|---|---|
-| Knowledge form | Matched documents pasted into the prompt | Compiled into model-native K/V + GDN state |
-| Retrieval | External embedding similarity | The model's own Attention-Q × Tensor-Bank-K |
-| Admission | Inject whatever is similar | A semantic Judge reviews each candidate, rejects with reasons |
-| Experience | None, or hand-written prompts | Distilled automatically from real trajectories, hot-updated |
-| Observability | Black box | Telemetry evidence for every recall / rejection / injection |
+| Knowledge form | Matched documents pasted into the prompt | Files stay on the server; the model searches and reads them |
+| Retrieval | External embedding similarity, inject on hit | Server-side BM25 excerpts plus the model re-searching with its own terms |
+| Admission | Similar enough means injected | The model decides whether to read the full text; writing to long-term memory must pass a binary semantic review |
+| Context cost | Top-k full documents re-shipped every turn | At most three ~200-character excerpts per turn; everything else via tools |
+| Experience | None, or hand-written prompts | Distilled from real trajectories, written by the model, tidied nightly |
+| Observability | Black box | Telemetry evidence for every search / read / write / admission, replayable in the console |
 
 Every capability has its own boundary: individually toggleable, auditable, and traceable.
 
-## The knowledge path of one request
+## The memory path of one request
 
 ```mermaid
 flowchart LR
-    A["Live request<br/>Attention-Q extracted"] --> B["Q × K retrieval<br/>role windows · relative scores · doc margin"]
-    B --> C["Semantic Judge<br/>per-candidate verdict"]
-    C -->|admit| D["Native state restored<br/>Full-Attention K/V + GDN"]
-    C -->|reject with reason| E["Telemetry evidence<br/>replayable in console"]
+    A["Every turn opens with<br/>a server memory block<br/>up to 3 BM25 excerpts"] --> B["The model decides<br/>qwen_exo_memory_search / read"]
+    B --> C["Executed by the server<br/>grep-style search · per-file caps · time-bounded"]
+    C --> D["Result returns to the model<br/>inside the same turn; the client is not involved"]
+    D --> E["After the task<br/>segmented reflection · binary admission<br/>published as memory files"]
+    E --> F["Nightly tidy-up<br/>merge duplicates · fix conflicts · deletions go to trash"]
 ```
 
-QK only nominates; the semantic Judge decides. Candidates with low scores, weak margins, wrong task scope, or a negative verdict are rejected—with the reason and telemetry evidence preserved.
+Each turn opens with a server-side memory block stating that these recollections come from the user's knowledge base and past sessions, are unrelated to the current session, and that any files, paths, keys, or commands inside them must not be looked for or used in the current agent's environment. With hits it lists up to three excerpts of about 200 characters (never repeated within a conversation); without hits it prompts the model to search. Whether to search, what to search for, and how far to read is the model's own decision; the server only executes and accounts for it.
 
-Semantic review uses two fixed options: `A=pass`, `B=reject`. Each candidate requires one prefill, reading both token logprobs at the same answer position. Admission requires `log P(A) > log P(B)` (equivalent to a pass score above 0.5 after a two-option softmax); ties reject. There is no third semantic option, generated review text/JSON, or autoregressive Judge fallback. Scoring failures or misaligned results admit nothing, are not cached, and retain an execution-failure marker. Candidates are reviewed independently; existing Q×K ranking, scope checks, and injection budgets remain in force. This removes review-answer decoding, not prefill, and the scores are not calibrated correctness probabilities. Reflection text and compaction summaries keep their existing generation paths.
+Long-term admission uses two fixed options: `A=pass`, `B=reject`. Each candidate requires one prefill, reading both token logprobs at the same answer position. Admission requires `log P(A) > log P(B)` (equivalent to a pass score above 0.5 after a two-option softmax); ties reject. There is no third semantic option, generated review text/JSON, or autoregressive Judge fallback. Scoring failures or misaligned results write nothing, are not cached, and retain an execution-failure marker. Candidates are reviewed independently; this removes review-answer decoding, not prefill, and the scores are not calibrated correctness probabilities. Reflection text and compaction summaries keep their existing generation paths.
+
+### Retired: Q×K attention retrieval and the retrieval-side gate
+
+Earlier versions compiled documents into native K/V plus a Tensor Bank, retrieved them with the model's own Attention-Q × Bank-K, and passed each candidate to a semantic Judge. Commit `896957c1b2` removed that stack end to end: Tensor Bank, query probe, PMI gate, reference judge, Self-Ask refresh, causal replay, the memory pipeline and its job types, CLI flags, managed settings, and launcher flags (−15,698 lines in one commit).
+
+The reason was live measurement, not theory: on real agentic traffic the path recalled nothing for an entire hour (every refresh returned `no_eligible_reference`) while burning 5-35 seconds of GPU per event, because a long tool-call context makes every rule card look lexically relevant and the judge rejects them all. What remains is session-initial GDN, reflection distillation with binary admission (now used for writing to long-term memory), per-turn BM25 excerpt hints, and the server-side memory tools. Files such as `document_ingest.py` and `knowledge.py` are still in the tree but are no longer reachable from any request path (`retrieval_mode` is always `file`); they are leftovers pending cleanup, so do not read current behaviour from them.
 
 ## Core capabilities
 
-### Model-native knowledge: Markdown is long-term knowledge
+### Server-side knowledge base: files are long-term memory
 
-Write technical docs, project rules, API references, or team experience as Markdown; the knowledge base is built at startup. QWEN-EXO never pastes the whole store into every request: it queries with model-native Attention-Q × Tensor-Bank-K, filters candidates with role windows, relative scores, and document margins, then hands them to a semantic Judge. Only genuinely relevant, well-evidenced content is injected—**a bigger knowledge base does not mean a dirtier context**.
+Write technical docs, project rules, API references, or team experience as Markdown and upload them: they stay in the knowledge directory as plain files, while SQLite keeps only file identity, titles, boilerplate detection, and per-file summaries. Nothing needs to be compiled into a bank. Each turn opens with up to three BM25 excerpt hints (words, code identifiers plus their camelCase/snake_case parts, and CJK character bigrams, so Chinese needs no segmenter); the model then decides whether to call `qwen_exo_memory_search` with different terms or `qwen_exo_memory_read` for full context - **a bigger knowledge base does not mean more text injected every turn**.
 
-![Model-native knowledge injection](images/1.png)
+![Knowledge base](images/1.png)
 
 ### Reflection Memory: every failure becomes the next run's head start
 
@@ -64,11 +72,17 @@ Final admission reuses the internal binary semantic-scoring path: read logprobs 
 
 Successfully analyzed segments can be reused, while failed or uncovered portions can be retried. Lessons retain entry-level versions. Replacing or retiring an old entry requires binary model approval of the complete old entry together with the proposed change. Review policy and model identity participate in result-reuse keys, so old-policy cached verdicts cannot masquerade as new binary reviews. **Analysis completion, task success, and long-term-memory admission are three different states.**
 
-Global initial GDN includes admitted `active` reflections, not only `verified` ones; candidates and retired entries are excluded. Its input and consolidated reflection preserve evidence grades, applicability, missing evidence, and conditional wording. Whole entries are packed within the budget without promoting supported experience to established causation. Existing active memories retain their original admission provenance; no new binary-review records are fabricated for them.
+Admitted `active` reflections still feed the session-initial GDN, packed as complete entries within budget and each labelled "admission means the lesson is usable, not that its causality was proven"; candidates and retired entries are excluded. Its input and consolidated reflection preserve evidence grades, applicability, missing evidence, and conditional wording, without promoting supporting experience into confirmed causality. Existing active memory keeps its original admission source rather than fabricating a new binary review.
 
-Only published Knowledge documents join ordinary Knowledge recall. Records without a `document_path` remain unindexed; eligibility does not mean publication or actual recall. Different questions may pass semantic review through the same underlying problem or applicable mechanism without repeating the original task wording. Topic overlap alone is insufficient, and selection is not guaranteed. Applying a lesson still requires checking current conditions, its scope, and unresolved evidence gaps.
+Published reflections no longer build a vector store or native state: they are written into the knowledge base as plain text files with front matter (`reflection-memory` and `outcome-*` tags), so the model finds them with the same `qwen_exo_memory_search`; similar earlier lessons are now matched lexically instead of being nominated by Q×K. Eligibility still does not mean the model actually read anything: only entries it searched and read enter the context.
 
 ![Reflection Memory](images/2.png)
+
+### Work memory and the nightly dream: the model writes, corrects, and tidies
+
+Beyond what people upload, the model can write its own daily work memory (`work-memory/`) with `qwen_exo_memory_write`, saving root causes, fixes that worked, conventions, traps, and environment facts as Markdown notes. That area is the only place it may write: 16 KiB per note, 256 KiB in total, rate-limited over a sliding window (at most 30 writes per 10 minutes), and anything that looks like a key, token, password, or private key is refused before it touches disk. When a note it wrote earlier turns out wrong or stale, the model can `edit` / `replace` / `delete` it directly instead of piling contradictory notes on top; deletions go to a trash folder and can be restored. Everything outside `work-memory/` is read-only for the model, so imported memory is never rewritten by it.
+
+At local midnight (or on demand from the console or `POST /qwen-exo/memory/dream/run`) the served model runs as an agent over its work memory: it lists today's and older notes separately, searches and reads them, then merges duplicates, resolves conflicts, rewrites, moves, creates, or deletes notes and folders - one JSON action per turn - until it declares itself done. Deletions go to trash, secrets are refused as always, and every action lands in the run log (`GET /qwen-exo/memory/dream/runs/{run_id}`). This is maintenance work on its own lane and does not compete with foreground requests.
 
 ### Identity, policy, and knowledge in separate lanes
 
@@ -76,27 +90,28 @@ Identity should not dissolve into task history. QWEN-EXO splits personality, Pol
 
 | Lane | Contents | Delivery |
 |---|---|---|
-| Factual knowledge | Markdown compiled into the bank, recalled on demand | native K/V + GDN state |
-| Reflection lessons | Distilled after task outcomes, hot-written back | native K/V + GDN state |
-| Execution policy (PolicyData) | Versioned team rules and tool discipline | text instructions |
-| Identity (Cognition) | Stable identity layer, isolated from task history | text instructions |
-| Session-initial GDN | Global snapshot built at startup, pinned COW per session | GDN recurrent state |
+| Factual knowledge / reflection / work memory | Plain files, with BM25 excerpt hints each turn | The model fetches bodies via `qwen_exo_memory_search` / `read` |
+| Execution policy (PolicyData) | Versioned team rules and tool discipline | Text instructions, injected in full (no truncation; live switch and hot reload) |
+| Identity (Cognition) | Stable identity layer, isolated from task history | Text instructions, injected in full |
+| Session-initial GDN | Global snapshot built at startup (includes admitted reflections), pinned COW per session | GDN recurrent state |
+
+Personality and Cognition are no longer cut at `qwen_exo_max_policy_tokens` (4096) - a 13k-token persona used to lose its last two thirds. The setting is removed (persisted values drop the legacy key on the next boot), injection can be switched live from the persona or settings page (`PUT /qwen-exo/policydata-injection`), and edits made directly on disk are picked up on the next request.
 
 ### Not prompt stuffing: context stays available
 
-Classic RAG pays for every hit by pasting the document back into the prompt. QWEN-EXO's model-native K/V, GDN/DeltaNet state, and text instructions work in layers: memory that can be expressed as native state is not copied into natural language, and text carries only what must be explicitly readable. This is not an "infinite context" claim—it keeps the finite context for the current task, the latest tool results, and the evidence the model actually needs to read.
+Classic RAG pays for every hit by pasting the document back into the prompt: the larger the top-k and the more turns, the more text you re-ship. QWEN-EXO keeps memory files on the server and puts only "where the answer might be" into context as short hints, with bodies fetched by the model on demand; opening memory that can live in GDN recurrent state is not copied into natural language, and text instructions carry only what must be explicitly readable. This is not an "infinite context" claim - it keeps the finite window for the current task, the newest tool results, and the evidence the model genuinely needs to read.
 
-Knowledge text delivery uses `<memory>` framing with an advisory warning and escaped content/source IDs; framing counts toward the total token budget. Explicit `document_group` identifies a generic logical source. Q/K ranks groups and returns representative fragments; Judge receives group ID, fragment path, digest, and member count. Among admitted explicit groups, only the highest Q/K-scoring group is retained; ungrouped documents retain existing behavior. Group identity is provenance, not proof of task identity or applicability.
+The block is appended to the current turn's prompt and never returned or stored for the client: the next turn re-prefills only from the state checkpoint before where the block sat (measured: 1024 of about 1450 prompt tokens still cached). It is wrapped in `<server_side_qwen_exo_memory_block>` with escaped content, states plainly that the inference server appended it - not the user, not the model - warns that its contents may be wrong, stale, or contradictory, and forbids looking for or using its files, paths, keys, or commands in the current agent's environment. Excerpts and framing count toward the total token budget, and hints already shown in a conversation are remembered so later blocks bring new ones. The same direction may be searched at most twice (once, then once more with different words or another language); after that the model must treat memory as silent on the topic instead of burning the turn on rephrasings, and must not report "nothing in memory" as an answer. This stop rule is written into every block.
 
-### Attention Bias: bounded and audited, not blind amplification
+### Attention Bias: bounded and audited (off by default)
 
-Score Bias can surface relevant system rules, tool traces, and history to the attention path, but it is not a permanent memory amplifier. QWEN-EXO supports shadow observation, relevance thresholds, maximum weights, task scope, and fallback policies: watch what the model would pick first, then decide whether to enable bias. Every candidate, weight, rejection, and actual pick is checkable via telemetry.
+Score Bias can surface relevant system rules, tool traces, and history to the attention path, but it is not a permanent memory amplifier and it ships disabled (`score_bias=False`, `score_bias_mode="off"`). It supports shadow observation, relevance thresholds, a maximum weight (default `score_bias_max=0.05`), block caps, an age window, and tail protection: watch what the model selects first, then decide whether to enable bias. Every candidate, weight, rejection, and actual selection is inspectable in telemetry. It is independent of the memory path: memory goes through server tools, Score Bias only reweights attention inside the current prompt.
 
 ### Think truncation, tool boundaries, and incomplete-response recovery
 
 Long reasoning and multi-round tool calls break at boundaries: truncations, half tool calls, leaked reasoning. QWEN-EXO keeps reasoning, tool calls, tool outputs, and final answers strictly separate, and provides a controlled recovery path for incomplete responses. Even when the model stops at a budget boundary, a half-finished internal thought is never passed off as the final answer.
 
-Responses enforces the reasoning budget independently of Observer, Adaptive Refresh and external-memory retrieval. The cap applies to target-generated reasoning tokens, including when EAGLE/MTP remains enabled. Explicit THINK opt-out bypasses the two-phase path only when forced automatic mode is off; a cutoff continues the answer within the remaining total output budget, with exhaustion still reported as `incomplete`. Self-Ask cutoff-question injection retains its original Observer/refresh-context gate, so an independent cap does not launch extra internal generation. `reasoning.budget_forced.observed_tokens` records the actual cutoff; API `reasoning_tokens` also counts synthetic boundary/cutoff-control text and is not identical to the generated-token cap.
+Responses enforces the reasoning budget independently of Observer and the external memory tools. The cap applies to target-generated reasoning tokens, including when EAGLE/MTP remain enabled. Without forced auto-budget and with THINK explicitly off, the two-stage path is not entered; after truncation the answer continues on the remaining output budget, and exhausting the total still marks the response `incomplete`. Mid-think divergent self-question injection still requires the Observer to confirm a reasoning trap through sustained surprisal drift, plus `think_context_enabled`; it no longer runs a Q/K retrieval plus semantic-gate round, instead issuing one teacher-forced generation of a few deliberately divergent questions injected at the reasoning boundary, with no extra retrieval round. `reasoning.budget_forced.observed_tokens` is the actual truncation position; the API's `reasoning_tokens` also counts synthetic boundary/truncation control text and should not be equated with that generation limit.
 
 When forced automatic budgeting is disabled, managed `default_enable_thinking` controls thinking for unspecified requests, with explicit request settings taking precedence. `default_preserve_thinking` controls historical assistant reasoning in the template. Preservation cannot restore THINK omitted by the client: historical reasoning must still be supplied.
 
@@ -118,7 +133,7 @@ Automatic budgets are separate from template effort: every JEV-selected request 
 
 For compatibility with the installed OpenAI SSE event models, response metadata serializes `min` as `minimal`, `xhigh/max` as `high`, and `none` as null. This serialization does not change the actual budget. A server-inserted default effort is not treated as an explicit client choice and therefore does not block dynamic selection.
 
-Responses effort selection and memory Judge are now separate: effort passes only the latest genuine user message as raw text to the internal JEV, with no canonical JSON/serialization wrapper and no old task, assistant reasoning, or tool results. Main generation still receives the complete effective history. When enabled, memory admission retains its full-context Judge; effort selection no longer shares that long history prefix. With Knowledge disabled, no full-workflow decision snapshot is built for effort selection.
+Responses effort selection is fully separate from the memory path: selection passes only the latest genuine user message as raw text to the internal JEV (`/v1/systemone`), with no canonical JSON or serialization wrapper, and it never reads old tasks, assistant reasoning, or tool results. The main model still receives the full effective history, and the two no longer need to share one long history prefix. When the knowledge base is off, no full workflow snapshot is built just for selection.
 
 With default `qwen_exo_reasoning_session_once=true`, a new user task is evaluated once and subsequent tool continuations reuse its tier. Resending full history does not make old user messages new; an additional occurrence of identical user text is a new task. Explicitly disabling this setting reevaluates each turn, still using only the latest user message. New sessions, cache eviction, and restart require selection again. Missing recoverable user tasks fail explicitly rather than being invented from tool output.
 
@@ -137,9 +152,11 @@ After consuming the request body, `/v1/systemone` watches for client disconnects
 
 ### Observability: no black-box magic
 
-Which queries ran, which K matched, which candidates the Judge rejected, whether native state was used, whether thinking was truncated—everything is visible in the console and telemetry. Performance gains are measurable, wrong recalls are locatable, reflection memory is reversible—**an unverified "the model seems to remember" is never treated as fact**.
+Which memory tool calls a request made (arguments, status, duration, full output), which excerpts were offered as hints, each reflection entry's admission margin and evidence citations, whether thinking was truncated, and which blocks Score Bias actually selected - everything is visible in the console and telemetry. Speedups can be measured, wrong recalls localized, reflection memory rolled back. **"The model seems to remember" is never treated as fact without evidence.**
 
 ![Observability](images/3.png)
+
+> This screenshot shows the old recall-trace Q×K panel, retired together with the retrieval stack, and is kept only as historical reference; the page now lists memory tool calls per request with their arguments, status, duration, and output.
 
 ### Conversation attention diagnostics: develop and debug Agents
 
@@ -169,13 +186,15 @@ Endpoints: `POST /qwen-exo/attention-diagnostics/preview` and `POST /qwen-exo/at
 
 The **Server sessions** console page (`#/server-sessions`) supports conversation-ID search, pagination, single deletion, cross-page selection, and clear-all. It shows update time, event count, estimated retained payload bytes, snapshot count, and busy status. Deletion requires explicit confirmation; clear-all ignores the current search and page. Sessions with active requests or source-writing reflection work are conservatively skipped without interrupting inference.
 
-Deletion removes the conversation's retained event journal, all source snapshots, and in-memory trajectories/pending reflection sources. These records are then unavailable for diagnostic import or re-reflection. Published Reflection/Knowledge documents, personality, Tensor Bank, serving Responses state, and browser chat history remain unchanged. This is not a complete privacy purge of telemetry, analysis caches, or backups. SQLite free pages remain reusable, but files may not immediately shrink. Future client requests that resend history can create new retained records.
+Deletion removes the conversation's retained event journal, all source snapshots, and in-memory trajectories/pending reflection sources; these records are then unavailable for diagnostics or re-reflection. Published reflection files, knowledge base files, personality and Cognition, in-flight Responses state, and browser chat history are left untouched. This is not a complete privacy sweep of telemetry, analytics caches, or backups; free SQLite pages are reused later but files do not necessarily shrink immediately. A client re-sending history can create new saved records afterwards.
 
 Endpoints: `GET /qwen-exo/server-sessions?limit=25&offset=0&q=` and `POST /qwen-exo/server-sessions/delete`, accepting either `{"conversation_keys":["conversation ID"]}` or `{"all":true}` and returning deleted, skipped-busy, and missing lists. These belong to the existing control plane, not the public `/v1` gateway, and require a supporting backend version.
 
 ## Measured
 
 ### DeepSWE memory recall · GraphQL SWE: perfect score after 18 rounds
+
+> These runs date from August 2026 and used the Q×K retrieval plus semantic gate, since retired in `896957c1b2`; the sequence was never re-run on the current memory path. It is kept to show a real convergence trajectory including regressions, not as a claim that today's configuration reproduces it.
 
 | Round | F2P | P2P | partial | reward | Notes |
 |---:|---:|---:|---:|---:|---|
@@ -204,7 +223,7 @@ Accelerator model: [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen
 
 ### Honest limits
 
-Requests still have a context ceiling. QK retrieval can be wrong, which is exactly why the Judge and rejection reasons exist. Reflection memory is external memory, not parameter learning, and its value depends on trajectory quality. Experimental features (e.g. Context Integrity) are off by default and load only when `QWEN_EXO_EXPERIMENTAL_CONTEXT_INTEGRITY=1` is set at startup (or `--qwen-exo-experimental-context-integrity` is passed).
+Requests still have a context ceiling. Memory retrieval is lexical: different wording, another language, or another keyword can miss, and a lesson never appears in every turn automatically, so give the model room to search and accept that it may find nothing. Reflection memory is external memory, not parameter learning, so its quality depends on trajectory quality; binary admission only means the lesson is usable, not that its causality was proven - still check current conditions and scope before applying it. The three memory tools are provided by the QWEN-EXO server; swap in a different gateway and they are gone. Experimental features are not loaded by default and require their explicit startup environment variable (or matching flag).
 
 ## Quickstart
 
@@ -216,7 +235,7 @@ bash scripts/qwen_exo/build_image.sh
 
 See `docker/compose.yaml` (service `sglang`) for orchestration. `scripts/qwen_exo/launch_js4090.sh` is a complete two-GPU launch example; adjust the flags for your machine.
 
-Internal work inherits its parent's scheduling class. Query Probe, Judge, and Refresh required by the current request remain foreground; reflection and its children use an independent one-slot lane, while maintenance uses an independent three-slot lane. Memory organization has its own FIFO queue rather than sharing its organization lock with per-conversation reflection. Background descendants cannot promote themselves to foreground; cancellation, expiry, and completion release admission. Logical lanes do not add physical GPU capacity: KV, Mamba, and request-slot limits still apply. Foreground can preempt background, never the reverse.
+Internal work inherits its parent's scheduling class: scoring and diagnostics required by the current request stay foreground; reflection and its children use a separate single-slot lane, while maintenance such as summary generation and memory organization uses a separate three-slot lane. The nightly dream runs on its own FIFO queue and does not share the per-conversation reflection lock. Background descendants cannot promote themselves into the foreground lane; queue cancellation, timeout, and completion all release admission. Logical lanes add no GPU capacity: KV/Mamba/request-slot ceilings still apply, foreground can preempt background, and never the reverse.
 
 On single-stage, non-speculative CUDA scheduling, background prefill yields at chunk boundaries to interleave foreground prefill/decode while retaining the same chunk owner and full reflection input/output budgets. Short foreground prefills can fit between chunks; longer inputs exceeding the remaining chunk budget may still wait for the current background prefill to finish. This is not immediate switching for arbitrary prompt lengths. Set `QWEN_EXO_CHUNKED_PREFILL_SIZE=2048` to tune chunks and, for a six-request deployment, `QWEN_EXO_CUDA_GRAPH_MAX_BS=6`, keeping decode graphs `full` and prefill graphs `disabled`. Requests above captured sizes still use eager execution. Verify mixed workloads and actual decode-graph logs rather than inferring latency gains from configuration.
 
@@ -300,11 +319,11 @@ On js4090, the existing 128-shard, 320001536 × 160 per-row FP8 table passed rea
 
 Native Bank artifacts preserve KV/GDN, compressed QSA index keys/coordinates, and PLE short-conv/ngram state. Sparse selection retains complete compression groups and 64-token alignment. Verify commits only accepted QSA/PLE state; ordinary GDN and ReplaySSM share the same acceptance boundary. Session artifacts declare their components and reject missing parts. Use a separate model fingerprint and state directory; old compiled artifacts and 27B Engram readers are incompatible. This path requires TP/EP/PP/MoE-DP=1 and BF16/FP8 KV, rejecting old NVFP4 KV, dense Score Bias, unified-memory/disaggregation, and generic weight-offload combinations. HiCache, LMCache, and FlexKV host transfer does not yet preserve QSA/PLE state and is explicitly rejected rather than silently losing context; ordinary radix cache and Native Bank remain supported.
 
-Flash-Next Knowledge and Reflection Memory use the same native pipeline: document compilation, model Q×K retrieval, semantic admission, and complete hybrid-state restoration. Publishing a reflection hot-rebuilds the Bank; it does not replace native recall with ordinary prompt concatenation. The first import into an empty Bank also creates a Query Probe with the actual attention-head geometry and binds it to Self-Ask. Disabling Observer no longer disables retrieval Q capture. PolicyData, Cognition, compaction, and reflection-source management retain their existing controls; native PLE training is not a prerequisite.
+Flash-Next knowledge and reflection memory no longer use native state compilation: documents and reflections live in the knowledge base as files, are searched by the server-side memory tools, and the model decides which passages to read; only session-initial GDN still uses native recurrent state (including admitted `active` reflections). PolicyData, Cognition, session compaction, and reflection source management keep their existing control planes and switches, and native PLE training is not a prerequisite for them.
 
 With native MTP (EAGLE), EXO target-only internal requests use an isolated scheduling lane without draft prefill/verify; external requests retain native speculative decoding. Bank publication and restoration reject missing, nonfinite, or shape-incompatible KV/GDN/QSA/PLE state and duplicated, reordered, or split compression groups. CPU regressions cover full-page export through sparse-prefix restoration, ReplaySSM, first hot import, and scheduling transitions; these do not replace real-GPU end-to-end generation acceptance.
 
-Use `QWEN_EXO_REFLECTION_MEMORY_MODE=active` for reflection and `QWEN_EXO_RESPONSE_COMPACTION_MODE=active` for compaction. Mid-inference Self-Ask requires `QWEN_EXO_OBSERVER_MODE=active` and `QWEN_EXO_ENABLE_ADAPTIVE_REFRESH=1`. Keep `QWEN_EXO_SCORE_BIAS_MODE=off`: QSA does not support dense Score Bias, but this does not disable Knowledge or Reflection Memory. Existing managed settings can override launcher environment variables; inspect the effective configuration. Updating source does not change a running service.
+Use `QWEN_EXO_REFLECTION_MEMORY_MODE=active` for reflection and `QWEN_EXO_RESPONSE_COMPACTION_MODE=active` for compaction. Keep Score Bias at its default off: QSA does not yet support dense Score Bias, and that limit does not mean the knowledge base or reflection is disabled. Existing managed configuration can override startup environment variables, so verify the effective configuration; a code update never changes a running service by itself.
 
 QSA attention diagnostics reconstruct probabilities at the actual top-k logical positions, with zero mass on unselected tokens rather than a dense-softmax substitute. Uncached prefill reads original current K; prefix prefill reads cached K with its actual scale. This remains probability reconstruction, not causal attribution. CUDA end-to-end diagnostics and full-checkpoint memory generation/recall require separate acceptance on an idle GPU.
 
@@ -366,10 +385,15 @@ Then open `http://127.0.0.1:30000/qwen-exo/`.
 
 | Entry | Purpose |
 |---|---|
-| `/qwen-exo/` | Chat and runtime status |
-| `/qwen-exo/admin` | Operations |
-| `/qwen-exo/recall-trace` | Recall traces |
-| Reflection Memory | View, re-reflect, hot-update lessons |
+| `/qwen-exo/` (`#/overview`) | Overview and runtime status |
+| `#/chat` | Chat |
+| `#/trace` | Recall trace: memory tool calls per request |
+| `#/attention-diagnostic` | Conversation attention diagnostics |
+| `#/server-sessions` | Server session management and deletion |
+| `#/knowledge` | Knowledge base, personality (PolicyData/Cognition) |
+| `#/reflection` | Reflection memory and nightly dream runs |
+| `#/editor` | Trajectory tuning (experimental, must be enabled) |
+| `#/catalog` · `#/api-keys` · `#/settings` | Model catalog · API keys · managed settings |
 
 ## API
 
@@ -387,9 +411,12 @@ curl --no-buffer http://127.0.0.1:30000/v1/responses \
 ```
 
 ```bash
-curl http://127.0.0.1:30000/qwen-exo/knowledge                    # knowledge base
-curl 'http://127.0.0.1:30000/qwen-exo/recall-trace?limit=10'      # recall traces
+curl 'http://127.0.0.1:30000/qwen-exo/knowledge/tree'             # knowledge file tree
+curl 'http://127.0.0.1:30000/qwen-exo/knowledge/search?q=deploy'  # the same lexical search the model gets
+curl 'http://127.0.0.1:30000/qwen-exo/memory-tool-calls?limit=10' # recent memory tool calls
+curl 'http://127.0.0.1:30000/qwen-exo/request-traces?limit=10'    # request index
 curl 'http://127.0.0.1:30000/qwen-exo/telemetry?limit=100'        # telemetry
+curl 'http://127.0.0.1:30000/qwen-exo/memory/dream'               # nightly dream status
 ```
 
 ## Local verification
@@ -418,7 +445,7 @@ python3 scripts/qwen_exo/smoke_contracts.py
 ## Layout
 
 ```text
-python/qwen_exo_booster/             runtime, memory pipeline, Judge, Observer, API
+python/qwen_exo_booster/             runtime, memory tools and index, reflection, Observer, API
 python/sglang/                       inference engine and scheduler integration
 scripts/qwen_exo/                    build, launch, preflight, smoke, evaluation tools
 scripts/qwen_exo/corpus/knowledge/   factual and reflection knowledge sources
