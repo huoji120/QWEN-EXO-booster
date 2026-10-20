@@ -111,7 +111,7 @@ Score Bias 可以把相关的系统规约、工具轨迹和历史证据提供给
 
 长思考和多轮工具调用最容易出现截断、半个 tool call 或 reasoning 泄漏。QWEN-EXO 将 reasoning、tool call、tool output 和最终 output 分开处理，并对不完整响应提供受控恢复路径。即使模型在预算边界停止，也不会把半截内部思考直接冒充最终答案。
 
-Responses 的思考预算截断独立于 Observer 和外部记忆工具；它限制目标模型实际生成的思考 tokens，因此保留 EAGLE/MTP 也可执行预算截断。未强制自动且显式关闭 THINK 时不进入两阶段路径；截断后用剩余总输出预算继续回答，耗尽总预算仍标记 `incomplete`。Think 中途的发散自问注入仍要求 Observer 通过持续的 surprisal 漂移确认思考陷入陷阱，且 `think_context_enabled` 启用；它已不再走 Q/K 检索加语义闸门，而是单次 teacher-forced 生成几条刻意发散的短问题，在思考边界注入后让模型换角度重想，不额外启动检索轮。`reasoning.budget_forced.observed_tokens` 是实际截断位置；API `reasoning_tokens` 还会计入合成边界／截断控制文本，不应直接等同于该生成限额。
+Responses 的思考预算截断独立于 Observer 和外部记忆工具；它限制目标模型实际生成的思考 tokens，因此保留 EAGLE/MTP 也可执行预算截断。未强制自动且显式关闭 THINK 时不进入两阶段路径；截断后用剩余总输出预算继续回答，耗尽总预算仍标记 `incomplete`。思考与回答在同一个调度请求内完成，自问注入（截断自检问题、Think 中途发散自问）已整体移除。思考期间还有两项可配置的 logit 塑形：思考超过 `qwen_exo_think_suppress_after_tokens`（默认 1024）后压低 Wait / Hmm / Alternatively / 等等 等反复验证用词；思考用到预算的 `qwen_exo_think_landing_start_ratio`（默认 0.75）后逐步提高 `</think>` 的概率（软着陆），预算用完时仍由硬截断兜底。`reasoning.budget_forced.observed_tokens` 是实际截断位置；API `reasoning_tokens` 还会计入合成边界／截断控制文本，不应直接等同于该生成限额。
 
 未开启强制自动预算时，托管设置 `default_enable_thinking` 控制未显式指定时是否思考，显式请求设置优先；`default_preserve_thinking` 控制模板是否保留历史 assistant 思考。保留历史不会恢复客户端未发送的 THINK，客户端仍须提供历史推理。
 

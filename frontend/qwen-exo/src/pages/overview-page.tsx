@@ -47,7 +47,7 @@ function runtimeMode(status: RuntimeStatus | null, key: string) {
 }
 
 function observerModeSource(value: string | null) {
-  if (value === "active") return "主动干预";
+  if (value === "active") return "仅观测（旧值）";
   if (value === "shadow") return "仅观测";
   if (value === "off") return "关闭";
   return value || "读取中";

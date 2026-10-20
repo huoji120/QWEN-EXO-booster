@@ -1004,7 +1004,6 @@ class ResponsesThinkingDefaultTestCase(unittest.TestCase):
     def test_explicit_none_disables_reasoning_boundary_and_observer_mode(self):
         class FakeRuntime:
             reasoning_end_token_id = 99
-            think_context_enabled = True
 
             def reasoning_budget_for_effort(self, effort):
                 return 3072
@@ -1072,167 +1071,16 @@ class ResponsesThinkingDefaultTestCase(unittest.TestCase):
         generated_request = serving.tokenizer_manager.generate_request.call_args.args[0]
 
         self.assertNotIn("stop_token_ids", generated_request.sampling_params)
-        self.assertEqual(runtime.observed[0]["thinking_enabled"], False)
+        self.assertNotIn(
+            "qwen_exo_reasoning_budget",
+            generated_request.sampling_params.get("custom_params") or {},
+        )
         self.assertEqual(snapshots[-1].last_output["text"], "answer")
 
 
 class NativeThinkContinuationTestCase(unittest.TestCase):
-    def test_phase_two_self_ask_spill_is_partitioned_from_final_text(self):
-        spill = (
-            "\n\nSelf-question: What does the challenge say?\n"
-            "Self-answer: Padding Oracle FTW.\n"
-            "</think>\n\n"
-            "Self-question: What is the likely type?\n"
-            "Self-answer: Padding Oracle.\n"
-            "</think>\n\nFinal answer"
-        )
 
-        reasoning, normal = OpenAIServingResponses._partition_qwen_exo_self_ask_spill(
-            spill
-        )
 
-        self.assertIn("Self-question: What does the challenge say?", reasoning)
-        self.assertIn("Self-question: What is the likely type?", reasoning)
-        self.assertNotIn("</think>", reasoning)
-        self.assertEqual(normal, "\n\nFinal answer")
-
-    def test_complete_response_moves_phase_two_self_ask_into_reasoning(self):
-        serving = make_serving()
-        serving.reasoning_parser = "qwen3"
-        request = ResponsesRequest(model="x", input="inspect", store=False)
-        parser = Mock()
-        parser.parse_non_stream.return_value = (
-            "Initial reasoning.\nSelf-question: Official?\nSelf-answer: Yes.\n",
-            (
-                "\n\nSelf-question: Follow-up?\n"
-                "Self-answer: More evidence.\n</think>\n\nFinal answer"
-            ),
-        )
-
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser",
-            return_value=parser,
-        ):
-            items = serving._make_response_output_items(
-                request,
-                "ignored",
-                serving.tokenizer_manager.tokenizer,
-            )
-
-        self.assertEqual([item.type for item in items], ["reasoning", "message"])
-        reasoning = items[0].content[0].text
-        answer = items[1].content[0].text
-        self.assertIn("Self-question: Official?", reasoning)
-        self.assertIn("Self-question: Follow-up?", reasoning)
-        self.assertNotIn("</think>", reasoning)
-        self.assertEqual(answer, "\n\nFinal answer")
-
-    def test_streamed_phase_two_self_ask_stays_in_reasoning_and_complete(self):
-        class FakeReasoningParser:
-            def __init__(self, **_kwargs):
-                self.in_reasoning = True
-
-            def parse_stream_chunk(self, text):
-                if not self.in_reasoning:
-                    return None, text
-                before, boundary, after = text.partition("</think>")
-                before = before.replace("<think>", "", 1)
-                if boundary:
-                    self.in_reasoning = False
-                    return before, after
-                return before, ""
-
-        serving = make_serving()
-        serving.reasoning_parser = "qwen3"
-        serving.tokenizer_manager.tokenizer.encode.side_effect = (
-            lambda text, add_special_tokens=False: list(range(len(str(text).split())))
-        )
-        request = ResponsesRequest(
-            model="x",
-            input="inspect",
-            request_id="resp-self-ask-spill",
-            stream=True,
-            store=True,
-        )
-        metadata = RequestResponseMetadata(request_id=request.request_id)
-        prefix = (
-            "<think>Initial reasoning.\n\n"
-            "Self-question: Official?\nSelf-answer: Yes.\n</think>"
-        )
-        spill = (
-            "\n\nSelf-question: Follow-up one?\n"
-            "Self-answer: Evidence one.\n</think>\n\n"
-            "Self-question: Follow-up two?\n"
-            "Self-answer: Evidence two.\n</think>"
-        )
-        final_text = "\n\nFinal answer"
-
-        async def results():
-            yield {
-                "text": prefix,
-                "meta_info": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 8,
-                    "reasoning_tokens": 8,
-                    "qwen_exo_self_ask_boundary": True,
-                },
-            }
-            yield {
-                "text": prefix + spill + final_text,
-                "meta_info": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 30,
-                    "reasoning_tokens": 8,
-                    "finish_reason": {"type": "stop", "matched": 0},
-                },
-            }
-
-        async def collect():
-            with patch(
-                "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser",
-                FakeReasoningParser,
-            ):
-                return await collect_stream_events(
-                    serving.responses_stream_generator_non_harmony(
-                        request,
-                        {},
-                        results(),
-                        "x",
-                        serving.tokenizer_manager.tokenizer,
-                        metadata,
-                    )
-                )
-
-        payloads = event_payloads(asyncio.run(collect()))
-        reasoning_deltas = "".join(
-            payload.get("delta", "")
-            for payload in payloads
-            if payload.get("type") == "response.reasoning_text.delta"
-        )
-        answer_deltas = "".join(
-            payload.get("delta", "")
-            for payload in payloads
-            if payload.get("type") == "response.output_text.delta"
-        )
-        completed = next(
-            payload["response"]
-            for payload in payloads
-            if payload.get("type") == "response.completed"
-        )
-
-        self.assertIn("Self-question: Official?", reasoning_deltas)
-        self.assertIn("Self-question: Follow-up one?", reasoning_deltas)
-        self.assertIn("Self-question: Follow-up two?", reasoning_deltas)
-        self.assertNotIn("</think>", reasoning_deltas)
-        self.assertEqual(answer_deltas, final_text)
-        self.assertEqual(
-            [item["type"] for item in completed["output"]],
-            ["reasoning", "message"],
-        )
-        self.assertNotIn("Self-question:", completed["output"][1]["content"][0]["text"])
-        self.assertGreater(
-            completed["usage"]["output_tokens_details"]["reasoning_tokens"], 8
-        )
 
     def test_score_bias_logprobs_start_at_earliest_capture_span(self):
         prompt = list(range(1000))
@@ -1255,7 +1103,9 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
             len(prompt),
         )
 
-    def test_self_ask_is_committed_inside_think_before_final_answer(self):
+    def test_forced_boundary_continuation_observes_each_token_once(self):
+        """After the budget cutoff the answer continues in a second request;
+        cumulative chunks must reach the observer as deltas, once each."""
         class FakeTokenizer:
             @staticmethod
             def encode(text, add_special_tokens=False):
@@ -1288,7 +1138,7 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
                                 "prompt_tokens": 2,
                                 "cached_tokens": 0,
                                 "completion_tokens": 2,
-                                "finish_reason": {"type": "stop", "matched": 99},
+                                "finish_reason": {"type": "length", "length": 2},
                             },
                         }
                     else:
@@ -1316,10 +1166,9 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
 
         class FakeRuntime:
             reasoning_end_token_id = 99
-            think_context_enabled = True
 
             def reasoning_budget_for_effort(self, effort):
-                return 3072
+                return 2
 
             def __init__(self):
                 self.observed = []
@@ -1328,16 +1177,13 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
             def register_generation_prompt(self, *_args, **_kwargs):
                 pass
 
+            def think_shaping_params(self, _max_reasoning_tokens):
+                return None
+
             def observe_generation_result(self, _request_id, result, **kwargs):
                 self.observed.append((result, kwargs))
 
-            async def await_think_context(self, _request_id):
-                return SimpleNamespace(
-                    text="\n\nSelf-question: Which invariant failed?\n"
-                    "Self-answer: The wrapper omitted the final callsite.\n"
-                )
-
-            def record_reasoning_boundary(self, request_id, **kwargs):
+            def record_forced_reasoning_boundary(self, request_id, **kwargs):
                 self.boundaries.append((request_id, kwargs))
 
         serving = object.__new__(OpenAIServingResponses)
@@ -1370,16 +1216,10 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
 
         snapshots = asyncio.run(collect())
 
-        self.assertEqual(
-            serving.tokenizer_manager.requests[0].sampling_params["stop_token_ids"],
-            [99],
-        )
         self.assertEqual(serving.tokenizer_manager.requests[1].input_ids[-1], 99)
         self.assertNotIn("finish_reason", snapshots[0]["meta_info"])
-        self.assertIn("Self-question: Which invariant failed?", snapshots[1]["text"])
-        self.assertIn("Self-answer: The wrapper omitted", snapshots[1]["text"])
+        self.assertIn("stop over thinking", snapshots[1]["text"])
         self.assertTrue(snapshots[1]["text"].endswith("</think>"))
-        self.assertTrue(snapshots[1]["meta_info"]["qwen_exo_self_ask_boundary"])
         self.assertEqual(
             snapshots[-1]["text"],
             snapshots[1]["text"] + "final answer",
@@ -1392,242 +1232,6 @@ class NativeThinkContinuationTestCase(unittest.TestCase):
             runtime.observed[-1][0]["meta_info"]["output_token_logprobs"],
             [-0.2],
         )
-
-    def test_reasoning_budget_forces_boundary_without_self_ask(self):
-        class FakeTokenizer:
-            @staticmethod
-            def encode(text, add_special_tokens=False):
-                del add_special_tokens
-                return [200 + index for index, _ in enumerate(text.split())]
-
-            @staticmethod
-            def decode(token_ids, skip_special_tokens=False):
-                del skip_special_tokens
-                return "</think>" if token_ids == [99] else ""
-
-        class FakeTokenizerManager:
-            def __init__(self):
-                self.tokenizer = FakeTokenizer()
-                self.server_args = SimpleNamespace(incremental_streaming_output=False)
-                self.model_config = SimpleNamespace(context_len=1024)
-                self.num_reserved_tokens = 0
-                self.requests = []
-
-            def generate_request(self, request, _raw_request):
-                self.requests.append(request)
-                request_index = len(self.requests)
-
-                async def generate():
-                    if request_index == 1:
-                        yield {
-                            "text": "<think>bounded reasoning",
-                            "output_ids": [10, 11, 12, 13],
-                            "meta_info": {
-                                "prompt_tokens": 2,
-                                "completion_tokens": 4,
-                                "finish_reason": {"type": "length"},
-                            },
-                        }
-                    else:
-                        yield {
-                            "text": "final action",
-                            "output_ids": [20, 21],
-                            "meta_info": {
-                                "prompt_tokens": len(request.input_ids),
-                                "completion_tokens": 2,
-                                "finish_reason": {"type": "stop", "matched": 0},
-                            },
-                        }
-
-                return generate()
-
-        class FakeRuntime:
-            reasoning_end_token_id = 99
-            think_context_enabled = False
-            max_reasoning_tokens = 4
-
-            def reasoning_budget_for_effort(self, effort):
-                return self.max_reasoning_tokens
-
-            def __init__(self):
-                self.discarded = []
-                self.boundaries = []
-
-            def register_generation_prompt(self, *_args, **_kwargs):
-                pass
-
-            def observe_generation_result(self, *_args, **_kwargs):
-                pass
-
-            async def await_think_context(self, _request_id):
-                raise AssertionError("Forced reasoning boundary must skip Self-Ask")
-
-            async def build_reasoning_cutoff_injection(self, request_id, **kwargs):
-                # Feature disabled (count == 0): plain cutoff, no questions.
-                self.discarded.append((request_id, kwargs))
-                return None
-
-            def record_reasoning_boundary(self, request_id, **kwargs):
-                self.boundaries.append((request_id, kwargs))
-
-        serving = object.__new__(OpenAIServingResponses)
-        serving.use_harmony = False
-        serving.tokenizer_manager = FakeTokenizerManager()
-        runtime = FakeRuntime()
-        raw_request = SimpleNamespace(
-            app=SimpleNamespace(state=SimpleNamespace(qwen_exo_runtime=runtime))
-        )
-        adapted_request = GenerateReqInput(
-            input_ids=[1, 2],
-            sampling_params={"max_new_tokens": 10},
-            stream=False,
-            rid="resp-reasoning-budget",
-        )
-        context = SimpleContext()
-
-        async def collect():
-            snapshots = []
-            async for current in serving._generate_with_builtin_tools(
-                "resp-reasoning-budget",
-                [1, 2],
-                adapted_request,
-                {"max_new_tokens": 10},
-                context,
-                raw_request=raw_request,
-            ):
-                snapshots.append(dict(current.last_output))
-            return snapshots
-
-        snapshots = asyncio.run(collect())
-
-        self.assertNotIn("finish_reason", snapshots[0]["meta_info"])
-        self.assertTrue(snapshots[1]["text"].endswith("</think>"))
-        self.assertFalse(snapshots[1]["meta_info"]["qwen_exo_self_ask_boundary"])
-        self.assertEqual(serving.tokenizer_manager.requests[1].input_ids[-1], 99)
-        self.assertEqual(runtime.discarded[0][1]["observed_tokens"], 4)
-        self.assertIsNone(runtime.boundaries[0][1]["injection"])
-
-    def test_reasoning_budget_injects_cutoff_questions_before_stop(self):
-        # When the cutoff feature is enabled, the forced boundary renders the
-        # self-check questions FIRST, then the stop-and-go line, then </think>.
-        class FakeTokenizer:
-            @staticmethod
-            def encode(text, add_special_tokens=False):
-                del add_special_tokens
-                return [200 + index for index, _ in enumerate(text.split())]
-
-            @staticmethod
-            def decode(token_ids, skip_special_tokens=False):
-                del skip_special_tokens
-                return "</think>" if token_ids == [99] else ""
-
-        class FakeTokenizerManager:
-            def __init__(self):
-                self.tokenizer = FakeTokenizer()
-                self.server_args = SimpleNamespace(incremental_streaming_output=False)
-                self.model_config = SimpleNamespace(context_len=1024)
-                self.num_reserved_tokens = 0
-                self.requests = []
-
-            def generate_request(self, request, _raw_request):
-                self.requests.append(request)
-                request_index = len(self.requests)
-
-                async def generate():
-                    if request_index == 1:
-                        yield {
-                            "text": "<think>bounded reasoning",
-                            "output_ids": [10, 11, 12, 13],
-                            "meta_info": {
-                                "prompt_tokens": 2,
-                                "completion_tokens": 4,
-                                "finish_reason": {"type": "length"},
-                            },
-                        }
-                    else:
-                        yield {
-                            "text": "final action",
-                            "output_ids": [20, 21],
-                            "meta_info": {
-                                "prompt_tokens": len(request.input_ids),
-                                "completion_tokens": 2,
-                                "finish_reason": {"type": "stop", "matched": 0},
-                            },
-                        }
-
-                return generate()
-
-        injection = SimpleNamespace(
-            text="\n\n[自检] 收束前先核对：\n1. did I verify the load-bearing assumption?\n"
-        )
-
-        class FakeRuntime:
-            reasoning_end_token_id = 99
-            think_context_enabled = True
-            max_reasoning_tokens = 4
-
-            def reasoning_budget_for_effort(self, effort):
-                return self.max_reasoning_tokens
-
-            def __init__(self):
-                self.boundaries = []
-
-            def register_generation_prompt(self, *_args, **_kwargs):
-                pass
-
-            def observe_generation_result(self, *_args, **_kwargs):
-                pass
-
-            async def await_think_context(self, _request_id):
-                raise AssertionError("Forced reasoning boundary must not await Self-Ask")
-
-            async def build_reasoning_cutoff_injection(self, _request_id, **_kwargs):
-                return injection
-
-            def record_reasoning_boundary(self, request_id, **kwargs):
-                self.boundaries.append((request_id, kwargs))
-
-        serving = object.__new__(OpenAIServingResponses)
-        serving.use_harmony = False
-        serving.tokenizer_manager = FakeTokenizerManager()
-        runtime = FakeRuntime()
-        raw_request = SimpleNamespace(
-            app=SimpleNamespace(state=SimpleNamespace(qwen_exo_runtime=runtime))
-        )
-        adapted_request = GenerateReqInput(
-            input_ids=[1, 2],
-            sampling_params={"max_new_tokens": 10},
-            stream=False,
-            rid="resp-reasoning-cutoff",
-        )
-        context = SimpleContext()
-
-        async def collect():
-            snapshots = []
-            async for current in serving._generate_with_builtin_tools(
-                "resp-reasoning-cutoff",
-                [1, 2],
-                adapted_request,
-                {"max_new_tokens": 10},
-                context,
-                raw_request=raw_request,
-            ):
-                snapshots.append(dict(current.last_output))
-            return snapshots
-
-        snapshots = asyncio.run(collect())
-
-        boundary_text = snapshots[1]["text"]
-        # Questions appear, then the stop-and-go line, then </think>, in order.
-        self.assertIn("load-bearing assumption", boundary_text)
-        self.assertIn("stop over thinking", boundary_text)
-        self.assertLess(
-            boundary_text.index("load-bearing assumption"),
-            boundary_text.index("stop over thinking"),
-        )
-        self.assertTrue(boundary_text.endswith("</think>"))
-        self.assertTrue(snapshots[1]["meta_info"]["qwen_exo_self_ask_boundary"])
-        self.assertIs(runtime.boundaries[0][1]["injection"], injection)
 
 
 class ContinuationCacheRegressionTestCase(CustomTestCase):
@@ -1660,7 +1264,7 @@ class ContinuationCacheRegressionTestCase(CustomTestCase):
                             "prompt_tokens": 100,
                             "cached_tokens": 96,
                             "completion_tokens": 2,
-                            "finish_reason": {"type": "stop", "matched": 99},
+                            "finish_reason": {"type": "length", "length": 2},
                         },
                     }
                 else:
@@ -1680,11 +1284,14 @@ class ContinuationCacheRegressionTestCase(CustomTestCase):
 
         class FakeRuntime:
             reasoning_end_token_id = 99
-            think_context_enabled = True
             score_bias_enabled = True
 
             def reasoning_budget_for_effort(self, effort):
-                return 3072
+                return 2
+
+            @staticmethod
+            def think_shaping_params(_max_reasoning_tokens):
+                return None
 
             @staticmethod
             def score_bias_payload(_request_id, _prompt_ids):
@@ -1703,11 +1310,7 @@ class ContinuationCacheRegressionTestCase(CustomTestCase):
                 pass
 
             @staticmethod
-            async def await_think_context(_request_id):
-                return None
-
-            @staticmethod
-            def record_reasoning_boundary(*_args, **_kwargs):
+            def record_forced_reasoning_boundary(*_args, **_kwargs):
                 pass
 
         runtime = FakeRuntime()

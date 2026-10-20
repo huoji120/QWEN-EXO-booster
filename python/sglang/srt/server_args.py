@@ -2975,6 +2975,20 @@ class ServerArgs:
     qwen_exo_reasoning_budget_xhigh: A[
         int, "Maximum thinking tokens for explicit xhigh/max reasoning effort."
     ] = 8192
+    qwen_exo_think_suppress_after_tokens: A[
+        int,
+        "Thinking tokens after which 'Wait / Hmm / 等等' style tokens are biased down (0 disables).",
+    ] = 1024
+    qwen_exo_think_suppress_strength: A[
+        float, "Negative logit bias applied to those tokens once suppression starts."
+    ] = 5.0
+    qwen_exo_think_landing_start_ratio: A[
+        float,
+        "Fraction of the reasoning budget after which </think> gets a ramping bias (1 disables).",
+    ] = 0.75
+    qwen_exo_think_landing_bias: A[
+        float, "Maximum </think> logit bias, reached at the reasoning budget (0 disables)."
+    ] = 8.0
     qwen_exo_reasoning_mode: A[
         str,
         Arg(
@@ -3030,10 +3044,13 @@ class ServerArgs:
     qwen_exo_observer_mode: A[
         str,
         Arg(
-            help="QWEN-EXO in-flight observer mode.",
+            help=(
+                "QWEN-EXO in-flight observer mode (decode signals for telemetry "
+                "and score bias). 'active' is a legacy alias of 'shadow'."
+            ),
             choices=["off", "shadow", "active"],
         ),
-    ] = "active"
+    ] = "shadow"
     qwen_exo_engram_path: A[
         Optional[str],
         Arg(
@@ -3214,62 +3231,10 @@ class ServerArgs:
         str,
         "Telemetry text recording mode: off, edited (bounded, edited requests only), or all.",
     ] = "off"
-    qwen_exo_observer_surprisal_threshold: A[
-        float,
-        "Local-window selected-token surprisal threshold for QWEN-EXO events.",
-    ] = 0.8
-    qwen_exo_observer_surprisal_window: A[
-        int,
-        "Surprisal tokens in the QWEN-EXO local trigger window.",
-    ] = 8
-    qwen_exo_observer_surprisal_margin: A[
-        float,
-        "Minimum local-window surprisal increase over history.",
-    ] = 0.2
-    qwen_exo_observer_surprisal_sustain: A[
-        int,
-        "Consecutive elevated-window tokens required before a Mid-Think trigger "
-        "(continuous-drift confirmation; 1 = single-spike trigger).",
-    ] = 1
     qwen_exo_observer_q_drift_threshold: A[
         float,
-        "Attention-Q drift threshold for QWEN-EXO triggers.",
+        "Attention-Q drift threshold for the score-bias anchor.",
     ] = 0.35
-    qwen_exo_observer_cooldown_tokens: A[
-        int,
-        "Minimum decode-token distance between QWEN-EXO observer triggers.",
-    ] = 64
-    qwen_exo_observer_max_triggers: A[
-        int, "Enable at most one observer-triggered refresh per user request (0 or 1)."
-    ] = 1
-    qwen_exo_observer_q_pre_tokens: A[
-        int,
-        "Attention-Q sketches retained before one Mid-Think trigger.",
-    ] = 8
-    qwen_exo_observer_q_post_tokens: A[
-        int,
-        "Attention-Q sketches retained after one Mid-Think trigger.",
-    ] = 4
-    qwen_exo_observer_recovery_tokens: A[
-        int,
-        "Future surprisal tokens used to classify uncertainty recovery.",
-    ] = 8
-    qwen_exo_immediate_uncertainty_retrieval: A[
-        bool,
-        Arg(
-            help=(
-                "Start the external QWEN-EXO Self-Ask at the observer trigger "
-                "before recovery classification."
-            ),
-            action=argparse.BooleanOptionalAction,
-        ),
-    ] = False
-    qwen_exo_reasoning_cutoff_question_count: A[
-        int,
-        "When think generation is truncated at --qwen-exo-max-reasoning-tokens, "
-        "inject this many short concrete self-check questions before the "
-        "stop-and-go boundary. 0 disables the questions (plain cutoff).",
-    ] = 3
     qwen_exo_telemetry_include_text: A[
         bool,
         Arg(
@@ -4017,17 +3982,8 @@ class ServerArgs:
                 "QWEN-EXO active Observer requires target-side accepted-token "
                 "Q integration for the selected speculative algorithm"
             )
-        if (
-            self.qwen_exo_observer_surprisal_threshold < 0
-            or self.qwen_exo_observer_q_drift_threshold < 0
-        ):
-            raise ValueError("QWEN-EXO observer thresholds must be non-negative")
-        if self.qwen_exo_observer_surprisal_sustain < 1:
-            raise ValueError("QWEN-EXO observer surprisal sustain must be at least 1")
-        if self.qwen_exo_reasoning_cutoff_question_count < 0:
-            raise ValueError(
-                "QWEN-EXO reasoning cutoff question count must be non-negative"
-            )
+        if self.qwen_exo_observer_q_drift_threshold < 0:
+            raise ValueError("QWEN-EXO observer q-drift threshold must be non-negative")
         if self.qwen_exo_max_output_tokens < 1:
             raise ValueError("QWEN-EXO max output tokens must be positive")
         if self.qwen_exo_max_reasoning_tokens < 1:

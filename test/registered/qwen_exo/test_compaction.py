@@ -291,7 +291,7 @@ class TestResponseCompaction(CustomTestCase):
         serving = object.__new__(OpenAIServingResponses)
         serving.tokenizer_manager = SimpleNamespace(tokenizer=BoundaryTokenizer())
 
-        text, token_ids = serving._reasoning_boundary_tokens(None, 999, forced=True)
+        text, token_ids = serving._reasoning_boundary_tokens(999)
 
         assert text == "\nlet me do this now stop over thinking\n</think>"
         assert token_ids[-1] == 999

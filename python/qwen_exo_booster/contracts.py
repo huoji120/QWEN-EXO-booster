@@ -31,7 +31,6 @@ class HybridStateNamespace(str, Enum):
 class InternalJobType(str, Enum):
     CAPSULE_UPDATE = "capsule_update"
     CAUSAL_REPLAY = "causal_replay"
-    SELF_ASK = "self_ask"
     SELF_ANSWER = "self_answer"
     REFLECTION_MEMORY = "reflection_memory"
     RESPONSE_COMPACTION = "response_compaction"

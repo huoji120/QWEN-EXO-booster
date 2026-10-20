@@ -75,7 +75,6 @@ from qwen_exo_booster.latent_transplant import (
     LatentArtifactStore,
     validate_artifact_name,
 )
-from qwen_exo_booster.mid_think_questions import MidThinkQuestionService
 from qwen_exo_booster.observer import (
     InFlightObserver,
     ObserverResult,
@@ -111,6 +110,7 @@ from qwen_exo_booster.score_bias import (
 from qwen_exo_booster.service_config import ServiceConfigStore
 from qwen_exo_booster.telemetry import TelemetryStore
 from qwen_exo_booster.task_scheduling import internal_task_scope
+from qwen_exo_booster.think_shaping_policy import suppress_token_ids, think_shaping_params
 
 logger = logging.getLogger(__name__)
 
@@ -178,50 +178,6 @@ def _finish_reason_type(value: object) -> str:
     return str(value or "")
 
 
-_SELF_QUESTION_STOP_WORDS = frozenset(
-    {
-        "a",
-        "actually",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "before",
-        "by",
-        "can",
-        "current",
-        "did",
-        "do",
-        "does",
-        "during",
-        "for",
-        "from",
-        "how",
-        "if",
-        "in",
-        "into",
-        "is",
-        "it",
-        "of",
-        "on",
-        "or",
-        "should",
-        "that",
-        "the",
-        "this",
-        "to",
-        "was",
-        "what",
-        "when",
-        "where",
-        "whether",
-        "which",
-        "why",
-        "with",
-    }
-)
 
 
 class QwenExoRequestConflict(ValueError):
@@ -232,24 +188,6 @@ class QwenExoCapacityConflict(RuntimeError):
     pass
 
 
-@dataclass(frozen=True, slots=True)
-class ThinkContextInjection:
-    turn_id: str
-    event_id: str | None
-    purpose: str
-    question: str
-    answer: str
-    text: str
-
-    @property
-    def identity(self) -> str:
-        return stable_digest(
-            self.turn_id,
-            self.event_id or "",
-            self.purpose,
-            self.question,
-            self.answer,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,11 +198,6 @@ class TrajectoryCaptureBlock:
     observation_kind: str
 
 
-@dataclass(frozen=True, slots=True)
-class SelfQuestionAttempt:
-    question: str
-    answer: str
-    evidence_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,7 +348,6 @@ class QwenExoRuntime:
             config.state_directory / "reflection-evidence.sqlite3"
         )
         self.capsules: ExecutionCapsuleService | None = None
-        self.mid_think_questions: MidThinkQuestionService | None = None
         self.reflection_memory_service: ReflectionMemoryService | None = None
         self.memory_summaries: MemorySummaryService | None = None
         self._memory_summary_task: asyncio.Task[None] | None = None
@@ -440,17 +372,6 @@ class QwenExoRuntime:
         self.observer = InFlightObserver(
             self.telemetry,
             mode=config.observer_mode,
-            surprisal_threshold=config.observer_surprisal_threshold,
-            surprisal_window=config.observer_surprisal_window,
-            surprisal_margin=config.observer_surprisal_margin,
-            surprisal_sustain=config.observer_surprisal_sustain,
-            q_drift_threshold=config.observer_q_drift_threshold,
-            cooldown_tokens=config.observer_cooldown_tokens,
-            max_triggers=config.observer_max_triggers,
-            q_pre_tokens=config.observer_q_pre_tokens,
-            q_post_tokens=config.observer_q_post_tokens,
-            recovery_tokens=config.observer_recovery_tokens,
-            immediate_uncertainty_retrieval=config.immediate_uncertainty_retrieval,
         )
         self.state = QwenExoRuntimeState.CREATED
         self._session_initial_gdn_refresh_lock = asyncio.Lock()
@@ -551,16 +472,6 @@ class QwenExoRuntime:
             tuple[str, str], tuple[str, str, str]
         ] = OrderedDict()
         self._request_conversation_keys: dict[str, str] = {}
-        self._recent_self_questions: OrderedDict[
-            str, tuple[SelfQuestionAttempt, ...]
-        ] = OrderedDict()
-        self._max_self_questions_per_conversation = 16
-        self._post_tool_refresh_counts: OrderedDict[str, int] = OrderedDict()
-        self._max_post_tool_refreshes_per_conversation = 8
-        self._post_tool_no_eligible_streaks: OrderedDict[str, int] = OrderedDict()
-        self._post_tool_no_eligible_cooldowns: OrderedDict[str, int] = OrderedDict()
-        self._post_tool_no_eligible_streak_limit = 2
-        self._post_tool_no_eligible_cooldown_turns = 4
         self._capsule_invalid_streaks: OrderedDict[str, int] = OrderedDict()
         self._capsule_invalid_cooldowns: OrderedDict[str, int] = OrderedDict()
         self._capsule_invalid_threshold = 2
@@ -593,8 +504,7 @@ class QwenExoRuntime:
         self._request_score_bias_user_query_captured: set[str] = set()
         self._request_score_bias_capture_failure_emitted: set[str] = set()
         self._reasoning_end_token_id: int | None = None
-        self._pending_think_contexts: dict[str, ThinkContextInjection] = {}
-        self._consumed_think_contexts: set[str] = set()
+        self._think_suppress_ids: tuple[int, ...] = ()
 
     @property
     def score_bias_enabled(self) -> bool:
@@ -1304,25 +1214,14 @@ class QwenExoRuntime:
                 self._reasoning_end_token_id = (
                     int(convert_token("</think>")) if callable(convert_token) else None
                 )
+                self._think_suppress_ids = (
+                    suppress_token_ids(tokenizer) if tokenizer is not None else ()
+                )
                 if self.config.feature_flags.capsule:
                     self.capsules = ExecutionCapsuleService(
                         self.internal_jobs,
                         self.capsule_store,
                         tokenizer,
-                    )
-                if (
-                    self.config.reasoning_cutoff_question_count > 0
-                    and tokenizer is not None
-                ):
-                    cutoff_count = self.config.reasoning_cutoff_question_count
-                    self.mid_think_questions = MidThinkQuestionService(
-                        self.internal_jobs,
-                        tokenizer,
-                        self.telemetry,
-                        question_count=cutoff_count,
-                        # Generated synchronously at the reasoning cutoff, so keep
-                        # the output tight to minimise the added boundary latency.
-                        max_output_tokens=max(160, 40 * cutoff_count),
                     )
                 if tokenizer is not None:
                     self.memory_summaries = MemorySummaryService(
@@ -1504,8 +1403,6 @@ class QwenExoRuntime:
             self._request_score_bias_user_query_prepared.clear()
             self._request_score_bias_user_query_captured.clear()
             self._stateless_history_requests.clear()
-            self._pending_think_contexts.clear()
-            self._consumed_think_contexts.clear()
             refresh_task = self._session_initial_gdn_refresh_task
             if refresh_task is not None and not refresh_task.done():
                 refresh_task.cancel()
@@ -2642,7 +2539,6 @@ class QwenExoRuntime:
         *,
         incremental_logprobs: bool = False,
         generation_index: int = 0,
-        thinking_enabled: bool | None = None,
     ) -> ObserverResult:
         self._record_generation_tokens(
             request_id,
@@ -2727,32 +2623,12 @@ class QwenExoRuntime:
                 },
             )
 
-        observer_reasoning_end_token_id = (
-            self._reasoning_end_token_id if thinking_enabled is not False else None
-        )
-        observation = self.observer.observe_generation_result(
+        return self.observer.observe_generation_result(
             request_id,
             result,
             incremental_logprobs=incremental_logprobs,
             generation_index=generation_index,
-            reasoning_end_token_id=observer_reasoning_end_token_id,
-            thinking_enabled=thinking_enabled,
         )
-        for resolved_event in observation.events:
-            if resolved_event.uncertainty_state == "resolved_by_continuation":
-                self.telemetry.emit(
-                    request_id,
-                    "adaptive.resolved_without_refresh",
-                    {
-                        "event_id": resolved_event.event_id,
-                        "token_index": resolved_event.token_index,
-                        "generation_index": resolved_event.generation_index,
-                    },
-                )
-        # Mid-think self-questions are no longer triggered by observer drift; they
-        # are generated synchronously at the reasoning-budget cutoff (see
-        # build_reasoning_cutoff_injection).
-        return observation
 
     def record_tool_event(
         self,
@@ -4539,162 +4415,12 @@ class QwenExoRuntime:
             self._seen_tool_events.popitem(last=False)
         return tuple(unseen)
 
-    def _reserve_post_tool_refresh(self, request_id: str) -> tuple[bool, str, int, int]:
-        conversation_key = getattr(self, "_request_conversation_keys", {}).get(
-            str(request_id), stable_digest("request", str(request_id))
-        )
-        counts = getattr(self, "_post_tool_refresh_counts", None)
-        if counts is None:
-            counts = OrderedDict()
-            self._post_tool_refresh_counts = counts
-        limit = getattr(self, "_max_post_tool_refreshes_per_conversation", 8)
-        count = counts.get(conversation_key, 0)
-        if count >= limit:
-            counts.move_to_end(conversation_key, last=True)
-            return False, conversation_key, count, limit
-        count += 1
-        counts[conversation_key] = count
-        counts.move_to_end(conversation_key, last=True)
-        max_conversations = getattr(self, "_max_self_question_conversations", 2048)
-        while len(counts) > max_conversations:
-            counts.popitem(last=False)
-        return True, conversation_key, count, limit
 
-    def _post_tool_no_eligible_cooldown_turn(self, conversation_key: str) -> int | None:
-        cooldowns = getattr(self, "_post_tool_no_eligible_cooldowns", None)
-        if cooldowns is None:
-            return None
-        remaining = int(cooldowns.get(conversation_key, 0) or 0)
-        if remaining <= 0:
-            return None
-        remaining -= 1
-        if remaining:
-            cooldowns[conversation_key] = remaining
-            cooldowns.move_to_end(conversation_key, last=True)
-        else:
-            cooldowns.pop(conversation_key, None)
-        return remaining
 
-    def _track_post_tool_no_eligible(
-        self,
-        conversation_key: str,
-        *,
-        reference_status: str,
-        admitted: bool,
-    ) -> None:
-        streaks = getattr(self, "_post_tool_no_eligible_streaks", None)
-        cooldowns = getattr(self, "_post_tool_no_eligible_cooldowns", None)
-        if streaks is None or cooldowns is None:
-            return
-        if admitted or reference_status != "no_eligible_reference":
-            streaks.pop(conversation_key, None)
-            cooldowns.pop(conversation_key, None)
-            return
-        streak = int(streaks.get(conversation_key, 0) or 0) + 1
-        streaks[conversation_key] = streak
-        streaks.move_to_end(conversation_key, last=True)
-        threshold = int(getattr(self, "_post_tool_no_eligible_streak_limit", 2) or 0)
-        cooldown_turns = int(
-            getattr(self, "_post_tool_no_eligible_cooldown_turns", 4) or 0
-        )
-        if (
-            threshold > 0
-            and cooldown_turns > 0
-            and streak >= threshold
-            and conversation_key not in cooldowns
-        ):
-            cooldowns[conversation_key] = cooldown_turns
-            cooldowns.move_to_end(conversation_key, last=True)
-        max_conversations = getattr(self, "_max_self_question_conversations", 2048)
-        while len(streaks) > max_conversations:
-            streaks.popitem(last=False)
-        while len(cooldowns) > max_conversations:
-            cooldowns.popitem(last=False)
 
-    @staticmethod
-    def _normalize_self_question(question: str) -> str:
-        return " ".join(
-            "".join(
-                character.lower() if character.isalnum() or character == "_" else " "
-                for character in str(question or "")
-            ).split()
-        )
 
-    @staticmethod
-    def _self_question_terms(question: str) -> tuple[str, ...]:
-        return tuple(
-            term for term in question.split() if term not in _SELF_QUESTION_STOP_WORDS
-        )
 
-    @classmethod
-    def _same_self_question(cls, left: str, right: str) -> bool:
-        if not left or not right:
-            return False
-        if left == right:
-            return True
-        left_terms = cls._self_question_terms(left)
-        right_terms = cls._self_question_terms(right)
-        if not left_terms or not right_terms or left_terms[0] != right_terms[0]:
-            return False
-        left_set = set(left_terms)
-        right_set = set(right_terms)
-        overlap = len(left_set & right_set)
-        return (
-            overlap / len(left_set | right_set) >= 0.72
-            and overlap / min(len(left_set), len(right_set)) >= 0.85
-        )
 
-    def _register_self_question(
-        self,
-        request_id: str,
-        question: str,
-        answer: str | None,
-        *,
-        evidence_fingerprint: str,
-    ) -> SelfQuestionAttempt | None:
-        normalized_question = self._normalize_self_question(question)
-        normalized_answer = self._normalize_self_question(answer or "")
-        if not normalized_question or not evidence_fingerprint:
-            return None
-        conversation_keys = getattr(self, "_request_conversation_keys", {})
-        conversation_key = conversation_keys.get(
-            str(request_id), stable_digest("request", str(request_id))
-        )
-        histories = getattr(self, "_recent_self_questions", None)
-        if histories is None:
-            histories = OrderedDict()
-            self._recent_self_questions = histories
-        history = histories.get(conversation_key, ())
-        repeated = next(
-            (
-                previous
-                for previous in reversed(history)
-                if self._same_self_question(normalized_question, previous.question)
-                and (
-                    previous.answer == normalized_answer
-                    if normalized_answer
-                    else not previous.answer
-                    and previous.evidence_fingerprint == evidence_fingerprint
-                )
-            ),
-            None,
-        )
-        if repeated is not None:
-            histories.move_to_end(conversation_key, last=True)
-            return repeated
-        max_questions = getattr(self, "_max_self_questions_per_conversation", 16)
-        histories[conversation_key] = (
-            *history[-(max_questions - 1) :],
-            SelfQuestionAttempt(
-                question=normalized_question,
-                answer=normalized_answer,
-                evidence_fingerprint=evidence_fingerprint,
-            ),
-        )
-        max_conversations = getattr(self, "_max_self_question_conversations", 2048)
-        while len(histories) > max_conversations:
-            histories.popitem(last=False)
-        return None
 
     async def recall_after_tool(
         self,
@@ -4704,33 +4430,16 @@ class QwenExoRuntime:
         generation_index: int,
         tool_call: dict[str, Any] | None = None,
         trajectory_context: str | None = None,
-    ) -> ThinkContextInjection | None:
+    ) -> None:
         """Record a tool observation for the request (capsule/reflection
         evidence). Mid-generation retrieval after tools was retired."""
         self.record_tool_event(str(request_id), tool_observation, tool_call=tool_call)
-        return None
 
-    @staticmethod
-    def _safe_think_text(value: str) -> str:
-        return (
-            str(value or "")
-            .replace("<|im_start|>", "")
-            .replace("<|im_end|>", "")
-            .replace("<think>", "&lt;think&gt;")
-            .replace("</think>", "&lt;/think&gt;")
-            .strip()
-        )
 
     @property
     def reasoning_end_token_id(self) -> int | None:
         return self._reasoning_end_token_id
 
-    @property
-    def think_context_enabled(self) -> bool:
-        return (
-            self.observer.mode == "active"
-            and self._reasoning_end_token_id is not None
-        )
 
     def activation_editor_request(self, raw_custom: object = None) -> dict[str, object]:
         if not self.config.feature_flags.activation_training:
@@ -4805,6 +4514,17 @@ class QwenExoRuntime:
 
     def reasoning_budget_for_effort(self, effort: str | None) -> int:
         return self.config.reasoning_budget_for_effort(effort)
+
+    def think_shaping_params(self, max_reasoning_tokens: int) -> dict[str, Any] | None:
+        """Thinking-time bias for one request (suppression + soft landing)."""
+        if self._reasoning_end_token_id is None:
+            return None
+        return think_shaping_params(
+            config=self.config,
+            end_token_id=self._reasoning_end_token_id,
+            suppress_ids=self._think_suppress_ids,
+            max_reasoning_tokens=max_reasoning_tokens,
+        )
 
     def _forget_reasoning_task(
         self, key: tuple[str, str, str], entry: ReasoningTaskSelection | None = None
@@ -5006,45 +4726,21 @@ class QwenExoRuntime:
                 elif entry.task.cancelled() or entry.task.exception() is not None:
                     self._forget_reasoning_task(key, entry)
 
-    async def build_reasoning_cutoff_injection(
+
+
+    def record_forced_reasoning_boundary(
         self,
         request_id: str,
         *,
         observed_tokens: int,
-        generation_index: int,
         max_reasoning_tokens: int,
-    ) -> ThinkContextInjection | None:
-        """At the reasoning-budget cutoff, synchronously build the self-question
-        injection (if enabled) that precedes the stop-and-go boundary.
-
-        Returns the injection to render before ``</think>``, or ``None`` to fall
-        back to the plain cutoff. Any stale pending context and in-flight
-        refresh/replay tasks for this request are cleared either way.
-        """
+        committed_text: str,
+        token_ids: tuple[int, ...],
+        generation_index: int,
+    ) -> None:
+        """The reasoning budget ran out: record the synthetic boundary the
+        server appended (capsule, reflection and score bias read the output)."""
         request_id = str(request_id)
-        stale = self._pending_think_contexts.pop(request_id, None)
-        if stale is not None:
-            self._consumed_think_contexts.add(stale.turn_id)
-        questions = None
-        if self.think_context_enabled and self.mid_think_questions is not None:
-            try:
-                questions = await self.mid_think_questions.generate(
-                    parent_request_id=request_id,
-                    turn_id=request_id,
-                    event_id=None,
-                    user_question=self._request_questions.get(request_id, ""),
-                    partial_output=self._request_outputs.get(request_id, ""),
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.telemetry.emit(
-                    request_id,
-                    "reasoning_cutoff.questions_failed_closed",
-                    {"error_type": type(exc).__name__},
-                )
-                questions = None
-
         self.telemetry.emit(
             request_id,
             "reasoning.budget_forced",
@@ -5052,45 +4748,8 @@ class QwenExoRuntime:
                 "max_reasoning_tokens": int(max_reasoning_tokens),
                 "observed_tokens": int(observed_tokens),
                 "generation_index": int(generation_index),
-                "cutoff_questions": questions is not None,
-                "had_pending_context": stale is not None,
             },
         )
-        if questions is None:
-            return None
-        turn_id = (
-            f"{request_id}:reasoning_cutoff_questions:"
-            f"{stable_digest(questions.injection_text)[:16]}"
-        )
-        return ThinkContextInjection(
-            turn_id=turn_id,
-            event_id=questions.event_id,
-            purpose="reasoning_cutoff_questions",
-            question="",
-            answer="",
-            text=questions.injection_text,
-        )
-
-    async def await_think_context(
-        self, request_id: str
-    ) -> ThinkContextInjection | None:
-        request_id = str(request_id)
-        injection = self._pending_think_contexts.pop(request_id, None)
-        if injection is None or injection.turn_id in self._consumed_think_contexts:
-            return None
-        self._consumed_think_contexts.add(injection.turn_id)
-        return injection
-
-    def record_reasoning_boundary(
-        self,
-        request_id: str,
-        *,
-        injection: ThinkContextInjection | None,
-        committed_text: str,
-        token_ids: tuple[int, ...],
-        generation_index: int,
-    ) -> None:
-        request_id = str(request_id)
         self.observe_generation_result(
             request_id,
             {
@@ -5101,21 +4760,6 @@ class QwenExoRuntime:
             incremental_logprobs=True,
             generation_index=generation_index,
         )
-        self.observer.mark_reasoning_end(request_id)
-        if injection is not None:
-            self.telemetry.emit(
-                request_id,
-                "self_ask.think_context_committed",
-                {
-                    "turn_id": injection.turn_id,
-                    "event_id": injection.event_id,
-                    "purpose": injection.purpose,
-                    "question_digest": stable_digest(injection.question),
-                    "answer_digest": stable_digest(injection.answer),
-                    "token_count": len(token_ids),
-                    "generation_index": int(generation_index),
-                },
-            )
 
     def owns_request(self, request_id: str) -> bool:
         return request_id in self._request_questions
@@ -5764,12 +5408,6 @@ class QwenExoRuntime:
             self._parent_capsules.pop(request_id, None)
             self._capsule_restorations.pop(request_id, None)
             self._stateless_history_requests.discard(request_id)
-            self._pending_think_contexts.pop(request_id, None)
-            self._consumed_think_contexts = {
-                key
-                for key in self._consumed_think_contexts
-                if not key.startswith(f"{request_id}:")
-            }
             self._clear_generation_state(request_id)
             self.observer.release(request_id)
 
@@ -5815,12 +5453,6 @@ class QwenExoRuntime:
         self._capsule_restorations.pop(request_id, None)
         self._original_tasks.pop(request_id, None)
         self._stateless_history_requests.discard(request_id)
-        self._pending_think_contexts.pop(request_id, None)
-        self._consumed_think_contexts = {
-            key
-            for key in self._consumed_think_contexts
-            if not key.startswith(f"{request_id}:")
-        }
         self._clear_generation_state(request_id)
         self._request_completion_emitted.discard(request_id)
         self.observer.release(request_id)

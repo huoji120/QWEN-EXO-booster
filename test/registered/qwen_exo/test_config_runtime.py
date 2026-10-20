@@ -266,18 +266,6 @@ def test_policy_data_cli_arguments_are_registered():
     assert not hasattr(parsed, "qwen_exo_tensor_bank_max_document_tokens")
 
 
-def test_immediate_uncertainty_retrieval_cli_argument_is_registered():
-    if sys.platform == "win32":
-        pytest.skip("SGLang ServerArgs imports the POSIX resource module")
-    from sglang.srt.server_args import ServerArgs
-
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    parsed = parser.parse_args(
-        ["--model", "dummy", "--qwen-exo-immediate-uncertainty-retrieval"]
-    )
-
-    assert parsed.qwen_exo_immediate_uncertainty_retrieval is True
 
 
 def test_response_compaction_config_is_bounded_and_public(tmp_path):
@@ -322,24 +310,6 @@ def test_reflection_memory_rejects_shadow(tmp_path):
         )
 
 
-def test_immediate_uncertainty_retrieval_requires_active_observer(tmp_path):
-    config = QwenExoConfig.from_server_args(
-        server_args(
-            tmp_path,
-            qwen_exo_observer_mode="active",
-            qwen_exo_immediate_uncertainty_retrieval=True,
-        )
-    )
-    assert config.immediate_uncertainty_retrieval is True
-    assert config.public_dict()["immediate_uncertainty_retrieval"] is True
-
-    with pytest.raises(ValueError, match="requires qwen_exo_observer_mode=active"):
-        QwenExoConfig.from_server_args(
-            server_args(
-                tmp_path,
-                qwen_exo_immediate_uncertainty_retrieval=True,
-            )
-        )
 
 
 def test_policy_data_flag_follows_server_args(tmp_path):
@@ -350,11 +320,6 @@ def test_policy_data_flag_follows_server_args(tmp_path):
     assert value.feature_flags.policy_data is False
 
 
-def test_observer_rejects_unimplemented_multiple_refresh_attempts(tmp_path):
-    with pytest.raises(ValueError, match="trigger limits"):
-        QwenExoConfig.from_server_args(
-            server_args(tmp_path, qwen_exo_observer_max_triggers=2)
-        )
 
 
 def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):

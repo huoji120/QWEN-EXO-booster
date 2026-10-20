@@ -11,6 +11,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.think_shaping import ThinkShapingBias
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -78,6 +79,9 @@ class SamplingBatchInfo:
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
+
+    # Per-forward thinking-time bias (set only on the forward copy).
+    think_shaping: Optional[ThinkShapingBias] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -296,6 +300,9 @@ class SamplingBatchInfo:
         if self.logit_bias is not None:
             logits.add_(self.logit_bias)
 
+        if self.think_shaping is not None:
+            self.think_shaping.apply(logits)
+
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
@@ -447,10 +454,12 @@ class SamplingBatchInfo:
 
         self.adjusted_merge_batch(other)
 
-    def copy_for_forward(self):
+    def copy_for_forward(self, think_shaping: Optional[ThinkShapingBias] = None):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        return dataclasses.replace(
+            self, penalizer_orchestrator=None, think_shaping=think_shaping
+        )
 
 
 def merge_bias_tensor(

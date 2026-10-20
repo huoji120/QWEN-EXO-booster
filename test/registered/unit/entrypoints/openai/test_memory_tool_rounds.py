@@ -84,6 +84,27 @@ class ChatMLTokenizer:
 
 
 class ToolResponseTemplateTestCase(CustomTestCase):
+    def test_auto_reasoning_high_effort_is_mapped_to_the_templates_xhigh(self):
+        """Prod: automatic reasoning renders with reasoning_effort="high";
+        Qwen3.8 templates accept only xhigh/medium/low, so the tool-block
+        layout render raised and memory tools were silently disabled."""
+
+        class Qwen38Tokenizer(ChatMLTokenizer):
+            chat_template = "Supported types are xhigh (default), medium, and low."
+
+            def apply_chat_template(self, messages, **kwargs):
+                if kwargs.get("reasoning_effort") not in (None, "xhigh", "medium", "low"):
+                    raise ValueError("Unexpected reasoning effort")
+                return super().apply_chat_template(messages, **kwargs)
+
+        tokenizer = Qwen38Tokenizer()
+        template = ToolResponseTemplate(tokenizer, {"reasoning_effort": "high"})
+        self.assertEqual(template.template_kwargs["reasoning_effort"], "xhigh")
+        ids = template.continuation_ids(
+            output_ids=[1050, IM_END], outputs=["a"], generation_prompt_ids=()
+        )
+        self.assertIn("<tool_response>", tokenizer.decode(ids))
+
     def test_block_follows_template_and_neutralizes_control_markers(self):
         tokenizer = ChatMLTokenizer()
         template = ToolResponseTemplate(tokenizer, {})

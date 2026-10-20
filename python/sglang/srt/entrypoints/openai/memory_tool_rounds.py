@@ -16,6 +16,7 @@ import orjson
 from openai.types.responses.response_output_item import McpCall
 from qwen_exo_booster.memory_tools import MEMORY_SERVER_LABEL, MEMORY_TOOL_NAMES
 
+from sglang.srt.entrypoints.openai.serving_chat import _normalize_model_reasoning_effort
 from sglang.srt.utils import random_uuid
 
 MAX_MEMORY_TOOL_ROUNDS = 4
@@ -61,6 +62,12 @@ class ToolResponseTemplate:
     def __init__(self, tokenizer: Any, template_kwargs: dict[str, Any] | None):
         self.tokenizer = tokenizer
         self.template_kwargs = dict(template_kwargs or {})
+        # Same alias mapping as the main prompt render: Qwen3.8 templates
+        # reject the generic "high" spelling of their native "xhigh".
+        if "reasoning_effort" in self.template_kwargs:
+            self.template_kwargs["reasoning_effort"] = _normalize_model_reasoning_effort(
+                tokenizer, self.template_kwargs["reasoning_effort"]
+            )
         self._layouts: dict[int, tuple[str, str, list[str]]] = {}
 
     def _layout(self, count: int) -> tuple[str, str, list[str]]:

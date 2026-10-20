@@ -92,26 +92,17 @@ class QwenExoConfig:
     reasoning_budget_medium: int = 2048
     reasoning_budget_high: int = 4090
     reasoning_budget_xhigh: int = 8192
+    # Thinking-time shaping (sglang/srt/sampling/think_shaping.py).
+    think_suppress_after_tokens: int = 1024
+    think_suppress_strength: float = 5.0
+    think_landing_start_ratio: float = 0.75
+    think_landing_bias: float = 8.0
     reasoning_mode: str = "fixed"
     force_auto_reasoning: bool = True
     reasoning_session_once: bool = True
     reasoning_dynamic_context_tokens: int = 2048
-    observer_surprisal_threshold: float = 0.8
-    observer_surprisal_window: int = 8
-    observer_surprisal_margin: float = 0.2
-    observer_surprisal_sustain: int = 1
+    # Score-bias anchor drift threshold (passed to the model's Q-signal capture).
     observer_q_drift_threshold: float = 0.35
-    observer_cooldown_tokens: int = 64
-    observer_max_triggers: int = 1
-    observer_q_pre_tokens: int = 8
-    observer_q_post_tokens: int = 4
-    observer_recovery_tokens: int = 8
-    immediate_uncertainty_retrieval: bool = False
-    # When think generation hits its resolved reasoning budget and is truncated, inject
-    # this many short, concrete self-check questions before the stop-and-go line
-    # so the model reconsiders before committing. ``0`` disables the questions and
-    # keeps the plain reasoning-budget cutoff.
-    reasoning_cutoff_question_count: int = 3
     knowledge_retrieval_mode: Literal["file"] = "file"
 
     def __post_init__(self) -> None:
@@ -150,6 +141,12 @@ class QwenExoConfig:
             raise ValueError(
                 "qwen_exo_reasoning_dynamic_context_tokens must be an integer >= 256"
             )
+        if type(self.think_suppress_after_tokens) is not int or self.think_suppress_after_tokens < 0:
+            raise ValueError("qwen_exo_think_suppress_after_tokens must be an integer >= 0")
+        if self.think_suppress_strength < 0 or self.think_landing_bias < 0:
+            raise ValueError("qwen_exo_think_suppress_strength / landing_bias must be >= 0")
+        if not 0 < self.think_landing_start_ratio <= 1:
+            raise ValueError("qwen_exo_think_landing_start_ratio must be within (0, 1]")
         for effort in ("min", "low", "medium", "high", "xhigh"):
             budget = getattr(self, f"reasoning_budget_{effort}")
             if type(budget) is not int or budget < 1:
@@ -216,11 +213,6 @@ class QwenExoConfig:
         if self.response_compaction_max_output_tokens < 256:
             raise ValueError("Response compaction output budget must be at least 256")
 
-        if self.reasoning_cutoff_question_count < 0:
-            raise ValueError(
-                "qwen_exo_reasoning_cutoff_question_count must be non-negative"
-            )
-
         if self.score_bias_mode not in _SCORE_BIAS_MODES:
             raise ValueError(
                 "qwen_exo_score_bias_mode must be one of "
@@ -230,26 +222,8 @@ class QwenExoConfig:
             raise ValueError("Score Bias feature flag and mode disagree")
         if self.feature_flags.observer != (self.observer_mode != "off"):
             raise ValueError("Observer feature flag and observer mode disagree")
-        if self.immediate_uncertainty_retrieval and self.observer_mode != "active":
-            raise ValueError(
-                "Immediate uncertainty retrieval requires qwen_exo_observer_mode=active"
-            )
-        if (
-            self.observer_surprisal_threshold < 0
-            or self.observer_surprisal_window < 2
-            or self.observer_surprisal_margin < 0
-            or self.observer_surprisal_sustain < 1
-            or self.observer_q_drift_threshold < 0
-        ):
-            raise ValueError("Observer thresholds and windows are invalid")
-        if (
-            self.observer_cooldown_tokens < 1
-            or self.observer_max_triggers not in {0, 1}
-            or self.observer_q_pre_tokens < 1
-            or self.observer_q_post_tokens < 1
-            or self.observer_recovery_tokens < 1
-        ):
-            raise ValueError("Observer trigger limits are invalid")
+        if self.observer_q_drift_threshold < 0:
+            raise ValueError("qwen_exo_observer_q_drift_threshold must be non-negative")
 
         if self.score_bias_mode != "off" and self.observer_mode == "off":
             raise ValueError("Score Bias requires an active or shadow observer")
@@ -345,6 +319,16 @@ class QwenExoConfig:
             reasoning_budget_xhigh=getattr(
                 server_args, "qwen_exo_reasoning_budget_xhigh", 8192
             ),
+            think_suppress_after_tokens=int(
+                getattr(server_args, "qwen_exo_think_suppress_after_tokens", 1024)
+            ),
+            think_suppress_strength=float(
+                getattr(server_args, "qwen_exo_think_suppress_strength", 5.0)
+            ),
+            think_landing_start_ratio=float(
+                getattr(server_args, "qwen_exo_think_landing_start_ratio", 0.75)
+            ),
+            think_landing_bias=float(getattr(server_args, "qwen_exo_think_landing_bias", 8.0)),
             reasoning_mode=getattr(server_args, "qwen_exo_reasoning_mode", "fixed"),
             force_auto_reasoning=getattr(server_args, "qwen_exo_force_auto_reasoning", True),
             reasoning_session_once=getattr(
@@ -488,43 +472,8 @@ class QwenExoConfig:
             activation_editor_strength=float(
                 getattr(server_args, "qwen_exo_activation_editor_strength", 2.0)
             ),
-            observer_surprisal_threshold=float(
-                getattr(server_args, "qwen_exo_observer_surprisal_threshold", 0.8)
-            ),
-            observer_surprisal_window=int(
-                getattr(server_args, "qwen_exo_observer_surprisal_window", 8)
-            ),
-            observer_surprisal_margin=float(
-                getattr(server_args, "qwen_exo_observer_surprisal_margin", 0.2)
-            ),
-            observer_surprisal_sustain=int(
-                getattr(server_args, "qwen_exo_observer_surprisal_sustain", 1)
-            ),
             observer_q_drift_threshold=float(
                 getattr(server_args, "qwen_exo_observer_q_drift_threshold", 0.35)
-            ),
-            observer_cooldown_tokens=int(
-                getattr(server_args, "qwen_exo_observer_cooldown_tokens", 64)
-            ),
-            observer_max_triggers=int(
-                getattr(server_args, "qwen_exo_observer_max_triggers", 1)
-            ),
-            observer_q_pre_tokens=int(
-                getattr(server_args, "qwen_exo_observer_q_pre_tokens", 8)
-            ),
-            observer_q_post_tokens=int(
-                getattr(server_args, "qwen_exo_observer_q_post_tokens", 4)
-            ),
-            observer_recovery_tokens=int(
-                getattr(server_args, "qwen_exo_observer_recovery_tokens", 8)
-            ),
-            immediate_uncertainty_retrieval=bool(
-                getattr(server_args, "qwen_exo_immediate_uncertainty_retrieval", False)
-            ),
-            reasoning_cutoff_question_count=int(
-                getattr(
-                    server_args, "qwen_exo_reasoning_cutoff_question_count", 3
-                )
             ),
         )
 
@@ -573,6 +522,10 @@ class QwenExoConfig:
             "reasoning_budget_medium": self.reasoning_budget_medium,
             "reasoning_budget_high": self.reasoning_budget_high,
             "reasoning_budget_xhigh": self.reasoning_budget_xhigh,
+            "think_suppress_after_tokens": self.think_suppress_after_tokens,
+            "think_suppress_strength": self.think_suppress_strength,
+            "think_landing_start_ratio": self.think_landing_start_ratio,
+            "think_landing_bias": self.think_landing_bias,
             "reasoning_mode": self.reasoning_mode,
             "force_auto_reasoning": self.force_auto_reasoning,
             "reasoning_session_once": self.reasoning_session_once,
@@ -602,18 +555,7 @@ class QwenExoConfig:
             "score_bias_query_window": self.score_bias_query_window,
             "latent_transplant_enabled": self.latent_transplant_enabled,
             "latent_transplant_strength": self.latent_transplant_strength,
-            "observer_surprisal_threshold": self.observer_surprisal_threshold,
-            "observer_surprisal_window": self.observer_surprisal_window,
-            "observer_surprisal_margin": self.observer_surprisal_margin,
-            "observer_surprisal_sustain": self.observer_surprisal_sustain,
             "observer_q_drift_threshold": self.observer_q_drift_threshold,
-            "observer_cooldown_tokens": self.observer_cooldown_tokens,
-            "observer_max_triggers": self.observer_max_triggers,
-            "observer_q_pre_tokens": self.observer_q_pre_tokens,
-            "observer_q_post_tokens": self.observer_q_post_tokens,
-            "observer_recovery_tokens": self.observer_recovery_tokens,
-            "immediate_uncertainty_retrieval": self.immediate_uncertainty_retrieval,
-            "reasoning_cutoff_question_count": self.reasoning_cutoff_question_count,
             "features": flags,
             "model_path": self.model_path,
             "tp_size": self.tp_size,

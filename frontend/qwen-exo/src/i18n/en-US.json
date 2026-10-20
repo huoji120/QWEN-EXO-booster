@@ -1524,5 +1524,17 @@
   "已停止注入人格文档，立即生效": "Persona document no longer injected, effective immediately",
   "切换失败": "Toggle failed",
   "人格文档注入": "Persona injection",
-  "把人格文档完整加入每个请求的系统提示词（不截断）；在「人格文档」页也能直接开关，立即生效、无需重启。": "Adds the full persona document to every request's system prompt (never truncated); it can also be toggled on the persona page, effective immediately without a restart."
+  "把人格文档完整加入每个请求的系统提示词（不截断）；在「人格文档」页也能直接开关，立即生效、无需重启。": "Adds the full persona document to every request's system prompt (never truncated); it can also be toggled on the persona page, effective immediately without a restart.",
+  "压制“再想想”起点": "Reconsider-word suppression start",
+  "思考超过这么多 token 后，压低 Wait / Hmm / Alternatively / 等等 这类反复验证用词的概率，减少长篇反复思考；0 表示关闭，默认 1024。": "After this many thinking tokens, lowers the probability of re-verification words such as Wait / Hmm / Alternatively / 等等 to cut long self-checking loops; 0 disables it. Default 1024.",
+  "压制强度": "Suppression strength",
+  "压制时给这些词加的负 logit 偏置，越大越少出现（5 约降为原概率的 1/150）；默认 5。": "Negative logit bias applied to those words once suppression starts; larger means rarer (5 is about 1/150 of the original probability). Default 5.",
+  "软着陆起点": "Soft landing start",
+  "思考用到预算的这个比例后，逐步提高结束思考（</think>）的概率，让模型在自然的位置收尾而不是被硬截断；1 表示关闭，默认 0.75。": "After this fraction of the reasoning budget, gradually raises the probability of ending the thinking (</think>) so the model wraps up at a natural point instead of being cut off; 1 disables it. Default 0.75.",
+  "软着陆力度": "Soft landing strength",
+  "到预算用完时给 </think> 加的最大正偏置，从起点线性增长到这个值；0 表示关闭，默认 8。": "Maximum positive bias on </think>, reached when the budget runs out (it grows linearly from the start point); 0 disables it. Default 8.",
+  "限制反思记忆、上下文压缩、记忆总结与整理等后台任务的并行度，防止内部负载挤占主请求调度资源与 Mamba 状态槽；推荐 8。": "Limits the parallelism of background jobs such as reflection memory, context compaction and memory summaries/organizing, so internal load does not crowd out user requests or Mamba state slots; recommended 8.",
+  "定义解码期惊奇度与 Attention-Q 漂移的观测，观测信号供遥测和注意力分数偏置使用；仅观测记录信号（旧值“主动干预”与之相同），关闭最省开销，但分数偏置需要开启观测。": "Decode-time observation of surprisal and Attention-Q drift, used for telemetry and attention score bias; shadow records the signals (the legacy value 'active' behaves the same), off is cheapest but score bias needs the observer on.",
+  "注意力分数偏置选取锚点时的 Attention-Q 漂移门槛；推荐 0.35。": "Attention-Q drift threshold used when score bias picks anchors; recommended 0.35.",
+  "仅观测（旧值）": "Shadow (legacy value)"
 }

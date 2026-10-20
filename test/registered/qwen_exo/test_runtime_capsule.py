@@ -10,7 +10,6 @@ from qwen_exo_booster.compaction import CompactionSummary
 from qwen_exo_booster.config import QwenExoConfig, QwenExoFeatureFlags
 from qwen_exo_booster.contracts import stable_digest
 from qwen_exo_booster.hybrid_state import HybridRuntimePolicy
-from qwen_exo_booster.observer import MidThinkEvent, ObserverResult
 from qwen_exo_booster.reflection_memory import (
     ReflectionMemory,
     ReflectionSourceSnapshot,
@@ -444,40 +443,8 @@ def valid_capsule():
     }
 
 
-def observer_event(state, *, event_id):
-    return MidThinkEvent(
-        event_id=event_id,
-        request_id="resp-observer",
-        token_index=10,
-        trigger_reasons=("surprisal",),
-        current_surprisal=7.0,
-        window_mean=7.0,
-        history_mean=1.0,
-        ema_surprisal=2.0,
-        recovery_window_mean=1.0,
-        uncertainty_state=state,
-        pre_q_sketches=(),
-        post_q_sketches=(),
-    )
 
 
-def observer_result(*events):
-    return ObserverResult(
-        request_id="resp-observer",
-        token_count=10,
-        new_tokens=1,
-        current_surprisal=7.0,
-        local_window_mean=7.0,
-        history_mean=1.0,
-        ema_surprisal=2.0,
-        max_surprisal=7.0,
-        latest_q_drift=None,
-        latest_memory_energy=None,
-        triggered=bool(events),
-        trigger_reasons=("surprisal",),
-        events=tuple(events),
-        finished=False,
-    )
 
 
 def test_previous_turn_capsule_is_privately_restored(tmp_path):
@@ -829,38 +796,30 @@ def test_response_tool_events_preserve_function_name():
     )
 
 
-@pytest.mark.asyncio
-async def test_reasoning_budget_discards_pending_self_ask_and_refresh(tmp_path):
+def test_forced_reasoning_boundary_is_traced_and_recorded_as_output(tmp_path):
+    """The trace page reads ``reasoning.budget_forced``; capsule, reflection and
+    score bias read the generation's output ids, which must include the
+    synthetic stop line and </think> the server appended."""
     value = runtime(tmp_path)
-    async def unexpected_self_ask(**kwargs):
-        raise AssertionError("Independent reasoning cutoff must not launch Self-Ask")
-
-    value.mid_think_questions = SimpleNamespace(generate=unexpected_self_ask)
     request_id = "resp-reasoning-budget"
-    turn_id = f"{request_id}:post_tool:0"
-    value._pending_think_contexts[request_id] = SimpleNamespace(turn_id=turn_id)
 
-    # Budget enforcement must not launch internal generation when the Observer
-    # and refresh context lane are inactive, even if the service exists.
-    injection = await value.build_reasoning_cutoff_injection(
+    value.record_forced_reasoning_boundary(
         request_id,
         observed_tokens=4090,
-        generation_index=2,
         max_reasoning_tokens=4090,
+        committed_text="\nstop\n</think>",
+        token_ids=(11, 12, 999),
+        generation_index=2,
     )
 
-    assert injection is None
-    assert request_id not in value._pending_think_contexts
-    assert turn_id in value._consumed_think_contexts
     events = value.telemetry.events(request_id, limit=10)
-    assert [event.event_type for event in events] == ["reasoning.budget_forced"]
-    assert events[0].payload == {
+    forced = [event for event in events if event.event_type == "reasoning.budget_forced"]
+    assert forced[0].payload == {
         "max_reasoning_tokens": 4090,
         "observed_tokens": 4090,
         "generation_index": 2,
-        "cutoff_questions": False,
-        "had_pending_context": True,
     }
+    assert value._request_generation_output_ids[(request_id, 2)] == (11, 12, 999)
 
 
 def test_response_trajectory_context_keeps_recent_model_and_tool_evidence(tmp_path):

@@ -1,55 +1,10 @@
 import json
 
 import pytest
-from qwen_exo_booster.contracts import ContractViolation
-from qwen_exo_booster.observer import (
-    AdaptiveRetrievalPhase,
-    AdaptiveRetrievalStateMachine,
-    InFlightObserver,
-)
+from qwen_exo_booster.observer import InFlightObserver
 from qwen_exo_booster.telemetry import TelemetryStore
 
 
-def test_adaptive_retrieval_state_machine_enforces_ordered_transitions(tmp_path):
-    telemetry = TelemetryStore(tmp_path / "adaptive.jsonl")
-    machine = AdaptiveRetrievalStateMachine(telemetry)
-
-    machine.begin("request-adaptive")
-    machine.transition(
-        "request-adaptive",
-        AdaptiveRetrievalPhase.TRIGGERED,
-        event_id="event-1",
-        decision="observer_trigger",
-    )
-    machine.transition("request-adaptive", AdaptiveRetrievalPhase.REFRESHING)
-    machine.transition("request-adaptive", AdaptiveRetrievalPhase.SEMANTIC_READY)
-    machine.transition("request-adaptive", AdaptiveRetrievalPhase.REPLAY_SCORING)
-    machine.transition(
-        "request-adaptive",
-        AdaptiveRetrievalPhase.NEXT_TURN_READY,
-        decision="admit_maybe",
-    )
-    completed = machine.transition("request-adaptive", AdaptiveRetrievalPhase.COMPLETED)
-
-    assert completed.sequence == 6
-    assert completed.event_id == "event-1"
-    assert machine.public_dict()["phase_counts"] == {"completed": 1}
-    transitions = [
-        event.payload["to"]
-        for event in telemetry.events("request-adaptive")
-        if event.event_type == "adaptive.transition"
-    ]
-    assert transitions == [
-        "observing",
-        "triggered",
-        "refreshing",
-        "semantic_ready",
-        "replay_scoring",
-        "next_turn_ready",
-        "completed",
-    ]
-    with pytest.raises(ContractViolation, match="Invalid adaptive retrieval"):
-        machine.transition("request-adaptive", AdaptiveRetrievalPhase.REPLAY_SCORING)
 
 
 def test_telemetry_redacts_sensitive_text(tmp_path):
@@ -174,14 +129,7 @@ def test_telemetry_write_failure_does_not_break_inference(tmp_path, monkeypatch)
 
 def test_observer_does_not_double_count_cumulative_stream_chunks(tmp_path):
     store = TelemetryStore(tmp_path / "trace.jsonl")
-    observer = InFlightObserver(
-        store,
-        mode="shadow",
-        surprisal_window=2,
-        surprisal_threshold=6.0,
-        cooldown_tokens=2,
-        max_triggers=2,
-    )
+    observer = InFlightObserver(store, mode="shadow")
     first = observer.observe_generation_result(
         "request-1",
         {
@@ -218,11 +166,9 @@ def test_observer_does_not_double_count_cumulative_stream_chunks(tmp_path):
     )
 
     assert first.new_tokens == 4
-    assert first.triggered
     assert second.new_tokens == 4
-    assert second.triggered
     assert second.token_count == 8
-    assert observer.state("request-1").trigger_tokens == [4, 8]
+    assert observer.surprisal_history("request-1") == (1.0, 1.0, 7.0, 7.0, 2.0, 2.0, 8.0, 8.0)
 
 
 def test_observer_counts_each_incremental_stream_chunk(tmp_path):
@@ -276,58 +222,11 @@ def test_observer_state_is_bound_to_request_id(tmp_path):
     assert observer.state("a").ema_surprisal != observer.state("b").ema_surprisal
 
 
-def test_explicitly_disabled_thinking_cannot_trigger_observer(tmp_path):
-    observer = InFlightObserver(
-        TelemetryStore(tmp_path / "trace-no-think.jsonl"),
-        mode="active",
-        surprisal_window=2,
-        surprisal_threshold=0.0,
-        surprisal_margin=0.0,
-        q_drift_threshold=0.0,
-    )
-
-    result = observer.observe_generation_result(
-        "request-no-think",
-        {
-            "meta_info": {
-                "output_token_logprobs": [
-                    (-4.0, 1),
-                    (-4.0, 2),
-                    (-4.0, 3),
-                    (-4.0, 4),
-                ],
-                "qwen_exo_q_drift": [float("nan"), 0.9, 0.9, 0.9],
-            }
-        },
-        incremental_logprobs=True,
-        reasoning_end_token_id=999,
-        thinking_enabled=False,
-    )
-
-    assert not result.triggered
-    assert observer.state("request-no-think").in_reasoning is False
 
 
-def test_attention_q_drift_can_trigger_and_memory_energy_is_reported(tmp_path):
+def test_attention_q_drift_and_memory_energy_are_reported(tmp_path):
     store = TelemetryStore(tmp_path / "trace.jsonl")
-    observer = InFlightObserver(
-        store,
-        mode="shadow",
-        surprisal_threshold=99.0,
-        q_drift_threshold=0.3,
-        surprisal_window=2,
-    )
-
-    unconfirmed = observer.observe_generation_result(
-        "request-q-stable",
-        {
-            "meta_info": {
-                "output_token_logprobs": [(-1.0, 1), (-1.0, 2), (-1.0, 3), (-1.0, 4)],
-                "qwen_exo_q_drift": [float("nan"), 0.0, 0.0, 0.42],
-            }
-        },
-    )
-    assert not unconfirmed.triggered
+    observer = InFlightObserver(store, mode="shadow")
 
     result = observer.observe_generation_result(
         "request-q",
@@ -342,105 +241,21 @@ def test_attention_q_drift_can_trigger_and_memory_energy_is_reported(tmp_path):
                 "qwen_exo_q_norm": [1.0, 1.0, 1.1, 1.2],
                 "qwen_exo_q_drift": [float("nan"), 0.0, 0.0, 0.42],
                 "qwen_exo_memory_energy": [0.4, 0.45, 0.55, 0.61],
+                "finish_reason": {"type": "stop"},
             }
         },
     )
 
-    assert result.triggered
-    assert result.trigger_reasons == ("attention_q_drift",)
     assert result.latest_q_drift == 0.42
     assert result.latest_memory_energy == 0.61
     event = store.events("request-q")[-1]
+    assert event.event_type == "observer.decode_summary"
     assert event.payload["memory_attention_energy_proxy"] == 0.61
-    trigger = next(
-        event
-        for event in store.events("request-q")
-        if event.event_type == "observer.mid_think_triggered"
-    )
-    assert trigger.payload["attention_q_drift"] == 0.42
+    assert event.payload["max_q_drift"] == 0.42
 
 
-def test_immediate_uncertainty_retrieval_emits_external_event(tmp_path):
-    store = TelemetryStore(tmp_path / "trace-immediate.jsonl")
-    observer = InFlightObserver(
-        store,
-        mode="active",
-        surprisal_window=2,
-        surprisal_threshold=99.0,
-        surprisal_margin=1.0,
-        q_drift_threshold=0.3,
-        recovery_tokens=8,
-        immediate_uncertainty_retrieval=True,
-    )
-
-    result = observer.observe_generation_result(
-        "request-immediate",
-        {
-            "meta_info": {
-                "output_token_logprobs": [
-                    (-1.0, 1),
-                    (-1.0, 2),
-                    (-4.0, 3),
-                    (-4.0, 4),
-                ],
-                "qwen_exo_q_drift": [float("nan"), 0.0, 0.0, 0.42],
-            }
-        },
-        incremental_logprobs=True,
-    )
-
-    assert result.triggered
-    assert len(result.events) == 1
-    assert result.events[0].uncertainty_state == "uncertainty_detected"
-    assert result.events[0].post_q_sketches == ()
-    assert any(
-        event.event_type == "observer.mid_think_event"
-        and event.payload["uncertainty_state"] == "uncertainty_detected"
-        for event in store.events("request-immediate")
-    )
 
 
-def test_attention_q_drift_persists_below_absolute_surprisal_threshold(tmp_path):
-    observer = InFlightObserver(
-        TelemetryStore(tmp_path / "trace-persistent.jsonl"),
-        mode="shadow",
-        surprisal_window=2,
-        surprisal_threshold=99.0,
-        surprisal_margin=1.0,
-        q_drift_threshold=0.3,
-        recovery_tokens=2,
-    )
-    triggered = observer.observe_generation_result(
-        "request-persistent-q",
-        {
-            "meta_info": {
-                "output_token_logprobs": [
-                    (-1.0, 1),
-                    (-1.0, 2),
-                    (-4.0, 3),
-                    (-4.0, 4),
-                ],
-                "qwen_exo_q_drift": [float("nan"), 0.0, 0.0, 0.42],
-            }
-        },
-        incremental_logprobs=True,
-    )
-    recovered = observer.observe_generation_result(
-        "request-persistent-q",
-        {
-            "meta_info": {
-                "output_token_logprobs": [(-4.0, 5), (-4.0, 6)],
-                "qwen_exo_q_drift": [0.0, 0.0],
-            }
-        },
-        incremental_logprobs=True,
-    )
-
-    assert triggered.trigger_reasons == ("attention_q_drift",)
-    assert len(recovered.events) == 1
-    event = recovered.events[0]
-    assert event.uncertainty_state == "persistent_uncertainty"
-    assert event.attention_q_drift == 0.42
 
 
 def test_telemetry_edited_mode_records_bounded_text_only_for_edited_requests(tmp_path):
@@ -473,61 +288,11 @@ def test_telemetry_clear_truncates_disk_and_memory(tmp_path):
     assert status["ok"] is True
 
 
-def _drifting_stream():
-    # Four low-surprisal warmup tokens, then a sustained high-surprisal run.
-    return [(-1.0, i + 1) for i in range(4)] + [(-8.0, 100 + i) for i in range(6)]
 
 
-def _observer(tmp_path, **kwargs):
-    base = dict(
-        mode="shadow",
-        surprisal_window=2,
-        surprisal_threshold=6.0,
-        surprisal_margin=2.0,
-        cooldown_tokens=1,
-        max_triggers=1,
-    )
-    base.update(kwargs)
-    return InFlightObserver(TelemetryStore(tmp_path / "trace.jsonl"), **base)
 
 
-def test_sustain_one_reproduces_single_window_trigger(tmp_path):
-    observer = _observer(tmp_path, surprisal_sustain=1)
-    result = observer.observe_generation_result(
-        "r",
-        {"meta_info": {"output_token_logprobs": _drifting_stream(),
-                       "finish_reason": {"type": "stop"}}},
-    )
-    assert result.triggered
 
 
-def test_high_sustain_suppresses_the_same_drift(tmp_path):
-    """The false-trigger fix: an elevated run that fires at sustain=1 must not
-    fire when the continuous-drift requirement is longer than the run. On live
-    traffic single-window spikes drove nearly every mid-think event, all of
-    which recalled nothing."""
-    observer = _observer(tmp_path, surprisal_sustain=1000)
-    result = observer.observe_generation_result(
-        "r",
-        {"meta_info": {"output_token_logprobs": _drifting_stream(),
-                       "finish_reason": {"type": "stop"}}},
-    )
-    assert not result.triggered
-    assert observer.state("r").trigger_tokens == []
 
 
-def test_sustained_count_resets_when_drift_lapses(tmp_path):
-    """A low-surprisal tail must clear the accumulated drift count so two
-    separated bursts never add up to a false confirmation."""
-    observer = _observer(tmp_path, surprisal_sustain=1000)
-    stream = (
-        [(-1.0, i + 1) for i in range(4)]
-        + [(-8.0, 100 + i) for i in range(4)]
-        + [(-1.0, 200 + i) for i in range(4)]
-    )
-    observer.observe_generation_result(
-        "r",
-        {"meta_info": {"output_token_logprobs": stream,
-                       "finish_reason": {"type": "stop"}}},
-    )
-    assert observer.state("r").sustained_count == 0

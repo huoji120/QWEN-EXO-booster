@@ -12,6 +12,7 @@ from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingRespons
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.sampling.sampling_params import QWEN_EXO_REASONING_BUDGET_KEY
+from sglang.srt.sampling.think_shaping import QWEN_EXO_THINK_SHAPING_KEY
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -91,14 +92,12 @@ class FakeTokenizerManager:
 
 class FakeRuntime:
     reasoning_end_token_id = END
-    think_context_enabled = False
     max_reasoning_tokens = 4
 
     def reasoning_budget_for_effort(self, effort):
         return self.max_reasoning_tokens
 
     def __init__(self):
-        self.boundaries = []
         self.cutoffs = []
 
     def register_generation_prompt(self, *_args, **_kwargs):
@@ -107,15 +106,11 @@ class FakeRuntime:
     def observe_generation_result(self, *_args, **_kwargs):
         pass
 
-    async def await_think_context(self, _request_id):
-        raise AssertionError("single-phase reasoning has no think-context stop")
+    def think_shaping_params(self, max_reasoning_tokens):
+        return {"end_token_id": END, "landing_end": max_reasoning_tokens}
 
-    async def build_reasoning_cutoff_injection(self, request_id, **kwargs):
+    def record_forced_reasoning_boundary(self, request_id, **kwargs):
         self.cutoffs.append((request_id, kwargs))
-        return None
-
-    def record_reasoning_boundary(self, request_id, **kwargs):
-        self.boundaries.append((request_id, kwargs))
 
 
 def run_generation(outputs, rid, *, runtime=None, response_request=None, output_limit=10):
@@ -234,9 +229,12 @@ class SinglePhaseReasoningTestCase(CustomTestCase):
             {"end_token_id": END, "max_tokens": 4},
         )
         self.assertEqual(snapshots[-1]["meta_info"]["finish_reason"]["type"], "stop")
+        # The thinking-time bias rides on the same request.
+        self.assertEqual(
+            params["custom_params"][QWEN_EXO_THINK_SHAPING_KEY],
+            {"end_token_id": END, "landing_end": 4},
+        )
         self.assertEqual(context.num_reasoning_tokens, 2)
-        self.assertEqual(len(runtime.boundaries), 1)
-        self.assertIsNone(runtime.boundaries[0][1]["injection"])
         self.assertFalse(runtime.cutoffs)
 
     def test_budget_finish_still_forces_the_cutoff_continuation(self):
@@ -268,6 +266,12 @@ class SinglePhaseReasoningTestCase(CustomTestCase):
         self.assertIn("stop over thinking", snapshots[1]["text"])
         self.assertEqual(serving.tokenizer_manager.requests[1].input_ids[-1], END)
         self.assertEqual(runtime.cutoffs[0][1]["observed_tokens"], 4)
+        self.assertEqual(runtime.cutoffs[0][1]["token_ids"][-1], END)
+        # The answer continuation carries no thinking-time bias.
+        continuation = serving.tokenizer_manager.requests[1].sampling_params
+        self.assertNotIn(
+            QWEN_EXO_THINK_SHAPING_KEY, continuation.get("custom_params") or {}
+        )
 
     def test_answer_length_finish_after_reasoning_end_is_not_a_cutoff(self):
         # max_new_tokens exhausted by the answer: no forced boundary or retry.

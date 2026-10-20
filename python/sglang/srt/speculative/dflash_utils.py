@@ -272,6 +272,11 @@ def apply_dflash_verify_logits_adjustments(
             )
         get_logits_3d().add_(logit_bias[:, None, :])
 
+    # The dense fallback above already applied it through apply_logits_bias.
+    think_shaping = sampling_info.think_shaping
+    if think_shaping is not None:
+        think_shaping.apply_per_position(get_logits_3d())
+
 
 def _get_or_create_chain_verify_buffers(
     *,

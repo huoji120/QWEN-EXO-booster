@@ -32,7 +32,7 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   ],
   qwen_exo_max_internal_fanout: [
     "内部任务并发",
-    "限制反思记忆、上下文压缩、推理截断自问等后台任务的并行度，防止内部负载挤占主请求调度资源与 Mamba 状态槽；推荐 8。",
+    "限制反思记忆、上下文压缩、记忆总结与整理等后台任务的并行度，防止内部负载挤占主请求调度资源与 Mamba 状态槽；推荐 8。",
   ],
   qwen_exo_max_internal_tokens: [
     "内部任务 Token 预算",
@@ -61,6 +61,22 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   qwen_exo_reasoning_budget_xhigh: [
     "xhigh 思考预算",
     "显式 xhigh（或 max）档位不受默认思考预算限制，仍受请求总输出与上下文限制；默认 8192。",
+  ],
+  qwen_exo_think_suppress_after_tokens: [
+    "压制“再想想”起点",
+    "思考超过这么多 token 后，压低 Wait / Hmm / Alternatively / 等等 这类反复验证用词的概率，减少长篇反复思考；0 表示关闭，默认 1024。",
+  ],
+  qwen_exo_think_suppress_strength: [
+    "压制强度",
+    "压制时给这些词加的负 logit 偏置，越大越少出现（5 约降为原概率的 1/150）；默认 5。",
+  ],
+  qwen_exo_think_landing_start_ratio: [
+    "软着陆起点",
+    "思考用到预算的这个比例后，逐步提高结束思考（</think>）的概率，让模型在自然的位置收尾而不是被硬截断；1 表示关闭，默认 0.75。",
+  ],
+  qwen_exo_think_landing_bias: [
+    "软着陆力度",
+    "到预算用完时给 </think> 加的最大正偏置，从起点线性增长到这个值；0 表示关闭，默认 8。",
   ],
   qwen_exo_reasoning_mode: [
     "思考预算模式",
@@ -92,47 +108,11 @@ export const SETTING_COPY: Record<string, readonly [string, string]> = {
   ],
   qwen_exo_observer_mode: [
     "观测模式",
-    "定义解码期惊奇度与 Attention-Q 漂移的观测级别，观测信号供注意力分数偏置使用；主动干预允许触发自我提问，仅观测只记录，关闭最省开销。",
-  ],
-  qwen_exo_immediate_uncertainty_retrieval: [
-    "即时自我提问",
-    "观测命中后立即启动隐藏的自我提问；纠错速度优先时开启，内部请求过多时可关闭。",
-  ],
-  qwen_exo_observer_surprisal_threshold: [
-    "局部惊奇度阈值",
-    "定义最近 token 局部平均惊奇度的触发下限；降低更敏感，提高更安静，推荐 0.8。",
-  ],
-  qwen_exo_observer_surprisal_window: [
-    "惊奇度窗口",
-    "定义局部惊奇度统计使用的最近 token 数；窗口小响应快但噪声高，窗口大更稳定，推荐 8。",
-  ],
-  qwen_exo_observer_surprisal_margin: [
-    "惊奇度增量",
-    "要求局部惊奇度相对历史基线超过指定增量才触发，减少缓慢波动误报，推荐 0.2。",
+    "定义解码期惊奇度与 Attention-Q 漂移的观测，观测信号供遥测和注意力分数偏置使用；仅观测记录信号（旧值“主动干预”与之相同），关闭最省开销，但分数偏置需要开启观测。",
   ],
   qwen_exo_observer_q_drift_threshold: [
     "查询漂移阈值",
-    "定义当前 Attention-Q 相对近期方向的差异触发下限；降低更敏感，提高减少误触发，推荐 0.35。",
-  ],
-  qwen_exo_observer_cooldown_tokens: [
-    "观测冷却间隔",
-    "定义同一请求两次观测干预的最小 token 间隔；重复触发较多时提高，推荐 64。",
-  ],
-  qwen_exo_observer_max_triggers: [
-    "单次触发上限",
-    "限制一次请求允许的自动干预次数；当前安全上限为 1，0 表示仅观测不触发。",
-  ],
-  qwen_exo_observer_q_pre_tokens: [
-    "触发前查询快照",
-    "定义触发点前保留的 Attention-Q 快照数量，用于恢复偏航前的关注上下文，推荐 8。",
-  ],
-  qwen_exo_observer_q_post_tokens: [
-    "触发后查询快照",
-    "定义触发点后继续采集的 Attention-Q 快照数量，用于确认不确定性是否持续，推荐 4。",
-  ],
-  qwen_exo_observer_recovery_tokens: [
-    "恢复判定窗口",
-    "定义触发后观察多少个未来 token 再判定不确定性恢复；较大更谨慎，较小更快进入纠错，推荐 8。",
+    "注意力分数偏置选取锚点时的 Attention-Q 漂移门槛；推荐 0.35。",
   ],
   qwen_exo_score_bias_mode: [
     "注意力控制模式",

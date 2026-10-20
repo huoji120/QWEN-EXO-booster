@@ -232,9 +232,9 @@ def test_second_unhealthy_boot_rolls_back_to_last_healthy_revision(tmp_path: Pat
 
 def test_validation_rejects_incompatible_runtime_contract():
     values = default_values()
-    values["qwen_exo_observer_mode"] = "shadow"
+    values["qwen_exo_observer_mode"] = "off"  # score bias (on by default) needs it
 
-    with pytest.raises(ServiceConfigError, match="Immediate uncertainty retrieval") as exc_info:
+    with pytest.raises(ServiceConfigError, match="Score Bias requires") as exc_info:
         validate_values(values)
 
     assert exc_info.value.code == "invalid_contract"

@@ -265,6 +265,7 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.think_shaping import build_think_shaping
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import (
@@ -4696,9 +4697,11 @@ class Scheduler(
         )
         sched_sampling_info = batch.sampling_info
 
-        # 2. sampling_info substitute
+        # 2. sampling_info substitute (plus this forward's thinking-time bias)
         if sched_sampling_info is not None:
-            batch.sampling_info = sched_sampling_info.copy_for_forward()
+            batch.sampling_info = sched_sampling_info.copy_for_forward(
+                think_shaping=build_think_shaping(batch.reqs, device=batch.device)
+            )
 
         # 3. pin for 2-iter tensor lifetime (overlap path only)
         if overlap:

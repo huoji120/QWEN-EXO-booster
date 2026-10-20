@@ -98,15 +98,8 @@ fi
 : "${QWEN_EXO_MAX_MAMBA_CACHE_SIZE:=}"
 : "${QWEN_EXO_MAMBA_SSM_DTYPE:=bfloat16}"
 
-: "${QWEN_EXO_OBSERVER_MODE:=active}"
-: "${QWEN_EXO_SURPRISAL_THRESHOLD:=0.8}"
-: "${QWEN_EXO_SURPRISAL_WINDOW:=8}"
-: "${QWEN_EXO_SURPRISAL_MARGIN:=0.2}"
+: "${QWEN_EXO_OBSERVER_MODE:=shadow}"
 : "${QWEN_EXO_Q_DRIFT_THRESHOLD:=0.35}"
-: "${QWEN_EXO_Q_PRE_TOKENS:=8}"
-: "${QWEN_EXO_Q_POST_TOKENS:=4}"
-: "${QWEN_EXO_RECOVERY_TOKENS:=8}"
-: "${QWEN_EXO_IMMEDIATE_UNCERTAINTY_RETRIEVAL:=1}"
 : "${QWEN_EXO_MOE_TOP_K:=}"
 : "${QWEN_EXO_MOE_EXTRA_EXPERTS:=0}"
 : "${QWEN_EXO_ENABLE_RETURN_ROUTED_EXPERTS:=0}"
@@ -551,13 +544,7 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-reasoning-mode "${QWEN_EXO_REASONING_MODE}"
     --qwen-exo-reasoning-dynamic-context-tokens "${QWEN_EXO_REASONING_DYNAMIC_CONTEXT_TOKENS}"
     --qwen-exo-observer-mode "${QWEN_EXO_OBSERVER_MODE}"
-    --qwen-exo-observer-surprisal-threshold "${QWEN_EXO_SURPRISAL_THRESHOLD}"
-    --qwen-exo-observer-surprisal-window "${QWEN_EXO_SURPRISAL_WINDOW}"
-    --qwen-exo-observer-surprisal-margin "${QWEN_EXO_SURPRISAL_MARGIN}"
     --qwen-exo-observer-q-drift-threshold "${QWEN_EXO_Q_DRIFT_THRESHOLD}"
-    --qwen-exo-observer-q-pre-tokens "${QWEN_EXO_Q_PRE_TOKENS}"
-    --qwen-exo-observer-q-post-tokens "${QWEN_EXO_Q_POST_TOKENS}"
-    --qwen-exo-observer-recovery-tokens "${QWEN_EXO_RECOVERY_TOKENS}"
     --qwen-exo-console-trace-default-scope "${QWEN_EXO_CONSOLE_TRACE_DEFAULT_SCOPE}"
     --qwen-exo-reflection-memory-mode "${QWEN_EXO_REFLECTION_MEMORY_MODE}"
     --qwen-exo-reflection-memory-idle-seconds "${QWEN_EXO_REFLECTION_MEMORY_IDLE_SECONDS}"
@@ -585,9 +572,6 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
   fi
   if [[ "${QWEN_EXO_MOE_EXTRA_EXPERTS}" != "0" ]]; then
     server_args+=( --qwen-exo-moe-extra-experts "${QWEN_EXO_MOE_EXTRA_EXPERTS}" )
-  fi
-  if [[ "${QWEN_EXO_IMMEDIATE_UNCERTAINTY_RETRIEVAL}" == "1" ]]; then
-    server_args+=( --qwen-exo-immediate-uncertainty-retrieval )
   fi
   if [[ "${QWEN_EXO_TELEMETRY_INCLUDE_TEXT}" == "1" ]]; then
     server_args+=( --qwen-exo-telemetry-include-text )

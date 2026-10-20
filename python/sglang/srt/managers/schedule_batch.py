@@ -820,6 +820,8 @@ class Req(ReqDllmMixin):
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
+        # Lazily created by think_shaping.build_think_shaping (thinking-time bias).
+        self.qwen_exo_think_shaping = None
         self.return_hidden_states = return_hidden_states
 
         # extra key for classifying the request (e.g. cache_salt)
