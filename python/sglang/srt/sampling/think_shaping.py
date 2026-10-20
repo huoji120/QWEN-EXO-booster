@@ -38,12 +38,19 @@ class ThinkShapingConfig(msgspec.Struct, frozen=True):
     landing_bias: float = 0.0
 
     def to_params(self) -> dict[str, Any]:
-        return msgspec.to_builtins(self)
+        """custom_params payload. Values must be scalars to survive the
+        msgpack IPC (``CustomParamValue``), so token ids travel as "1,2,3"."""
+        params = msgspec.to_builtins(self)
+        params["suppress_token_ids"] = ",".join(str(i) for i in self.suppress_token_ids)
+        return params
 
     @classmethod
     def from_params(cls, params: Any) -> Optional["ThinkShapingConfig"]:
         if not params:
             return None
+        params = dict(params)
+        ids = params.get("suppress_token_ids") or ""
+        params["suppress_token_ids"] = tuple(int(i) for i in str(ids).split(",") if i)
         return msgspec.convert(params, cls)
 
     def row_bias(self, thinking_tokens: int) -> dict[int, float]:
@@ -100,6 +107,13 @@ class ThinkShapingBias(msgspec.Struct):
         """``logits``: [batch, vocab]."""
         columns = logits[:, self.token_ids]
         logits[:, self.token_ids] = columns + self.bias.to(columns.dtype)
+
+    def apply_repeated(self, logits: torch.Tensor, repeats: int) -> None:
+        """``logits``: [batch * repeats, vocab], rows grouped per request
+        (EAGLE / n-gram verify)."""
+        columns = logits[:, self.token_ids]
+        bias = self.bias.repeat_interleave(int(repeats), dim=0)
+        logits[:, self.token_ids] = columns + bias.to(columns.dtype)
 
     def apply_per_position(self, logits_3d: torch.Tensor) -> None:
         """``logits_3d``: [batch, positions, vocab] (speculative verify)."""

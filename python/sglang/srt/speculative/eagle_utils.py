@@ -677,6 +677,11 @@ def eagle_sample(
                 sampling_info.logit_bias, verify_input.draft_token_num, dim=0
             )
         )
+    if sampling_info.think_shaping is not None:
+        # Rows are grouped per request: [bs * draft_token_num, vocab].
+        sampling_info.think_shaping.apply_repeated(
+            next_token_logits, verify_input.draft_token_num
+        )
 
     # Apply grammar mask if provided
     if vocab_mask is not None:

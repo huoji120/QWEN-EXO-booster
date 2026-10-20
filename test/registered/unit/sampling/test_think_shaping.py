@@ -94,6 +94,37 @@ def test_bias_is_applied_on_decode_and_on_every_speculative_verify_position():
     assert verify.sum() == -1.0 * draft
 
 
+def test_shaping_params_survive_the_scheduler_ipc_round_trip():
+    """custom_params values must be scalars (``CustomParamValue``); a token-id
+    list nested in the shaping dict failed msgpack validation on the way to
+    the scheduler."""
+    import msgspec
+
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    params = SamplingParams(
+        max_new_tokens=8,
+        custom_params={QWEN_EXO_THINK_SHAPING_KEY: CONFIG.to_params()},
+    )
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(params), type=SamplingParams)
+    restored = ThinkShapingConfig.from_params(
+        decoded.custom_params[QWEN_EXO_THINK_SHAPING_KEY]
+    )
+    assert restored == CONFIG
+
+
+def test_bias_reaches_eagle_verify_rows_grouped_per_request():
+    """Prod runs EAGLE: its verify logits are [bs * draft, vocab] and never
+    went through apply_logits_bias, so the shaping had no effect there."""
+    shaping = build_think_shaping([_req([1] * 8), _req([1] * 8, config=None)], device="cpu")
+    draft = 3
+    logits = torch.zeros(2 * draft, 12)
+    shaping.apply_repeated(logits, draft)
+    assert logits[:draft, WAIT].tolist() == [-5.0] * draft
+    assert logits[:draft, END].tolist() == [4.0] * draft
+    assert logits[draft:].abs().sum() == 0
+
+
 def test_only_single_token_suppress_words_are_biased():
     """A multi-token word must not be biased through its first piece (which
     other words share)."""
