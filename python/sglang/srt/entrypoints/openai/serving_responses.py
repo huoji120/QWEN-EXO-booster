@@ -11,7 +11,7 @@ import logging
 import time
 from collections.abc import Iterable, Mapping
 from contextlib import AsyncExitStack
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -180,6 +180,13 @@ class _ResponsePromptEncoding:
 
 class _ResponsesInputError(ValueError):
     """Invalid client history, distinct from internal reasoning scoring failures."""
+
+
+@dataclass(frozen=True)
+class _ResponseConversation:
+    sources: tuple[Any, ...]
+    state: tuple[Any, ...]
+    messages: list[ChatCompletionMessageParam]
 
 
 def _log_response_shape(*, request_id, stream, status, items, finish_reason, usage):
@@ -527,6 +534,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+        # A request can be reused by a pending/background dispatcher. Never
+        # carry normalized history across separate serving lifecycles.
+        request._responses_conversation = None
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
@@ -1061,7 +1071,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     if self.use_harmony
                     else self._conversation_messages(request, prev_response)
                 )
-                self.msg_store[request.request_id] = public_messages
+                # Stored history has its own list: later output handling must
+                # not append to the request's canonical input conversation.
+                self.msg_store[request.request_id] = (
+                    public_messages if self.use_harmony else list(public_messages)
+                )
             created_time = int(time.time())
             if request.store and not request.background:
                 pending_response = await self.register_in_progress_response(
@@ -2035,12 +2049,41 @@ class OpenAIServingResponses(OpenAIServingChat):
         output item (reasoning, tool calls, ``mcp_call``, messages) through the
         same normalization a stateless client's replay takes, so a chained
         prompt renders exactly like the equivalent full-history request.
+
+        Only completed parent responses are immutable enough to reuse. The
+        incoming input is immutable during one serving lifecycle; replacements
+        and server model copies with changed history are checked by identity.
         """
+        parent_messages = (
+            self.msg_store[prev_response.id] if prev_response is not None else None
+        )
+        parent_output = prev_response.output if prev_response is not None else None
+        # Keep the actual sources alive rather than using id(input): replacement
+        # must invalidate even if Python reuses a released object's address.
+        sources = (request.input, prev_response, parent_messages, parent_output)
+        state = (
+            id(self),
+            request.request_id,
+            request.previous_response_id,
+            len(request.input),
+            getattr(prev_response, "status", None),
+            len(parent_messages) if parent_messages is not None else 0,
+            len(parent_output) if parent_output is not None else 0,
+        )
+        cached = request._responses_conversation
+        if (
+            cached is not None
+            and (prev_response is None or prev_response.status == "completed")
+            and cached.state == state
+            and all(old is new for old, new in zip(cached.sources, sources))
+        ):
+            return cached.messages
+
         messages: list[ChatCompletionMessageParam] = []
         if prev_response is not None:
-            for message in self.msg_store[prev_response.id]:
+            for message in parent_messages:
                 messages.extend(self._normalize_response_items_for_chat(message))
-            for output_item in prev_response.output:
+            for output_item in parent_output:
                 messages.extend(self._normalize_response_items_for_chat(output_item))
         # Responses API supports simple text inputs without chat format
         if isinstance(request.input, str):
@@ -2050,6 +2093,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 messages.extend(  # type: ignore
                     self._normalize_response_items_for_chat(input_item)
                 )
+        request._responses_conversation = _ResponseConversation(
+            sources=sources, state=state, messages=messages
+        )
         return messages
 
     def _construct_input_messages_with_harmony(

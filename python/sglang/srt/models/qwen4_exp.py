@@ -44,6 +44,10 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from qwen_exo_booster.sm120_profile import (
+    enforce_sm120_profile_runtime,
+    sm120_profile_enabled,
+)
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
@@ -1347,6 +1351,7 @@ class Qwen4ExpLayerExtensionMixin:
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
+            sm120_fast=sm120_profile_enabled(config),
         )
         self.attn_hyper_connection = GatedResidual(
             hc_config,
@@ -1367,6 +1372,12 @@ class Qwen4ExpLayerExtensionMixin:
         *,
         ple_batch: Optional[_PLEBatch],
     ):
+        # A cross-layer fused combine->mix already produced the next layer's
+        # mixed stream. Keep its deferred residual until that layer's combine.
+        if isinstance(residual, tuple):
+            if self.ple is not None:
+                raise RuntimeError("deferred HC residual cannot cross a PLE boundary")
+            return hidden_states, residual
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
             assert hidden_states.shape[-1] == self.hidden_size
@@ -1398,10 +1409,13 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        if self.attn_hyper_connection.config.sm120_fast:
+            hidden_states, residual = self.attn_hyper_connection.combine_then_mix(
+                hidden_states, residual, self.mlp_hyper_connection
+            )
+        else:
+            hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
+            hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1466,7 +1480,13 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        *,
+        next_hyper_connection=None,
     ):
+        if next_hyper_connection is not None:
+            return self.mlp_hyper_connection.combine_then_mix(
+                hidden_states, residual, next_hyper_connection
+            )
         hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
         return hidden_states, None
 
@@ -1508,7 +1528,12 @@ class Qwen4ExpLinearDecoderLayer(
             hidden_states, residual, forward_batch
         )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states,
+            residual,
+            forward_batch,
+            next_hyper_connection=kwargs.get("next_hyper_connection"),
+        )
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -1662,7 +1687,12 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states, residual, forward_batch
         )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states,
+            residual,
+            forward_batch,
+            next_hyper_connection=kwargs.get("next_hyper_connection"),
+        )
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1718,6 +1748,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
+            sm120_fast=sm120_profile_enabled(config),
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
 
@@ -1884,6 +1915,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         prefix: str = "",
         language_model_cls=Qwen4ExpVLModel,
     ) -> None:
+        # Validate the model-bound numerical contract before VL/HC modules allocate.
+        enforce_sm120_profile_runtime(config)
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -2082,7 +2115,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                 )
 
+        warned_ple_downcast = False
+
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
+            nonlocal warned_ple_downcast
             if ".ngram_embedding.shard_" not in name:
                 return False
             import re
@@ -2131,8 +2167,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 emb.weight.dtype == torch.float8_e4m3fn
                 and loaded_weight.dtype != torch.float8_e4m3fn
             ):
-                if not getattr(load_qwen4_exp_ple_shard, "_warned_downcast", False):
-                    load_qwen4_exp_ple_shard._warned_downcast = True
+                if not warned_ple_downcast:
+                    warned_ple_downcast = True
                     logger.warning(
                         "PLE checkpoint shards are %s but the embedding storage "
                         "is fp8 (ple_embedding_dtype / fp8 quant config); "
@@ -2338,6 +2374,30 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+
+        if sm120_profile_enabled(self.config):
+            incomplete_hc = []
+            loaded_names = loaded_params | loaded_buffers | loaded_shard_params
+            for module_name, module in self.named_modules():
+                if not isinstance(module, GatedResidual) or not module.config.sm120_fast:
+                    continue
+                required = (
+                    f"{module_name}.input_mix_weight_down.weight",
+                    f"{module_name}.input_mix_weight_up.weight",
+                )
+                if any(name not in loaded_names for name in required):
+                    incomplete_hc.append(module_name or "<root>")
+                    continue
+                module.prepare_sm120_int8_weights()
+            if incomplete_hc:
+                raise RuntimeError(
+                    "SM120 HC INT8 preparation saw partially loaded modules: "
+                    + ", ".join(incomplete_hc)
+                )
+
+        # Loading metadata must not retain pre-conversion GPU Parameters while
+        # quantization postprocessing replaces their resident storage.
+        params_dict.clear()
 
         return loaded_params
 

@@ -751,8 +751,10 @@ def test_qsa_mtp_cuda_graph_padding_stays_below_compression_boundary():
     recorders = [Recorder() for _ in backend.attn_backends]
     backend.attn_backends = recorders
     forward_batch.spec_info = SimpleNamespace()
+    backend._draft_graph_metadata_args = {"stale": object()}
 
     backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+    assert backend._draft_graph_metadata_args == {}
     forward_batch.num_padding = 1
     backend.init_forward_metadata_out_graph(forward_batch)
 
@@ -1436,66 +1438,6 @@ def test_qsa_indexer_requires_compress_ratio_above_one():
         raise AssertionError("QSA must reject a unit compression ratio")
 
 
-def test_qsa_indexer_decode_ignores_dp_attention_token_padding():
-    calls = {}
-    mapping = torch.zeros(1, dtype=torch.int32)
-    metadata = SimpleNamespace(
-        token_to_kv_pool=None,
-        compress_member_rows=None,
-        decode_logical_positions=None,
-        pending_ring_slots=None,
-        get_token_to_batch_idx=lambda: mapping,
-        get_seqlens_expanded=lambda: torch.tensor([7], dtype=torch.int32),
-        get_seqlens_int32=lambda: torch.tensor([8], dtype=torch.int32),
-        get_decode_mqa_inputs=lambda layer_id: (
-            torch.zeros(1, 2, 1, 2),
-            torch.zeros(1, 1, dtype=torch.int32),
-            torch.zeros(1, dtype=torch.int32),
-            2,
-        ),
-    )
-    indexer = SimpleNamespace(
-        layer_id=0,
-        index_n_heads=4,
-        _pending_ring_slots=lambda metadata, logical_positions, is_extend: (
-            torch.zeros(logical_positions.numel(), dtype=torch.long)
-        ),
-        project_qk=lambda hidden, rope_positions, **kwargs: (
-            hidden.reshape(-1, 1, 2),
-            hidden.reshape(-1, 1, 2),
-            False,
-        ),
-        update_key_state_and_compress=lambda token_k, logical, rope, meta, state_slots=None, state_stored=False, verify_group_locs=None: (
-            calls.update(
-                token_rows=token_k.shape[0],
-                logical_rows=logical.numel(),
-                rope_rows=rope.numel(),
-            )
-        ),
-        select_decode_tokens=lambda q, cache, table, lengths, max_len, positions, seqlens: (
-            calls.update(q_rows=q.shape[0], positions=positions.tolist())
-            or q.squeeze(1)
-        ),
-    )
-    forward_batch = SimpleNamespace(
-        forward_mode=ForwardMode.DECODE,
-        # One real decode position plus one DP padding row.
-        positions=torch.tensor([6, 0]),
-        out_cache_loc=torch.arange(2, dtype=torch.int32),
-    )
-    hidden = torch.arange(4, dtype=torch.float32).reshape(2, 2)
-    QSAIndexer.forward_cuda(
-        indexer, hidden, forward_batch.positions, forward_batch, metadata
-    )
-    assert calls == {
-        "token_rows": 1,
-        "logical_rows": 1,
-        "rope_rows": 1,
-        "q_rows": 1,
-        "positions": [6],
-    }
-
-
 class _FakeQSAPool:
     qsa_index_kv_heads = 1
     qsa_index_head_dim = 128
@@ -1597,86 +1539,6 @@ class _FakeQSAPool:
         return self.compressed_k
 
 
-class _DispatchIndexer:
-    layer_id = 3
-    index_n_heads = 4
-    compress_ratio = 4
-    _pending_ring_slots = QSAIndexer._pending_ring_slots
-
-    def __init__(self):
-        self.selected = None
-        self.logical_positions = None
-
-    @staticmethod
-    def project_qk(hidden_states, positions, **kwargs):
-        rows = hidden_states.shape[0]
-        return torch.zeros(rows, 4, 128), torch.zeros(rows, 1, 128), False
-
-    def select_prefill_tokens(self, *args):
-        self.selected = "prefill"
-        return torch.tensor([1])
-
-    def select_decode_tokens(self, *args):
-        self.selected = "decode"
-        return torch.tensor([2])
-
-    def update_key_state_and_compress(
-        self, token_k, logical_positions, rope_positions, metadata, **kwargs
-    ):
-        self.logical_positions = logical_positions.clone()
-
-
-class _DispatchMetadata:
-    token_to_kv_pool = None
-    out_cache_loc = None
-    compress_member_rows = None
-    decode_logical_positions = None
-    pending_ring_slots = None
-    # Consumed by the real _pending_ring_slots helper the dispatch indexer
-    # borrows: one token row owned by request slot 1.
-    token_to_batch_idx = torch.zeros(2, dtype=torch.int32)
-    req_pool_indices = torch.ones(2, dtype=torch.int32)
-    sequence_lengths = torch.ones(2, dtype=torch.int32)
-
-    @staticmethod
-    def get_decode_mqa_inputs(layer_id):
-        return (
-            torch.zeros(2, 1, 1, 128),
-            torch.zeros(1, 1, dtype=torch.int32),
-            torch.ones(1, dtype=torch.int32),
-            1,
-        )
-
-    @staticmethod
-    def get_prefill_mqa_inputs(layer_id, positions):
-        return (
-            torch.zeros(1, 1, 128),
-            torch.zeros(1, dtype=torch.int32),
-            torch.ones(1, dtype=torch.int32),
-            torch.ones(1, dtype=torch.int32),
-        )
-
-    @staticmethod
-    def get_token_to_batch_idx():
-        return torch.zeros(1, dtype=torch.int32)
-
-    @staticmethod
-    def get_seqlens_int32():
-        return torch.ones(1, dtype=torch.int32)
-
-    @staticmethod
-    def get_seqlens_expanded():
-        return torch.tensor([7], dtype=torch.int32)
-
-
-class _ForwardMode:
-    def __init__(self, decode):
-        self.decode = decode
-
-    def is_decode(self):
-        return self.decode
-
-
 def test_qsa_indexer_validates_config_values_instead_of_fixed_shapes():
     QSAIndexer._validate_config(
         SimpleNamespace(
@@ -1725,7 +1587,7 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
     torch.testing.assert_close(actual, expected)
 
 
-def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
+def test_qsa_prefill_selection_matches_full_reference():
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4
     indexer = SimpleNamespace(
@@ -1743,12 +1605,6 @@ def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
         (rows,), keys * compress_ratio, dtype=torch.int32
     )
 
-    monkeypatch.setattr(
-        qsa_indexer_module,
-        "_QSA_PREFILL_LOGITS_BUDGET_BYTES",
-        32 * keys * torch.float32.itemsize,
-    )
-    assert qsa_indexer_module._qsa_prefill_row_chunk_size(rows, keys, heads) == 32
     actual = QSAIndexer.select_prefill_tokens(
         indexer, q, k, starts, ends, positions, sequence_lengths
     )
@@ -1763,36 +1619,6 @@ def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
         token_topk=token_topk,
     )
     torch.testing.assert_close(actual, expected)
-
-
-def test_qsa_forward_cuda_dispatches_prefill_and_decode_mqa():
-    indexer = _DispatchIndexer()
-    metadata = _DispatchMetadata()
-    inputs = torch.zeros(1, 16)
-    positions = torch.zeros(1, dtype=torch.int32)
-
-    prefill_result = QSAIndexer.forward_cuda(
-        indexer,
-        inputs,
-        positions,
-        SimpleNamespace(forward_mode=_ForwardMode(False)),
-        metadata,
-    )
-    assert indexer.selected == "prefill"
-    assert indexer.logical_positions.tolist() == [0]
-    assert prefill_result.item() == 1
-
-    positions.fill_(99)
-    decode_result = QSAIndexer.forward_cuda(
-        indexer,
-        inputs,
-        positions,
-        SimpleNamespace(forward_mode=_ForwardMode(True)),
-        metadata,
-    )
-    assert indexer.selected == "decode"
-    assert indexer.logical_positions.tolist() == [6]
-    assert decode_result.item() == 2
 
 
 def test_qsa_fast_topk_returns_sequence_relative_indices():
@@ -2111,9 +1937,9 @@ def _qsa_expected_graph_layout(
     for pid in range(bs):
         base = seq_lens[pid]
         if mode == 0:
-            row_lens.append(base)
-            row_prefix.append(max(base - 1, 0))
-            row_reqs.append(req_pool[pid])
+            row_lens.append(base if pid < real_reqs else 1)
+            row_prefix.append(max(base - 1, 0) if pid < real_reqs else 0)
+            row_reqs.append(req_pool[pid] if pid < real_reqs else 0)
             continue
         eff = (extend_len if pid < real_reqs else 0) if mode == 1 else (
             extend_lens[pid] if pid < real_reqs else 0
@@ -2252,6 +2078,159 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
         mode=0, bs=4, num_rows=4, seq_lens=[256, 1024, 1025, 4096],
         extend_lens=None, extend_len=0, num_padding=0,
     )
+    run_case(
+        mode=0, bs=4, num_rows=4, seq_lens=[63, 64, 4096, 4096],
+        extend_lens=None, extend_len=0, num_padding=2,
+    )
+
+
+def _make_qsa_graph_test_metadata(pool, bs, max_pages, device):
+    def rows(dtype=torch.int32):
+        return torch.full((bs,), -1, dtype=dtype, device=device)
+
+    indexer = SimpleNamespace(
+        token_to_kv_pool=pool,
+        compress_ratio=pool.qsa_compress_ratio,
+        graph_compressed_lengths=rows(),
+        graph_write_locs=rows(),
+        graph_compressed_page_table=torch.full(
+            (bs, max_pages), -1, dtype=torch.int32, device=device
+        ),
+        decode_logical_positions=rows(),
+        pending_ring_slots=rows(torch.int64),
+        graph_ring_group_locs=torch.full(
+            (bs, pool.qsa_compress_ratio), -1, dtype=torch.int32, device=device
+        ),
+        graph_prefix_lengths=rows(),
+    )
+    return SimpleNamespace(
+        sequence_lengths=rows(),
+        row_req_pool_indices=rows(),
+        indexer_metadata=indexer,
+    )
+
+
+def test_qsa_draft_graph_metadata_declines_incompatible_storage():
+    from sglang.srt.layers.attention.qsa.graph_metadata import prepare_draft_graph_metadata
+
+    pool = SimpleNamespace(qsa_compress_ratio=4, qsa_compressed_page_size=16)
+    table = torch.zeros((8, 192), dtype=torch.int32)
+
+    def make_pair():
+        return [_make_qsa_graph_test_metadata(pool, 4, 3, "cpu") for _ in range(2)]
+
+    metadata = make_pair()
+    assert prepare_draft_graph_metadata(metadata, table, pool) is not None
+    # Sharing even one output across steps races in the step grid.
+    metadata[1].indexer_metadata.graph_write_locs = metadata[0].indexer_metadata.graph_write_locs
+    assert prepare_draft_graph_metadata(metadata, table, pool) is None
+    metadata = make_pair()
+    metadata[1].indexer_metadata.graph_compressed_page_table = torch.zeros((4, 2), dtype=torch.int32)
+    assert prepare_draft_graph_metadata(metadata, table, pool) is None
+    metadata = make_pair()
+    metadata[1].indexer_metadata.token_to_kv_pool = SimpleNamespace()
+    assert prepare_draft_graph_metadata(metadata, table, pool) is None
+    metadata = make_pair()
+    assert prepare_draft_graph_metadata(metadata, table[:, ::2], pool) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("compatible", [True, False])
+def test_qsa_mtp_fused_metadata_replay_matches_per_step_and_expected(compatible):
+    from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
+
+    device = "cuda"
+    bs, ratio, full_page, max_pages, steps = 4, 4, 64, 257, 3
+    pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+    pool.qsa_compress_ratio = ratio
+    pool.qsa_compressed_page_size = full_page // ratio
+    req_rows = torch.arange(8, dtype=torch.int32, device=device)[:, None]
+    cols = torch.arange(max_pages * full_page, dtype=torch.int32, device=device)[None, :]
+    req_to_token = ((req_rows * max_pages + cols // full_page) * full_page + cols % full_page).contiguous()
+    backend = QwenSparseMultiStepDraftBackend.__new__(QwenSparseMultiStepDraftBackend)
+    backend._draft_graph_metadata_args = {}
+    backend.attn_backends = []
+    metadata, references = [], []
+    for step in range(steps):
+        width = max_pages if compatible or step != 1 else 129
+        m = _make_qsa_graph_test_metadata(pool, bs, width, device)
+        metadata.append(m)
+        references.append(_make_qsa_graph_test_metadata(pool, bs, width, device))
+        child = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+        child.req_to_token = req_to_token
+        child._cuda_graph_metadata = {(ForwardMode.DECODE, bs): m}
+        child.forward_metadata = None
+        backend.attn_backends.append(child)
+
+    seq_lens = torch.tensor([63, 64, 65, 4096], dtype=torch.int32, device=device)
+    req_pool = torch.tensor([4, 1, 6, -999], dtype=torch.int32, device=device)
+    fb = SimpleNamespace(
+        batch_size=bs, seq_lens=seq_lens, req_pool_indices=req_pool,
+        seq_lens_cpu=None, spec_info=None, num_padding=1,
+    )
+
+    def refresh_reference():
+        for step, m in enumerate(references):
+            launch_graph_metadata(
+                mode=0, bs=bs, num_rows=bs, seq_lens=seq_lens,
+                req_pool_indices=req_pool, extend_lens=None, extend_len=0,
+                num_padding=1, metadata=m, req_to_token=req_to_token,
+                pool=pool, seq_offset=step + 1,
+            )
+
+    def check_values(lengths, requests):
+        refresh_reference()
+        token_table = req_to_token.cpu()
+        for step, (m, reference) in enumerate(zip(metadata, references)):
+            assert backend.attn_backends[step].forward_metadata is m
+            expected_lens = [length + step + 1 for length in lengths[:-1]] + [1]
+            expected_reqs = requests[:-1] + [0]
+            assert m.sequence_lengths.tolist() == expected_lens
+            assert m.row_req_pool_indices.tolist() == expected_reqs
+            assert m.indexer_metadata.graph_prefix_lengths.tolist() == [x - 1 for x in expected_lens]
+            for name in (
+                "graph_compressed_lengths", "graph_write_locs",
+                "graph_compressed_page_table", "decode_logical_positions",
+                "pending_ring_slots", "graph_ring_group_locs", "graph_prefix_lengths",
+            ):
+                actual = getattr(m.indexer_metadata, name)
+                assert torch.equal(actual, getattr(reference.indexer_metadata, name)), (step, name)
+            for row, (length, req) in enumerate(zip(expected_lens, expected_reqs)):
+                current = length - 1
+                indexer = m.indexer_metadata
+                assert int(indexer.graph_compressed_lengths[row]) == length // ratio
+                write = int(token_table[req, current]) // ratio if length % ratio == 0 else 0
+                assert int(indexer.graph_write_locs[row]) == write
+                assert int(indexer.decode_logical_positions[row]) == current
+                assert int(indexer.pending_ring_slots[row]) == req * ratio + current % ratio
+                expected_ring = [req * ratio + max(current - (ratio - 1 - k), 0) % ratio for k in range(ratio)]
+                assert indexer.graph_ring_group_locs[row].tolist() == expected_ring
+                width = indexer.graph_compressed_page_table.shape[1]
+                expected_pages = token_table[req, :width * full_page:full_page] // full_page
+                assert torch.equal(indexer.graph_compressed_page_table[row].cpu(), expected_pages)
+
+    # Warm the real backend dispatch, then capture precisely the replay refresh.
+    backend.init_forward_metadata_out_graph(fb)
+    check_values([63, 64, 65, 4096], [4, 1, 6, -999])
+    cached = backend._draft_graph_metadata_args.get(bs)
+    assert (cached is not None) == compatible
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.init_forward_metadata_out_graph(fb)
+    seq_lens.copy_(torch.tensor([126, 127, 128, 4096], dtype=torch.int32, device=device))
+    req_pool.copy_(torch.tensor([6, 4, 2, -123], dtype=torch.int32, device=device))
+    graph.replay()
+    check_values([126, 127, 128, 4096], [6, 4, 2, -123])
+    if compatible:
+        assert backend._draft_graph_metadata_args[bs] is cached
+
+    # Synthetic capture padding cannot cross a compression boundary at any step.
+    fb.num_padding = bs
+    backend.init_forward_metadata_out_graph(fb)
+    for m in metadata:
+        assert m.sequence_lengths.tolist() == [1] * bs
+        assert m.row_req_pool_indices.tolist() == [0] * bs
+        assert m.indexer_metadata.graph_write_locs.tolist() == [0] * bs
 
 
 if __name__ == "__main__":

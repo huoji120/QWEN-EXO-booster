@@ -326,6 +326,53 @@ class InputMessageConstructionTestCase(unittest.TestCase):
             ],
         )
 
+    def test_public_conversation_survives_prompt_only_copies_not_input_replacement(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x", instructions="public", input=[
+                {"role": "developer", "content": "persona"},
+                {"role": "user", "content": "inspect"},
+                {"type": "reasoning", "summary": [{"text": "check the result"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "probe",
+                 "arguments": {"path": "workspace"}},
+                {"type": "function_call_output", "call_id": "call_1", "output": "old"},
+            ],
+        )
+        public = serving._conversation_messages(request, None)
+        before = json.loads(json.dumps(public))
+        copied = request.model_copy(update={"instructions": "private", "reasoning": None})
+        self.assertIs(serving._conversation_messages(copied, None), public)
+        prompt = serving._construct_input_messages(copied)
+        self.assertEqual(prompt[0], {"role": "system", "content": "private\n\npersona"})
+        self.assertEqual(prompt[2]["reasoning_content"], "check the result")
+        self.assertEqual(prompt[2]["tool_calls"][0]["function"]["arguments"],
+                         '{"path":"workspace"}')
+        self.assertEqual(public, before)
+        self.assertNotIn("_responses_conversation", copied.model_dump())
+        deep = request.model_copy(deep=True)
+        deep_public = serving._conversation_messages(deep, None)
+        self.assertEqual(deep_public, public)
+        self.assertIsNot(deep_public, public)
+        renamed = request.model_copy(update={"request_id": "resp_distinct"})
+        renamed_public = serving._conversation_messages(renamed, None)
+        self.assertEqual(renamed_public, public)
+        self.assertIsNot(renamed_public, public)
+
+        replaced = copied.model_copy(update={"input": [{
+            "type": "function_call_output", "call_id": "call_1", "output": "new",
+        }]})
+        self.assertEqual(serving._conversation_messages(replaced, None), [{
+            "role": "tool", "tool_call_id": "call_1", "content": "new",
+        }])
+        self.assertEqual(public, before)
+        copied.input = "replacement task"
+        self.assertEqual(serving._conversation_messages(copied, None), [
+            {"role": "user", "content": "replacement task"},
+        ])
+        invalid = request.model_copy(update={"input": [{"type": "unsupported_item"}]})
+        with self.assertRaisesRegex(ValueError, "Unsupported Responses API input item"):
+            serving._construct_input_messages(invalid)
+
     def test_previous_response_id_input_list_does_not_call_copy_module(self):
         serving = make_serving()
         serving.use_harmony = True
@@ -1426,6 +1473,9 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
             tokenized_requests[request.rid] = tokenized
             # Permit another request to preprocess before this one completes.
             await asyncio.sleep(0)
+            # The real tokenizer manager removes a completed scheduler request
+            # before its final result is consumed by the serving layer.
+            del manager.rid_to_state[request.rid]
             yield {
                 "text": "answer",
                 "output_ids": [tokenizer.convert_tokens_to_ids("answer")],
@@ -1490,6 +1540,94 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
             )
 
         return serving, tokenizer, tokenized_requests, raw_request
+
+    def test_planning_prompt_and_store_share_public_history_across_server_copies(self):
+        serving, _tokenizer, _tokenized, raw_request = self._fixture(context_len=128)
+        runtime = raw_request().app.state.qwen_exo_runtime
+        runtime.config = SimpleNamespace(reasoning_mode="dynamic", force_auto_reasoning=False)
+        planned = []
+        rendered = []
+
+        async def plan(_request_id, messages, *, request, **_kwargs):
+            planned.append((request._responses_conversation.messages, messages))
+            return "low"
+
+        async def memory(*_args, **_kwargs):
+            return "private"
+
+        original_make_request = serving._make_request
+
+        async def capture_prompt(request, previous, tokenizer):
+            result = await original_make_request(request, previous, tokenizer)
+            rendered.append((request._responses_conversation.messages, result[0]))
+            return result
+
+        runtime.plan_reasoning_effort = plan
+        runtime.memory_block_for_turn = memory
+        serving._make_request = capture_prompt
+        request = ResponsesRequest(
+            model="x", instructions="public", request_id="resp_public_history",
+            input=[
+                {"role": "developer", "content": "alpha"},
+                {"role": "user", "content": "current"},
+                {"type": "reasoning", "summary": [{"text": "inspect result"}]},
+                {"type": "function_call", "call_id": "call_probe", "name": "probe",
+                 "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_probe", "output": "old"},
+            ],
+            max_output_tokens=3, store=True,
+        )
+        response = asyncio.run(serving.create_responses(request, raw_request()))
+        self.assertEqual(getattr(response, "status", None), "completed",
+                         getattr(response, "body", b""))
+        public = planned[0][0]
+        self.assertIs(rendered[0][0], public)
+        self.assertEqual(public, [
+            {"role": "system", "content": "alpha"},
+            {"role": "user", "content": "current"},
+            {"role": "assistant", "reasoning_content": "inspect result"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_probe", "type": "function",
+                "function": {"name": "probe", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_probe", "content": "old"},
+        ])
+        self.assertEqual(rendered[0][1][:-1], planned[0][1])
+        self.assertEqual(rendered[0][1][0], {"role": "system", "content": "public\n\nalpha"})
+        self.assertEqual(rendered[0][1][-1], {"role": "assistant", "content": "private"})
+        self.assertEqual(serving.msg_store[request.request_id], public)
+        self.assertIsNot(serving.msg_store[request.request_id], public)
+        self.assertNotIn("answer", json.dumps(public))
+        self.assertNotIn("private", json.dumps(public))
+
+        chained = ResponsesRequest(
+            model="x", instructions="public", input="new", previous_response_id=response.id,
+        )
+        full = ResponsesRequest(model="x", instructions="public", input=[
+            *request.input, *[item.model_dump() for item in response.output],
+            {"role": "user", "content": "new"},
+        ])
+        self.assertEqual(serving._construct_input_messages(chained, response),
+                         serving._construct_input_messages(full))
+        self.assertEqual(public[-1]["content"], "old")
+
+        # Re-dispatching the same request object starts a new lifecycle, even
+        # when an existing input container was edited rather than replaced.
+        request.input[-1]["output"] = "new"
+        repeated = asyncio.run(serving.create_responses(request, raw_request()))
+        self.assertEqual(getattr(repeated, "status", None), "completed",
+                         getattr(repeated, "body", b""))
+        self.assertEqual(planned[-1][0][-1]["content"], "new")
+        self.assertEqual(serving.msg_store[request.request_id][-1]["content"], "new")
+        self.assertEqual(public[-1]["content"], "old")
+
+        invalid = request.model_copy(update={
+            "input": [{"type": "unsupported_item"}], "request_id": "resp_invalid_history",
+        })
+        error = asyncio.run(serving.create_responses(invalid, raw_request()))
+        self.assertEqual(error.status_code, 400)
+        self.assertIn("Unsupported Responses API input item", json.loads(error.body)["error"]["message"])
+        self.assertNotIn(invalid.request_id, serving.msg_store)
 
     def test_bos_counts_for_usage_and_context_limit_but_not_internal_prompt(self):
         from sglang.srt.entrypoints.openai.serving_responses import (

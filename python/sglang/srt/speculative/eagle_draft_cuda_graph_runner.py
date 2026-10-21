@@ -210,6 +210,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
+            self.top_ks = torch.full((self.max_bs,), -1, dtype=torch.int32)
+            self.top_ps = torch.ones((self.max_bs,), dtype=torch.float32)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -400,8 +402,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
-            top_ps=torch.ones((num_seqs,), dtype=torch.float),
-            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
+            top_ps=self.top_ps[:num_seqs],
+            top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
             is_any_greedy=False,
@@ -535,6 +537,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if buffers.dsa_seed_topk is not None:
                 buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
+            if self.model_runner.server_args.qwen_exo_sm120_fast:
+                self.temperatures.fill_(1.0)
+                self.top_ks.fill_(64)
+                self.top_ps.fill_(1.0)
 
         num_tokens = bs * self.captured_req_width
 
@@ -608,6 +614,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
+            if self.model_runner.server_args.qwen_exo_sm120_fast:
+                self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
+                self.top_ps[:raw_bs].copy_(forward_batch.sampling_info.top_ps[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -683,5 +692,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
             forward_batch.seq_lens_sum = raw_seq_lens_sum
+        if out[3] is not None:
+            # Graph outputs live in a private pool shared with later forwards.
+            # Materialize q on the replay/consumer stream before target replay
+            # can reuse that storage; paused overlap batches retain this clone.
+            out = (*out[:3], out[3].clone())
 
         return out

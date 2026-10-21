@@ -378,6 +378,32 @@ class PLEFileReader:
         return self.maps[path]
 
     def _read_mmap_rows(self, rows: list[int], data: bytearray, scales: bytearray):
+        # Decode/verify gathers contain few rows spread across many shards.
+        # Building NumPy groups and indexed views costs more than copying those
+        # short records directly. Prefill keeps the bounded vectorized path.
+        if len(rows) <= 128:
+            row_bytes = self.manifest.shards[0].row_bytes
+            for index, row in enumerate(rows):
+                shard = self.manifest.locate_record(row)
+                mapping = self._mapping(shard.path)
+                delta = row - shard.row_start
+                offset = shard.offset + delta * row_bytes
+                record = mapping[offset : offset + row_bytes]
+                if len(record) != row_bytes:
+                    raise OSError(f"incomplete PLE row at {shard.path}:{offset}")
+                start = index * row_bytes
+                data[start : start + row_bytes] = record
+                if scales:
+                    if shard.scale_offset < 0:
+                        scale = struct.pack("<f", 1.0)
+                    else:
+                        per_row = shard.scale_row_bytes == 4 and self.manifest.scale_is_per_row
+                        scale_offset = shard.scale_offset + (delta * 4 if per_row else 0)
+                        scale = mapping[scale_offset : scale_offset + 4]
+                        if len(scale) != 4:
+                            raise OSError(f"incomplete PLE row scale at {shard.path}:{scale_offset}")
+                    scales[index * 4 : index * 4 + 4] = scale
+            return
         try:
             row_ids = np.asarray(rows, dtype=np.int64)
         except OverflowError as exc:

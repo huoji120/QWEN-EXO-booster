@@ -15,6 +15,7 @@ def speculative_sampling_classic_kernel(
     TargetProbs,
     DraftProbs,
     ForceAcceptMask,
+    SkipRequests,
     # Strides
     stride_cand_b,
     stride_cand_s,
@@ -35,8 +36,12 @@ def speculative_sampling_classic_kernel(
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
     FORCE_ACCEPT: tl.constexpr,
+    SKIP_REQUESTS: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    if SKIP_REQUESTS:
+        if tl.load(SkipRequests + pid):
+            return
     cur_prob_row = 0
 
     cand_ptr_base = Candidates + pid * stride_cand_b
@@ -181,6 +186,7 @@ def chain_speculative_sampling_triton(
     threshold_acc,
     deterministic,  # not used
     force_accept_mask=None,
+    skip_requests=None,
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
@@ -200,6 +206,16 @@ def chain_speculative_sampling_triton(
         # device tensor to keep the unchanged path allocation-free.
         force_accept_mask = target_probs
 
+    use_skip_requests = skip_requests is not None
+    if use_skip_requests:
+        if tuple(skip_requests.shape) != (batch_size,):
+            raise ValueError("skip_requests must have shape [batch_size]")
+        if skip_requests.device != candidates.device:
+            raise ValueError("skip_requests must be on the candidates device")
+        skip_requests = skip_requests.contiguous()
+    else:
+        skip_requests = target_probs
+
     grid = (batch_size,)
     speculative_sampling_classic_kernel[grid](
         predicts,
@@ -212,6 +228,7 @@ def chain_speculative_sampling_triton(
         target_probs,
         draft_probs,
         force_accept_mask,
+        skip_requests,
         candidates.stride(0),
         candidates.stride(1),
         retrive_index.stride(0),
@@ -229,5 +246,6 @@ def chain_speculative_sampling_triton(
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
         FORCE_ACCEPT=use_force_accept,
+        SKIP_REQUESTS=use_skip_requests,
         BLOCK_V=4096,
     )

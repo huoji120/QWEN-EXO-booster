@@ -12,6 +12,7 @@ from sglang.srt.sampling.think_shaping import (
     QWEN_EXO_THINK_SHAPING_KEY,
     ThinkShapingConfig,
     build_think_shaping,
+    ThinkShapingWorkspace,
 )
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 
@@ -135,3 +136,52 @@ def test_only_single_token_suppress_words_are_biased():
         encode=lambda text, add_special_tokens=False: vocab.get(text, [7, 8])
     )
     assert suppress_token_ids(tokenizer) == (1, 2, 3, 6)
+
+
+def test_workspace_snapshots_survive_reuse_reordering_and_think_completion():
+    workspace = ThinkShapingWorkspace("cpu")
+    overlap_config = ThinkShapingConfig(
+        end_token_id=WAIT, suppress_after=4, suppress_token_ids=(WAIT, WAIT, 5),
+        suppress_strength=5.0, landing_start=6, landing_end=10, landing_bias=8.0,
+    )
+    first = _req([1] * 4)
+    overlapping = _req([1] * 6, overlap_config)
+    plain = _req([1] * 8, None)
+    snapshots = []
+    for requests, configs in (
+        ([first, overlapping], [CONFIG, overlap_config]),
+        ([overlapping, first, plain], [overlap_config, CONFIG, None]),
+        ([first], [CONFIG]),
+        ([overlapping, plain, first, plain], [overlap_config, None, CONFIG, None]),
+    ):
+        for tokens in (6, 8, 12):
+            first.output_ids = [1] * tokens
+            overlapping.output_ids = [1] * tokens
+            shaping = workspace.build(requests)
+            expected = torch.zeros(len(requests), 3, 12)
+            for row, config in enumerate(configs):
+                if config is not None:
+                    for token, value in config.row_bias(tokens).items():
+                        expected[row, :, token] = value
+            snapshots.append((shaping, expected))
+    first.output_ids.append(END)
+    overlapping.output_ids.append(WAIT)
+    assert workspace.build([first, overlapping, plain]) is None
+    # Delayed consumers must still see the old forward's values and token layout.
+    for shaping, expected in snapshots:
+        logits = torch.zeros_like(expected)
+        shaping.apply_repeated(logits.view(-1, logits.shape[-1]), 3)
+        torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
+def test_workspace_repeated_bias_matches_each_logits_dtype_without_touching_other_columns():
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        workspace = ThinkShapingWorkspace("cpu")
+        thinking, plain = _req([1] * 8), _req([1] * 8, None)
+        shaping = workspace.build([thinking, plain])
+        logits = torch.arange(2 * 4 * 12, dtype=dtype).reshape(8, 12)
+        expected = logits.clone()
+        for token, value in CONFIG.row_bias(8).items():
+            expected[:4, token] += torch.tensor(value, dtype=dtype)
+        shaping.apply_repeated(logits, 4)
+        torch.testing.assert_close(logits, expected, rtol=0, atol=0)

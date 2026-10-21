@@ -534,6 +534,10 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths: torch.Tensor,
         share_mtp_queries: bool = False,
     ) -> torch.Tensor:
+        # The local JIT fast_topk's <=512 branch writes every valid index
+        # without loading scores; its radix branch reads only [0, length).
+        # Keep all scores for other consumers, including the CPU reference.
+        use_fast_topk = q.is_cuda and self.block_topk == 512
         logits = None
         if (
             share_mtp_queries
@@ -554,8 +558,9 @@ class QSAIndexer(MultiPlatformOp):
                 compressed_page_table,
                 compressed_lengths,
                 max_model_len,
+                min_scored_len=self.block_topk if use_fast_topk else 0,
             )
-        if logits.is_cuda and self.block_topk == 512:
+        if use_fast_topk:
             # Decode rows start at zero, so lengths are the compressed lengths
             # themselves; calling the JIT kernel directly skips the zeros_like
             # fill + subtract of the generic path.

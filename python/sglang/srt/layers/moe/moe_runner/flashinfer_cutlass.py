@@ -18,12 +18,16 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_size,
+    is_allocation_symmetric,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
@@ -108,6 +112,26 @@ def _flashinfer_cutlass_fused_moe():
     from flashinfer.fused_moe.core import ActivationType
 
     return cutlass_fused_moe, ActivationType
+
+
+# Matches FlashInfer's default tuning range, not a limit on live input rows.
+_FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS = 8192
+
+
+def _cutlass_moe_tune_max_num_tokens(num_tokens: int) -> int:
+    server_args = get_server_args()
+    if server_args.disaggregation_mode == "decode":
+        return next_power_of_2(num_tokens)
+    prefill_tokens = (
+        server_args.max_prefill_buffer_tokens() or server_args.max_prefill_tokens
+    )
+    prefill_ceiling = min(
+        prefill_tokens * get_attention_dp_size(),
+        _FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS,
+    )
+    # FlashInfer's tuning shape must still cover this call, including large
+    # unchunked prefills or DP-gathered batches beyond the usual tuning range.
+    return max(num_tokens, prefill_ceiling)
 
 
 def _activation_type(runner_config: MoeRunnerConfig):
@@ -232,7 +256,7 @@ def _run_flashinfer_cutlass(
         ep_rank=quant_info.moe_ep_rank,
         tp_size=quant_info.moe_tp_size,
         tp_rank=quant_info.moe_tp_rank,
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
     )[0]
@@ -385,7 +409,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         activation_type=ActivationType.Swiglu,
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
         output=out,
     )
 

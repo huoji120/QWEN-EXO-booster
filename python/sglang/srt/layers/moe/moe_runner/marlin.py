@@ -146,6 +146,30 @@ def fused_experts_none_to_marlin(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"
         )
 
+    from sglang.srt.runtime_context import get_server_args
+
+    if getattr(get_server_args(), "qwen_exo_sm120_fast", False):
+        from sglang.jit_kernel.sm120_persistent_moe import (
+            persistent_moe,
+            supports_persistent_moe,
+        )
+
+        if supports_persistent_moe(
+            hidden_states,
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            quant_info,
+            runner_config,
+        ):
+            return StandardCombineInput(
+                hidden_states=persistent_moe(
+                    hidden_states,
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    quant_info,
+                )
+            )
+
     # Use a per-call workspace so captured graphs cannot alias Marlin's
     # inter-block reduction locks and deadlock during capture.
     workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)

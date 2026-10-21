@@ -102,6 +102,8 @@ class ThinkShapingBias(msgspec.Struct):
 
     token_ids: torch.Tensor
     bias: torch.Tensor
+    # Keep one-shot pinned staging alive until its asynchronous copy completes.
+    _staging: Any = None
 
     def apply(self, logits: torch.Tensor) -> None:
         """``logits``: [batch, vocab]."""
@@ -111,9 +113,7 @@ class ThinkShapingBias(msgspec.Struct):
     def apply_repeated(self, logits: torch.Tensor, repeats: int) -> None:
         """``logits``: [batch * repeats, vocab], rows grouped per request
         (EAGLE / n-gram verify)."""
-        columns = logits[:, self.token_ids]
-        bias = self.bias.repeat_interleave(int(repeats), dim=0)
-        logits[:, self.token_ids] = columns + bias.to(columns.dtype)
+        self.apply_per_position(logits.view(self.bias.shape[0], int(repeats), -1))
 
     def apply_per_position(self, logits_3d: torch.Tensor) -> None:
         """``logits_3d``: [batch, positions, vocab] (speculative verify)."""
@@ -137,30 +137,132 @@ def _state_for(req: Any) -> Optional[ThinkShapingState]:
     return state
 
 
+class _ThinkShapingStaging:
+    def __init__(self, rows: int, columns: int, *, pinned: bool):
+        self.host = torch.empty((rows, columns), dtype=torch.float32, pin_memory=pinned)
+        self.values = self.host.numpy()
+        self.copied = torch.cuda.Event() if pinned else None
+        self.pending = False
+
+    def wait(self) -> None:
+        # Protect DMA's pinned source, not only the lifetime of its Tensor object.
+        if self.pending:
+            self.copied.synchronize()
+            self.pending = False
+
+
+class ThinkShapingWorkspace:
+    """Scheduler-owned layouts and two bounded pinned CPU staging slots.
+
+    Device bias snapshots remain independent: a delayed sampler or an overlap
+    forward can retain one after the next forward has prepared its bias.
+    """
+
+    def __init__(self, device: torch.device | str):
+        self.device = torch.device(device)
+        self._signature = None
+        self._token_ids = None
+        self._tokens = ()
+        self._row_layouts = ()
+        self._staging = []
+        self._slot = 0
+        self._row_capacity = 0
+
+    def _layout(self, signature) -> None:
+        if signature == self._signature:
+            return
+        tokens = set()
+        for config in signature:
+            if config is None:
+                continue
+            if config.suppress_after > 0 and config.suppress_strength > 0:
+                tokens.update(config.suppress_token_ids)
+            if config.landing_bias > 0 and config.landing_end > config.landing_start:
+                tokens.add(config.end_token_id)
+        token_ids = tuple(sorted(tokens))
+        columns = {token: index for index, token in enumerate(token_ids)}
+        self._row_layouts = tuple(
+            (
+                tuple(columns[token] for token in set(config.suppress_token_ids) if token in columns),
+                columns.get(config.end_token_id),
+            ) if config is not None else ((), None)
+            for config in signature
+        )
+        if self._token_ids is None or token_ids != self._tokens:
+            for staging in self._staging:
+                staging.wait()
+            self._staging = []
+            self._tokens = token_ids
+            self._token_ids = torch.tensor(token_ids, dtype=torch.int64, device=self.device)
+        self._signature = signature
+
+    def build(self, reqs: Iterable[Any]) -> Optional[ThinkShapingBias]:
+        rows = []
+        any_bias = False
+        for req in reqs:
+            state = _state_for(req)
+            config = None if state is None else state.config
+            thinking = None if state is None else state.thinking_tokens(req.output_ids)
+            suppress = (
+                thinking is not None and config.suppress_after > 0
+                and config.suppress_strength > 0 and thinking >= config.suppress_after
+                and bool(config.suppress_token_ids)
+            )
+            landing = (
+                thinking is not None and config.landing_bias > 0
+                and config.landing_end > config.landing_start
+                and thinking >= config.landing_start
+            )
+            any_bias = any_bias or suppress or landing
+            rows.append((config, thinking, suppress, landing))
+        if not any_bias:
+            return None
+        self._layout(tuple(row[0] for row in rows))
+        count = len(rows)
+        if not self._staging or count > self._row_capacity:
+            for staging in self._staging:
+                staging.wait()
+            self._row_capacity = max(self._row_capacity, 1 << (count - 1).bit_length())
+            self._staging = [
+                _ThinkShapingStaging(
+                    self._row_capacity, len(self._tokens), pinned=self.device.type == "cuda"
+                ) for _ in range(2)
+            ]
+            self._slot = 0
+        staging = self._staging[self._slot]
+        self._slot = (self._slot + 1) % len(self._staging)
+        staging.wait()
+        values = staging.values[:count]
+        values.fill(0)
+        for index, ((config, thinking, suppress, landing), (suppress_columns, end_column)) in enumerate(
+            zip(rows, self._row_layouts)
+        ):
+            if suppress:
+                for column in suppress_columns:
+                    values[index, column] = -config.suppress_strength
+            if landing:
+                progress = (thinking - config.landing_start) / (config.landing_end - config.landing_start)
+                # Landing overrides suppression if both target the end token.
+                values[index, end_column] = config.landing_bias * min(1.0, progress)
+        host = staging.host[:count]
+        if self.device.type == "cpu":
+            bias = host.clone()
+        else:
+            bias = host.to(self.device, non_blocking=staging.copied is not None)
+        if staging.copied is not None:
+            staging.copied.record(torch.cuda.current_stream(self.device))
+            staging.pending = True
+        return ThinkShapingBias(self._token_ids, bias, staging)
+
+
 def build_think_shaping(
-    reqs: Iterable[Any], *, device: torch.device | str
+    reqs: Iterable[Any], *, device: torch.device | str,
+    workspace: Optional[ThinkShapingWorkspace] = None,
 ) -> Optional[ThinkShapingBias]:
-    """The shaping bias for this forward's rows, or ``None`` when no row needs it."""
-    rows: list[dict[int, float]] = []
-    any_bias = False
-    for req in reqs:
-        state = _state_for(req)
-        thinking = None if state is None else state.thinking_tokens(req.output_ids)
-        row = {} if thinking is None else state.config.row_bias(thinking)
-        any_bias = any_bias or bool(row)
-        rows.append(row)
-    if not any_bias:
-        return None
-    token_ids = sorted({token for row in rows for token in row})
-    column = {token: index for index, token in enumerate(token_ids)}
-    bias = torch.zeros((len(rows), len(token_ids)), dtype=torch.float32)
-    for index, row in enumerate(rows):
-        for token, value in row.items():
-            bias[index, column[token]] = value
-    return ThinkShapingBias(
-        token_ids=torch.tensor(token_ids, dtype=torch.int64).to(device, non_blocking=True),
-        bias=bias.to(device, non_blocking=True),
-    )
+    """Build an independent forward snapshot, optionally reusing its staging."""
+    if workspace is None:
+        workspace = ThinkShapingWorkspace(device)
+    return workspace.build(reqs)
 
 
 __all__ = [
@@ -168,5 +270,6 @@ __all__ = [
     "ThinkShapingBias",
     "ThinkShapingConfig",
     "ThinkShapingState",
+    "ThinkShapingWorkspace",
     "build_think_shaping",
 ]

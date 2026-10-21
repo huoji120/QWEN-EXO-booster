@@ -45,6 +45,7 @@ from qwen_exo_booster.activation_editor import (
     apply_activation_editor,
 )
 from sglang.kernels.ops.attention.score_mod import qwen_exo_block_bias_score_mod
+from sglang.jit_kernel.sm120_gdn_output import try_fused_gdn_output
 from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
@@ -86,6 +87,11 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.sm120_dense import (
+    Sm120Int8FusedProjection,
+    Sm120Int8LinearMethod,
+    apply_sm120_int8_linear,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -235,6 +241,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.activation = config.hidden_act
         self.output_gate_type = config.output_gate_type
         self.layer_norm_epsilon = config.rms_norm_eps
+        self._sm120_fused_output = get_server_args().qwen_exo_sm120_fast
 
         # Conv1d layer
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -276,6 +283,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._bind_packed_weight_loaders(self.in_proj_ba)
         self._fused_in_proj_weight: Optional[torch.Tensor] = None
         self._fused_in_proj_qkvz_width = 0
+        self._sm120_fused_in_proj = None
+        if (
+            _is_cuda
+            and isinstance(self.in_proj_qkvz.quant_method, Sm120Int8LinearMethod)
+            and isinstance(self.in_proj_ba.quant_method, Sm120Int8LinearMethod)
+            and self.in_proj_qkvz.bias is None
+            and self.in_proj_ba.bias is None
+            and not get_server_args().enable_lora
+            and not get_server_args().lora_paths
+        ):
+            # The loader finalizes BF16 projections before quantizer postprocess.
+            # Native INT8 pairs instead merge once the second projection has
+            # been converted, before warmup/capture starts.
+            self._sm120_fused_in_proj = Sm120Int8FusedProjection(
+                self.in_proj_qkvz, self.in_proj_ba
+            )
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
@@ -560,6 +583,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if (
+            self._sm120_fused_in_proj is not None
+            and self._sm120_fused_in_proj.weight is not None
+            and hidden_states.dtype == torch.bfloat16
+            and 1 <= hidden_states.shape[0] <= 8
+        ):
+            fused_out = apply_sm120_int8_linear(
+                self._sm120_fused_in_proj, hidden_states
+            )
+            width = self._sm120_fused_in_proj.first_width
+            return fused_out[:, :width], fused_out[:, width:]
+
+        if (
             self._fused_in_proj_weight is not None
             and hidden_states.dtype == torch.bfloat16
             # At prefill widths cuBLAS serves the merged (m, 4120) shape
@@ -626,7 +661,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
+        if (
+            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            and not _is_npu
+            and (not _is_cpu or self.num_v_heads // self.num_k_heads in (1, 2, 4))
+        ):
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
@@ -670,6 +709,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad = torch.zeros_like(z)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
+        if self._sm120_fused_output:
+            output = try_fused_gdn_output(
+                core_attn_out,
+                z,
+                self.norm,
+                self.out_proj,
+                enabled=True,
+                tp_size=self.attn_tp_size,
+                projection_is_unquantized=isinstance(
+                    self.out_proj.quant_method, UnquantizedLinearMethod
+                ),
+            )
+            if output is not None:
+                return output.reshape(*z_shape_og[:-2], self.hidden_size)
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)

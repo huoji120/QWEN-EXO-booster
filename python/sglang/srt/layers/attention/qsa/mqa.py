@@ -5,12 +5,15 @@ kernels: the per-head weight input and all unrelated feature branches are
 removed. Torch implementations are kept as the only fallback and reference.
 """
 
+import functools
 import math
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -216,8 +219,8 @@ if HAS_TILELANG:
         heads: int,
         head_dim: int,
         page_size: int = 64,
-        groups_per_cta: int = 1,
-        num_stages: int = 3,
+        ctas_per_row: int = 1,
+        min_scored_len: int = 0,
         threads: int = 128,
     ):
         # The validated MMA layout wants 64 GEMM rows; pages narrower than
@@ -240,52 +243,55 @@ if HAS_TILELANG:
             Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
             Scale: T.float32,
         ):
-            with T.Kernel(
-                batch,
-                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),
-                threads=threads,
-            ) as (bx, group_block):
+            # Fixed CTA tiers bound launch work independently of page-table width.
+            with T.Kernel(batch, ctas_per_row, threads=threads) as (bx, cta):
                 q_shared = T.alloc_shared([heads, head_dim], T.bfloat16)
                 k_shared = T.alloc_shared([GROUP, head_dim], T.bfloat16)
                 scores = T.alloc_fragment([GROUP, heads], T.float32)
                 reduced = T.alloc_fragment([GROUP], T.float32)
-                T.copy(Q[bx, 0, :, :], q_shared)
-                context_len = ContextLens[bx]
+                context_len = T.alloc_var(T.int32)
+                context_len = T.min(
+                    ContextLens[bx], T.min(max_model_len, max_pages * page_size)
+                )
+                num_groups = T.ceildiv(context_len, GROUP)
 
-                for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):
-                    group = group_block * groups_per_cta + gi
-                    if group * GROUP < context_len:
-                        # Python-level unroll: sub_pages is a compile-time
-                        # constant and TileLang's pipeliner rejects dynamic
-                        # inner loops around shared-memory copies.
-                        for sp in range(sub_pages):
-                            if (group * sub_pages + sp) * page_size < context_len:
-                                T.copy(
-                                    KCache[
-                                        PageTable[bx, group * sub_pages + sp],
-                                        :,
-                                        0,
-                                        :,
-                                    ],
-                                    k_shared[
-                                        sp * page_size : (sp + 1) * page_size, :
-                                    ],
-                                )
-                        T.gemm(
-                            k_shared,
-                            q_shared,
-                            scores,
-                            transpose_B=True,
-                            clear_accum=True,
-                            policy=T.GemmWarpPolicy.FullCol,
-                        )
-                        for token, head in T.Parallel(GROUP, heads):
-                            scores[token, head] = T.max(scores[token, head], 0.0)
-                        T.reduce_sum(scores, reduced, dim=1, clear=True)
-                        for token in T.Parallel(GROUP):
-                            position = group * GROUP + token
-                            if position < context_len:
-                                Logits[bx, position] = reduced[token] / Scale
+                # Only the length-bounded, score-free short-row top-k consumer
+                # may request omitted scores (see tilelang_qsa_mqa_decode).
+                if context_len > min_scored_len:
+                    T.copy(Q[bx, 0, :, :], q_shared)
+                    for step in T.serial(T.ceildiv(num_groups, ctas_per_row)):
+                        group = step * ctas_per_row + cta
+                        if group < num_groups:
+                            # Python-unroll sub-pages: TileLang cannot pipeline
+                            # dynamic inner loops around shared-memory copies.
+                            for sp in range(sub_pages):
+                                if (group * sub_pages + sp) * page_size < context_len:
+                                    T.copy(
+                                        KCache[
+                                            PageTable[bx, group * sub_pages + sp],
+                                            :,
+                                            0,
+                                            :,
+                                        ],
+                                        k_shared[
+                                            sp * page_size : (sp + 1) * page_size, :
+                                        ],
+                                    )
+                            T.gemm(
+                                k_shared,
+                                q_shared,
+                                scores,
+                                transpose_B=True,
+                                clear_accum=True,
+                                policy=T.GemmWarpPolicy.FullCol,
+                            )
+                            for token, head in T.Parallel(GROUP, heads):
+                                scores[token, head] = T.max(scores[token, head], 0.0)
+                            T.reduce_sum(scores, reduced, dim=1, clear=True)
+                            for token in T.Parallel(GROUP):
+                                position = group * GROUP + token
+                                if position < context_len:
+                                    Logits[bx, position] = reduced[token] / Scale
 
         return kernel
 
@@ -342,6 +348,26 @@ def tilelang_qsa_mqa_prefill(
     return logits
 
 
+# Keep TileLang specializations to three levels, targeting about four SM waves.
+_DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    wanted = -(-4 * _num_sms(device_index) // max(rows, 1))
+    for level in _DECODE_CTAS_PER_ROW_LEVELS:
+        if level >= wanted:
+            return level
+    return _DECODE_CTAS_PER_ROW_LEVELS[-1]
+
+
 def tilelang_qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -349,8 +375,16 @@ def tilelang_qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    *,
+    min_scored_len: int = 0,
 ) -> torch.Tensor:
-    """Validated TileLang paged decode kernel with weights removed."""
+    """Validated TileLang paged decode kernel with weights removed.
+
+    A positive ``min_scored_len`` is only safe for a consumer that never reads
+    scores for rows at or below that length, or past any row's context length.
+    Those entries are left unset. Batch-invariant mode always scores every row
+    and initializes padding, including when a caller requests this optimization.
+    """
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
@@ -361,12 +395,19 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    logits = torch.full(
-        (q.shape[0], max_model_len),
-        -float("inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if is_batch_invariant_mode_enabled():
+        min_scored_len = 0
+    if min_scored_len > 0:
+        logits = torch.empty(
+            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
+        )
+    else:
+        logits = torch.full(
+            (q.shape[0], max_model_len),
+            -float("inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
     if not q.shape[0] or not max_model_len:
         return logits
     # The validated MMA layout requires N (the Q-head dimension) to be a
@@ -383,7 +424,11 @@ def tilelang_qsa_mqa_decode(
             dim=1,
         )
     _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads, head_dim=head_dim, page_size=page_size
+        heads=kernel_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),
+        min_scored_len=min_scored_len,
     )(
         q_kernel.unsqueeze(1).contiguous(),
         _as_dtype_contiguous(k_cache, torch.bfloat16, q.device),
@@ -416,14 +461,16 @@ def _qsa_shared_mqa_decode_kernel(
     group = tl.program_id(0)
     q_rows = group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
     q_lengths = tl.load(context_lens_ptr + q_rows)
+    context_len = tl.minimum(tl.max(q_lengths, axis=0), max_model_len)
+    context_len = tl.minimum(context_len, max_pages * PAGE_SIZE)
     d = tl.arange(0, HEAD_DIM)
-    for block_start in tl.range(0, max_model_len, BLOCK_N):
+    for block_start in tl.range(0, context_len, BLOCK_N):
         positions = block_start + tl.arange(0, BLOCK_N)
         page_indices = positions // PAGE_SIZE
         in_page = positions % PAGE_SIZE
         page_ids = tl.load(
             page_table_ptr + group * page_stride + page_indices,
-            mask=page_indices < max_pages,
+            mask=(page_indices < max_pages) & (positions < context_len),
             other=0,
         )
         k_offsets = (
@@ -433,7 +480,7 @@ def _qsa_shared_mqa_decode_kernel(
         )
         k = tl.load(
             k_ptr + k_offsets,
-            mask=positions[:, None] < max_model_len,
+            mask=positions[:, None] < context_len,
             other=0.0,
         ).to(tl.bfloat16)
         for query_offset in range(GROUP_SIZE):
@@ -517,10 +564,18 @@ def qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    *,
+    min_scored_len: int = 0,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
-            q, k_cache, page_table, context_lens, max_model_len, score_scale
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
+            min_scored_len=min_scored_len,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale

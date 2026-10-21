@@ -1523,6 +1523,10 @@ class ResponsesRequest(BaseModel):
     _qwen_exo_template_kwargs: Dict[str, Any] = PrivateAttr(default_factory=dict)
     # Server-side memory block for this turn's prompt only (never returned).
     _qwen_exo_memory_block: Optional[str] = PrivateAttr(default=None)
+    # Canonical public chat history, owned by the Responses serving layer.
+    # Shallow server model_copy calls retain it; its source identities are
+    # checked before reuse, and each create_responses lifecycle resets it.
+    _responses_conversation: Any = PrivateAttr(default=None)
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0

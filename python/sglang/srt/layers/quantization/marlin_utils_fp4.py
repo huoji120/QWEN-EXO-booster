@@ -455,7 +455,12 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             size_n, size_k = hidden_size, intermediate_size
         assert weight.shape == (num_experts, size_n, size_k // 2)
 
-        tensor_list = []
+        # The packed layout has exactly the loader layout's byte count.
+        # Reuse each expert's storage after its repack has consumed the source;
+        # retaining all expert outputs plus torch.stack doubles the layer peak.
+        output = weight.view(torch.int32).view(
+            num_experts, size_k // 16, size_n * 2
+        )
         for i in range(num_experts):
             qweight = weight[i].view(torch.int32).T.contiguous()
             marlin_qweight = gptq_marlin_repack(
@@ -465,27 +470,34 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
                 size_n=size_n,
                 num_bits=4,
             )
-            tensor_list.append(marlin_qweight)
-        return torch.stack(tensor_list)
+            output[i].copy_(marlin_qweight)
+        return output
 
     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
-        scales = scales.to(param_dtype)
+        # Cast one expert at a time rather than expanding the entire scale bank.
         if is_w13:
             size_n, size_k = intermediate_size * num_shards, hidden_size
         else:
             size_n, size_k = hidden_size, intermediate_size
 
-        tensor_list = []
+        output = None
         for i in range(num_experts):
-            scale = scales[i].T.contiguous()
+            scale = scales[i].T.contiguous().to(param_dtype)
             marlin_scales = marlin_permute_scales(
                 s=scale,
                 size_k=size_k,
                 size_n=size_n,
                 group_size=16,
             )
-            tensor_list.append(nvfp4_marlin_process_scales(marlin_scales))
-        return torch.stack(tensor_list)
+            processed = nvfp4_marlin_process_scales(marlin_scales)
+            if output is None:
+                shape = (num_experts, *processed.shape)
+                if scales.element_size() == processed.element_size():
+                    output = scales.view(processed.dtype).view(shape)
+                else:
+                    output = torch.empty(shape, dtype=processed.dtype, device=device)
+            output[i].copy_(processed)
+        return output
 
     def _process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
         return nvfp4_marlin_process_global_scale(global_scale.to(param_dtype))

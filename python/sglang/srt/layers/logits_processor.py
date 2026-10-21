@@ -41,6 +41,10 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
+from sglang.srt.layers.quantization.sm120_dense import (
+    apply_sm120_int8_linear,
+    is_sm120_int8_linear,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -734,6 +738,15 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         quant_method = getattr(lm_head, "quant_method", None)
+        if is_sm120_int8_linear(lm_head):
+            # The draft can share a target head while carrying its own stale
+            # native FP8 method. Dispatch from the actual resident format.
+            return apply_sm120_int8_linear(lm_head, hidden_states, embedding_bias)
+        if (
+            getattr(getattr(lm_head, "weight", None), "dtype", None) == torch.int8
+            and getattr(get_server_args(), "qwen_exo_sm120_fast", False)
+        ):
+            raise ValueError("INT8 LM head is missing its SM120 group scales")
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)

@@ -93,6 +93,36 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.subTest(incompatible=incompatible), self.assertRaises(ValueError):
                 ServerArgs(model_path="dummy", qwen4_ple_disk_path="/tables/native", **incompatible)
 
+    def test_offload_graph_json_is_validated_after_resolution(self):
+        with patch.dict(os.environ, {}, clear=False):
+            for disk_ple in (False, True):
+                for prefill, decode, valid in (
+                    ("disabled", "disabled", True),
+                    ("disabled", "full", disk_ple),
+                    ("tc_piecewise", "disabled", False),
+                    ("disabled", "breakable", False),
+                ):
+                    with self.subTest(disk_ple=disk_ple, prefill=prefill, decode=decode):
+                        envs.SGLANG_QWEN4_PLE_NVME_PATH.set("")
+                        args = ServerArgs(
+                            model_path="dummy",
+                            qwen4_ple_disk_path="/tables/native" if disk_ple else None,
+                            qwen_exo_moe_cpu_offload=not disk_ple,
+                            disable_shared_experts_fusion=True,
+                            moe_runner_backend="flashinfer_cutlass",
+                            cuda_graph_config={
+                                "prefill": {"backend": prefill},
+                                "decode": {"backend": decode},
+                            },
+                        )
+                        args._parse_cuda_graph_config()
+                        if valid:
+                            args._handle_offload_compatibility()
+                            self.assertEqual(args.cuda_graph_config.decode.backend, decode)
+                        else:
+                            with self.assertRaisesRegex(ValueError, "requires eager prefill|only full decode|disabled CUDA graphs"):
+                                args._handle_offload_compatibility()
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")

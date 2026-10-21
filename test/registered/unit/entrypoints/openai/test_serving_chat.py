@@ -567,10 +567,8 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.tokenizer.apply_chat_template.side_effect = render
         # An existing default must not make the automatic prefix tier-dependent.
         self.chat.default_chat_template_kwargs = {"reasoning_effort": "low"}
-        serving = object.__new__(OpenAIServingResponses)
-        serving.tokenizer_manager = self.tm
+        serving = OpenAIServingResponses(self.tm, self.template_manager)
         serving._process_messages = self.chat._process_messages
-        serving.msg_store = {}
 
         class Runtime:
             config = SimpleNamespace(force_auto_reasoning=True, reasoning_mode="dynamic")

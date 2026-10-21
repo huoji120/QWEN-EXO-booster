@@ -1197,6 +1197,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         spec_info,
         seq_lens_cpu,
         num_padding: int = 0,
+        seq_offset: int = 0,
     ) -> None:
         """Sync-free graph replay metadata refresh (CUDA pools only).
 
@@ -1242,6 +1243,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata=metadata,
             req_to_token=self.req_to_token,
             pool=pool,
+            seq_offset=seq_offset,
         )
 
     def _update_qsa_cuda_graph_metadata(
@@ -1910,6 +1912,7 @@ class QwenSparseMultiStepDraftBackend:
         self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self._draft_graph_metadata_args = {}
         self.attn_backends = [
             QwenSparseAttnBackend(model_runner)
             for _ in range(speculative_num_steps - 1)
@@ -2002,6 +2005,7 @@ class QwenSparseMultiStepDraftBackend:
             )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        self._draft_graph_metadata_args = {}
         for backend in self.attn_backends:
             backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
@@ -2009,6 +2013,7 @@ class QwenSparseMultiStepDraftBackend:
         self, forward_batch, in_capture: bool = False
     ):
         if in_capture:
+            self._draft_graph_metadata_args = {}
             for step, backend in enumerate(self.attn_backends):
                 # Every capture row is synthetic.  Keep its sequence length
                 # below the first compression boundary so graph warmup cannot
@@ -2031,7 +2036,70 @@ class QwenSparseMultiStepDraftBackend:
 
         num_padding = getattr(forward_batch, "num_padding", None)
         num_padding = num_padding if num_padding is not None else 0
+        if forward_batch.seq_lens.is_cuda and self.attn_backends:
+            from sglang.srt.layers.attention.qsa.graph_metadata import (
+                launch_draft_graph_metadata,
+                prepare_draft_graph_metadata,
+            )
+
+            bs = forward_batch.batch_size
+            cached = self._draft_graph_metadata_args.get(bs)
+            if cached is None:
+                metadata = tuple(
+                    backend._cuda_graph_metadata[(ForwardMode.DECODE, bs)]
+                    for backend in self.attn_backends
+                )
+                first = self.attn_backends[0]
+                if all(
+                    backend.req_to_token is first.req_to_token
+                    and backend._can_replay_with_gpu_kernels(m, forward_batch.seq_lens)
+                    and m.sequence_lengths.numel() == bs
+                    for backend, m in zip(self.attn_backends, metadata)
+                ):
+                    args = prepare_draft_graph_metadata(
+                        metadata,
+                        first.req_to_token,
+                        metadata[0].indexer_metadata.token_to_kv_pool,
+                    )
+                    if args is not None:
+                        cached = (metadata, args)
+                        self._draft_graph_metadata_args[bs] = cached
+            if cached is not None:
+                metadata, args = cached
+                launch_draft_graph_metadata(
+                    args,
+                    forward_batch.seq_lens,
+                    forward_batch.req_pool_indices,
+                    bs,
+                    num_padding,
+                )
+                for backend, m in zip(self.attn_backends, metadata):
+                    backend.forward_metadata = m
+                return
         for step, backend in enumerate(self.attn_backends):
+            metadata = (
+                backend._cuda_graph_metadata[
+                    (ForwardMode.DECODE, forward_batch.batch_size)
+                ]
+                if forward_batch.seq_lens.is_cuda
+                else None
+            )
+            if metadata is not None and backend._can_replay_with_gpu_kernels(
+                metadata, forward_batch.seq_lens
+            ):
+                backend._replay_cuda_graph_metadata_gpu(
+                    metadata,
+                    bs=forward_batch.batch_size,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    forward_mode=ForwardMode.DECODE,
+                    spec_info=forward_batch.spec_info,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                    num_padding=num_padding,
+                    seq_offset=step + 1,
+                )
+                backend.forward_metadata = metadata
+                continue
             step_batch = self._make_step_forward_batch(
                 forward_batch, step, num_padding=num_padding
             )

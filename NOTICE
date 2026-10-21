@@ -1,0 +1,32 @@
+QWEN-EXO-booster PRO6000 kernel adaptations
+
+Portions of the SM120 persistent MoE, grouped INT8 dense/HC, GDN output,
+Top-K and speculative-sampling implementations are adapted from:
+  SSHdotCodes/qwen-3.8-flash-next-pro6000
+  https://github.com/SSHdotCodes/qwen-3.8-flash-next-pro6000
+  revision 1233bf628f42940ec8e4fb060fa35c1a30eecfc2
+  Copyright 2026 SSHdotCodes contributors
+  Distributed under the Apache License, Version 2.0 (see LICENSE).
+
+Modifications in this repository integrate native ModelOpt/Marlin checkpoint
+layouts, model-bound configuration and fingerprint isolation, bounded
+stream/graph-owned workspaces, complete-tie sampling eligibility, and
+QWEN-EXO PLE/observer boundaries rather than workstation-specific extensions
+or process-global monkeypatch registries.
+
+Upstream notice retained for attribution:
+
+Qwen3.8-Flash-Next RTX PRO 6000 runtime configuration and measurements
+Copyright 2026 SSHdotCodes contributors
+
+serve/overlays/sglang contains modified SGLang 0.5.20 source, distributed
+under Apache-2.0. Upstream: https://github.com/sgl-project/sglang
+Modifications: SM120 QSA/FP8 handling, pending-ring storage and indexing,
+draft vocabulary selection, proposal-probability lifetime, and startup loading.
+See the upstream serve/runtime.json for the immutable base and installed hashes.
+
+The upstream numeric draft token map derives from the public hot_tokens_64k.pt
+artifact in https://github.com/gabrielolympie/sglang-flashnext-sm120 with all
+Qwen special IDs included. Provenance and source checksum: upstream docs/runtime.md.
+That map is not incorporated by this adaptation; target and proposal tensors
+retain the full native vocabulary. No model weights are redistributed here.

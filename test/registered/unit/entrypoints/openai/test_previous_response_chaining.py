@@ -98,6 +98,43 @@ class PreviousResponseChainingTestCase(CustomTestCase):
         ]
         self.assertEqual(system_messages, [{"role": "system", "content": INSTRUCTIONS}])
 
+    def test_pending_parent_output_and_replaced_store_do_not_reuse_stale_history(self):
+        serving = make_serving()
+        parent = ResponsesResponse(
+            id="resp_parent", model="m", status="in_progress", output=[
+                ResponseOutputMessage(
+                    id="msg_parent", type="message", role="assistant",
+                    status="in_progress", content=[
+                        ResponseOutputText(type="output_text", text="partial", annotations=[]),
+                    ],
+                ),
+            ],
+        )
+        serving.msg_store[parent.id] = [{"role": "user", "content": "first"}]
+        request = ResponsesRequest(
+            model="m", input="next", previous_response_id=parent.id,
+        )
+        partial = serving._conversation_messages(request, parent)
+        parent.output[0].content[0].text = "completed answer"
+        # Pending output can change in place without replacing or growing its list.
+        updated = serving._conversation_messages(request, parent)
+        self.assertEqual(partial[1]["content"][0]["text"], "partial")
+        self.assertEqual(updated[1]["content"][0]["text"], "completed answer")
+        parent.status = "completed"
+        completed = serving._conversation_messages(request, parent)
+        self.assertIs(serving._conversation_messages(request, parent), completed)
+        serving.msg_store[parent.id] = [{"role": "user", "content": "replaced"}]
+        refreshed = serving._conversation_messages(request, parent)
+        self.assertEqual(refreshed[0], {"role": "user", "content": "replaced"})
+        full = ResponsesRequest(model="m", input=[
+            {"role": "user", "content": "replaced"},
+            parent.output[0].model_dump(),
+            {"role": "user", "content": "next"},
+        ])
+        self.assertEqual(serving._construct_input_messages(request, parent),
+                         serving._construct_input_messages(full))
+
+
 
 class BoundedStoreTestCase(CustomTestCase):
     def test_lru_count_bytes_and_idle_ttl(self):

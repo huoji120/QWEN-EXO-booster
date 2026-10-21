@@ -149,6 +149,22 @@ Responses 在单次请求内复用同一份已渲染文本、相同编码选项�
 
 `/v1/systemone` 在读取完整请求体后监听客户端断开，取消并等待该请求的评分、子任务和预留资源清理；正在等待准入的任务不会在调用方离开后继续派发。正常完成、断连和 handler 取消的竞态都等待 parent 清理结束，不取消其他请求。
 
+chunked-prefill 准入按实际请求槽位计数：继续执行的 chunk 复用已持有的行，不再挤占另一个空闲行的预算；停放请求仍占用并发额度，普通 prefill、PD prefill 与 DLLM 的候选列表使用相同规则。该修复不扩大 KV、Mamba 或输出 token 预算。
+
+QSA 的 decode／固定宽度 verify metadata 合并 layout 与页表更新；兼容的多步 MTP draft metadata 一次提交，仍为每一步保留独立输出，padding 使用保留槽 0。不兼容的 pool／布局继续逐步刷新。decode indexer 的 CTA 档位按 SM 数与行数选择，再遍历实际压缩上下文；512-block fast-topk 对全部候选必选的短行省略评分，只有不读取省略区域的消费者才能使用未初始化 logits，batch-invariant 模式保留完整评分与初始化。MTP draft decode 已复用 sparse selection 的路径不会重复运行 indexer。
+
+FlashInfer CUTLASS MoE 的调优范围覆盖配置的 prefill buffer × attention-DP 大小，常规调优上限为 8192 行，同时保证不小于本次实际输入；PD decode 保留按当前行数向上取 2 次幂的行为。不改变模型精度、采样或服务容量，代价可能是更长的首次调优。未引入 `autotune_v2` 或升级 FlashInfer；CPU 回归和 kernel 解释器检查不代表真实 CUDA 数值、Graph replay 或端到端加速已经验收。
+
+js4090 的这组改动已通过 143 项真实 GPU 检查（含 QSA 边界、CUDA Graph replay、MTP metadata、host KV 和 CUTLASS）及 126 项 CPU 检查、59 个 subtests。停服隔离、相同合成输入的组件 A/B 中，三步 MTP metadata 刷新在 batch 1／4 约从 `0.125ms` 降到 `0.023ms`，QSA indexer 四组样本约降低 `1.6%–4.6%`；这是组件时间，不是整体推理提速倍数。重启后两轮 14814-token 合成序列请求均正确输出相同的 404 tokens：冷请求首字 `2.82s`、首字后约 `113 token/s`；热请求命中 14400 tokens，首字 `0.386s`、首字后约 `138 token/s`。没有旧服务的同输入端到端对照，不据此声称端到端加速倍率。证据与回滚文件位于 `inference-opt-20261020/`，不随源码发布。
+
+第二轮优化保留当前目标精度与采样算法：eligible eager、非 gathered-buffer、batch > 1 的 MTP draft-extend 在 LM head 前只选择每请求最后接受位置；Graph／gathered／单请求保留全行路径，HC hidden 与 QSA seed 仍按完整布局处理。CUDA、非 greedy、topk=1、非 rejection-sampling 的链式 target-only 采样使用轻量 JIT 内核，将拒绝候选保存在寄存器，省去完整 `[B,W,V]` 辅助清零缓冲；通用树与真正 rejection sampling 不变。这不是开启 exact rejection sampling，也不改变随机数生成与消费。
+
+THINK shaping 复用固定 token 列布局与两个有界 pinned CPU staging 槽；每个 forward 的 GPU bias 仍是独立快照，DMA 完成前不覆盖 host 源，verify 用广播而非重复展开。Responses 在单次不可变请求生命周期内复用公共历史规范化结果；instructions、临时 memory 与 assistant 合并不进入该缓存，存储历史使用独立列表，输入或 parent 身份／状态变化时失效。
+
+第二轮隔离验证通过 239 项 CPU 检查和 140 个 subtests、67 项 GPU 检查和 19 个 subtests；单请求 LM-head 性能保护另通过 8 项 CPU 检查和 71 个 subtests。完整 248320 词表固定随机数的 10 组合成对照输出一致，THINK 双 stream 的 20 个延迟快照检查也一致。SM120、width=4、batch=10 的采样组件在全部接受／首位拒绝／末位拒绝时分别约从 `101/111/112μs` 降至 `92/91/92μs`；合成 BF16 head 的 batch=10 约从 `0.941ms` 降至 `0.871ms`。单请求裁剪样本反而更慢，因此默认保留原路径。这些不是完整模型端到端吞吐验收；第二轮候选尚未部署，证据保留于 `inference-opt-20261021/`。
+
+参考 [SSHdotCodes PRO6000 固定版本](https://github.com/SSHdotCodes/qwen-3.8-flash-next-pro6000/tree/1233bf628f42940ec8e4fb060fa35c1a30eecfc2) 的适配须区分格式与语义：W4A16 常驻 MoE 依赖 Marlin 布局，INT8 dense／HC 会改变目标数值。1–8 是物理 token 行数，width=4 时只覆盖至多两请求，不是八并发。默认模型仍保持原精度与采样；完整方案由下面的独立 PRO6000 preset 显式选择，不能复用原模型状态，也不能把参考仓库吞吐直接当成本分支成绩。
+
 
 ### 可观测性：不是黑盒魔法
 
@@ -361,6 +377,59 @@ Responses 会话关联优先已验证的 `previous_response_id`／压缩 lineage
 
 该 GPU 常驻组合随后通过真实网关 `/v1/responses` 流式生成：中文算术请求正常返回并以 `response.completed` 结束；本机控制台也完成实际聊天。当前试用配置按用户决定关闭外部知识、PolicyData、反思记忆及依赖外部记忆的 Responses 压缩，原始文件保留。关闭 adaptive refresh 时必须同时将 CLI-only 的 `QWEN_EXO_CONTEXT_INTEGRITY_MODE=off`，否则启动校验失败，托管配置可能自动回退；以在线 `applied_revision == healthy_revision == revision` 和实际功能开关确认生效。
 
+
+#### PRO6000 完整优化 preset：GPU 与启动验证通过，未达 200 token/s
+
+`config.json` 的 `qwen_exo_sm120_fast` 标记将该方案绑定为独立模型，而非进程级 monkeypatch：
+
+| 组件 | 新路径与回退边界 |
+|---|---|
+| Persistent W4A16 MoE | 复用 NVIDIA ModelOpt→Marlin 的 NVFP4 权重与尺度，1–8 物理行走常驻 tensor-core 队列；大行数保留同 W4A16 精度的普通 Marlin，不保留第二份 CUTLASS 专家权重。 |
+| INT8 dense | 原始 BF16 heavy dense 层转 G128 INT8＋BF16 scale；小行数 MMA，prefill／大行数按同一 BF16 反量化权重分块 GEMM。非 BF16 的原生 FP8／NVFP4 层不被误读。 |
+| HC 融合 | Down G128、Up G64 的 INT8 HC；层内 attention combine 融入下一次 MLP mix。大行数使用同一反量化权重；跨层仍物化 Tensor，保留 PLE、latent、activation editor 等边界。 |
+| FP8 MTP | 保留原生 block-FP8 草稿主体，完整共享目标 INT8 head 模块及尺度；图输出的 proposal 在后续 target forward 前取得独立副本。 |
+| 截断 proposal＋exact RS | 草稿按自身温度／top-k／top-p 产生并保留真实完整词表 q；target 按 p/q 与 residual 验证。无静态 hot map，词表仍为 248320。 |
+| GDN／Top-K／Sampling | 小行数 gated RMSNorm＋输出投影融合、sorted Top-K≤64；设备端证明 cutoff ties 完整时使用稀疏 verify，否则完整词表回退，不用固定“多留 8 个”冒充严格覆盖。 |
+
+每个串行目标 CUDA Graph 为所有 routed 层复用一份私有 MoE arena，不为每层重复分配；不同 graph／stream 不共享控制计数器。preset 要求 SM120 PRO6000 resident-grid 几何、BF16 激活、TP/EP/PP/DP=1、untied head、无 LoRA／CPU expert paging。原有 host KV、磁盘 PLE、上下文与并发上限不因 preset 被压到两路。精确 RS 保持的是**该 INT8/W4A16 目标的分布**，不恢复量化前目标。
+
+Marlin 加载按专家在原 packed 存储内重排权重／FP8 scale，不累积整层输出后再 `stack`；不分配仅 FlashInfer 消费的 swizzled scale 副本。PLE 加载结束即释放参数索引，避免闭包循环将已被 INT8 替换的 BF16 参数保留到 GC。HC 的大行数 BF16 回退仍保留，不将其误当作无用副本删除。显式 JSON Graph 配置先归一化，再执行磁盘 PLE／CPU expert paging 的 Graph 兼容性检查。
+
+只创建模型视图，不启动服务：
+
+```bash
+PYTHONPATH=python python scripts/qwen_exo/build_sm120_profile.py \
+  --source /path/to/native-flash-next-profile \
+  --output /path/to/separate-pro6000-fast-profile
+```
+
+权重硬链接但不改字节；config 和可编辑 metadata 独立复制。新 config 参与模型指纹，必须重建该模型的 KV/GDN 状态。选择该模型后，`service_launcher` 在托管设置之后派生 `--qwen-exo-sm120-fast`、Marlin、原生 EAGLE 3/1/4 与 exact-RS／threshold=1 的耦合参数；不能只给原模型附加一个 fast flag 来绕过指纹隔离。
+
+验证已从离线编译推进到真实 PRO6000：sampling 7 项、INT8 dense 3 项、GDN 94 项、HC 7 项、MoE 8 项及 QSA state 5 项 GPU 检查通过；MoE 重排与原实现逐位一致，覆盖不同 Graph／stream 的私有 scratch。147 组小行数 INT8 MMA／replay 与 FP32 累加 oracle 在原容差内一致；9 组大行数回退保持原 BF16 cuBLAS 行为，不把其 reduction rounding 差异冒充 MMA 错误。Graph 参数校验及 PLE／scale 的最新 CPU 回归另通过 32 项、81 个 subtests，3 项 CUDA-only 跳过。
+
+独立模型实际完成加载、完整 decode Graph 初始化、算术／1–128 序列检查及双请求并发检查。保持 context=262144、max-running=10、host-KV token 上限=1300032、mem-fraction-static=0.95、chunk=1024、EAGLE 3/1/4 和 exact RS；12 个 THINK 长输出样本均生成 4096 tokens，temperature=1、top-p=0.95、top-k=20，未忽略 EOS。客户端首批输出后的 decode 中位数 **95.98 token/s**，范围 **48.07–103.08**；TTFT 中位数 0.204s，accept length 约 2.09–2.52，整个验收进程峰值显存 92249 MiB。**未达到 200 token/s，也未完成广泛质量回归或同输入旧版本 A/B，不能声明整体提速。** 证据位于 js4090 的 `/root/autodl-tmp/pro6000-port-20261021/runtime-acceptance/`；模型视图仍与原模型指纹、KV/GDN 状态隔离。
+
+实验启动入口随后切到同一优化源码／独立模型，Supervisor `qwen` 在 30000 启动并达到 ready，未恢复旧模型；10 个同时发起的原生算术请求全部正确。带临时密钥的 `/v1/models` 与 Responses SSE 已贯通，后者以 `response.completed` 结束，delta 与终态文本一致、末个数值为正确结果，但未遵守“只输出数字”的严格格式，因此该格式 smoke 仍记录失败，不能称全部质量门禁通过；临时密钥已撤销。
+
+实验 launcher 必须继承原入口的 `SGLANG_ENABLE_REQUEST_DECOMPRESSION=1`；遗漏后，PI／网关发送的压缩 JSON 会被错误地直接解析，返回 HTTP 400 `There was an error parsing the body`。已恢复该开关，并使用本机 PI 的既有 `qwen-local` 公网配置验证成功，未修改客户端密钥或要求关闭压缩。
+
+同轮还纠正了实验入口绕过 `service_launcher` 的功能回归：最终重新使用完整 `launch_native_js4090.sh → launch_js4090.sh → service_launcher`，继承原始托管设置、人格／知识目录与 API key store，独立模型只隔离 KV/GDN 状态。运行时 `reasoning_parser=qwen3`、`tool_call_parser=qwen3_coder`；本机 PI 经原公网配置以 xhigh 完成两轮 THINK、一次真实 read 工具调用，正文无 THINK／tool-call 控制标签。未用关闭 QWEN-EXO 功能换速度。
+
+随后选择性加入不重新量化的执行优化：INT8 dense 使用精确整数转换和 BF16 成对乘法，仍在 MMA 前按 BF16 舍入；GDN 的 QKVZ／BA 已量化权重与尺度一次合并为共享存储，小行数合并 GEMM 并启用已有 ratio-3 splitter；HC 必须物化的 combine 边界改成单 kernel，保持 FP32 分步乘加再转 BF16；PLE 的 ≤128 行 mmap gather 改为直接按行拷贝，prefill 继续向量化。保留现有 NVFP4/W4A16 persistent MoE、FP8 MTP、完整目标词表与 exact RS；未照搬静态 draft 热词表、shared-expert 融合的不同舍入算法或跨 PLE／EXO 边界融合。
+
+最新验证：128 项 GPU 检查和 11 个 subtests 通过；CPU dense/worker 检查 19 项和 73 个 subtests 通过；PLE 检查 17 项和 100 个 subtests 通过，3 项 CUDA-only 跳过。dense 新旧内核在 12 组形状及 3328 组 signed-byte／scale 边界组合中数值一致；完整 LM head 交错计时基本持平，其余部分形状降低耗时。真实模型最终十请求并发算术全部正确。
+
+保留完整 EXO 功能的同模型 A/B（相同 prompt、THINK、temperature=1、top-p=0.95、top-k=20、每次 2048 tokens，预热后各三次）：baseline decode 中位数 107.02 token/s，候选 105.34 token/s；按 accept length 归一化的步骤率估算分别为 44.33／45.49 steps/s。**组件优化未证明稳定的端到端吞吐提升，200 token/s 仍未达到**。相同 32 道固定抽样 GSM8K、temperature=0、关闭 THINK、双并发检查：baseline 30/32，最终候选 31/32；这只是不退化的有限样本证据，不是全量质量保证，也不是对原始 BF16／W4A4 模型的比较。证据：`/root/autodl-tmp/nvfp4-speed-20261021/`。
+
+PLE 内存／I/O 实测：容器 cgroup 上限 120 GiB、soft limit 118 GiB；当前 FP8＋row-scale 表约 48.88 GiB，展开 BF16 为 95.37 GiB，不能以宿主机空闲内存推断可安全整表 pinned。两次 2048-token decode 分别读取约 803／376 MiB、发生 2356／1324 次 major fault，但 cgroup I/O pressure 只有约 54／23 ms，内存 pressure 约 145／55 ms；磁盘确有参与，但这些样本不支持“磁盘等待是速度减半的主因”。CPU warm 32／128 行 gather 从约 263／783 μs 降至候选算法约 31／116 μs，排除了 GPU 索引同步与 H2D，不代表完整 PLE 延迟。未启用整表 BF16 pinned，也未更改 PLE 权重。
+
+#### 四项执行优化候选：已实现与验证，未通过吞吐上线门禁
+
+在保留同一权重、INT8 舍入、完整目标词表与 exact RS 的条件下实现了四项扩展：PLE 图输入准备拆成 start/finish，让 CPU 查表与 replay metadata 准备重叠，并复用有界 pinned 索引缓冲；草稿 q 直接写入最终 `[B, steps, V]` 切片，保留 replay 后独立快照与所有 padding 步清零；将 INT8 shared expert 加入原 NVFP4 persistent MoE 队列；在非 PLE、非 EXO 干预和非中间隐藏状态观察的边界，连接本层 MLP combine 与下一层 attention mix。跨层 HC 使用独立严格算术 specialization，原层内融合不被改写；MTP 最终隐藏状态仍完整物化。
+
+最终候选联合回归 **120 项和 373 个 subtests 全部通过**，覆盖 CUDA 数值、q/RNG、padding→full→padding、跨 Graph／stream、反序 pending gather、状态提交与原生大行数回退。候选实际 PI xhigh 完成 THINK 与 read 工具调用，正文无控制标签；十路原生算术均正确。实际 trace 出现 shared persistent kernel 与严格跨层 HC kernel，非仅接线。
+
+合成 hot-cache shared-expert 组件测试在 M=4 时，unique routing 约 92.88→84.05 μs、重复 routing 约 26.12→19.19 μs，不能当作整模型加速。完整 EXO 配置不变、官方模板原生生成、temperature=1/top-p=.95/top-k=20、2048 tokens、一次预热后三次的 A/B：原版中位数 **112.86 token/s**；I/O 工作线程执行 CUDA event 同步的首版仅 **58.17**；同步回 producer thread 后一版 **106.47**；去掉额外 event 往返的 pinned-copy 候选 **93.85**。恢复原版后重测为 **93.76**，说明存在明显时序／采样波动，不能把前后全部差异归因给代码。所有候选均未证明稳定整体收益，故**运行入口恢复原完整 EXO 版本，不默认部署这四项扩展**。固定同样 32 道 GSM8K，原版 30/32、最终候选 31/32，仅是有限质量证据；未声明模型能力提升或 200 token/s。实现保留在 `/root/autodl-tmp/nvfp4-four-20261021/`，测试和回退证据在其 `evidence/` 下；最终运行源码仍为 `/root/autodl-tmp/nvfp4-speed-20261021/candidate`。
 
 ### Apple Silicon
 

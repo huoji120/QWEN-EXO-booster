@@ -79,7 +79,6 @@ from sglang.srt.speculative.eagle_worker_common import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -104,6 +103,7 @@ from sglang.srt.utils.common import (
     is_npu,
     is_xpu,
     log_info_on_rank0,
+    require_gathered_buffer,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -759,6 +759,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 probs, topk_p, topk_index = sample_draft_proposal(
                     logits_output.next_token_logits,
                     forward_batch.sampling_info.temperatures,
+                    sampling_info=forward_batch.sampling_info,
+                    sm120_fast=self.server_args.qwen_exo_sm120_fast,
                 )
                 draft_probs_list.append(probs)
                 forward_batch.positions.add_(1)
@@ -922,14 +924,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = self.server_args.speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            probs, topk_p, topk_index = sample_draft_proposal(
+                logits_output.next_token_logits,
+                batch.sampling_info.temperatures,
+                sampling_info=batch.sampling_info,
+                sm120_fast=self.server_args.qwen_exo_sm120_fast,
+            )
         else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits, batch.sampling_info, False
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1007,6 +1012,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
+        # Keep graph, gathered-buffer and singleton logits in their full-window
+        # layout: pruning a singleton regresses the small LM-head GEMM. Larger
+        # eager local batches can prune without narrowing hidden/HC or QSA seeds.
+        prune_logits = (
+            not can_cuda_graph
+            and len(batch.seq_lens) > 1
+            and forward_batch.forward_mode.is_draft_extend_v2()
+            and not require_gathered_buffer(self.server_args)
+        )
+        if prune_logits:
+            forward_batch.spec_info.select_index = select_index
+
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
         if self.seed_dsa_topk_from_draft_extend and not can_cuda_graph:
@@ -1058,9 +1075,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
+        if not prune_logits:
+            draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+                select_index
+            ]
         if draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
@@ -1071,6 +1089,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
+                sampling_info=batch.sampling_info,
+                sm120_fast=self.server_args.qwen_exo_sm120_fast,
             )
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts

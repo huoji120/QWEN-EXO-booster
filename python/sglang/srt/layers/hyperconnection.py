@@ -16,6 +16,8 @@ class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_lowrank: int = 16
     rms_norm_eps: float = 1e-6
     hc_per_branch_norm: bool = False
+    # Model-bound SM120 preset; ordinary BF16 HC remains the default path.
+    sm120_fast: bool = False
 
 
 class GroupedGemmaRMSNorm(nn.Module):
@@ -191,6 +193,28 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+        self._sm120_prepared = False
+        if config.sm120_fast and use_mix:
+            self.register_buffer(
+                "input_mix_weight_down_int8",
+                torch.empty((0,), dtype=torch.int8, device=self.input_mix_weight_down.weight.device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "input_mix_weight_down_scale",
+                torch.empty((0,), dtype=torch.bfloat16, device=self.input_mix_weight_down.weight.device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "input_mix_weight_up_int8",
+                torch.empty((0,), dtype=torch.int8, device=self.input_mix_weight_up.weight.device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "input_mix_weight_up_scale",
+                torch.empty((0,), dtype=torch.bfloat16, device=self.input_mix_weight_up.weight.device),
+                persistent=False,
+            )
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -230,6 +254,53 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    @staticmethod
+    def _quantize_groupwise(weight: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if weight.is_meta or weight.ndim != 2 or weight.shape[1] % group_size:
+            raise RuntimeError("cannot prepare incomplete HC INT8 weight")
+        grouped = weight.detach().float().reshape(weight.shape[0], -1, group_size)
+        scale = (grouped.abs().amax(dim=-1) / 127.0).clamp_min(1e-30).to(torch.bfloat16)
+        quantized = torch.round(grouped / scale.float().unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
+        return quantized.reshape_as(weight).contiguous(), scale.contiguous()
+
+    @torch.no_grad()
+    def prepare_sm120_int8_weights(self) -> None:
+        """Convert fully loaded HC weights and retain exact BF16 dequant fallback."""
+        if not self.config.sm120_fast or not hasattr(self, "input_mix_weight_down"):
+            return
+        if self._sm120_prepared:
+            return
+        down = self.input_mix_weight_down.weight
+        up = self.input_mix_weight_up.weight
+        if down.is_meta or up.is_meta or down.numel() == 0 or up.numel() == 0:
+            raise RuntimeError("SM120 HC INT8 preparation requires loaded, non-meta weights")
+        if down.shape != (self.config.hc_lowrank, self.hc_count * self.hidden_size):
+            raise RuntimeError(f"unexpected HC down shape: {tuple(down.shape)}")
+        if up.shape != (self.hc_count * self.hidden_size, self.config.hc_lowrank):
+            raise RuntimeError(f"unexpected HC up shape: {tuple(up.shape)}")
+        down_q, down_s = self._quantize_groupwise(down, 128)
+        up_q, up_s = self._quantize_groupwise(up, 64)
+        self.input_mix_weight_down_int8, self.input_mix_weight_down_scale = down_q, down_s
+        self.input_mix_weight_up_int8, self.input_mix_weight_up_scale = up_q, up_s
+        down.data.copy_((down_q.float() * down_s.float().repeat_interleave(128, dim=1)).to(down.dtype))
+        up.data.copy_((up_q.float() * up_s.float().repeat_interleave(64, dim=1)).to(up.dtype))
+        self._sm120_prepared = True
+
+    def _sm120_mix_ready(self, x: torch.Tensor) -> bool:
+        return (
+            self.config.sm120_fast
+            and self._sm120_prepared
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+            and self.config.hc_lowrank == 320
+            and x.ndim == 2
+            and 1 <= x.shape[0] <= 8
+        )
+
+
+
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -237,6 +308,30 @@ class GatedResidual(HyperConnectionBase):
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input)
+
+        if self._sm120_mix_ready(hyper_input):
+            from sglang.kernels.ops.elementwise.hc_w8 import hc_mix_fused_w8
+
+            inject_weight = (
+                self.block_inject_weight.weight
+                if hasattr(self, "block_inject_weight")
+                else None
+            )
+            mixed_input, inject, normed = hc_mix_fused_w8(
+                hyper_input,
+                self.hc_norm.weight,
+                self.input_mix_weight_down_int8,
+                self.input_mix_weight_down_scale,
+                inject_weight,
+                self.input_mix_weight_up_int8,
+                self.input_mix_weight_up_scale,
+                self.config.rms_norm_eps,
+            )
+            return mixed_input.to(self.params_dtype), (
+                hyper_input,
+                normed,
+                inject if inject_weight is not None else None,
+            )
 
         if self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
@@ -289,11 +384,24 @@ class GatedResidual(HyperConnectionBase):
         return mixed_input, (hyper_input, hyper_input_normed)
 
     def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
-        hyper_input, hyper_input_normed = residuals
+        hyper_input, hyper_input_normed, *rest = residuals
+        inject = rest[0] if rest else None
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
+
+        if (
+            inject is not None
+            and self.config.sm120_fast
+            and block_output.is_cuda
+            and block_output.dtype == torch.bfloat16
+            and hyper_input.dtype == torch.bfloat16
+            and inject.dtype == torch.float32
+        ):
+            from sglang.kernels.ops.elementwise.hc_w8 import hc_combine_w8
+
+            return hc_combine_w8(block_output, hyper_input, inject).to(self.params_dtype)
 
         if (
             self._jit_combine_ok
@@ -304,9 +412,7 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
             if self._split_combine_ok and block_output.shape[0] <= 32:
-                from sglang.kernels.ops.elementwise.hc_combine import (
-                    hc_combine_split,
-                )
+                from sglang.kernels.ops.elementwise.hc_combine import hc_combine_split
 
                 return hc_combine_split(
                     block_output,
@@ -327,7 +433,7 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             )
 
-        updated_residuals = self._combine_compute(
+        return self._combine_compute(
             block_output,
             hyper_input,
             hyper_input_normed,
@@ -335,7 +441,43 @@ class GatedResidual(HyperConnectionBase):
             self.hc_count,
             self.hidden_size,
         ).to(self.params_dtype)
-        return updated_residuals
+
+    def combine_then_mix(self, block_output: torch.Tensor, residuals, next_mixer):
+        """Fuse this HC's combine with an eligible next HC mix."""
+        hyper_input, _normed, *rest = residuals
+        inject_prev = rest[0] if rest else None
+        if (
+            inject_prev is not None
+            and self.config.sm120_fast
+            and next_mixer is not None
+            and next_mixer._sm120_mix_ready(hyper_input)
+            and block_output.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.elementwise.hc_w8 import hc_combine_mix_w8
+
+            next_inject = (
+                next_mixer.block_inject_weight.weight
+                if hasattr(next_mixer, "block_inject_weight")
+                else None
+            )
+            mixed, inject, normed, combined = hc_combine_mix_w8(
+                block_output,
+                hyper_input,
+                inject_prev,
+                next_mixer.hc_norm.weight,
+                next_mixer.input_mix_weight_down_int8,
+                next_mixer.input_mix_weight_down_scale,
+                next_inject,
+                next_mixer.input_mix_weight_up_int8,
+                next_mixer.input_mix_weight_up_scale,
+                next_mixer.config.rms_norm_eps,
+            )
+            return mixed, (
+                combined,
+                normed,
+                inject if next_inject is not None else None,
+            )
+        return next_mixer.mix(self.combine(block_output, residuals))
 
 
 HYPERCONNECTION_CLASS_DICT = {

@@ -81,28 +81,57 @@ def test_cutlass_adapter_import_does_not_require_flashinfer(monkeypatch):
             sys.modules[module_name] = cached_module
 
 
-def test_dsv4_sm120_load_contract(monkeypatch):
-    import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
+@pytest.mark.parametrize(
+    "mode,chunked,max_prefill,dp_size,pp_size,dynamic,num_tokens,expected",
+    [
+        ("null", 1024, 16384, 1, 1, False, 1, 1024),
+        ("null", 1024, 16384, 1, 1, False, 777, 1024),
+        ("null", 1024, 16384, 1, 1, False, 1024, 1024),
+        ("prefill", 1024, 16384, 4, 1, False, 33, 4096),
+        ("null", 4096, 16384, 4, 1, False, 33, 8192),
+        ("null", 0, 6144, 1, 1, False, 33, 6144),
+        ("null", -1, 16384, 1, 1, False, 33, 8192),
+        ("null", 1024, 4096, 1, 2, True, 33, 4096),
+        ("null", 1024, 1024, 1, 2, True, 33, 1280),
+        ("null", 1024, 4096, 1, 1, True, 33, 1024),
+        ("null", 16384, 16384, 1, 1, False, 8192, 8192),
+        ("null", 16384, 16384, 1, 1, False, 8193, 8193),
+        ("null", 1024, 16384, 1, 1, False, 1025, 1025),
+        ("decode", 1024, 16384, 4, 1, False, 33, 64),
+        ("decode", 1024, 16384, 4, 1, False, 8193, 16384),
+    ],
+)
+def test_cutlass_tuning_ceiling(
+    monkeypatch,
+    mode,
+    chunked,
+    max_prefill,
+    dp_size,
+    pp_size,
+    dynamic,
+    num_tokens,
+    expected,
+):
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
+    from sglang.srt.server_args import ServerArgs
 
-    monkeypatch.setattr(adapter_module, "is_sm120_supported", lambda: True)
+    # Use the real buffer sizing policy without model/device initialization.
+    args = ServerArgs.__new__(ServerArgs)
+    args.disaggregation_mode = mode
+    args.chunked_prefill_size = chunked
+    args.max_prefill_tokens = max_prefill
+    args.pp_size = pp_size
+    args.enable_dynamic_chunking = dynamic
+    monkeypatch.setattr(runner_module, "get_server_args", lambda: args)
 
-    captured = {}
+    def attention_dp_size():
+        assert mode != "decode", "PD decode must not consult prefill topology"
+        return dp_size
 
-    class _Fp8Method:
-        def create_weights(self, *args, **kwargs):
-            captured.update(kwargs)
-
-    method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
-    method.create_weights(
-        SimpleNamespace(),
-        num_experts=4,
-        hidden_size=256,
-        intermediate_size_per_partition=256,
-        params_dtype=torch.bfloat16,
-    )
-
-    assert method.load_up_proj_weight_first
-    assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
+    monkeypatch.setattr(runner_module, "get_attention_dp_size", attention_dp_size)
+    ceiling = runner_module._cutlass_moe_tune_max_num_tokens(num_tokens)
+    assert ceiling == expected
+    assert ceiling >= num_tokens
 
 
 def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
@@ -129,6 +158,14 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
     monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
+    monkeypatch.setattr(
+        runner_module,
+        "get_server_args",
+        lambda: SimpleNamespace(
+            disaggregation_mode="null", max_prefill_buffer_tokens=lambda: 8192
+        ),
+    )
+    monkeypatch.setattr(runner_module, "get_attention_dp_size", lambda: 1)
 
     num_experts, hidden, intermediate = 4, 256, 256
     w13, w2, w13_scale, w2_scale = _random_weights(num_experts, hidden, intermediate)

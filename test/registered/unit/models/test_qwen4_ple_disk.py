@@ -29,6 +29,29 @@ def load_checkpoint_scale(table, scale):
 
 
 class TestNativePLEDisk(unittest.TestCase):
+    def test_loader_releases_replaced_parameters_without_cyclic_gc(self):
+        import gc
+        import weakref
+        from types import SimpleNamespace
+        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+
+        model = Qwen4ExpForConditionalGeneration.__new__(Qwen4ExpForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(num_experts=None, tie_word_embeddings=False)
+        model.weight = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+        original = weakref.ref(model.weight)
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            loaded = model.load_weights([("weight", torch.ones(2))])
+            self.assertIn("weight", loaded)
+            torch.testing.assert_close(model.weight, torch.ones(2))
+            model.weight = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+            self.assertIsNone(original())
+        finally:
+            if enabled:
+                gc.enable()
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -179,6 +202,27 @@ class TestPLEFileReader(unittest.TestCase):
                                     reader.read_rows([0, invalid])
                         finally:
                             reader.close()
+
+    def test_small_and_vectorized_mmap_paths_preserve_identical_records(self):
+        for count in (1, 8, 32, 128, 129, 256):
+            ids = ([2, 0, 1, 2] * ((count + 3) // 4))[:count]
+            for storage in ("bf16", "f16", "fp8_e4m3"):
+                for scale_mode in ("none", "row", "global", "mixed"):
+                    manifest, raw, scales = self._fixture(storage, scale_mode)
+                    width = manifest.shards[0].row_bytes
+                    expected = b"".join(raw[row * width:(row + 1) * width] for row in ids)
+                    expected_scales = b"" if scales is None else struct.pack(
+                        f"<{count}f", *(scales[row] for row in ids)
+                    )
+                    reader = PLEFileReader(manifest, "mmap")
+                    try:
+                        with self.subTest(count=count, storage=storage, scale_mode=scale_mode):
+                            self.assertEqual(reader.read_rows(ids), (expected, expected_scales))
+                            for invalid in (-1, 3, 1 << 80):
+                                with self.assertRaises(IndexError):
+                                    reader.read_rows(ids[:-1] + [invalid])
+                    finally:
+                        reader.close()
 
     def test_mmap_chunk_boundary_preserves_duplicates_and_scale_alignment(self):
         manifest, raw, scales = self._fixture("bf16", "row")

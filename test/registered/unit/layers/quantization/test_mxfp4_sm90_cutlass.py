@@ -14,6 +14,7 @@ Run on H100/H200:
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -49,6 +50,20 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.core import ActivationType
 
 GROUP_SIZE = 32  # MXFP4 block size
+
+
+@pytest.fixture(autouse=True)
+def _cutlass_runtime_args(monkeypatch):
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
+
+    monkeypatch.setattr(
+        runner_module,
+        "get_server_args",
+        lambda: SimpleNamespace(
+            disaggregation_mode="null", max_prefill_buffer_tokens=lambda: 8192
+        ),
+    )
+    monkeypatch.setattr(runner_module, "get_attention_dp_size", lambda: 1)
 
 
 class _MockLayer:
@@ -459,7 +474,6 @@ def test_dsv4_apply_matches_flashinfer_direct(
     """End-to-end: SGLang's DSv4 ``Mxfp4FlashinferCutlassMoEMethod.apply``
     output must match a direct FlashInfer ``cutlass_fused_moe`` call with
     the equivalent native E8M0 scale/weight interleave applied manually."""
-    from types import SimpleNamespace
 
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod

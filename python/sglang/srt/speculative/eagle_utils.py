@@ -727,37 +727,55 @@ def eagle_sample(
 
         use_rejection_sampling = get_server_args().speculative_use_rejection_sampling
 
-        # Apply temperature and get target probs
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
+        sm120_distribution = None
+        if (
+            get_server_args().qwen_exo_sm120_fast
+            and use_rejection_sampling
+            and _is_cuda
+            and verify_input.tree_topk == 1
+            and 1 <= verify_input.draft_token_num <= 8
+            and next_token_logits.shape[-1] >= 64
+        ):
+            from sglang.jit_kernel.sm120_sampling import prepare_target_distribution
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
+            sm120_distribution = prepare_target_distribution(
+                next_token_logits, sampling_info, verify_input.draft_token_num
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
+            target_probs = sm120_distribution.dense.reshape(
+                bs, verify_input.draft_token_num, -1
+            )
+        else:
+            # The unmarked/default path keeps the original full-vocab sampler.
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, verify_input.draft_token_num, dim=0
+            )
+            target_probs = F.softmax(
+                next_token_logits / expanded_temperature, dim=-1
+            )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+            if sampling_info.need_top_k_sampling:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+            if sampling_info.need_top_p_sampling:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        use_compact_chain = (
+            _is_cuda and verify_input.tree_topk == 1 and not use_rejection_sampling
         )
+        draft_probs = verify_input.draft_probs if use_rejection_sampling else None
+        if not use_rejection_sampling and not use_compact_chain:
+            draft_probs = torch.zeros_like(target_probs)
         # Defense-in-depth behind the spec_hook startup allowlist: validate the
         # actual kernel inputs (catches draft_probs plumbing regressions or a
         # startup guard bypassed by a worker subclass) before the Triton kernel.
@@ -777,7 +795,23 @@ def eagle_sample(
 
         threshold_single = get_server_args().speculative_accept_threshold_single
         threshold_acc = get_server_args().speculative_accept_threshold_acc
-        if use_rejection_sampling:
+        if sm120_distribution is not None:
+            from sglang.jit_kernel.sm120_sampling import exact_chain_sampling
+
+            exact_chain_sampling(
+                sm120_distribution,
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                draft_probs=draft_probs,
+            )
+        elif use_rejection_sampling:
             chain_speculative_sampling_triton(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -793,6 +827,24 @@ def eagle_sample(
                 threshold_single=threshold_single,
                 threshold_acc=threshold_acc,
                 deterministic=True,
+            )
+        elif use_compact_chain:
+            from sglang.kernels.ops.speculative.chain_target_only import (
+                chain_speculative_sampling_target_only,
+            )
+
+            chain_speculative_sampling_target_only(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
             )
         elif _TARGET_SAMPLING_KERNEL_ARGUMENT_COUNT >= 15:
             torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(

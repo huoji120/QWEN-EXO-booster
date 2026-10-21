@@ -84,7 +84,10 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         runner.require_gathered_buffer = False
         runner.model_runner = SimpleNamespace(
             model_config=SimpleNamespace(vocab_size=8),
-            server_args=SimpleNamespace(speculative_use_rejection_sampling=False),
+            server_args=SimpleNamespace(
+                speculative_use_rejection_sampling=False,
+                qwen_exo_sm120_fast=False,
+            ),
             device_timer=None,
             draft_attn_backend=backend,
         )
@@ -94,7 +97,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         def replay_graph_stub(shape_key, forward_batch):
             # Observe again during graph replay to catch a premature restore.
             backend.observe("graph_replay", forward_batch)
-            return None
+            return (None, None, None, None)
 
         runner._replay_graph = replay_graph_stub
         return runner
@@ -193,6 +196,38 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+    def test_profile_stages_truncation_and_owns_returned_q(self):
+        runner = self._build_runner(_RecordingDraftBackend())
+        runner.model_runner.server_args.qwen_exo_sm120_fast = True
+        runner.model_runner.server_args.speculative_use_rejection_sampling = True
+        runner.temperatures = torch.full((CAPTURE_BS, 1), 99.0)
+        runner.top_ks = torch.full((CAPTURE_BS,), 99, dtype=torch.int32)
+        runner.top_ps = torch.full((CAPTURE_BS,), 0.1)
+        runner.buffers.draft_probs = torch.empty((CAPTURE_BS, 8))
+        batch = self._build_forward_batch([10, 11], 21)
+        batch.spec_info.draft_probs = torch.full((2, 8), 0.125)
+        batch.sampling_info = SimpleNamespace(
+            temperatures=torch.tensor([[0.7], [1.3]]),
+            top_ks=torch.tensor([3, 7], dtype=torch.int32),
+            top_ps=torch.tensor([0.7, 0.9]),
+        )
+        runner._postprocess_output_to_raw_bs = (
+            EAGLEDraftCudaGraphRunner._postprocess_output_to_raw_bs.__get__(runner)
+        )
+        runner._replay_graph = lambda *_: (
+            None, None, None, runner.buffers.draft_probs[:, None, :]
+        )
+        result = runner.execute(batch)
+        self.assertEqual(runner.top_ks.tolist(), [3, 7, 64, 64])
+        torch.testing.assert_close(runner.top_ps, torch.tensor([0.7, 0.9, 1.0, 1.0]))
+        torch.testing.assert_close(
+            runner.temperatures, torch.tensor([[0.7], [1.3], [1.0], [1.0]])
+        )
+        self.assertEqual(result[3].shape, (2, 1, 8))
+        # A later target/private-pool writer must not mutate retained q.
+        runner.buffers.draft_probs.fill_(123)
+        torch.testing.assert_close(result[3], torch.full((2, 1, 8), 0.125))
 
 
 if __name__ == "__main__":

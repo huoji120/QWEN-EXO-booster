@@ -2896,6 +2896,10 @@ class ServerArgs:
         bool,
         "Enable the QWEN-EXO-booster hybrid-memory runtime.",
     ] = False
+    qwen_exo_sm120_fast: A[
+        bool,
+        "Enable the model-bound SM120 W4A16/INT8 and exact-RS preset; requires a separately fingerprinted profile.",
+    ] = False
     qwen_exo_moe_top_k: A[
         Optional[int],
         Arg(
@@ -3480,7 +3484,7 @@ class ServerArgs:
         if self.qwen4_ple_disk_path or envs.SGLANG_QWEN4_PLE_NVME_PATH.get():
             if self.tp_size != 1:
                 raise ValueError("disk-backed Qwen4 PLE requires --tp-size=1")
-            if self.cuda_graph_config is not None:
+            if isinstance(self.cuda_graph_config, CudaGraphConfig):
                 if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
                     raise ValueError("disk-backed Qwen4 PLE requires eager prefill")
                 if self.cuda_graph_config.decode.backend not in {Backend.DISABLED, Backend.FULL}:
@@ -3494,7 +3498,7 @@ class ServerArgs:
             return
         if self.tp_size != 1 or self.ep_size != 1 or self.pp_size != 1 or self.moe_dp_size != 1:
             raise ValueError("CPU expert paging requires TP/EP/PP/MoE-DP=1")
-        if self.cuda_graph_config is not None and (
+        if isinstance(self.cuda_graph_config, CudaGraphConfig) and (
             self.cuda_graph_config.decode.backend != Backend.DISABLED
             or self.cuda_graph_config.prefill.backend != Backend.DISABLED
         ):
@@ -3545,6 +3549,10 @@ class ServerArgs:
             from qwen_exo_booster.fingerprint import validate_qwen_exo_config
 
             validate_qwen_exo_config(hf_config)
+        from qwen_exo_booster.sm120_profile import sm120_profile_enabled
+
+        if sm120_profile_enabled(hf_config) != self.qwen_exo_sm120_fast:
+            raise ValueError("SM120 fast model marker and launch flag disagree")
 
         # HRM-Text needs bidirectional prompt attention (prefill), which only
         # the Triton backend honors at the kernel level. Radix/prefix reuse is
@@ -3858,6 +3866,10 @@ class ServerArgs:
         return int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0) == 1
 
     def _handle_qwen_exo_runtime(self):
+        if self.qwen_exo_sm120_fast:
+            from qwen_exo_booster.sm120_profile import validate_sm120_profile_args
+
+            validate_sm120_profile_args(self)
         if self.qwen_exo_moe_top_k is not None and not self.enable_qwen_exo:
             raise ValueError("--qwen-exo-moe-top-k requires --enable-qwen-exo")
         if self.qwen_exo_moe_extra_experts < 0:

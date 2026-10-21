@@ -47,6 +47,10 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
     prepare_nvfp4_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.sm120_dense import (
+    sm120_dense_method,
+    sm120_fast_enabled,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -291,7 +295,7 @@ class ModelOptQuantConfig(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return sm120_dense_method(prefix) or UnquantizedLinearMethod()
             return Linear(self)
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
@@ -808,7 +812,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return sm120_dense_method(prefix) or UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo in {"FP8_BLOCK_SCALES", "FP8_PB_WO"}:
@@ -817,7 +821,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
-            return UnquantizedLinearMethod()
+            return sm120_dense_method(prefix) or UnquantizedLinearMethod()
 
         if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self.fp8_config)
@@ -2060,10 +2064,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
-        # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        # TRTLLM aliases the loaded scales later; Marlin uses its own layout.
+        # Neither backend consumes a separate FlashInfer swizzled scale bank.
+        if self.enable_flashinfer_trtllm_moe or get_moe_runner_backend().is_marlin():
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2083,7 +2086,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or get_moe_runner_backend().is_marlin():
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2182,6 +2185,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     # Some checkpoints store a shared scale for w1/w3.
                     w13_weight_scale_2 = layer.w13_weight_scale_2
                 else:
+                    if sm120_fast_enabled() and (
+                        layer.w13_weight_scale_2.shape[1] != 2
+                        or not torch.equal(
+                            layer.w13_weight_scale_2[:, 0],
+                            layer.w13_weight_scale_2[:, 1],
+                        )
+                    ):
+                        raise ValueError(
+                            "SM120 Marlin requires exactly equal gate/up global scales"
+                        )
                     if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
                         layer.w13_weight_scale_2[:, 0],
                         layer.w13_weight_scale_2[:, 1],

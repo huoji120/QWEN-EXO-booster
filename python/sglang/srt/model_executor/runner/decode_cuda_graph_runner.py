@@ -437,6 +437,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
         self._disk_ple_graph_buffers = {}
+        self._sm120_moe_graph_arenas = {}
         self._allocate_disk_ple_graph = (
             getattr(model_runner.model, "allocate_disk_ple_graph_buffers", None)
             if not model_runner.is_draft_worker else None
@@ -1082,18 +1083,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
-                maybe_flashinfer_autotune_speculative_draft(
-                    self,
-                    run_once,
-                    post_warmup_hook=post_warmup_hook,
-                    skip_logits=False,
-                )
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    dummies=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                moe_capture_ctx = contextlib.nullcontext()
+                if (
+                    getattr(self.model_runner.server_args, "qwen_exo_sm120_fast", False)
+                    and not self.model_runner.is_draft_worker
+                    and 0 < num_tokens <= 8
+                ):
+                    from sglang.jit_kernel.sm120_persistent_moe import (
+                        PersistentMoeScratch,
+                        use_persistent_moe_capture_scratch,
+                    )
+
+                    # Routed layers execute serially inside this graph. One arena
+                    # suffices for all layers, but different graphs retain their own.
+                    arena = PersistentMoeScratch.allocate(self.buffers.input_ids.device)
+                    self._sm120_moe_graph_arenas[shape_key] = arena
+                    moe_capture_ctx = use_persistent_moe_capture_scratch(arena)
+                with moe_capture_ctx:
+                    maybe_flashinfer_autotune_speculative_draft(
+                        self,
+                        run_once,
+                        post_warmup_hook=post_warmup_hook,
+                        skip_logits=False,
+                    )
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        dummies=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
         # If the required capture_hidden_mode changes, we need to recapture the graph
@@ -1126,6 +1144,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode = required_capture_hidden_mode
             self.backend.cleanup()
             self._disk_ple_graph_buffers.clear()
+            self._sm120_moe_graph_arenas.clear()
             self.capture()
 
     def load_batch(

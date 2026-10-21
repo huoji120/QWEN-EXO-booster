@@ -119,6 +119,13 @@ def main() -> None:
     except ServiceConfigError as exc:
         raise SystemExit(f"QWEN-EXO service config error [{exc.code}]: {exc}") from exc
 
+    from qwen_exo_booster.sm120_profile import configure_sm120_profile_arguments
+
+    try:
+        effective_args = configure_sm120_profile_arguments(effective_args)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"QWEN-EXO SM120 profile error: {exc}") from exc
+
     if "--enable-qwen-exo" in effective_args:
         from qwen_exo_booster.runtime_lora import RuntimeLoRA
 

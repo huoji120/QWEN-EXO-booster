@@ -26,6 +26,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 )
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -142,6 +143,7 @@ class TestDFlashPriorityYield(CustomTestCase):
         req.mamba_pool_idx = None
         req.retracted_stain = False
         req.inflight_middle_chunks = 0
+        req.req_pool_idx = None
         req.needs_host_load_back.return_value = False
 
         def set_extend_range(start, end):
@@ -226,7 +228,9 @@ class TestDFlashPriorityYield(CustomTestCase):
         scheduler.dllm_config = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
-        scheduler.get_num_allocatable_reqs = lambda running_bs: 8 - running_bs
+        scheduler.get_num_allocatable_reqs = (
+            lambda running_bs, *, num_held_rows=0: 8 - running_bs
+        )
         scheduler.policy = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.evictable_size.return_value = 0
@@ -317,6 +321,46 @@ class TestDFlashPriorityYield(CustomTestCase):
         ):
             return scheduler._get_new_batch_prefill_raw(None, running, last)
 
+    def test_final_chunk_reuses_its_row_without_blocking_the_free_slot(self):
+        for mode in (DisaggregationMode.NULL, DisaggregationMode.PREFILL):
+            for parked_count in (0, 1):
+                with self.subTest(mode=mode, parked=parked_count):
+                    owners = [self._request(f"owner-{i}", 0) for i in range(2)]
+                    chunk = self._request("final-chunk", 0)
+                    chunk.prefix_indices = [1]
+                    chunk.kv_committed_len = 1
+                    waiting = [self._request(f"waiting-{i}", 0) for i in range(2)]
+                    scheduler = self._scheduler(waiting)
+                    scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+                    scheduler.enable_priority_preemption = False
+                    scheduler.disaggregation_mode = mode
+                    scheduler.max_running_requests = scheduler.max_prefill_bs = 4
+                    scheduler.chunked_prefill_size = 8
+                    scheduler.chunked_req = chunk
+                    scheduler.req_to_token_pool = ReqToTokenPool(4, 16, "cpu", False)
+                    scheduler.req_to_token_pool.alloc([*owners, chunk])
+                    held_row = chunk.req_pool_idx
+                    scheduler.get_num_allocatable_reqs = (
+                        Scheduler.get_num_allocatable_reqs.__get__(scheduler)
+                    )
+                    if parked_count:
+                        scheduler._qwen_exo_parked_batch = self._batch(owners[:1])
+                        scheduler._qwen_exo_parked_batch.new_tokens_required_next_decode.return_value = 1
+                    running = self._batch(owners[parked_count:])
+                    with patch(
+                        "sglang.srt.managers.scheduler.get_server_args",
+                        return_value=SimpleNamespace(pp_max_micro_batch_size=4),
+                    ):
+                        scheduled, _ = self._prefill(
+                            scheduler, running, real_admission=True
+                        )
+                    self.assertEqual(scheduled.reqs, [chunk, waiting[0]])
+                    self.assertEqual(scheduler.waiting_queue, [waiting[1]])
+                    rows = scheduler.req_to_token_pool.alloc(scheduled.reqs)
+                    self.assertEqual(rows[0], held_row)
+                    self.assertEqual(len({r.req_pool_idx for r in [*owners, *scheduled.reqs]}), 4)
+                    self.assertEqual(scheduler.req_to_token_pool.available_size(), 0)
+
     def test_non_speculative_waiter_runs_before_background_decode_finishes(self):
         for exo in (False, True):
             for low_first in (False, True):
@@ -356,7 +400,9 @@ class TestDFlashPriorityYield(CustomTestCase):
                 scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
                 scheduler.server_args.enable_qwen_exo = True
                 scheduler.max_running_requests = 6
-                scheduler.get_num_allocatable_reqs = lambda running_bs: 6 - running_bs
+                scheduler.get_num_allocatable_reqs = (
+                    lambda running_bs, *, num_held_rows=0: 6 - running_bs
+                )
                 scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
                 running = self._batch(foreground + background, target_only=True)
                 scheduled, retained = self._prefill(
@@ -795,7 +841,9 @@ class TestDFlashPriorityYield(CustomTestCase):
                 if resource == "tokens":
                     scheduler.token_to_kv_pool_allocator.available_size.return_value = 1
                 else:
-                    scheduler.get_num_allocatable_reqs = lambda running_bs: 0
+                    scheduler.get_num_allocatable_reqs = (
+                        lambda running_bs, *, num_held_rows=0: 0
+                    )
                 selected = self._select_chunk_turn(scheduler)
                 self.assertIs(selected, original)
                 self.assertEqual(selected.reqs, [generator])

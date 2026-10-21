@@ -6,13 +6,19 @@ tests check that the pre-allocated `parent_list` / `top_scores_index` match the
 slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
@@ -75,21 +81,6 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
         max_running_requests=8,
     )
     return worker
-
-
-def _make_backend_factory(decode_backend, draft_extend_backend, captured_kwargs=None):
-    class FakeDraftBackendFactory:
-        def __init__(self, *args, **kwargs):
-            if captured_kwargs is not None:
-                captured_kwargs.update(kwargs)
-
-        def create_decode_backend(self):
-            return decode_backend
-
-        def create_draft_extend_backend(self):
-            return draft_extend_backend
-
-    return FakeDraftBackendFactory
 
 
 class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
@@ -203,53 +194,6 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 self.assertEqual(worker.cuda_graph_runner.execute.called, expect_graph)
                 self.assertEqual(worker.draft_forward.called, not expect_graph)
 
-    def test_preserves_initialized_backend_when_draft_extend_backend_is_unset(self):
-        worker = object.__new__(EagleDraftWorker)
-        existing_backend = object()
-        decode_backend = object()
-        worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
-        worker.topk = 1
-        worker.speculative_num_steps = 2
-        worker.seed_dsa_topk_from_draft_extend = False
-
-        with patch(
-            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
-            _make_backend_factory(decode_backend, None),
-        ):
-            worker.init_attention_backend()
-
-        self.assertIs(worker.draft_attn_backend, decode_backend)
-        self.assertIsNone(worker.draft_extend_attn_backend)
-        self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
-        self.assertIs(worker.draft_runner.attn_backend, existing_backend)
-
-    def test_uses_draft_extend_backend_when_available(self):
-        worker = object.__new__(EagleDraftWorker)
-        existing_backend = object()
-        decode_backend = object()
-        draft_extend_backend = object()
-        worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
-        worker.topk = 1
-        worker.speculative_num_steps = 2
-        worker.seed_dsa_topk_from_draft_extend = True
-        factory_kwargs = {}
-
-        with patch(
-            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
-            _make_backend_factory(
-                decode_backend, draft_extend_backend, captured_kwargs=factory_kwargs
-            ),
-        ):
-            worker.init_attention_backend()
-
-        self.assertIs(worker.draft_attn_backend, decode_backend)
-        self.assertIs(worker.draft_extend_attn_backend, draft_extend_backend)
-        self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
-        self.assertIs(worker.draft_runner.attn_backend, draft_extend_backend)
-        self.assertTrue(factory_kwargs["seed_dsa_topk_from_draft_extend"])
-
     def _make_adaptive_worker(self, runner_attn_backend):
         """An EAGLEWorkerV2 with a draft worker whose state-machine fields are
         filled with sentinels, sufficient to drive _override_worker_state /
@@ -340,6 +284,189 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             worker.spec_v2_attn_backends,
             (target_backend, decode_backend, fallback_backend),
         )
+
+
+class TestEagleDraftExtendSelectedLogits(CustomTestCase):
+    @staticmethod
+    def _make_processor(vocab_size):
+        # Exercise the real pruning, hidden capture and LM-head arithmetic,
+        # without initializing distributed process groups or a model runner.
+        processor = object.__new__(LogitsProcessor)
+        torch.nn.Module.__init__(processor)
+        processor.vocab_size = vocab_size
+        processor.do_tensor_parallel_all_gather = False
+        processor.do_tensor_parallel_all_gather_dp_attn = False
+        processor.use_fp32_lm_head = False
+        processor.rl_on_policy_target = None
+        processor.logit_scale = None
+        processor.final_logit_softcapping = None
+        return processor
+
+    def test_draft_extend_logits_hidden_and_seed_selection(self):
+        self._check_draft_extend_selection([3, 1, 0, 2], [1, 2, 3, 4])
+
+    def test_single_request_retains_full_lm_head_rows(self):
+        for accept_len in (1, 2, 3, 4):
+            with self.subTest(accept_len=accept_len):
+                self._check_draft_extend_selection([0], [accept_len])
+
+    def _check_draft_extend_selection(self, request_order, accept_lens):
+        bs, width, hidden_size = len(request_order), 4, 8
+        request_order = torch.tensor(request_order, device=DEVICE)
+        accept_lens = torch.tensor(accept_lens, device=DEVICE)[request_order]
+        selected = torch.arange(bs, device=DEVICE) * width + accept_lens - 1
+        base = torch.arange(bs * width * hidden_size, device=DEVICE).reshape(
+            bs, width, hidden_size
+        )
+        base = torch.sin(base.float() * 0.37)
+        winners = torch.arange(bs * width, device=DEVICE).reshape(bs, width) % hidden_size
+        base.scatter_add_(2, winners.unsqueeze(-1), torch.full_like(base[:, :, :1], 3))
+        base = base[request_order].reshape(bs * width, hidden_size)
+
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for graph_available, graph_runs, gathered, padding in (
+                (False, False, False, 0),
+                (True, False, False, 4),
+                (False, False, True, 4),
+                (True, True, False, 4),
+            ):
+                with self.subTest(
+                    dtype=dtype, graph_runs=graph_runs, gathered=gathered, padding=padding
+                ):
+                    states = torch.cat(
+                        (base, torch.full((padding, hidden_size), 99, device=DEVICE))
+                    ).to(dtype)
+                    hc_states = torch.cat((states + 7, states - 9), dim=-1)
+                    head = torch.nn.Linear(hidden_size, hidden_size, bias=False).to(
+                        device=DEVICE, dtype=dtype
+                    )
+                    with torch.no_grad():
+                        head.weight.copy_(
+                            torch.eye(hidden_size, device=DEVICE)
+                            + torch.arange(hidden_size, device=DEVICE).float()[:, None]
+                            * 0.001
+                        )
+                    weight_before = head.weight.detach().clone()
+                    processor = self._make_processor(hidden_size)
+                    seed = torch.arange(
+                        states.shape[0] * 3, device=DEVICE, dtype=torch.int32
+                    ).reshape(-1, 3)
+                    observed = {}
+
+                    def prepare(spec_info, batch, token_ids, *args, **kwargs):
+                        # Preparation must retain all target hidden/HC rows.
+                        self.assertIs(spec_info.hidden_states, hc_states)
+                        return ForwardBatch(
+                            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+                            batch_size=bs,
+                            input_ids=token_ids,
+                            req_pool_indices=request_order,
+                            seq_lens=batch.seq_lens,
+                            out_cache_loc=torch.arange(states.shape[0], device=DEVICE),
+                            seq_lens_sum=0,
+                            spec_info=spec_info,
+                            capture_hidden_mode=CaptureHiddenMode.FULL,
+                            next_token_logits_buffer=torch.empty(
+                                (states.shape[0], hidden_size),
+                                device=DEVICE,
+                                dtype=torch.float32,
+                            ),
+                        )
+
+                    def forward(forward_batch):
+                        if forward_batch.spec_info.dsa_seed_topk_capture is not None:
+                            forward_batch.spec_info.dsa_seed_topk_capture.copy_(seed)
+                        metadata = LogitsMetadata.from_forward_batch(forward_batch)
+                        with patch.object(
+                            processor, "_compute_lm_head", wraps=processor._compute_lm_head
+                        ) as compute:
+                            output = processor(
+                                forward_batch.input_ids,
+                                states,
+                                head,
+                                metadata,
+                                aux_hidden_states=[hc_states],
+                            )
+                        observed["head_rows"] = compute.call_args.args[0].shape[0]
+                        observed["logits"] = output.next_token_logits.clone()
+                        torch.testing.assert_close(output.hidden_states, hc_states)
+                        return output
+
+                    worker = object.__new__(EagleDraftWorker)
+                    worker.device = DEVICE
+                    worker.topk = 1
+                    worker.speculative_num_draft_tokens = width
+                    worker.server_args = _fake_server_args(
+                        speculative_use_rejection_sampling=False
+                    )
+                    worker.plan_stream = None
+                    worker.plan_stream_ctx = contextlib.nullcontext()
+                    worker.seed_dsa_topk_from_draft_extend = True
+                    worker.dsa_index_topk = 3
+                    worker.dsa_extend_topk_buf = None
+                    worker.draft_runner = SimpleNamespace(
+                        canary_manager=None,
+                        forward=lambda fb: SimpleNamespace(logits_output=forward(fb)),
+                    )
+                    worker.cuda_graph_runner_for_draft_extend = (
+                        SimpleNamespace(
+                            can_run_graph=lambda fb: graph_runs,
+                            execute=forward,
+                            buffers=SimpleNamespace(dsa_seed_topk_capture=seed),
+                        )
+                        if graph_available
+                        else None
+                    )
+                    batch = SimpleNamespace(
+                        seq_lens=torch.ones(bs, device=DEVICE, dtype=torch.int32),
+                        sampling_info=SimpleNamespace(),
+                    )
+                    result = SimpleNamespace(
+                        logits_output=SimpleNamespace(hidden_states=hc_states),
+                        accept_lens=accept_lens,
+                        next_token_ids=torch.arange(states.shape[0], device=DEVICE),
+                        next_draft_input=SimpleNamespace(),
+                    )
+                    with patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft_extend",
+                        side_effect=prepare,
+                    ), patch(
+                        "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
+                        return_value=gathered,
+                    ), patch("sglang.srt.speculative.eagle_worker_v2._is_hip", False):
+                        worker._draft_extend_for_decode(batch, result)
+
+                    pruned = bs > 1 and not graph_runs and not gathered
+                    self.assertEqual(
+                        observed["head_rows"], bs if pruned else states.shape[0]
+                    )
+                    reference = (states @ head.weight.T).float()[selected]
+                    actual = observed["logits"] if pruned else observed["logits"][selected]
+                    tolerance = {
+                        torch.float32: 1e-5,
+                        torch.float16: 0.002,
+                        torch.bfloat16: 0.02,
+                    }[dtype]
+                    torch.testing.assert_close(
+                        actual, reference, rtol=tolerance, atol=tolerance
+                    )
+                    next_input = result.next_draft_input
+                    self.assertEqual(
+                        next_input.topk_index.tolist(),
+                        reference.argmax(dim=-1, keepdim=True).tolist(),
+                    )
+                    torch.testing.assert_close(
+                        next_input.topk_p, torch.ones(bs, 1, device=DEVICE)
+                    )
+                    torch.testing.assert_close(
+                        next_input.hidden_states, hc_states[selected]
+                    )
+                    torch.testing.assert_close(
+                        next_input.dsa_topk_indices, seed[selected]
+                    )
+                    torch.testing.assert_close(
+                        head.weight, weight_before, rtol=0, atol=0
+                    )
 
 
 if __name__ == "__main__":
