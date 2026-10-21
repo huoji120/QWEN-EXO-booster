@@ -111,20 +111,20 @@ Score Bias can surface relevant system rules, tool traces, and history to the at
 
 Long reasoning and multi-round tool calls break at boundaries: truncations, half tool calls, leaked reasoning. QWEN-EXO keeps reasoning, tool calls, tool outputs, and final answers strictly separate, and provides a controlled recovery path for incomplete responses. Even when the model stops at a budget boundary, a half-finished internal thought is never passed off as the final answer.
 
-Responses enforces the reasoning budget independently of Observer and the external memory tools. The cap applies to target-generated reasoning tokens, including when EAGLE/MTP remain enabled. Without forced auto-budget and with THINK explicitly off, the two-stage path is not entered; after truncation the answer continues on the remaining output budget, and exhausting the total still marks the response `incomplete`. Thinking and answering run in one scheduler request; self-question injection (cutoff self-check questions and mid-think divergent questions) has been removed. Two configurable logit shapers act while thinking: after `qwen_exo_think_suppress_after_tokens` (default 1024) thinking tokens, re-verification words such as Wait / Hmm / Alternatively / 等等 are biased down; after `qwen_exo_think_landing_start_ratio` (default 0.75) of the budget, `</think>` gets a ramping bias (soft landing), with the hard cutoff still as the final backstop. `reasoning.budget_forced.observed_tokens` is the actual truncation position; the API's `reasoning_tokens` also counts synthetic boundary/truncation control text and should not be equated with that generation limit.
+Responses enforces the reasoning budget independently of Observer and the external memory tools. The cap applies to target-generated reasoning tokens, including when EAGLE/MTP remain enabled. Without forced auto-budget and with THINK explicitly off, the two-stage path is not entered; after truncation the answer continues on the remaining output budget, and exhausting the total still marks the response `incomplete`. Thinking and answering run in one scheduler request; self-question injection (cutoff self-check questions and mid-think divergent questions) has been removed. Two configurable logit shapers act while thinking: after `qwen_exo_think_suppress_after_tokens` (512 in the reference launcher; standalone CLI default 1024) thinking tokens, re-verification words such as Wait / Hmm / Alternatively / 等等 are biased down; after `qwen_exo_think_landing_start_ratio` (default 0.75) of the budget, `</think>` gets a ramping bias (soft landing), with the hard cutoff still as the final backstop. `reasoning.budget_forced.observed_tokens` is the actual truncation position; the API's `reasoning_tokens` also counts synthetic boundary/truncation control text and should not be equated with that generation limit.
 
 When forced automatic budgeting is disabled, managed `default_enable_thinking` controls thinking for unspecified requests, with explicit request settings taking precedence. `default_preserve_thinking` controls historical assistant reasoning in the template. Preservation cannot restore THINK omitted by the client: historical reasoning must still be supplied.
 
 #### Five reasoning budgets and dynamic selection
 
-Use `reasoning: {"effort": "high"}` with `POST /v1/responses` to request a tier. The default-on forced automatic switch overrides it with the internal JEV budget selection. Default maximum **generated reasoning tokens**:
+Use `reasoning: {"effort": "xhigh"}` with `POST /v1/responses` to request a tier. The reference launcher disables forced automatic selection, respects explicit effort (including `none`), and enables THINK and preservation of client-supplied historical reasoning by default. All five launcher budgets cap **generated reasoning tokens** at 8192; these are not the standalone CLI/configuration-class defaults:
 
 | Budget tier | Budget | Flash-Next template tier without automatic selection |
 |---|---:|---|
-| `min` (`minimal` alias) | 512 | `low` |
-| `low` | 1024 | `low` |
-| `medium` | 2048 | `medium` |
-| `high` | 4090 | `xhigh` |
+| `min` (`minimal` alias) | 8192 | `low` |
+| `low` | 8192 | `low` |
+| `medium` | 8192 | `medium` |
+| `high` | 8192 | `xhigh` |
 | `xhigh` (`max` alias) | 8192 | `xhigh` |
 
 The actual Qwen3.8-Flash-Next template supports only `low / medium / xhigh`; template aliases do not change the selected tier's budget. `none` disables thinking only when forced automatic mode is off. Configure `qwen_exo_reasoning_budget_min/low/medium/high/xhigh`, or launcher environment variables `QWEN_EXO_REASONING_BUDGET_MIN/LOW/MEDIUM/HIGH/XHIGH`. In non-forced fixed mode, omitted effort and internal tasks retain `qwen_exo_max_reasoning_tokens`; this fallback does not clamp explicit tiers. Total output and model context limits still apply; a budget is a ceiling, not a required token count.
@@ -135,9 +135,9 @@ For compatibility with the installed OpenAI SSE event models, response metadata 
 
 Responses effort selection is fully separate from the memory path: selection passes only the latest genuine user message as raw text to the internal JEV (`/v1/systemone`), with no canonical JSON or serialization wrapper, and it never reads old tasks, assistant reasoning, or tool results. The main model still receives the full effective history, and the two no longer need to share one long history prefix. When the knowledge base is off, no full workflow snapshot is built just for selection.
 
-With default `qwen_exo_reasoning_session_once=true`, a new user task is evaluated once and subsequent tool continuations reuse its tier. Resending full history does not make old user messages new; an additional occurrence of identical user text is a new task. Explicitly disabling this setting reevaluates each turn, still using only the latest user message. New sessions, cache eviction, and restart require selection again. Missing recoverable user tasks fail explicitly rather than being invented from tool output.
+The reference launcher sets `qwen_exo_reasoning_session_once=false` and does not enable automatic selection. Automatic mode remains opt-in: with `qwen_exo_reasoning_session_once=true`, a new user task is evaluated once and subsequent tool continuations reuse its tier. Resending full history does not make old user messages new; an additional occurrence of identical user text is a new task. Disabling this setting reevaluates each automatic turn, still using only the latest user message. New sessions, cache eviction, and restart require selection again. Missing recoverable user tasks fail explicitly rather than being invented from tool output.
 
-Forced automatic effort remains on by default; disabling it restores explicit-effort precedence. Automatic effort changes only the hard budget, keeping template effort stable. `reasoning.effort_selected` reports evaluated tokens and `reasoning.effort_reused` reports continuation reuse. Selection does not repeat during one generation and does not change main-generation KV/GDN cache policy.
+The reference launcher disables forced automatic effort by default. Explicitly enabling `qwen_exo_force_auto_reasoning` overrides client effort with JEV budget selection. Automatic effort changes only the hard budget, keeping template effort stable. `reasoning.effort_selected` reports evaluated tokens and `reasoning.effort_reused` reports continuation reuse. Selection does not repeat during one generation and does not change main-generation KV/GDN cache policy.
 
 Responses reuses token IDs for the same rendered text and encoding options within one request; rebuilt prompts do not reuse stale IDs, and the cache never spans requests. Default special-token encoding remains separate from internal no-special-token encoding. Plain-text QWEN-EXO generation supplies cached IDs alongside the original text to the native engine, avoiding another encoding pass; Harmony and multimodal requests retain their original processing. This reduces CPU preparation after tool-result returns without changing THINK, context limits, tool semantics, or KV/GDN state.
 
@@ -249,7 +249,7 @@ Requests still have a context ceiling. Memory retrieval is lexical: different wo
 bash scripts/qwen_exo/build_image.sh
 ```
 
-See `docker/compose.yaml` (service `sglang`) for orchestration. `scripts/qwen_exo/launch_js4090.sh` is a complete two-GPU launch example; adjust the flags for your machine.
+See `docker/compose.yaml` (service `sglang`) for orchestration. `scripts/qwen_exo/launch_js4090.sh` and its native entrypoint `launch_native_js4090.sh` now default to the verified single RTX PRO 6000 Blackwell 96GB reference below, not a two-GPU example. Do not assemble a deployment from later historical/optional experiment paragraphs. Other hardware requires explicit configuration and renewed acceptance, not an assumed equivalent best configuration.
 
 Internal work inherits its parent's scheduling class: scoring and diagnostics required by the current request stay foreground; reflection and its children use a separate single-slot lane, while maintenance such as summary generation and memory organization uses a separate three-slot lane. The nightly dream runs on its own FIFO queue and does not share the per-conversation reflection lock. Background descendants cannot promote themselves into the foreground lane; queue cancellation, timeout, and completion all release admission. Logical lanes add no GPU capacity: KV/Mamba/request-slot ceilings still apply, foreground can preempt background, and never the reverse.
 
@@ -286,6 +286,39 @@ QSA accepts only unpadded, uncached, complete causal windows; noncausal/nonconti
 ### Qwen3.8-Flash-Next NVFP4: isolated single-GPU path
 
 `Qwen4ExpForConditionalGeneration` uses GDN + QSA, a four-branch Gated Residual stream, and native PLE. It is not a directory-only replacement for Qwen3.5. NVIDIA's checkpoint is mixed precision: NVFP4 main routed experts, FP8 PLE, and block-FP8 MTP experts. Its runtime quantization name is `modelopt_mixed`.
+
+#### Default deployment: verified js4090 reference
+
+This is the current verified baseline, not a universally fastest hardware/workload claim. It requires an SM120 PRO6000, compatible CUDA environment, complete Flash-Next NVFP4 plus native MTP/PLE files, and sufficient host memory. Host-KV admission checks the actual cgroup limit; host-wide free RAM is not container capacity, and checks must not be bypassed to force startup.
+
+| Setting | Reference launcher |
+|---|---|
+| Capacity | TP=1, context=262144, mem-fraction=0.95, max-running=10 |
+| Scheduling/state | prefill=32768, chunk=1024, Mamba slots=64 |
+| KV/PLE | FP8 `fp8_e4m3`, GPU-first host-KV limit=1300032, disk PLE=`mmap` |
+| Execution | FlashInfer attention/sampling, full decode graphs for batches 1–6, eager prefill |
+| Numerical contract | Marked **MAIN model** derives SM120, Marlin, EAGLE 3/1/4, exact RS/threshold=1 |
+| Generation | output=32768, default THINK/history preservation on, fallback and all five reasoning budgets=8192; no forced auto-selection |
+| THINK shaping | suppress=512/strength=5, landing=0.75/bias=8 |
+| Features | hybrid-prefix/PolicyData on; Observer/Score Bias/Capsule/Reflection/Compaction off |
+| Compatibility | request decompression on; CPU image preprocessing, with vision encoding still on GPU |
+
+```bash
+export QWEN_EXO_PYTHON=/path/to/venv/bin/python
+PYTHONPATH=python "$QWEN_EXO_PYTHON" scripts/qwen_exo/build_sm120_profile.py \
+  --source /path/to/Qwen3.8-Flash-Next-NVFP4 \
+  --output /path/to/Qwen3.8-Flash-Next-NVFP4-sm120fast
+export QWEN_EXO_MODEL_PATH=/path/to/Qwen3.8-Flash-Next-NVFP4-sm120fast
+export QWEN_EXO_DATA_PATH=/path/to/persistent-flashnext-runtime
+bash scripts/qwen_exo/launch_native_js4090.sh
+```
+
+**Select the marked main model, not only a draft path.** SM120 changes dense/HC numerics and the sampling contract, so its marker and separate model fingerprint are mandatory. The service launcher applies the coupled parameters after catalog selection and managed settings. Original global-scale FP8 PLE and existing row-scaled FP8 PLE are both supported, but their contents are not equivalent: configuration alignment does not authorize converting tables or copying trained deltas.
+
+**New shell defaults do not migrate an existing deployment.** Saved `service-config.json` values override environment defaults; `model-catalog.json` selection can also override `QWEN_EXO_MODEL_PATH`. Migrate through managed settings/model selection, retain keys and data directories, drain requests, and use a reliable supervisor/container restart policy for the full launch chain. Accept actual `/get_server_info`, `/qwen-exo/status`, configuration `revision == applied_revision == healthy_revision`, active/applied/healthy/running model fingerprints, and real Responses THINK/tool turns. A process or health port alone does not establish applied settings. Explicit environment values override ordinary template defaults, but cannot split the model-bound numerical contract.
+
+#### Optional: CPU expert paging without the SM120 preset (not the default)
+
 
 ```bash
 export QWEN_EXO_PYTHON=/path/to/venv/bin/python

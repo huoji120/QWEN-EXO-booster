@@ -22,10 +22,15 @@ if [[ "${native_mode}" == "1" ]]; then
   export PATH="$(dirname -- "${QWEN_EXO_PYTHON}"):${PATH:-}"
   export PYTHONPATH="${QWEN_EXO_SOURCE_PATH}/python${PYTHONPATH:+:${PYTHONPATH}}"
 fi
-: "${QWEN_EXO_CONTEXT_LENGTH:=131072}"
-: "${QWEN_EXO_TP_SIZE:=2}"
+# Capacity defaults match the verified single-PRO6000 reference. Saved managed
+# settings take precedence; these defaults do not migrate an existing service.
+: "${QWEN_EXO_CONTEXT_LENGTH:=262144}"
+: "${QWEN_EXO_TP_SIZE:=1}"
 : "${QWEN_EXO_DOCKER_GPUS:=all}"
 : "${QWEN_EXO_DTYPE:=bfloat16}"
+# The shared service launcher applies quantization, resident Marlin experts and
+# exact EAGLE 3/1/4 together only for the selected MAIN model's SM120 marker.
+# Do not enable part of that numerical profile through shell defaults.
 : "${QWEN_EXO_QUANTIZATION:=}"
 : "${QWEN_EXO_KV_CACHE_DTYPE:=fp8_e4m3}"
 : "${QWEN_EXO_EXPERIMENTAL_ACTIVATION_TRAINING:=0}"
@@ -54,18 +59,18 @@ fi
 : "${QWEN_EXO_STATE_DIRECTORY_NAME:=state-cuda-tp${QWEN_EXO_TP_SIZE}-${QWEN_EXO_QUANTIZATION_LABEL}-${QWEN_EXO_KV_CACHE_DTYPE}}"
 : "${QWEN_EXO_USE_JIT_FP8_QUANT:=1}"
 : "${QWEN_EXO_LOGPROB_CHUNK_SIZE:=512}"
-: "${QWEN_EXO_MEM_FRACTION_STATIC:=0.80}"
+: "${QWEN_EXO_MEM_FRACTION_STATIC:=0.95}"
 : "${QWEN_EXO_MAX_RUNNING_REQUESTS:=10}"
-: "${QWEN_EXO_MAX_TOTAL_TOKENS:=}"
+: "${QWEN_EXO_MAX_TOTAL_TOKENS:=1300032}"
 : "${QWEN_EXO_CPU_OFFLOAD_GB:=0}"
 # Optional isolated Qwen4 native PLE and expert paging. These never change
 # num_experts_per_tok: all checkpoint-selected experts still execute.
 : "${QWEN_EXO_NATIVE_PLE_DISK_PATH:=}"
-: "${QWEN_EXO_NATIVE_PLE_BACKEND:=pread}"
-: "${QWEN_EXO_HOST_KV_CACHE:=0}"
+: "${QWEN_EXO_NATIVE_PLE_BACKEND:=mmap}"
+: "${QWEN_EXO_HOST_KV_CACHE:=1}"
 : "${QWEN_EXO_CPU_EXPERT_PAGING:=0}"
 : "${QWEN_EXO_MOE_RUNNER_BACKEND:=}"
-: "${QWEN_EXO_CUDA_GRAPH_MAX_BS:=5}"
+: "${QWEN_EXO_CUDA_GRAPH_MAX_BS:=6}"
 : "${QWEN_EXO_CUDA_GRAPH_BACKEND_DECODE:=full}"
 : "${QWEN_EXO_CUDA_GRAPH_BACKEND_PREFILL:=disabled}"
 if [[ "${QWEN_EXO_CPU_EXPERT_PAGING}" == "1" ]]; then
@@ -77,44 +82,51 @@ fi
 : "${QWEN_EXO_PORT:=30000}"
 : "${QWEN_EXO_MAX_INTERNAL_FANOUT:=32}"
 : "${QWEN_EXO_MAX_INTERNAL_TOKENS:=12288}"
-: "${QWEN_EXO_MAX_PREFILL_TOKENS:=65536}"
-: "${QWEN_EXO_CHUNKED_PREFILL_SIZE:=}"
-: "${QWEN_EXO_MAX_OUTPUT_TOKENS:=8192}"
-: "${QWEN_EXO_MAX_REASONING_TOKENS:=3072}"
-: "${QWEN_EXO_REASONING_BUDGET_MIN:=512}"
-: "${QWEN_EXO_REASONING_BUDGET_LOW:=1024}"
-: "${QWEN_EXO_REASONING_BUDGET_MEDIUM:=2048}"
-: "${QWEN_EXO_REASONING_BUDGET_HIGH:=4090}"
+: "${QWEN_EXO_MAX_PREFILL_TOKENS:=32768}"
+: "${QWEN_EXO_CHUNKED_PREFILL_SIZE:=1024}"
+: "${QWEN_EXO_MAX_OUTPUT_TOKENS:=32768}"
+: "${QWEN_EXO_MAX_REASONING_TOKENS:=8192}"
+: "${QWEN_EXO_REASONING_BUDGET_MIN:=8192}"
+: "${QWEN_EXO_REASONING_BUDGET_LOW:=8192}"
+: "${QWEN_EXO_REASONING_BUDGET_MEDIUM:=8192}"
+: "${QWEN_EXO_REASONING_BUDGET_HIGH:=8192}"
 : "${QWEN_EXO_REASONING_BUDGET_XHIGH:=8192}"
+: "${QWEN_EXO_THINK_SUPPRESS_AFTER_TOKENS:=512}"
+: "${QWEN_EXO_THINK_SUPPRESS_STRENGTH:=5}"
+: "${QWEN_EXO_THINK_LANDING_START_RATIO:=0.75}"
+: "${QWEN_EXO_THINK_LANDING_BIAS:=8}"
 : "${QWEN_EXO_REASONING_MODE:=fixed}"
-: "${QWEN_EXO_FORCE_AUTO_REASONING:=1}"
-: "${QWEN_EXO_REASONING_SESSION_ONCE:=1}"
+: "${QWEN_EXO_FORCE_AUTO_REASONING:=0}"
+: "${QWEN_EXO_REASONING_SESSION_ONCE:=0}"
 : "${QWEN_EXO_REASONING_DYNAMIC_CONTEXT_TOKENS:=2048}"
 : "${QWEN_EXO_MAMBA_STRATEGY:=extra_buffer}"
 # GDN state pool size relative to the full-attention KV pool (sglang default 0.9),
 # or an explicit slot count; with speculative decoding an explicit count also
 # reserves the per-draft-token intermediate states before sizing the KV pool.
 : "${QWEN_EXO_MAMBA_FULL_MEMORY_RATIO:=}"
-: "${QWEN_EXO_MAX_MAMBA_CACHE_SIZE:=}"
+: "${QWEN_EXO_MAX_MAMBA_CACHE_SIZE:=64}"
 : "${QWEN_EXO_MAMBA_SSM_DTYPE:=bfloat16}"
 
-: "${QWEN_EXO_OBSERVER_MODE:=shadow}"
+: "${QWEN_EXO_OBSERVER_MODE:=off}"
+: "${QWEN_EXO_ENABLE_HYBRID_PREFIX:=1}"
+: "${QWEN_EXO_ENABLE_POLICY_DATA:=1}"
+: "${QWEN_EXO_ENABLE_CAPSULE:=0}"
 : "${QWEN_EXO_Q_DRIFT_THRESHOLD:=0.35}"
 : "${QWEN_EXO_MOE_TOP_K:=}"
 : "${QWEN_EXO_MOE_EXTRA_EXPERTS:=0}"
 : "${QWEN_EXO_ENABLE_RETURN_ROUTED_EXPERTS:=0}"
 : "${QWEN_EXO_CONSOLE_TRACE_DEFAULT_SCOPE:=activity}"
-: "${QWEN_EXO_REFLECTION_MEMORY_MODE:=active}"
+: "${QWEN_EXO_REFLECTION_MEMORY_MODE:=off}"
 : "${QWEN_EXO_REFLECTION_MEMORY_IDLE_SECONDS:=600}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MIN_EVENTS:=3}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MIN_TOKENS:=256}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MAX_ATTEMPTS:=3}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MAX_OUTPUT_TOKENS:=4096}"
 : "${QWEN_EXO_REFLECTION_MEMORY_MAX_HISTORY_TOKENS:=92160}"
-: "${QWEN_EXO_RESPONSE_COMPACTION_MODE:=active}"
+: "${QWEN_EXO_RESPONSE_COMPACTION_MODE:=off}"
 : "${QWEN_EXO_WORKSPACE_SAFETY_RESERVE_MIB:=512}"
 : "${QWEN_EXO_TELEMETRY_INCLUDE_TEXT:=0}"
-: "${QWEN_EXO_SCORE_BIAS_MODE:=trajectory_active}"
+: "${QWEN_EXO_SCORE_BIAS_MODE:=off}"
 : "${QWEN_EXO_SCORE_BIAS_MIN_SURPRISAL:=0.8}"
 : "${QWEN_EXO_SCORE_BIAS_MAX:=0.25}"
 : "${QWEN_EXO_SCORE_BIAS_HALF_LIFE_STEPS:=4.0}"
@@ -136,6 +148,14 @@ fi
 : "${QWEN_EXO_PREFILL_ATTENTION_BACKEND:=}"
 : "${QWEN_EXO_DECODE_ATTENTION_BACKEND:=}"
 : "${QWEN_EXO_SAMPLING_BACKEND:=flashinfer}"
+: "${SGLANG_ENABLE_REQUEST_DECOMPRESSION:=1}"
+# Keep JSON defaults out of ${...} expansion: embedded braces terminate it.
+if [[ -z "${QWEN_EXO_MM_PROCESS_CONFIG:-}" ]]; then
+  QWEN_EXO_MM_PROCESS_CONFIG='{"image":{"device":"cpu"}}'
+fi
+if [[ -z "${QWEN_EXO_DEFAULT_CHAT_TEMPLATE_KWARGS:-}" ]]; then
+  QWEN_EXO_DEFAULT_CHAT_TEMPLATE_KWARGS='{"enable_thinking":true,"preserve_thinking":true}'
+fi
 
 case "${QWEN_EXO_ENABLED}" in
   0|1) ;;
@@ -337,6 +357,7 @@ fi
 runtime_env=(
   NCCL_P2P_DISABLE=1
   NCCL_SHM_DISABLE=0
+  "SGLANG_ENABLE_REQUEST_DECOMPRESSION=${SGLANG_ENABLE_REQUEST_DECOMPRESSION}"
   "SGLANG_MAMBA_SSM_DTYPE=${QWEN_EXO_MAMBA_SSM_DTYPE}"
   "SGLANG_MAMBA_CONV_DTYPE=${QWEN_EXO_MAMBA_SSM_DTYPE}"
   "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT=${QWEN_EXO_USE_JIT_FP8_QUANT}"
@@ -403,6 +424,7 @@ server_args=(
   --tp-size "${QWEN_EXO_TP_SIZE}"
   --dtype "${QWEN_EXO_DTYPE}"
   --kv-cache-dtype "${QWEN_EXO_KV_CACHE_DTYPE}"
+  --qwen4-ple-backend "${QWEN_EXO_NATIVE_PLE_BACKEND}"
   --context-length "${QWEN_EXO_CONTEXT_LENGTH}"
   --mem-fraction-static "${QWEN_EXO_MEM_FRACTION_STATIC}"
   --max-running-requests "${QWEN_EXO_MAX_RUNNING_REQUESTS}"
@@ -422,7 +444,7 @@ server_args=(
   --reasoning-parser qwen3
   --tool-call-parser qwen3_coder
   --default-chat-template-kwargs
-  '{"enable_thinking": false, "preserve_thinking": false}'
+  "${QWEN_EXO_DEFAULT_CHAT_TEMPLATE_KWARGS}"
   --watchdog-timeout 1200
   --host 127.0.0.1
   --port "${QWEN_EXO_PORT}"
@@ -438,7 +460,6 @@ if [[ -n "${QWEN_EXO_NATIVE_PLE_DISK_PATH}" ]]; then
   fi
   server_args+=(
     --qwen4-ple-disk-path "${runtime_ple_disk_path}"
-    --qwen4-ple-backend "${QWEN_EXO_NATIVE_PLE_BACKEND}"
   )
 fi
 if [[ "${QWEN_EXO_CPU_EXPERT_PAGING}" == "1" ]]; then
@@ -529,7 +550,6 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-state-dir "/data/qwen-exo/${QWEN_EXO_STATE_DIRECTORY_NAME}"
     --qwen-exo-api-key-store /data/qwen-exo/api-keys.json
     --qwen-exo-knowledge-dir /data/qwen-exo/knowledge
-    --qwen-exo-enable-policy-data
     --qwen-exo-policy-data-dir /data/qwen-exo/policydata
     --qwen-exo-cognition-dir /data/qwen-exo/cognition
     --qwen-exo-max-internal-fanout "${QWEN_EXO_MAX_INTERNAL_FANOUT}"
@@ -541,6 +561,10 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-reasoning-budget-medium "${QWEN_EXO_REASONING_BUDGET_MEDIUM}"
     --qwen-exo-reasoning-budget-high "${QWEN_EXO_REASONING_BUDGET_HIGH}"
     --qwen-exo-reasoning-budget-xhigh "${QWEN_EXO_REASONING_BUDGET_XHIGH}"
+    --qwen-exo-think-suppress-after-tokens "${QWEN_EXO_THINK_SUPPRESS_AFTER_TOKENS}"
+    --qwen-exo-think-suppress-strength "${QWEN_EXO_THINK_SUPPRESS_STRENGTH}"
+    --qwen-exo-think-landing-start-ratio "${QWEN_EXO_THINK_LANDING_START_RATIO}"
+    --qwen-exo-think-landing-bias "${QWEN_EXO_THINK_LANDING_BIAS}"
     --qwen-exo-reasoning-mode "${QWEN_EXO_REASONING_MODE}"
     --qwen-exo-reasoning-dynamic-context-tokens "${QWEN_EXO_REASONING_DYNAMIC_CONTEXT_TOKENS}"
     --qwen-exo-observer-mode "${QWEN_EXO_OBSERVER_MODE}"
@@ -557,6 +581,17 @@ if [[ "${QWEN_EXO_ENABLED}" == "1" ]]; then
     --qwen-exo-dflash-think-accept-mode "${QWEN_EXO_DFLASH_THINK_ACCEPT_MODE}"
     --qwen-exo-dflash-think-accept-probability "${QWEN_EXO_DFLASH_THINK_ACCEPT_PROBABILITY}"
   )
+  for feature in HYBRID_PREFIX POLICY_DATA CAPSULE; do
+    variable="QWEN_EXO_ENABLE_${feature}"
+    option="${feature,,}"
+    option="${option//_/-}"
+    case "${!variable}" in
+      1) server_args+=( "--qwen-exo-enable-${option}" ) ;;
+      0) server_args+=( "--no-qwen-exo-enable-${option}" ) ;;
+      *) echo "Invalid ${variable}; expected 0 or 1." >&2; exit 1 ;;
+    esac
+  done
+  unset feature variable option
   if [[ "${QWEN_EXO_FORCE_AUTO_REASONING}" == "1" ]]; then
     server_args+=( --qwen-exo-force-auto-reasoning )
   else

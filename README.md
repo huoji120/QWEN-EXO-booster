@@ -111,20 +111,20 @@ Score Bias 可以把相关的系统规约、工具轨迹和历史证据提供给
 
 长思考和多轮工具调用最容易出现截断、半个 tool call 或 reasoning 泄漏。QWEN-EXO 将 reasoning、tool call、tool output 和最终 output 分开处理，并对不完整响应提供受控恢复路径。即使模型在预算边界停止，也不会把半截内部思考直接冒充最终答案。
 
-Responses 的思考预算截断独立于 Observer 和外部记忆工具；它限制目标模型实际生成的思考 tokens，因此保留 EAGLE/MTP 也可执行预算截断。未强制自动且显式关闭 THINK 时不进入两阶段路径；截断后用剩余总输出预算继续回答，耗尽总预算仍标记 `incomplete`。思考与回答在同一个调度请求内完成，自问注入（截断自检问题、Think 中途发散自问）已整体移除。思考期间还有两项可配置的 logit 塑形：思考超过 `qwen_exo_think_suppress_after_tokens`（默认 1024）后压低 Wait / Hmm / Alternatively / 等等 等反复验证用词；思考用到预算的 `qwen_exo_think_landing_start_ratio`（默认 0.75）后逐步提高 `</think>` 的概率（软着陆），预算用完时仍由硬截断兜底。`reasoning.budget_forced.observed_tokens` 是实际截断位置；API `reasoning_tokens` 还会计入合成边界／截断控制文本，不应直接等同于该生成限额。
+Responses 的思考预算截断独立于 Observer 和外部记忆工具；它限制目标模型实际生成的思考 tokens，因此保留 EAGLE/MTP 也可执行预算截断。未强制自动且显式关闭 THINK 时不进入两阶段路径；截断后用剩余总输出预算继续回答，耗尽总预算仍标记 `incomplete`。思考与回答在同一个调度请求内完成，自问注入（截断自检问题、Think 中途发散自问）已整体移除。思考期间还有两项可配置的 logit 塑形：思考超过 `qwen_exo_think_suppress_after_tokens`（参考启动模板为 512；独立 CLI 默认 1024）后压低 Wait / Hmm / Alternatively / 等等 等反复验证用词；思考用到预算的 `qwen_exo_think_landing_start_ratio`（默认 0.75）后逐步提高 `</think>` 的概率（软着陆），预算用完时仍由硬截断兜底。`reasoning.budget_forced.observed_tokens` 是实际截断位置；API `reasoning_tokens` 还会计入合成边界／截断控制文本，不应直接等同于该生成限额。
 
 未开启强制自动预算时，托管设置 `default_enable_thinking` 控制未显式指定时是否思考，显式请求设置优先；`default_preserve_thinking` 控制模板是否保留历史 assistant 思考。保留历史不会恢复客户端未发送的 THINK，客户端仍须提供历史推理。
 
 #### 五档思考预算与动态模式
 
-`POST /v1/responses` 可用 `reasoning: {"effort": "high"}` 指定档位；默认开启的强制自动开关会覆盖该值，由内部 JEV 选择实际预算档位。默认最大**生成思考 token**：
+`POST /v1/responses` 可用 `reasoning: {"effort": "xhigh"}` 指定档位。参考启动模板默认关闭强制自动选档，尊重客户端的显式 effort（包括 `none`），默认开启 THINK 并保留客户端提供的历史思考。模板五档最大**生成思考 token** 均为 8192；以下不是独立 CLI／配置类的默认值：
 
 | 预算档位 | 预算 | 非自动选档时的 Flash-Next 模板档位 |
 |---|---:|---|
-| `min`（兼容 `minimal`） | 512 | `low` |
-| `low` | 1024 | `low` |
-| `medium` | 2048 | `medium` |
-| `high` | 4090 | `xhigh` |
+| `min`（兼容 `minimal`） | 8192 | `low` |
+| `low` | 8192 | `low` |
+| `medium` | 8192 | `medium` |
+| `high` | 8192 | `xhigh` |
 | `xhigh`（兼容 `max`） | 8192 | `xhigh` |
 
 实际 Qwen3.8-Flash-Next 模板仅支持 `low / medium / xhigh`；模板兼容映射不改变选中档位的预算。关闭强制自动后，`none` 才会关闭思考。五档可在服务端设置 `qwen_exo_reasoning_budget_min/low/medium/high/xhigh`，对应启动环境变量 `QWEN_EXO_REASONING_BUDGET_MIN/LOW/MEDIUM/HIGH/XHIGH`。非强制的固定模式下，未显式指定 effort 及内部任务继续使用 `qwen_exo_max_reasoning_tokens`；该默认预算不钳制显式档位。请求总输出上限和模型上下文限制仍然生效，预算不是必须消耗的 token 数。
@@ -135,9 +135,9 @@ Responses 的思考预算截断独立于 Observer 和外部记忆工具；它限
 
 Responses 的动态选档与记忆链路完全分开：动态选档只把当前最后一条真实 user 消息原文交给内部 JEV（`/v1/systemone`），不再构造 canonical JSON/序列化包装，也不读取旧任务、assistant 推理或工具结果。主模型仍接收完整有效历史，两者不再强求共享同一长历史前缀。知识库关闭时不为选档构造完整工作流快照。
 
-默认 `qwen_exo_reasoning_session_once=true`：新 user 任务选一次档位，同一任务后续工具轮复用。重发完整历史不会仅因出现旧 user 消息而重新选档；相同文字在后面新增的一次 user 消息仍视为新任务。显式关闭此设置时每轮重评，但输入仍只含最后一条 user 消息。新会话、缓存淘汰或服务重启后需要重新选择；无可恢复用户任务时明确失败，不凭工具结果编造任务。
+参考启动模板设置 `qwen_exo_reasoning_session_once=false`，且不启用自动选档。需要自动模式时可显式启用：`qwen_exo_reasoning_session_once=true` 会让新 user 任务只选一次档位，同一任务后续工具轮复用。重发完整历史不会仅因出现旧 user 消息而重新选档；相同文字在后面新增的一次 user 消息仍视为新任务。关闭此设置时自动模式每轮重评，但输入仍只含最后一条 user 消息。新会话、缓存淘汰或服务重启后需要重新选择；无可恢复用户任务时明确失败，不凭工具结果编造任务。
 
-“强制自动思考预算” `qwen_exo_force_auto_reasoning` 默认开启；关闭后显式 effort 优先。自动选档仍只改变硬预算，模板 effort 保持稳定。`reasoning.effort_selected` 记录实际评估 token 数，`reasoning.effort_reused` 记录工具轮复用。选档不在同一流式生成中途重复，且不改变主生成 KV/GDN 缓存策略。
+“强制自动思考预算” `qwen_exo_force_auto_reasoning` 在参考启动模板中默认关闭。显式开启后会覆盖客户端 effort，由 JEV 选择预算；自动选档仍只改变硬预算，模板 effort 保持稳定。`reasoning.effort_selected` 记录实际评估 token 数，`reasoning.effort_reused` 记录工具轮复用。选档不在同一流式生成中途重复，且不改变主生成 KV/GDN 缓存策略。
 
 Responses 在单次请求内复用同一份已渲染文本、相同编码选项的 token IDs；prompt 重建后不复用旧结果，缓存不跨请求。默认特殊 token 编码与内部无特殊 token 编码分别保留。纯文本 QWEN-EXO 生成将已编码 IDs 与原文一并交给原生引擎，避免重复编码；Harmony 和多模态仍走原处理路径。该优化减少工具结果回传后的 CPU 前处理，不改变 THINK、上下文上限、工具语义或 KV/GDN 状态。
 
@@ -249,7 +249,7 @@ THINK shaping 复用固定 token 列布局与两个有界 pinned CPU staging 槽
 bash scripts/qwen_exo/build_image.sh
 ```
 
-容器编排参考 `docker/compose.yaml`（服务名 `sglang`）。`scripts/qwen_exo/launch_js4090.sh` 是一份完整的双卡启动示例，按自己的机器改参数即可。
+容器编排参考 `docker/compose.yaml`（服务名 `sglang`）。`scripts/qwen_exo/launch_js4090.sh` 与其原生入口 `launch_native_js4090.sh` 默认采用下述已验证的单张 RTX PRO 6000 Blackwell 96GB 参考配置，不再是双卡示例。不要从后面的历史／可选实验段落拼接参数；其他硬件需显式配置并重新验收，不能直接称为同等最佳配置。
 
 内部任务按父任务继承调度类别：当前请求需要的评分与诊断留在前台；反思及其子任务使用独立的单槽 lane，摘要与记忆整理等维护任务使用独立的三槽 lane。夜间整理走独立 FIFO 队列，不与每会话反思共用组织锁。后台子任务不能自行升为前台；排队取消、超时和完成都会释放 admission。逻辑 lane 不增加 GPU 物理容量：KV/Mamba/请求槽上限仍然生效，前台可抢占后台，后台不能反向抢占。
 
@@ -286,6 +286,39 @@ QSA 仅接收无 padding、无缓存的完整因果窗口；非因果／非连�
 ### Qwen3.8-Flash-Next NVFP4：隔离单卡路径
 
 `Qwen4ExpForConditionalGeneration` 使用 GDN + QSA、四分支 Gated Residual 和原生 PLE，不能按旧 Qwen3.5 模型直接换目录。官方 NVIDIA checkpoint 是混合精度：主模型 routed experts 为 NVFP4，PLE 为 FP8，MTP experts 为 FP8 分块权重；运行量化名称是 `modelopt_mixed`。
+
+#### 默认部署：已验证的 js4090 参考配置
+
+这是当前验证基线，不是所有硬件／负载都最快的承诺。需要 SM120 PRO6000、兼容 CUDA 环境、完整 Flash-Next NVFP4＋原生 MTP／PLE 文件和足够的主机内存。Host KV 启动准入按实际 cgroup 上限检查；不能按整机空闲 RAM 推断容器可用容量，也不能通过关闭检查强行启动。
+
+| 项目 | 参考启动模板 |
+|---|---|
+| 容量 | TP=1，context=262144，mem-fraction=0.95，max-running=10 |
+| 调度与状态 | prefill=32768，chunk=1024，Mamba 槽=64 |
+| KV／PLE | FP8 `fp8_e4m3`，GPU-first Host KV 上限=1300032，磁盘 PLE=`mmap` |
+| 执行 | FlashInfer attention／sampling，decode full Graph batch 1–6，prefill eager |
+| 模型数值契约 | 已标记的 **MAIN 模型**派生 SM120、Marlin、EAGLE 3/1/4、exact RS／threshold=1 |
+| 生成 | output=32768，默认 THINK／保留历史开启，默认及五档思考预算=8192；不强制自动选档 |
+| 思考塑形 | suppress=512／strength=5，landing=0.75／bias=8 |
+| 功能 | hybrid-prefix／PolicyData 开启；Observer／Score Bias／Capsule／Reflection／Compaction 关闭 |
+| 兼容 | 请求解压开启；图像预处理在 CPU，视觉编码仍在 GPU |
+
+```bash
+export QWEN_EXO_PYTHON=/path/to/venv/bin/python
+PYTHONPATH=python "$QWEN_EXO_PYTHON" scripts/qwen_exo/build_sm120_profile.py \
+  --source /path/to/Qwen3.8-Flash-Next-NVFP4 \
+  --output /path/to/Qwen3.8-Flash-Next-NVFP4-sm120fast
+export QWEN_EXO_MODEL_PATH=/path/to/Qwen3.8-Flash-Next-NVFP4-sm120fast
+export QWEN_EXO_DATA_PATH=/path/to/persistent-flashnext-runtime
+bash scripts/qwen_exo/launch_native_js4090.sh
+```
+
+**必须选择已标记的主模型，而不只是草稿路径。** SM120 会改变 dense／HC 数值与采样契约，标记和模型指纹不能省略；服务启动器在模型目录选择及托管设置之后一次性应用耦合参数。原始全表 scale FP8 PLE 与已有逐行 FP8 PLE 均受支持，但表内容不等价，不能为“对齐配置”擅自转换或复制训练增量。
+
+**已有部署不会被新的 shell 默认值自动迁移。** `service-config.json` 的已保存设置优先于环境默认值，`model-catalog.json` 的选择也可能覆盖 `QWEN_EXO_MODEL_PATH`。通过托管设置与模型选择接口迁移，保留密钥和资料目录，排空请求后由可靠 supervisor／容器重启策略拉起完整启动链。验收实际 `/get_server_info`、`/qwen-exo/status`、配置的 `revision == applied_revision == healthy_revision`、模型的 active/applied/healthy/running 指纹，以及真实 Responses THINK／工具轮；仅看到进程或健康端口不算配置生效。显式环境参数可覆盖普通模板默认值，但不能拆开模型标记绑定的数值契约。
+
+#### 可选：非 SM120 preset 的 CPU 专家换入路径（不是默认）
+
 
 ```bash
 export QWEN_EXO_PYTHON=/path/to/venv/bin/python
