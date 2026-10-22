@@ -502,7 +502,7 @@ class TestDFlashPriorityYield(CustomTestCase):
         self.assertEqual(background.extend_range.end, 2048)
         self.assertEqual(background.inflight_middle_chunks, 0)
 
-    def _qwen4_chunk_decode_scheduler(self, *, decoding=True):
+    def _qwen4_chunk_decode_scheduler(self, *, decoding=True, decode_turns=1):
         cold = self._request("cold-prefill", 0)
         cold.full_untruncated_fill_ids = list(range(8192))
         cold.prefix_indices = torch.arange(7 * 8192, 7 * 8192 + 2048)
@@ -516,7 +516,9 @@ class TestDFlashPriorityYield(CustomTestCase):
         scheduler.model_config.hf_text_config = SimpleNamespace(model_type="qwen4_exp_text")
         scheduler.chunked_prefill_size = 2048
         scheduler.chunked_req = cold
-        scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness()
+        scheduler._qwen_exo_prefill_fairness = BackgroundPrefillFairness(
+            decode_turns=decode_turns
+        )
         scheduler._qwen_exo_prefill_fairness.record_prefill([cold])
         scheduler.running_batch = self._batch([decoder] if decoding else [])
         scheduler.running_batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
@@ -588,6 +590,37 @@ class TestDFlashPriorityYield(CustomTestCase):
         merged = self._select_chunk_turn(scheduler)
         self.assertEqual(merged.reqs, [decoder, cold])
         self.assertEqual(scheduler.get_new_batch_prefill.call_count, 3)
+
+    def test_mtp_decode_quantum_retains_chunk_and_resumes_prefill_at_bound(self):
+        scheduler, cold, decoder, _ = self._qwen4_chunk_decode_scheduler(decode_turns=3)
+        decode = scheduler.update_running_batch
+        scheduler.update_running_batch = MagicMock(side_effect=decode)
+        sequence = []
+        for _ in range(8):
+            batch = self._select_chunk_turn(scheduler)
+            if batch.forward_mode.is_extend():
+                sequence.append("prefill")
+                self.assertEqual(batch.reqs, [cold])
+                cold.inflight_middle_chunks -= int(batch.chunked_req is cold)
+            else:
+                sequence.append("decode")
+                self.assertEqual(batch.reqs, [decoder])
+                self.assertNotIn(cold, batch.reqs)
+            self.assertEqual(cold.req_pool_idx, 7)
+            self.assertEqual(cold.mamba_pool_idx.item(), 5)
+            self.assertEqual(cold.retraction_count, 0)
+        self.assertEqual(sequence, ["decode", "decode", "decode", "prefill"] * 2)
+        self.assertEqual(scheduler.update_running_batch.call_count, 6)
+        self.assertEqual(cold.extend_range.end, 6144)
+
+    def test_decoder_finishing_mid_quantum_immediately_resumes_cold_chunk(self):
+        scheduler, cold, decoder, _ = self._qwen4_chunk_decode_scheduler(decode_turns=3)
+        self.assertEqual(self._select_chunk_turn(scheduler).reqs, [decoder])
+        decoder.finished.return_value = True
+        batch = self._select_chunk_turn(scheduler)
+        self.assertTrue(batch.forward_mode.is_extend())
+        self.assertEqual(batch.reqs, [cold])
+        self.assertEqual(cold.extend_range.end, 4096)
 
     def test_no_decoder_runs_cold_chunks_without_artificial_idle_turns(self):
         scheduler, cold, _, _ = self._qwen4_chunk_decode_scheduler(decoding=False)

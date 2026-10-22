@@ -141,9 +141,9 @@ Responses 的动态选档与记忆链路完全分开：动态选档只把当前�
 
 Responses 在单次请求内复用同一份已渲染文本、相同编码选项的 token IDs；prompt 重建后不复用旧结果，缓存不跨请求。默认特殊 token 编码与内部无特殊 token 编码分别保留。纯文本 QWEN-EXO 生成将已编码 IDs 与原文一并交给原生引擎，避免重复编码；Harmony 和多模态仍走原处理路径。该优化减少工具结果回传后的 CPU 前处理，不改变 THINK、上下文上限、工具语义或 KV/GDN 状态。
 
-原生 Flash-Next EAGLE/MTP 在单卡、普通非混批 chunked-prefill 路径下，每个已调度的 prefill 后让仍在生成的请求获得一次 decode 机会，避免连续长 prefill 饿死流式输出；没有生成请求时持续 prefill，没有新 prefill 时持续 decode。该调度不启用 speculative mixed-chunk，也不释放停放请求的 KV/GDN/PLE 状态，不改变采样、思考预算或缓存隔离。PP、disaggregation、DP 同步、HiSparse、hybrid-SWA、DLLM 等未验证路径保持原行为。
+原生 Flash-Next EAGLE/MTP 在单卡、普通非混批 chunked-prefill 路径下，每个已调度的 prefill 后给已有 decoder 一个最多 8 回合的执行窗口，再继续 prefill。等轮次不等于等执行时间：长 prefill 分块可能比一次 decode 昂贵很多，原先每块只让一次 decode 仍可能让流式输出很慢。窗口按实际选中的非空 decode 回合计数，不把 overlap 中尚未完成的 prefill 等待计入 decode 时间；没有生成请求时持续 prefill，没有新 prefill 时持续 decode。每次 decode 仍执行结束过滤、内存检查及既有回收逻辑；该调度不启用 speculative mixed-chunk，不释放停放请求的 KV/GDN/PLE 状态，不改变采样、思考预算或缓存隔离。代价是冷长请求的首字可能稍晚，不增加 GPU 算力，也不保证固定毫秒级延迟。非推测后台优先级、target-only/MTP 通道切换及取消行为保持独立；PP、disaggregation、DP 同步、HiSparse、hybrid-SWA、DLLM 等未验证路径保持原行为。
 
-一次三轮 64K 冷 prefill 与 512-token 生成重叠实验中，最长流式停顿中位数从 5.56 秒降至 1.46 秒，生成总耗时从 14.92 秒降至 10.50 秒；冷请求耗时从 5.93 秒增至 6.36 秒。两侧均使用相同输入哈希、MTP/Graph 配置和输出上限，冷请求缓存为 0，后续热请求均命中 61440 tokens；测试期间生产流量仍可进入，因此这是该批样本的调度权衡，不是全负载性能保证或 GPU 算子加速倍率。
+此前单回合交替的一次三轮 64K 冷 prefill 与 512-token 生成重叠实验中，最长流式停顿中位数从 5.56 秒降至 1.46 秒，生成总耗时从 14.92 秒降至 10.50 秒；冷请求耗时从 5.93 秒增至 6.36 秒。该历史数据不是当前 8 回合窗口的测量。两侧均使用相同输入哈希、MTP/Graph 配置和输出上限，冷请求缓存为 0，后续热请求均命中 61440 tokens；测试期间生产流量仍可进入，因此这是该批样本的调度权衡，不是全负载性能保证或 GPU 算子加速倍率。
 
 原生单卡 Flash-Next 的 target-only 打分与 MTP 生成在安全 forward 边界轮转：同优先级的另一通道不必等待长生成结束。切换前提交 overlap 结果并同步 forward stream，停放原 batch 与 KV/GDN/PLE/请求槽；准入仍计算停放请求、剩余输出和下一轮 decode 的内存需求，不以回收长生成状态换取打分执行。资源不足时继续原生成；不混合两种执行模式。此路径不适用于多卡、PP/DP/CP、disaggregation、LoRA、HiSparse、hybrid-SWA、DLLM、PD multiplexing 或 decode offload。
 

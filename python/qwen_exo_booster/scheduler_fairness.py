@@ -74,19 +74,25 @@ class WorkClassAdmission:
 
 
 class BackgroundPrefillFairness:
-    """Track background priority and useful decode turns at chunk boundaries.
+    """Track background priority and bounded decode service at chunk boundaries.
 
+    Native MTP gets several decode turns per prefill: equal iteration counts do
+    not give equal service when a prefill chunk takes much longer than decode.
+    A turn budget avoids charging an overlapping prefill's wait to decode time.
     No request, cache, or token ownership lives here. An unscheduled chunk stays
     in Scheduler.chunked_req and uses the existing resume/abort/pause paths.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, decode_turns: int = 8) -> None:
+        if decode_turns < 1:
+            raise ValueError("decode_turns must be positive")
         self.last_was_background_prefill = False
-        self.last_was_prefill = False
+        self._decode_turns = decode_turns
+        self._decode_turns_remaining = 0
 
     def should_yield_to_decode(self, *, decoding: bool) -> bool:
-        """One admitted prefill buys one decode turn, never an idle turn."""
-        return self.last_was_prefill and decoding
+        """Bound decode service without inserting idle turns or starving prefill."""
+        return self._decode_turns_remaining > 0 and decoding
 
     def should_yield(self, *, foreground_waiting: bool, foreground_decoding: bool) -> bool:
         return self.last_was_background_prefill and (
@@ -95,11 +101,12 @@ class BackgroundPrefillFairness:
 
     def record_prefill(self, reqs: Iterable[Any]) -> None:
         self.last_was_background_prefill = any(is_background_request(req) for req in reqs)
-        self.last_was_prefill = True
+        self._decode_turns_remaining = self._decode_turns
 
     def record_decode(self) -> None:
         self.last_was_background_prefill = False
-        self.last_was_prefill = False
+        if self._decode_turns_remaining > 0:
+            self._decode_turns_remaining -= 1
 
 
 def fits_complete_prefill(req: Any, *, remaining_chunk_tokens: int, page_size: int) -> bool:

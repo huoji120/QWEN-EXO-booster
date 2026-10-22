@@ -108,6 +108,41 @@ def test_background_runs_without_useful_foreground_work():
     assert not policy.should_yield(foreground_waiting=False, foreground_decoding=False)
 
 
+def test_decode_quantum_preserves_prefill_progress_and_rearms_without_accumulating():
+    policy = BackgroundPrefillFairness(decode_turns=3)
+    assert not policy.should_yield_to_decode(decoding=True)
+    for _ in range(2):
+        policy.record_prefill([request("cold")])
+        policy.record_prefill([request("cold")])
+        for _ in range(3):
+            assert policy.should_yield_to_decode(decoding=True)
+            policy.record_decode()
+        assert not policy.should_yield_to_decode(decoding=True)
+    policy.record_decode()
+    assert not policy.should_yield_to_decode(decoding=True)
+
+
+def test_no_live_decoder_does_not_hold_prefill_behind_unused_quantum():
+    policy = BackgroundPrefillFairness(decode_turns=3)
+    policy.record_prefill([request("cold")])
+    assert not policy.should_yield_to_decode(decoding=False)
+    assert policy.should_yield_to_decode(decoding=True)
+
+
+def test_native_quantum_does_not_extend_non_spec_background_priority():
+    policy = BackgroundPrefillFairness(decode_turns=3)
+    policy.record_prefill([request("background", "reflection")])
+    policy.record_decode()
+    assert not policy.should_yield(foreground_waiting=True, foreground_decoding=True)
+    assert policy.should_yield_to_decode(decoding=True)
+
+
+@pytest.mark.parametrize("decode_turns", [0, -1])
+def test_decode_quantum_requires_progress_in_both_directions(decode_turns):
+    with pytest.raises(ValueError):
+        BackgroundPrefillFairness(decode_turns=decode_turns)
+
+
 @pytest.mark.parametrize(
     "total,prefix,remaining,expected",
     [(65, 0, 64, False), (64, 0, 64, True), (65, 1, 64, True), (1, 0, 63, False)],

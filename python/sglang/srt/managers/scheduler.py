@@ -3732,7 +3732,7 @@ class Scheduler(
         self, running_batch: ScheduleBatch
     ) -> bool:
         fairness = getattr(self, "_qwen_exo_prefill_fairness", None)
-        if fairness is None or not fairness.last_was_prefill:
+        if fairness is None:
             return False
         # Only the native Flash-Next path audited for parked KV/GDN/PLE owners.
         # In particular, spec must not use enable_mixed_chunk, and rank-local
