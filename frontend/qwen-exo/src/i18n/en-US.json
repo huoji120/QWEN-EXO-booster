@@ -84,6 +84,7 @@
   "第 {start}–{end} 条，共 {total} 条": "{start}–{end} of {total} records",
   "上一页": "Previous page",
   "下一页": "Next page",
+  "第 {page} / {pages} 页": "Page {page} / {pages}",
   "正在读取反思详情": "Loading reflection details",
   "反思详情加载失败": "Failed to load reflection details",
   "准入与发布": "Admission and publication",

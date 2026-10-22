@@ -24,6 +24,11 @@ from typing import IO, Any, Iterable, Iterator
 from qwen_exo_booster import memory_grep
 
 SCHEMA_VERSION = 2
+# Console file lists are paged. Callers that need every row (summary and dream
+# workers) still use ``metadata``.
+PAGE_SIZE_DEFAULT = 100
+PAGE_SIZE_MAX = 200
+WORK_MEMORY_ROOT = "work-memory"
 MAX_READ_LIMIT = 1_048_576
 MAX_SEARCH_RESULTS = 1_000
 MAX_REGEX_LENGTH = 4_096
@@ -1181,34 +1186,157 @@ class FileKnowledgeIndex:
 
     # --- metadata and summaries ---------------------------------------------------------
 
+    _FILE_SELECT = """
+        SELECT f.*, s.sha256 AS summary_sha256, s.title AS summary_title,
+               s.origin AS summary_origin, s.sampled AS summary_sampled,
+               s.updated_ns AS summary_updated_ns
+        FROM {table} f
+        LEFT JOIN knowledge_summaries s ON s.relative_path = f.relative_path
+    """
+
+    @staticmethod
+    def _public_file_row(row: sqlite3.Row) -> dict[str, Any]:
+        item = {key: row[key] for key in row.keys() if not str(key).startswith("summary_")}
+        if row["summary_sha256"] is None:
+            item["summary"] = None
+            return item
+        item["summary"] = {
+            "title": row["summary_title"],
+            "origin": row["summary_origin"],
+            "sampled": bool(row["summary_sampled"]),
+            "updated_ns": row["summary_updated_ns"],
+            "stale": row["summary_sha256"] != row["sha256"],
+        }
+        return item
+
     def metadata(self) -> list[dict[str, Any]]:
-        """Metadata rows (no file content), with each file's summary state."""
+        """Every metadata row (no file content), with each file's summary state.
+
+        Summary generation and dream still walk this full list on the server.
+        The console must use ``page_files`` instead of shipping it to the browser.
+        """
+        sql = self._FILE_SELECT.format(table=self.table_name) + " ORDER BY f.relative_path"
+        with self._connect() as connection:
+            rows = connection.execute(sql).fetchall()
+        return [self._public_file_row(row) for row in rows]
+
+    def directory_summary(self) -> dict[str, Any]:
+        """Directory paths and recursive file counts. Does not return file rows.
+
+        ``counts[""]`` is the whole corpus. ``areas`` splits imported files from
+        ``work-memory/``. Empty folders are included with a zero count.
+        """
+        directories = self.directories()
+        counts: dict[str, dict[str, int]] = {"": {"files": 0, "bytes": 0}}
+        areas = {
+            "imported": {"files": 0, "bytes": 0},
+            "work": {"files": 0, "bytes": 0},
+        }
         with self._connect() as connection:
             rows = connection.execute(
-                f"""
-                SELECT f.*, s.sha256 AS summary_sha256, s.title AS summary_title,
-                       s.origin AS summary_origin, s.sampled AS summary_sampled,
-                       s.updated_ns AS summary_updated_ns
-                FROM {self.table_name} f
-                LEFT JOIN knowledge_summaries s ON s.relative_path = f.relative_path
-                ORDER BY f.relative_path
-                """
-            ).fetchall()
-        result = []
-        for row in rows:
-            item = {key: row[key] for key in row.keys() if not key.startswith("summary_")}
-            if row["summary_sha256"] is None:
-                item["summary"] = None
+                f"SELECT relative_path, byte_count FROM {self.table_name}"
+            )
+            for row in rows:
+                path = str(row["relative_path"])
+                size = int(row["byte_count"])
+                counts[""]["files"] += 1
+                counts[""]["bytes"] += size
+                work = path == WORK_MEMORY_ROOT or path.startswith(f"{WORK_MEMORY_ROOT}/")
+                bucket = areas["work" if work else "imported"]
+                bucket["files"] += 1
+                bucket["bytes"] += size
+                parent = path.rpartition("/")[0]
+                while parent:
+                    slot = counts.setdefault(parent, {"files": 0, "bytes": 0})
+                    slot["files"] += 1
+                    slot["bytes"] += size
+                    parent = parent.rpartition("/")[0]
+        for directory in directories:
+            counts.setdefault(directory, {"files": 0, "bytes": 0})
+        return {"directories": directories, "counts": counts, "areas": areas}
+
+    def page_files(
+        self,
+        *,
+        folder: str = "",
+        nested: bool = True,
+        query: str = "",
+        area: str = "all",
+        limit: int = PAGE_SIZE_DEFAULT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """One page of file metadata for ``folder`` (``""`` is the corpus root).
+
+        A flat corpus (every file directly under the root) is the ``folder=""``
+        case. ``nested`` includes files in subfolders. ``query`` matches the
+        relative path or detected title. The response never includes file bytes
+        or summary text.
+        """
+        if area not in {"all", "imported", "work"}:
+            raise FileKnowledgeError("area must be all, imported or work")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise FileKnowledgeError("limit must be an integer")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise FileKnowledgeError("offset must be a non-negative integer")
+        if not 1 <= limit <= PAGE_SIZE_MAX:
+            raise FileKnowledgeError(f"limit must be between 1 and {PAGE_SIZE_MAX}")
+        folder_path = self._validate_relative_path(folder) if str(folder).strip() else ""
+        where: list[str] = []
+        params: list[Any] = []
+        work_like = self._like_prefix(WORK_MEMORY_ROOT)
+        if area == "work":
+            where.append("(f.relative_path = ? OR f.relative_path LIKE ? ESCAPE '\\')")
+            params.extend([WORK_MEMORY_ROOT, work_like])
+        elif area == "imported":
+            where.append(
+                "NOT (f.relative_path = ? OR f.relative_path LIKE ? ESCAPE '\\')"
+            )
+            params.extend([WORK_MEMORY_ROOT, work_like])
+        if folder_path:
+            prefix = self._like_prefix(folder_path)
+            if nested:
+                where.append("f.relative_path LIKE ? ESCAPE '\\'")
+                params.append(prefix)
             else:
-                item["summary"] = {
-                    "title": row["summary_title"],
-                    "origin": row["summary_origin"],
-                    "sampled": bool(row["summary_sampled"]),
-                    "updated_ns": row["summary_updated_ns"],
-                    "stale": row["summary_sha256"] != row["sha256"],
-                }
-            result.append(item)
-        return result
+                where.append(
+                    "f.relative_path LIKE ? ESCAPE '\\' "
+                    "AND f.relative_path NOT LIKE ? ESCAPE '\\'"
+                )
+                params.extend([prefix, prefix + "/%"])
+        elif not nested:
+            where.append("instr(f.relative_path, '/') = 0")
+        needle = str(query or "").strip().lower()
+        if needle:
+            escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            where.append(
+                "(lower(f.relative_path) LIKE ? ESCAPE '\\' "
+                "OR lower(f.title) LIKE ? ESCAPE '\\')"
+            )
+            params.extend([like, like])
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        sql_from = (
+            f"FROM {self.table_name} f "
+            "LEFT JOIN knowledge_summaries s ON s.relative_path = f.relative_path"
+        )
+        with self._connect() as connection:
+            total, total_bytes = connection.execute(
+                f"SELECT COUNT(*), COALESCE(SUM(f.byte_count), 0) {sql_from}{clause}",
+                params,
+            ).fetchone()
+            rows = connection.execute(
+                self._FILE_SELECT.format(table=self.table_name)
+                + clause
+                + " ORDER BY f.relative_path LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return {
+            "files": [self._public_file_row(row) for row in rows],
+            "total": int(total or 0),
+            "total_bytes": int(total_bytes or 0),
+            "offset": offset,
+            "limit": limit,
+        }
 
     def summary(self, path: str) -> dict[str, Any] | None:
         relative = self._validate_relative_path(path)

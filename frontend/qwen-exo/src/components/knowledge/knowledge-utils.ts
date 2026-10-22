@@ -165,8 +165,9 @@ export type FolderNode = {
  */
 export function buildFolderTree(
   directories: string[],
-  files: KnowledgeFile[],
+  files: KnowledgeFile[] = [],
   rootPath = "",
+  counts?: Record<string, { files: number }>,
 ) {
   const all = new Set<string>();
   const addWithParents = (path: string) => {
@@ -177,29 +178,36 @@ export function buildFolderTree(
     }
   };
   directories.forEach(addWithParents);
-  files.forEach((file) => addWithParents(parentOf(file.relative_path)));
+  if (!counts) files.forEach((file) => addWithParents(parentOf(file.relative_path)));
 
   const root: FolderNode = {
     path: rootPath,
     name: baseName(rootPath),
     children: [],
-    fileCount: files.length,
+    fileCount: counts ? counts[rootPath]?.files ?? 0 : files.length,
   };
   const nodes = new Map<string, FolderNode>([[rootPath, root]]);
   for (const path of Array.from(all).sort((a, b) => a.localeCompare(b))) {
-    const node: FolderNode = { path, name: baseName(path), children: [], fileCount: 0 };
+    const node: FolderNode = {
+      path,
+      name: baseName(path),
+      children: [],
+      fileCount: counts ? counts[path]?.files ?? 0 : 0,
+    };
     nodes.set(path, node);
   }
   for (const [path, node] of nodes) {
     if (path === rootPath) continue;
     nodes.get(parentOf(path))?.children.push(node);
   }
-  for (const file of files) {
-    let folder = parentOf(file.relative_path);
-    while (folder && folder !== rootPath) {
-      const node = nodes.get(folder);
-      if (node) node.fileCount += 1;
-      folder = parentOf(folder);
+  if (!counts) {
+    for (const file of files) {
+      let folder = parentOf(file.relative_path);
+      while (folder && folder !== rootPath) {
+        const node = nodes.get(folder);
+        if (node) node.fileCount += 1;
+        folder = parentOf(folder);
+      }
     }
   }
   const sortChildren = (node: FolderNode) => {

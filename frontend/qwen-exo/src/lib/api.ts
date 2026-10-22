@@ -13,6 +13,7 @@ import type {
   DreamStatus,
   KnowledgeDraft,
   KnowledgeFile,
+  KnowledgeFilePage,
   KnowledgeMoveResult,
   KnowledgeReadResponse,
   KnowledgeSearchResponse,
@@ -414,10 +415,28 @@ export async function getMemoryToolCalls(
   ).json()) as { calls: MemoryToolCall[] };
 }
 
-export async function listKnowledgeFiles(signal?: AbortSignal) {
+export async function listKnowledgeFiles(
+  query: {
+    folder?: string;
+    nested?: boolean;
+    q?: string;
+    area?: "all" | "imported" | "work";
+    limit?: number;
+    offset?: number;
+  } = {},
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams();
+  if (query.folder) params.set("folder", query.folder);
+  if (query.nested === false) params.set("nested", "false");
+  if (query.q) params.set("q", query.q);
+  if (query.area && query.area !== "all") params.set("area", query.area);
+  if (query.limit != null) params.set("limit", String(query.limit));
+  if (query.offset) params.set("offset", String(query.offset));
+  const suffix = params.size ? `?${params}` : "";
   return (await (
-    await apiFetch("/knowledge/files", { signal })
-  ).json()) as { files: KnowledgeFile[] };
+    await apiFetch(`/knowledge/files${suffix}`, { signal })
+  ).json()) as KnowledgeFilePage;
 }
 
 export async function uploadKnowledgeFile(

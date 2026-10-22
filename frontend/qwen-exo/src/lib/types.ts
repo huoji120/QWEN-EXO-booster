@@ -568,10 +568,29 @@ export type KnowledgeFileSummaryInfo = {
   stale: boolean;
 };
 
+export type KnowledgeDirectoryCount = {
+  files: number;
+  bytes: number;
+};
+
 export type KnowledgeTree = {
   /** Every folder (including empty ones), relative POSIX paths, sorted. */
   directories: string[];
+  /** Recursive file totals keyed by folder. ``""`` is the whole corpus. */
+  counts: Record<string, KnowledgeDirectoryCount>;
+  areas: {
+    imported: KnowledgeDirectoryCount;
+    work: KnowledgeDirectoryCount;
+  };
+};
+
+/** One server page of knowledge files. File bytes and summary text are absent. */
+export type KnowledgeFilePage = {
   files: KnowledgeFile[];
+  total: number;
+  total_bytes: number;
+  offset: number;
+  limit: number;
 };
 
 export type KnowledgeMoveResult = {
