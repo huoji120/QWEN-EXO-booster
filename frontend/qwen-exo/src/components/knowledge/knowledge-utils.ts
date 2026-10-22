@@ -1,6 +1,7 @@
 import type {
   KnowledgeFile,
   KnowledgeFileKind,
+  KnowledgeFolderCount,
   KnowledgeSummaryStatus,
 } from "@/lib/types";
 
@@ -159,14 +160,15 @@ export type FolderNode = {
 };
 
 /**
- * Build the folder tree from the server directory list plus file parents.
- * Callers pass only the entries of one area; ``rootPath`` is that area's
- * root folder (``""`` for the knowledge root) and is never listed itself.
+ * Build the folder tree from directory names and recursive server counts.
+ * Callers pass only the directories of one area; ``rootPath`` is that area's
+ * root folder and ``rootCount`` excludes other areas when sharing the root.
  */
 export function buildFolderTree(
   directories: string[],
-  files: KnowledgeFile[],
+  counts: Record<string, KnowledgeFolderCount>,
   rootPath = "",
+  rootCount = counts[rootPath]?.files ?? 0,
 ) {
   const all = new Set<string>();
   const addWithParents = (path: string) => {
@@ -177,30 +179,23 @@ export function buildFolderTree(
     }
   };
   directories.forEach(addWithParents);
-  files.forEach((file) => addWithParents(parentOf(file.relative_path)));
 
   const root: FolderNode = {
     path: rootPath,
     name: baseName(rootPath),
     children: [],
-    fileCount: files.length,
+    fileCount: rootCount,
   };
   const nodes = new Map<string, FolderNode>([[rootPath, root]]);
   for (const path of Array.from(all).sort((a, b) => a.localeCompare(b))) {
-    const node: FolderNode = { path, name: baseName(path), children: [], fileCount: 0 };
+    const node: FolderNode = {
+      path, name: baseName(path), children: [], fileCount: counts[path]?.files ?? 0,
+    };
     nodes.set(path, node);
   }
   for (const [path, node] of nodes) {
     if (path === rootPath) continue;
     nodes.get(parentOf(path))?.children.push(node);
-  }
-  for (const file of files) {
-    let folder = parentOf(file.relative_path);
-    while (folder && folder !== rootPath) {
-      const node = nodes.get(folder);
-      if (node) node.fileCount += 1;
-      folder = parentOf(folder);
-    }
   }
   const sortChildren = (node: FolderNode) => {
     node.children.sort((a, b) => a.name.localeCompare(b.name));

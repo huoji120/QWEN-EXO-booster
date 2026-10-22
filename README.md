@@ -513,13 +513,18 @@ curl --no-buffer http://127.0.0.1:30000/v1/responses \
 ```
 
 ```bash
-curl 'http://127.0.0.1:30000/qwen-exo/knowledge/tree'                 # 知识库文件树
+curl 'http://127.0.0.1:30000/qwen-exo/knowledge/tree'                 # 刷新索引，返回目录与统计，不含全量文件行
+curl 'http://127.0.0.1:30000/qwen-exo/knowledge/files?area=imported&limit=100&offset=100' # 第二页文件元数据
 curl 'http://127.0.0.1:30000/qwen-exo/knowledge/search?q=deploy'      # 与模型同一套词面检索
 curl 'http://127.0.0.1:30000/qwen-exo/memory-tool-calls?limit=10'     # 最近的记忆工具调用
 curl 'http://127.0.0.1:30000/qwen-exo/request-traces?limit=10'         # 请求索引
 curl 'http://127.0.0.1:30000/qwen-exo/telemetry?limit=100'             # 遥测
 curl 'http://127.0.0.1:30000/qwen-exo/memory/dream'                    # 夜间整理状态
 ```
+
+知识库文件列表使用服务端分页，控制台每页 100 行。`/knowledge/files` 支持 `folder`（空串为根目录）、`nested`、`q`、`area=all|imported|work`、`limit=1..200` 和非负 `offset`，返回 `files/total/total_bytes/offset/limit`。翻页只读取 SQLite 元数据，不重新扫描文件系统或返回正文；总数与文件行来自同一读事务。目录和 `work-memory/` 归属按大小写及路径边界精确匹配；名称、标题和总结标题筛选采用 Unicode 大小写折叠的字面子串，`%`、`_` 不作为通配符，查询最多 256 字符。目录统计包括空目录及已索引隐藏目录。后台总结／整理继续使用完整 `metadata()`，不受页面上限影响。
+
+页面在筛选、目录或区域切换时回到第一页，忽略已过期请求；加载失败后仍可修改筛选或重试。重命名／移动后刷新当前目录，删除末页最后一项时自动回到有效页。该 API 形状与前端资源需要配套更新；代码提交不代表线上部署或重启。
 
 ## 本地验证
 

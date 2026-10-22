@@ -644,10 +644,27 @@ async def telemetry_stream(
 
 
 @router.get("/knowledge/files")
-async def list_knowledge_files(request: Request):
-    index = _runtime(request).file_knowledge
-    await asyncio.to_thread(index.refresh)
-    return {"files": await asyncio.to_thread(index.metadata)}
+async def list_knowledge_files(
+    request: Request,
+    folder: str = Query(default="", max_length=1024),
+    nested: bool = Query(default=True),
+    q: str = Query(default="", max_length=256),
+    area: Literal["all", "imported", "work"] = Query(default="all"),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        return await asyncio.to_thread(
+            _runtime(request).file_knowledge.page_files,
+            folder=folder,
+            nested=nested,
+            q=q,
+            area=area,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise _knowledge_error(exc) from exc
 
 
 def _knowledge_error(exc: Exception) -> HTTPException:
@@ -737,10 +754,7 @@ async def upload_knowledge_archive(
 async def knowledge_tree(request: Request):
     index = _runtime(request).file_knowledge
     await asyncio.to_thread(index.refresh)
-    return {
-        "directories": await asyncio.to_thread(index.directories),
-        "files": await asyncio.to_thread(index.metadata),
-    }
+    return await asyncio.to_thread(index.directory_summary)
 
 
 @router.post("/knowledge/folders")

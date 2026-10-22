@@ -15,10 +15,17 @@ import {
   generateKnowledgeSummaries,
   getKnowledgeTree,
   getSummaryStatus,
+  listKnowledgeFiles,
   moveKnowledgeEntry,
 } from "@/lib/api";
 import { translate as t } from "@/lib/i18n";
-import type { KnowledgeFile, KnowledgeSummaryStatus, KnowledgeTree } from "@/lib/types";
+import type {
+  KnowledgeFile,
+  KnowledgeFilePage,
+  KnowledgeFileQuery,
+  KnowledgeSummaryStatus,
+  KnowledgeTree,
+} from "@/lib/types";
 import { formatBytes, formatNumber } from "@/lib/utils";
 import {
   KnowledgeDeleteDialog,
@@ -55,20 +62,36 @@ import {
 
 const BUSY_POLL_MS = 5_000;
 const IDLE_POLL_MS = 30_000;
+const PAGE_SIZE = 100;
+type FileQuery = KnowledgeFileQuery & { area: MemoryArea };
 
 export function FileKnowledgePanel() {
-  const [tree, setTree] = useState<KnowledgeTree>({ directories: [], files: [] });
+  const [tree, setTree] = useState<KnowledgeTree>({
+    directories: [],
+    counts: {},
+    areas: { imported: { files: 0, bytes: 0 }, work: { files: 0, bytes: 0 } },
+  });
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-
-  const [area, setArea] = useState<MemoryArea>("imported");
-  const [folder, setFolder] = useState("");
+  const [page, setPage] = useState<KnowledgeFilePage | null>(null);
+  const [query, setQuery] = useState<FileQuery>({
+    area: "imported", folder: "", nested: true, q: "", offset: 0, limit: PAGE_SIZE,
+  });
+  // Updated synchronously by navigation, so delayed mutations always reload the
+  // current query, not the render in which their callbacks were created.
+  const queryRef = useRef(query);
+  const { area, folder, nested } = query;
+  const treeReady = useRef(false);
+  const treePending = useRef(false);
+  const treeController = useRef<AbortController | null>(null);
+  const pageController = useRef<AbortController | null>(null);
+  const pageGeneration = useRef(0);
+  const [treeRevision, setTreeRevision] = useState(0);
   // Last selected folder of each area, restored when switching back.
   const areaFolders = useRef<Record<MemoryArea, string>>({
     imported: areaRoot("imported"),
     work: areaRoot("work"),
   });
-  const [nested, setNested] = useState(true);
   const [nameFilter, setNameFilter] = useState("");
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
 
@@ -84,19 +107,114 @@ export function FileKnowledgePanel() {
 
   const viewer = useKnowledgeViewer();
 
-  const load = useCallback(async (silent = false) => {
-    if (!silent) setLoading(true);
-    try {
-      setTree(await getKnowledgeTree());
-      setLoadError(null);
-    } catch (error) {
-      if (!silent) setLoadError(errorText(error, t("未知错误")));
-    } finally {
-      if (!silent) setLoading(false);
-    }
+  const invalidatePage = useCallback(() => {
+    pageGeneration.current += 1;
+    pageController.current?.abort();
+    setPage(null);
+    setSelected(new Set());
+    setLoadError(null);
+    setLoading(true);
   }, []);
 
-  // Summary worker status; reload the tree whenever a file finishes.
+  const updateQuery = useCallback((patch: Partial<FileQuery>) => {
+    const current = queryRef.current;
+    const next = { ...current, ...patch };
+    if (
+      next.area === current.area && next.folder === current.folder &&
+      next.nested === current.nested && next.q === current.q &&
+      next.offset === current.offset
+    ) return;
+    queryRef.current = next;
+    invalidatePage();
+    setQuery(next);
+  }, [invalidatePage]);
+
+  const refreshPage = useCallback(async () => {
+    // A fresh tree must reconcile deleted/moved folders before fetching rows.
+    if (!treeReady.current || treePending.current) return;
+    invalidatePage();
+    const generation = pageGeneration.current;
+    const controller = new AbortController();
+    pageController.current = controller;
+    const current = queryRef.current;
+    try {
+      const next = await listKnowledgeFiles(current, controller.signal);
+      if (controller.signal.aborted || generation !== pageGeneration.current) return;
+      const lastOffset = Math.max(0, Math.ceil(next.total / PAGE_SIZE) - 1) * PAGE_SIZE;
+      if (current.offset > lastOffset) {
+        updateQuery({ offset: lastOffset });
+        return;
+      }
+      setPage(next);
+      setLoadError(null);
+    } catch (error) {
+      if (!controller.signal.aborted && generation === pageGeneration.current) {
+        setLoadError(errorText(error, t("未知错误")));
+      }
+    } finally {
+      if (!controller.signal.aborted && generation === pageGeneration.current) {
+        setLoading(false);
+      }
+    }
+  }, [invalidatePage, updateQuery]);
+
+  const load = useCallback(async () => {
+    treeController.current?.abort();
+    const controller = new AbortController();
+    treeController.current = controller;
+    treePending.current = true;
+    treeReady.current = false;
+    invalidatePage();
+    try {
+      const next = await getKnowledgeTree(controller.signal);
+      if (controller.signal.aborted) return;
+      const current = queryRef.current;
+      const root = areaRoot(current.area);
+      const known = new Set(next.directories);
+      let nextFolder = current.folder;
+      if (areaOf(nextFolder) !== current.area) nextFolder = root;
+      while (nextFolder && nextFolder !== root && !known.has(nextFolder)) {
+        nextFolder = parentOf(nextFolder);
+      }
+      if (nextFolder !== current.folder) updateQuery({ folder: nextFolder, offset: 0 });
+      areaFolders.current[current.area] = nextFolder;
+      setTree(next);
+      setLoadError(null);
+      treeReady.current = true;
+      setTreeRevision((revision) => revision + 1);
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setLoadError(errorText(error, t("未知错误")));
+        setLoading(false);
+      }
+    } finally {
+      if (!controller.signal.aborted) treePending.current = false;
+    }
+  }, [invalidatePage, updateQuery]);
+
+  useEffect(() => {
+    void load();
+    return () => {
+      treeController.current?.abort();
+      pageController.current?.abort();
+      pageGeneration.current += 1;
+    };
+  }, [load]);
+
+  useEffect(() => {
+    if (treePending.current) return;
+    void (treeReady.current ? refreshPage() : load());
+  }, [query, treeRevision, refreshPage, load]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const q = nameFilter.trim().slice(0, 256);
+      if (q !== queryRef.current.q) updateQuery({ q, offset: 0 });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [nameFilter, updateQuery]);
+
+  // Summary updates refresh only the current metadata page, without a tree scan.
   const lastRun = useRef<{ current: string | null; completed: number; failed: number } | null>(
     null,
   );
@@ -117,21 +235,20 @@ export function FileKnowledgePanel() {
           previous.completed !== run.completed ||
           previous.failed !== run.failed)
       ) {
-        void load(true);
+        void refreshPage();
       }
     } catch {
       // Keep the last known status; the next poll retries.
     }
-  }, [load]);
+  }, [refreshPage]);
 
   useEffect(() => {
-    void load();
     void refreshStatus();
-  }, [load, refreshStatus]);
+  }, [refreshStatus]);
 
   // A finished dream run may have written, moved or deleted work notes.
   const dream = useDreamStatus(() => {
-    void load(true);
+    void load();
     void refreshStatus();
     setTrashKey((key) => key + 1);
   });
@@ -151,85 +268,55 @@ export function FileKnowledgePanel() {
   }, [refreshStatus, summaryBusy]);
 
   const rootPath = areaRoot(area);
-  const areaFiles = useMemo(
-    () => tree.files.filter((file) => areaOf(file.relative_path) === area),
-    [tree.files, area],
-  );
-  const areaCounts = useMemo(() => {
-    const work = tree.files.filter((file) => areaOf(file.relative_path) === "work").length;
-    return { imported: tree.files.length - work, work };
-  }, [tree.files]);
+  const areaCount = tree.areas[area];
   const { root, folders } = useMemo(
     () =>
       buildFolderTree(
         tree.directories.filter((path) => areaOf(path) === area),
-        areaFiles,
+        tree.counts,
         rootPath,
+        areaCount.files,
       ),
-    [tree.directories, areaFiles, area, rootPath],
+    [tree.directories, tree.counts, areaCount.files, area, rootPath],
   );
   // Move targets may lie in either area.
   const allFolders = useMemo(
-    () => buildFolderTree(tree.directories, tree.files).folders,
+    () => buildFolderTree(tree.directories, tree.counts).folders,
     [tree],
   );
 
   const switchArea = (next: MemoryArea, nextFolder?: string) => {
-    if (next !== area) {
-      areaFolders.current[area] = folder;
-      setArea(next);
-      setSelected(new Set());
+    const current = queryRef.current;
+    areaFolders.current[current.area] = current.folder;
+    let destination = nextFolder ?? areaFolders.current[next];
+    // Explicit destinations can be newly created/moved and await the next tree.
+    if (nextFolder === undefined && treeReady.current) {
+      const root = areaRoot(next);
+      while (destination && destination !== root && !tree.directories.includes(destination)) {
+        destination = parentOf(destination);
+      }
     }
-    setFolder(nextFolder ?? areaFolders.current[next]);
+    areaFolders.current[next] = destination;
+    updateQuery({ area: next, folder: destination, offset: 0 });
   };
 
   /** Select ``path``, switching to the area that owns it. */
   const focusFolder = (path: string) => switchArea(areaOf(path), path);
 
-  // Drop a selected folder / checked files that no longer exist.
-  // Runs on tree changes only, so a just-renamed selection survives until reload.
-  useEffect(() => {
-    const known = new Set(folders);
-    setFolder((current) => {
-      if (areaOf(current) !== area) return rootPath;
-      let next = current;
-      while (next && next !== rootPath && !known.has(next)) next = parentOf(next);
-      return next;
-    });
-  }, [folders, area, rootPath]);
-  useEffect(() => {
-    setSelected((previous) => {
-      if (!previous.size) return previous;
-      const existing = new Set(tree.files.map((file) => file.relative_path));
-      const next = new Set(Array.from(previous).filter((path) => existing.has(path)));
-      return next.size === previous.size ? previous : next;
-    });
-  }, [tree.files]);
-
-  const visibleFiles = useMemo(() => {
-    const needle = nameFilter.trim().toLowerCase();
-    return areaFiles.filter((file) => {
-      const path = file.relative_path;
-      if (nested ? !isWithin(path, folder) : parentOf(path) !== folder) return false;
-      if (!needle) return true;
-      return (
-        path.toLowerCase().includes(needle) || file.title.toLowerCase().includes(needle)
-      );
-    });
-  }, [areaFiles, folder, nested, nameFilter]);
+  const visibleFiles = page?.files ?? [];
 
   const views = useMemo(() => {
     const failures = new Map((status?.failed ?? []).map((item) => [item.path, item.error]));
     const queued = new Set(status?.queued ?? []);
     const map = new Map<string, SummaryView>();
-    for (const file of tree.files) {
+    for (const file of page?.files ?? []) {
       map.set(file.relative_path, summaryView(file, status, failures, queued));
     }
     return map;
-  }, [tree.files, status]);
+  }, [page, status]);
 
-  const totalBytes = areaFiles.reduce((sum, file) => sum + file.byte_count, 0);
-  const folderBytes = visibleFiles.reduce((sum, file) => sum + file.byte_count, 0);
+  const totalBytes = areaCount.bytes;
+  const folderBytes = page?.total_bytes ?? 0;
 
   const reportError = (title: string, error: unknown): never => {
     toast.error(title, { description: errorText(error, t("未知错误")) });
@@ -255,12 +342,13 @@ export function FileKnowledgePanel() {
   };
 
   const submitEntry = async (request: EntryRequest, destination: string) => {
+    const submittedQuery = queryRef.current;
     if (request.kind === "create") {
       try {
         const result = await createKnowledgeFolder(destination);
         toast.success(t("文件夹已创建"));
-        await load(true);
-        focusFolder(result.path || destination);
+        if (queryRef.current === submittedQuery) focusFolder(result.path || destination);
+        await load();
       } catch (error) {
         reportError(t("创建文件夹失败"), error);
       }
@@ -277,14 +365,16 @@ export function FileKnowledgePanel() {
             : target,
         },
       );
-      const rebased = rebasePath(folder, request.path, target);
-      if (rebased !== folder) focusFolder(rebased);
-      setSelected(
-        (previous) =>
-          new Set(Array.from(previous).map((path) => rebasePath(path, request.path, target))),
-      );
+      const currentFolder = queryRef.current.folder;
+      const rebased = rebasePath(currentFolder, request.path, target);
+      for (const memoryArea of ["imported", "work"] as const) {
+        const saved = rebasePath(areaFolders.current[memoryArea], request.path, target);
+        areaFolders.current[memoryArea] = areaOf(saved) === memoryArea
+          ? saved : areaRoot(memoryArea);
+      }
+      if (rebased !== currentFolder) focusFolder(rebased);
       setSummaryPath((current) => (current ? rebasePath(current, request.path, target) : current));
-      await load(true);
+      await load();
     } catch (error) {
       reportError(request.kind === "rename" ? t("重命名失败") : t("移动失败"), error);
     }
@@ -297,12 +387,14 @@ export function FileKnowledgePanel() {
         toast.success(t("文件夹已删除"), {
           description: t("共删除 {count} 个文件", { count: result.files }),
         });
-        if (isWithin(folder, request.path)) focusFolder(parentOf(request.path));
+        if (isWithin(queryRef.current.folder, request.path)) {
+          focusFolder(parentOf(request.path));
+        }
       } else {
         await deleteKnowledgeFile(request.path);
         toast.success(t("知识库文件已删除"));
       }
-      await load(true);
+      await load();
       void refreshStatus();
     } catch (error) {
       reportError(t("删除失败"), error);
@@ -316,7 +408,7 @@ export function FileKnowledgePanel() {
       setDeleteRequest({
         kind: "folder",
         path,
-        fileCount: areaFiles.filter((file) => isWithin(file.relative_path, path)).length,
+        fileCount: tree.counts[path]?.files ?? 0,
         folderCount: folders.filter((item) => item.startsWith(`${path}/`)).length,
       });
     } else {
@@ -343,20 +435,20 @@ export function FileKnowledgePanel() {
                 <BookOpen className="h-3.5 w-3.5" />
                 {t(AREA_LABELS.imported)}
                 <span className="font-mono text-[11px] text-muted-foreground">
-                  {formatNumber(areaCounts.imported)}
+                  {formatNumber(tree.areas.imported.files)}
                 </span>
               </TabsTrigger>
               <TabsTrigger value="work" className="gap-1.5">
                 <NotebookPen className="h-3.5 w-3.5" />
                 {t(AREA_LABELS.work)}
                 <span className="font-mono text-[11px] text-muted-foreground">
-                  {formatNumber(areaCounts.work)}
+                  {formatNumber(tree.areas.work.files)}
                 </span>
               </TabsTrigger>
             </TabsList>
           </Tabs>
           <Badge variant="secondary">
-            {t("{count} 个文件", { count: formatNumber(areaFiles.length) })}
+            {t("{count} 个文件", { count: formatNumber(areaCount.files) })}
           </Badge>
           <Badge variant="secondary">{formatBytes(totalBytes)}</Badge>
           <Badge variant="secondary">
@@ -383,7 +475,7 @@ export function FileKnowledgePanel() {
           targetDirectory={areaOf(folder) === "imported" ? folder : ""}
           onImported={async () => {
             setSearchResetKey((key) => key + 1);
-            await load(true);
+            await load();
             void refreshStatus();
           }}
         />
@@ -395,22 +487,6 @@ export function FileKnowledgePanel() {
 
       <Card>
         <CardContent className="p-0">
-          {loading ? (
-            <div className="space-y-2 p-5">
-              {Array.from({ length: 4 }).map((_, index) => (
-                <Skeleton key={index} className="h-10 w-full" />
-              ))}
-            </div>
-          ) : loadError ? (
-            <div className="p-5">
-              <p className="text-sm font-medium">{t("知识库加载失败")}</p>
-              <p className="mt-2 break-words text-xs text-muted-foreground">{loadError}</p>
-              <Button className="mt-4" variant="outline" onClick={() => void load()}>
-                <RefreshCw />
-                {t("重试")}
-              </Button>
-            </div>
-          ) : (
             <div className="grid lg:grid-cols-[17rem_minmax(0,1fr)]">
               <aside className="border-b p-3 lg:border-b-0 lg:border-r">
                 <div className="mb-2 flex items-center justify-between gap-2">
@@ -432,7 +508,7 @@ export function FileKnowledgePanel() {
                     root={root}
                     rootLabel={AREA_LABELS[area]}
                     selected={folder}
-                    onSelect={setFolder}
+                    onSelect={(path) => updateQuery({ folder: path, offset: 0 })}
                     onAction={onFolderAction}
                   />
                 </div>
@@ -446,7 +522,7 @@ export function FileKnowledgePanel() {
                     {folder !== rootPath ? `${folder}/` : t(AREA_LABELS[area])}
                   </span>
                   <Badge variant="outline">
-                    {t("{count} 个文件", { count: formatNumber(visibleFiles.length) })}
+                    {t("{count} 个文件", { count: formatNumber(page?.total ?? 0) })}
                     {" · "}
                     {formatBytes(folderBytes)}
                   </Badge>
@@ -454,7 +530,7 @@ export function FileKnowledgePanel() {
                     <input
                       type="checkbox"
                       checked={nested}
-                      onChange={(event) => setNested(event.target.checked)}
+                      onChange={(event) => updateQuery({ nested: event.target.checked, offset: 0 })}
                       className="h-4 w-4 accent-primary"
                     />
                     {t("包含子文件夹")}
@@ -463,7 +539,11 @@ export function FileKnowledgePanel() {
                     className="ml-auto h-8 w-full sm:w-56"
                     value={nameFilter}
                     placeholder={t("按名称或标题筛选")}
-                    onChange={(event) => setNameFilter(event.target.value)}
+                    maxLength={256}
+                    onChange={(event) => {
+                      setNameFilter(event.target.value.slice(0, 256));
+                      setSelected(new Set());
+                    }}
                   />
                 </div>
                 <KnowledgeSummaryToolbar
@@ -474,7 +554,26 @@ export function FileKnowledgePanel() {
                   onGenerateSelected={() => void generate(Array.from(selected))}
                   onClearSelection={() => setSelected(new Set())}
                 />
-                {visibleFiles.length ? (
+                {loading ? (
+                  <div className="space-y-2 py-5" aria-busy="true">
+                    {Array.from({ length: 4 }).map((_, index) => (
+                      <Skeleton key={index} className="h-10 w-full" />
+                    ))}
+                  </div>
+                ) : loadError ? (
+                  <div className="py-5" role="alert">
+                    <p className="text-sm font-medium">{t("知识库加载失败")}</p>
+                    <p className="mt-2 break-words text-xs text-muted-foreground">{loadError}</p>
+                    <Button
+                      className="mt-4"
+                      variant="outline"
+                      onClick={() => void (treeReady.current ? refreshPage() : load())}
+                    >
+                      <RefreshCw />
+                      {t("重试")}
+                    </Button>
+                  </div>
+                ) : visibleFiles.length ? (
                   <div className="rounded-md border">
                     <KnowledgeFileTable
                       files={visibleFiles}
@@ -503,7 +602,7 @@ export function FileKnowledgePanel() {
                       onAction={onFileAction}
                     />
                   </div>
-                ) : areaFiles.length ? (
+                ) : areaCount.files ? (
                   <p className="py-8 text-center text-sm text-muted-foreground">
                     {nameFilter.trim() ? t("没有匹配的文件") : t("这个文件夹里还没有文件")}
                   </p>
@@ -524,9 +623,35 @@ export function FileKnowledgePanel() {
                     )}
                   />
                 )}
+                <nav className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground" aria-live="polite">
+                    {page ? t("第 {start}–{end} 条，共 {total} 条", {
+                      start: page.total ? page.offset + 1 : 0,
+                      end: page.offset + page.files.length,
+                      total: page.total,
+                    }) : "—"}
+                  </span>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={loading || query.offset === 0}
+                      onClick={() => updateQuery({ offset: Math.max(0, queryRef.current.offset - PAGE_SIZE) })}
+                    >
+                      {t("上一页")}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={loading || !page || page.offset + PAGE_SIZE >= page.total}
+                      onClick={() => updateQuery({ offset: queryRef.current.offset + PAGE_SIZE })}
+                    >
+                      {t("下一页")}
+                    </Button>
+                  </div>
+                </nav>
               </section>
             </div>
-          )}
         </CardContent>
       </Card>
 
@@ -534,7 +659,7 @@ export function FileKnowledgePanel() {
         <KnowledgeWorkTrash
           refreshKey={trashKey}
           onRestored={async () => {
-            await load(true);
+            await load();
             void refreshStatus();
           }}
         />
@@ -547,7 +672,7 @@ export function FileKnowledgePanel() {
         view={summaryPath ? views.get(summaryPath) ?? null : null}
         onClose={() => setSummaryPath(null)}
         onChanged={() => {
-          void load(true);
+          void refreshPage();
           void refreshStatus();
         }}
       />

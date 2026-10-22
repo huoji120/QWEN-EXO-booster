@@ -568,10 +568,30 @@ export type KnowledgeFileSummaryInfo = {
   stale: boolean;
 };
 
+export type KnowledgeFolderCount = { files: number; bytes: number };
+
 export type KnowledgeTree = {
-  /** Every folder (including empty ones), relative POSIX paths, sorted. */
+  /** Every folder, including empty folders and indexed file parents. */
   directories: string[];
+  counts: Record<string, KnowledgeFolderCount>;
+  areas: Record<"imported" | "work", KnowledgeFolderCount>;
+};
+
+export type KnowledgeFileQuery = {
+  folder: string;
+  nested: boolean;
+  q: string;
+  area: "all" | "imported" | "work";
+  limit: number;
+  offset: number;
+};
+
+export type KnowledgeFilePage = {
   files: KnowledgeFile[];
+  total: number;
+  total_bytes: number;
+  offset: number;
+  limit: number;
 };
 
 export type KnowledgeMoveResult = {

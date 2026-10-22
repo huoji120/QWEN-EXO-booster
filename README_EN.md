@@ -513,13 +513,18 @@ curl --no-buffer http://127.0.0.1:30000/v1/responses \
 ```
 
 ```bash
-curl 'http://127.0.0.1:30000/qwen-exo/knowledge/tree'             # knowledge file tree
+curl 'http://127.0.0.1:30000/qwen-exo/knowledge/tree'             # refresh index; directories/counts only, no full file list
+curl 'http://127.0.0.1:30000/qwen-exo/knowledge/files?area=imported&limit=100&offset=100' # second metadata page
 curl 'http://127.0.0.1:30000/qwen-exo/knowledge/search?q=deploy'  # the same lexical search the model gets
 curl 'http://127.0.0.1:30000/qwen-exo/memory-tool-calls?limit=10' # recent memory tool calls
 curl 'http://127.0.0.1:30000/qwen-exo/request-traces?limit=10'    # request index
 curl 'http://127.0.0.1:30000/qwen-exo/telemetry?limit=100'        # telemetry
 curl 'http://127.0.0.1:30000/qwen-exo/memory/dream'               # nightly dream status
 ```
+
+Knowledge file lists use server-side pagination, with 100 rows per console page. `/knowledge/files` accepts `folder` (empty for root), `nested`, `q`, `area=all|imported|work`, `limit=1..200`, and nonnegative `offset`, returning `files/total/total_bytes/offset/limit`. Page requests read SQLite metadata without rescanning source files or returning bodies; counts and rows share one read transaction. Folder and `work-memory/` membership use exact case and path boundaries. Filename, title and summary-title filtering uses Unicode case-folded literal substrings: `%` and `_` are not wildcards, and queries are limited to 256 characters. Directory totals include empty and indexed hidden directories. Background summary/dream workers retain the complete `metadata()` interface, unaffected by page limits.
+
+Changing filters, folders or areas resets pagination; stale requests cannot replace current results. Filters and retry remain accessible after errors. Rename/move refreshes the current folder, and deleting the final row of the last page returns to a valid page. Deploy this API shape together with its frontend assets; a source commit does not imply deployment or a service restart.
 
 ## Local verification
 

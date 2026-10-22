@@ -223,6 +223,7 @@ class FileKnowledgeIndex:
             self.database_path, timeout=30, factory=_ClosingConnection
         )
         connection.row_factory = sqlite3.Row
+        connection.create_function("unicode_casefold", 1, str.casefold, deterministic=True)
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
@@ -417,13 +418,36 @@ class FileKnowledgeIndex:
             dirnames[:] = sorted(
                 name
                 for name in dirnames
-                if not name.startswith(".")
-                and not (directory_path / name).is_symlink()
+                if not (directory_path / name).is_symlink()
                 and not self._is_state_path(directory_path / name)
             )
             for name in dirnames:
                 found.append((directory_path / name).relative_to(self.root).as_posix())
         return sorted(found)
+
+    def directory_summary(self) -> dict[str, Any]:
+        """Folder and area totals without returning individual file metadata."""
+        directories = set(self.directories())
+        counts = {path: {"files": 0, "bytes": 0} for path in directories | {""}}
+        areas = {area: {"files": 0, "bytes": 0} for area in ("imported", "work")}
+        with self._connect() as connection:
+            for row in connection.execute(
+                f"SELECT relative_path, byte_count FROM {self.table_name}"
+            ):
+                path, size = row["relative_path"], row["byte_count"]
+                area = "work" if path.startswith("work-memory/") else "imported"
+                areas[area]["files"] += 1
+                areas[area]["bytes"] += size
+                parent = path.rpartition("/")[0]
+                while True:
+                    totals = counts.setdefault(parent, {"files": 0, "bytes": 0})
+                    totals["files"] += 1
+                    totals["bytes"] += size
+                    if not parent:
+                        break
+                    directories.add(parent)
+                    parent = parent.rpartition("/")[0]
+        return {"directories": sorted(directories), "counts": counts, "areas": areas}
 
     def refresh(self) -> dict[str, int]:
         """Incrementally refresh metadata and remove entries for deleted files."""
@@ -1128,8 +1152,8 @@ class FileKnowledgeIndex:
             inside = [
                 row[0]
                 for row in connection.execute(
-                    f"SELECT relative_path FROM {self.table_name} WHERE relative_path LIKE ? ESCAPE '\\'",
-                    (self._like_prefix(relative),),
+                    f"SELECT relative_path FROM {self.table_name} WHERE instr(relative_path, ?) = 1",
+                    (relative + "/",),
                 )
             ]
         shutil.rmtree(target)
@@ -1137,11 +1161,6 @@ class FileKnowledgeIndex:
             for item in inside:
                 self._forget(connection, item)
         return len(inside)
-
-    @staticmethod
-    def _like_prefix(relative: str) -> str:
-        escaped = relative.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        return escaped + "/%"
 
     def move(self, source: str, destination: str) -> dict[str, Any]:
         """Rename or move a file or folder; index rows and summaries follow it."""
@@ -1163,8 +1182,8 @@ class FileKnowledgeIndex:
                 pairs = [
                     (row[0], destination_relative + row[0][len(source_relative) :])
                     for row in connection.execute(
-                        f"SELECT relative_path FROM {self.table_name} WHERE relative_path LIKE ? ESCAPE '\\'",
-                        (self._like_prefix(source_relative),),
+                        f"SELECT relative_path FROM {self.table_name} WHERE instr(relative_path, ?) = 1",
+                        (source_relative + "/",),
                     )
                 ]
             else:
@@ -1194,6 +1213,10 @@ class FileKnowledgeIndex:
                 ORDER BY f.relative_path
                 """
             ).fetchall()
+        return self._format_metadata(rows)
+
+    @staticmethod
+    def _format_metadata(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         result = []
         for row in rows:
             item = {key: row[key] for key in row.keys() if not key.startswith("summary_")}
@@ -1209,6 +1232,84 @@ class FileKnowledgeIndex:
                 }
             result.append(item)
         return result
+
+    def page_files(
+        self,
+        *,
+        folder: str = "",
+        nested: bool = True,
+        q: str = "",
+        area: str = "all",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Read a bounded metadata page from one snapshot; never scan source files."""
+        if not isinstance(folder, str):
+            raise InvalidPathError("folder must be a relative POSIX path")
+        if folder:
+            folder = self._validate_relative_path(folder)
+        if not isinstance(nested, bool):
+            raise FileKnowledgeError("nested must be a boolean")
+        if not isinstance(q, str) or len(q) > 256:
+            raise FileKnowledgeError("q must be a string of at most 256 characters")
+        if area not in ("all", "imported", "work"):
+            raise FileKnowledgeError("area must be all, imported, or work")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise FileKnowledgeError("limit must be an integer between 1 and 200")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise FileKnowledgeError("offset must be a non-negative integer")
+
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if folder:
+            clauses.append("instr(f.relative_path, ?) = 1")
+            parameters.append(folder + "/")
+        if not nested:
+            clauses.append("instr(substr(f.relative_path, ?), '/') = 0")
+            parameters.append(len(folder) + 2 if folder else 1)
+        if area != "all":
+            clauses.append(
+                "instr(f.relative_path, 'work-memory/') "
+                + ("= 1" if area == "work" else "!= 1")
+            )
+        summary_join = "LEFT JOIN knowledge_summaries s ON s.relative_path = f.relative_path"
+        if q:
+            clauses.append(
+                "(instr(unicode_casefold(f.relative_path), ?) > 0 "
+                "OR instr(unicode_casefold(f.title), ?) > 0 "
+                "OR instr(unicode_casefold(coalesce(s.title, '')), ?) > 0)"
+            )
+            parameters.extend([q.casefold()] * 3)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._connect() as connection:
+            # sqlite3 does not implicitly begin a transaction for SELECTs.
+            connection.execute("BEGIN")
+            totals = connection.execute(
+                f"SELECT count(*), coalesce(sum(f.byte_count), 0) "
+                f"FROM {self.table_name} f {summary_join if q else ''}{where}",
+                parameters,
+            ).fetchone()
+            # SQLite accepts only signed 64-bit offsets. Larger Python integers
+            # are still valid out-of-range offsets and return an empty page.
+            rows = []
+            if offset < totals[0]:
+                rows = connection.execute(
+                    f"""
+                    SELECT f.*, s.sha256 AS summary_sha256, s.title AS summary_title,
+                           s.origin AS summary_origin, s.sampled AS summary_sampled,
+                           s.updated_ns AS summary_updated_ns
+                    FROM {self.table_name} f {summary_join}{where}
+                    ORDER BY f.relative_path LIMIT ? OFFSET ?
+                    """,
+                    [*parameters, limit, offset],
+                ).fetchall()
+        return {
+            "files": self._format_metadata(rows),
+            "total": totals[0],
+            "total_bytes": totals[1],
+            "offset": offset,
+            "limit": limit,
+        }
 
     def summary(self, path: str) -> dict[str, Any] | None:
         relative = self._validate_relative_path(path)
