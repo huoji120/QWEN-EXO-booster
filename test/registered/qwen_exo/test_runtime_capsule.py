@@ -15,6 +15,7 @@ from qwen_exo_booster.reflection_memory import (
     ReflectionSourceSnapshot,
 )
 from qwen_exo_booster.runtime import (
+    MemoryScopeError,
     PendingReflectionMemory,
     QwenExoCapacityConflict,
     QwenExoRuntime,
@@ -462,6 +463,7 @@ def test_previous_turn_capsule_is_privately_restored(tmp_path):
         telemetry_correlation_id="trace-1",
     )
     value.capsule_store.commit(original, valid_capsule())
+    value._conversation_keys_by_response_id["resp-1"] = "shared-conversation"
     value.capsules = SimpleNamespace()
 
     prepared = asyncio.run(
@@ -1541,7 +1543,7 @@ def test_replayed_full_history_skips_redundant_capsule_update(tmp_path):
     )
 
 
-def test_trajectory_lineage_and_original_task_survive_runtime_restart(tmp_path):
+def test_retained_capsule_replay_without_ownership_fails_after_restart(tmp_path):
     first = runtime(tmp_path)
     parent_update = CapsuleUpdateInput(
         parent_request_id="resp-root",
@@ -1561,32 +1563,26 @@ def test_trajectory_lineage_and_original_task_survive_runtime_restart(tmp_path):
     capsules = FakeCapsuleService()
     restarted.capsules = capsules
 
-    async def exercise():
-        await restarted.prepare_responses_request(
+    with pytest.raises(MemoryScopeError, match="no authenticated memory scope"):
+        asyncio.run(restarted.prepare_responses_request(
             FakeRequest(
-                request_id="resp-child",
-                previous_response_id="resp-root",
+                request_id="resp-child", previous_response_id="resp-root",
                 input="Continue after restart",
             )
+        ))
+    assert capsules.updates == []
+    assert restarted.capsule_store.get("resp-child") is None
+    # Persisted evidence remains available to the admin, not adopted by a caller.
+    lineage = restarted.trajectory_lineage("resp-root")
+    assert [record["trajectory_id"] for record in lineage] == ["resp-root"]
+    # Unknown stateless lineage without a retained capsule remains valid.
+    prepared = asyncio.run(restarted.prepare_responses_request(
+        FakeRequest(
+            request_id="fresh", previous_response_id="unknown-without-capsule",
+            input="An independent task",
         )
-        restarted.observe_generation_result(
-            "resp-child", {"text": "child result", "meta_info": {}}
-        )
-        await restarted.complete_request("resp-child")
-
-    asyncio.run(exercise())
-
-    child_update = capsules.updates[0]
-    assert child_update.original_task == "Persistent root task"
-    assert child_update.parent_trajectory_id == "resp-root"
-    assert child_update.event_sequence == 1
-    restarted.capsule_store.commit(child_update, valid_capsule())
-    lineage = restarted.trajectory_lineage("resp-child")
-    assert [record["trajectory_id"] for record in lineage] == [
-        "resp-root",
-        "resp-child",
-    ]
-    assert all(record["original_task"] == "Persistent root task" for record in lineage)
+    ))
+    assert "Persistent root task" not in str(prepared.instructions)
 
 
 def test_concurrent_capsule_branches_restore_only_their_own_child(tmp_path):
@@ -1605,6 +1601,7 @@ def test_concurrent_capsule_branches_restore_only_their_own_child(tmp_path):
         telemetry_correlation_id="parent-trace",
     )
     value.capsule_store.commit(parent_update, valid_capsule())
+    value._conversation_keys_by_response_id["resp-parent"] = "shared-conversation"
     value._original_tasks["resp-parent"] = "Original task"
 
     async def exercise():

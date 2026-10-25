@@ -18,7 +18,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from qwen_exo_booster.file_knowledge import FileKnowledgeError, FileKnowledgeIndex
+from qwen_exo_booster.file_knowledge import FileKnowledgeError, FileKnowledgeIndex, memory_mutation
 
 WORK_ROOT = "work-memory"
 MAX_NOTE_BYTES = 16 * 1024
@@ -132,6 +132,7 @@ def _read_existing(index: FileKnowledgeIndex, relative: str) -> str | None:
     return target.read_text(encoding="utf-8", errors="replace")
 
 
+@memory_mutation
 def write_note(
     index: FileKnowledgeIndex,
     path: str,
@@ -203,6 +204,7 @@ def existing_note(index: FileKnowledgeIndex, path: str) -> str:
     return relative
 
 
+@memory_mutation
 def edit_note(
     index: FileKnowledgeIndex,
     path: str,
@@ -274,6 +276,7 @@ class WorkMemoryTrash:
         self.index = index
         self.root = index.state_directory / "work-memory-trash"
 
+    @memory_mutation
     def discard(self, path: str, *, batch: str) -> str:
         relative = work_directory(path)
         if not self.index.path_of(relative).is_dir():
@@ -289,6 +292,7 @@ class WorkMemoryTrash:
         self.index.refresh()
         return relative
 
+    @memory_mutation
     def keep_copy(self, relative: str, *, batch: str, data: bytes | None = None) -> None:
         """Save a version of a note (``data``, or its current bytes) to the trash."""
         target = self.root / batch / relative
@@ -316,6 +320,7 @@ class WorkMemoryTrash:
                     )
         return found
 
+    @memory_mutation
     def restore(self, batch: str, path: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", batch):
             raise FileKnowledgeError("invalid trash batch")

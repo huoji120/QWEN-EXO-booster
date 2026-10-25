@@ -185,6 +185,7 @@ class MemoryHintIndex:
         self.database = Path(database)
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.Lock()
+        self._generation = 0
         with closing(self._connect()) as connection, connection:
             connection.executescript(
                 """
@@ -210,10 +211,26 @@ class MemoryHintIndex:
         with closing(self._connect()) as connection:
             return dict(connection.execute("SELECT path, sha256 FROM files"))
 
-    def refresh(self, files: Iterable[dict[str, Any]]) -> dict[str, int]:
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def invalidate(self) -> None:
+        """Fence captured rows, including synthetic summaries, and remove old hints."""
+        with self._write_lock, closing(self._connect()) as connection, connection:
+            self._generation += 1
+            connection.execute("DELETE FROM chunk_terms")
+            connection.execute("DELETE FROM chunks")
+            connection.execute("DELETE FROM files")
+
+    def refresh(
+        self, files: Iterable[dict[str, Any]], *, generation: int | None = None
+    ) -> dict[str, int]:
         """Sync with ``FileKnowledgeIndex.metadata()`` rows (path, sha256, encoding)."""
         wanted = {str(row["relative_path"]): row for row in files}
         with self._write_lock, closing(self._connect()) as connection:
+            if generation is not None and generation != self._generation:
+                return {"removed": 0, "indexed": 0, "files": 0}
             current = dict(connection.execute("SELECT path, sha256 FROM files"))
             removed = [path for path in current if path not in wanted]
             changed = [

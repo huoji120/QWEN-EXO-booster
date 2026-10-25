@@ -198,6 +198,8 @@ class FileMemoryToolServer(ToolServer):
     """
 
     def __init__(self, root, state_directory):
+        import threading
+
         from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
         from qwen_exo_booster.memory_tools import (
             MEMORY_TOOL_SCHEMAS,
@@ -205,7 +207,33 @@ class FileMemoryToolServer(ToolServer):
         )
 
         self.executor = MemoryToolExecutor(FileKnowledgeIndex(root, state_directory))
-        self.chat_tool_schemas = MEMORY_TOOL_SCHEMAS
+        self._memory_executors = {(None, "shared"): self.executor}
+        self._memory_write_windows = {None: self.executor._write_window}
+        self._memory_executor_lock = threading.Lock()
+        scope_descriptions = {
+            "shared": " This request uses shared memory only: reads, searches and work-memory writes target shared storage. No private memory is accessible.",
+            "private": " This request uses private memory: reads and searches include shared and your own private files only. Unprefixed read paths are shared; private/ read paths are your own. No other key's private memory is accessible.",
+            "private_only": " This request uses private_only memory: reads, searches and counts include ONLY your own private files, never shared or other owners. Reads require private/ paths; unprefixed shared paths are denied.",
+            "super": " This request uses super memory: reads and searches include shared files, your own private/ files, and all existing other owners' files at private-keys/<key_id>/<relative-path>, including removed or revoked owners. Unprefixed read paths are shared. These read rights grant no key administration or conversation access.",
+        }
+        own_writes = (
+            " All writes, edits and deletes target ONLY your own private work-memory notes, "
+            "with or without the private/ prefix. Shared and other owners' files cannot be "
+            "changed; private-keys/ write paths are rejected. Use private/work-memory/... "
+            "to read back a note you wrote."
+        )
+        self._scoped_chat_tool_schemas = {
+            mode: tuple(
+                {**schema, "function": {
+                    **schema["function"],
+                    "description": schema["function"]["description"] + description
+                    + (own_writes if mode != "shared" else ""),
+                }}
+                for schema in MEMORY_TOOL_SCHEMAS
+            )
+            for mode, description in scope_descriptions.items()
+        }
+        self.chat_tool_schemas = self._scoped_chat_tool_schemas["shared"]
         self._descriptions = {
             schema["function"]["name"]: ToolDescription.new(
                 name=schema["function"]["name"],
@@ -214,6 +242,47 @@ class FileMemoryToolServer(ToolServer):
             )
             for schema in MEMORY_TOOL_SCHEMAS
         }
+
+    def executor_for_memory_scope(self, key_id: str | None, memory_scope: str):
+        """Select from authenticated request identity, never model tool arguments."""
+        from qwen_exo_booster.memory_tools import MemoryToolExecutor, MemoryWriteWindow
+        from qwen_exo_booster.scoped_memory import get_private_memory_index
+
+        self.chat_tool_schemas_for_memory_scope(key_id, memory_scope)
+        with self._memory_executor_lock:
+            cache_key = (key_id, memory_scope)
+            executor = self._memory_executors.get(cache_key)
+            if executor is None:
+                shared = self.executor.index
+                window = self._memory_write_windows.get(key_id)
+                if window is None:
+                    window = MemoryWriteWindow()
+                    self._memory_write_windows[key_id] = window
+                if memory_scope == "shared":
+                    executor = MemoryToolExecutor(shared, write_window=window)
+                else:
+                    private = get_private_memory_index(shared.root, shared.state_directory, key_id)
+                    executor = MemoryToolExecutor(
+                        private, shared_index=shared, key_id=key_id,
+                        memory_scope=memory_scope, write_window=window,
+                    )
+                self._memory_executors[cache_key] = executor
+            return executor
+
+    def chat_tool_schemas_for_memory_scope(self, key_id: str | None, memory_scope: str):
+        from qwen_exo_booster.api_keys import ApiKeyStoreError, validate_memory_scope
+        from qwen_exo_booster.file_knowledge import FileKnowledgeError
+        from qwen_exo_booster.scoped_memory import validate_memory_key_id
+
+        try:
+            memory_scope = validate_memory_scope(memory_scope)
+        except ApiKeyStoreError as exc:
+            raise FileKnowledgeError(str(exc)) from exc
+        if key_id is not None:
+            validate_memory_key_id(key_id)
+        elif memory_scope != "shared":
+            raise FileKnowledgeError("private memory requires an authenticated owner")
+        return self._scoped_chat_tool_schemas[memory_scope]
 
     def has_tool(self, tool_name: str):
         return tool_name in self._descriptions

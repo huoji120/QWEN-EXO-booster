@@ -52,6 +52,7 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseReasoningItem,
+    ResponseUsage,
 )
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
@@ -1523,6 +1524,9 @@ class ResponsesRequest(BaseModel):
     _qwen_exo_template_kwargs: Dict[str, Any] = PrivateAttr(default_factory=dict)
     # Server-side memory block for this turn's prompt only (never returned).
     _qwen_exo_memory_block: Optional[str] = PrivateAttr(default=None)
+    # Bound by authenticated middleware; never accepted from request JSON.
+    _qwen_exo_memory_key_id: Optional[str] = PrivateAttr(default=None)
+    _qwen_exo_memory_scope: str = PrivateAttr(default="shared")
     # Canonical public chat history, owned by the Responses serving layer.
     # Shallow server model_copy calls retain it; its source identities are
     # checked before reuse, and each create_responses lifecycle resets it.
@@ -1684,12 +1688,6 @@ class ResponsesRequest(BaseModel):
         return params
 
 
-class PromptTokenUsageInfo(BaseModel):
-    """Prompt token usage details."""
-
-    cached_tokens: int = 0
-
-
 class ResponsesCompactRequest(BaseModel):
     """OpenAI Responses ``POST /responses/compact`` request."""
 
@@ -1699,6 +1697,8 @@ class ResponsesCompactRequest(BaseModel):
     previous_response_id: Optional[str] = None
     prompt_cache_key: Optional[str] = None
     request_id: str = Field(default_factory=lambda: f"resp_compact_{uuid.uuid4().hex}")
+    _qwen_exo_memory_key_id: Optional[str] = PrivateAttr(default=None)
+    _qwen_exo_memory_scope: str = PrivateAttr(default="shared")
 
 
 class ResponsesResponse(BaseModel):
@@ -1715,7 +1715,7 @@ class ResponsesResponse(BaseModel):
     status: Literal[
         "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
     ]
-    usage: Optional[UsageInfo] = None
+    usage: Optional[ResponseUsage] = None
     parallel_tool_calls: bool = True
     tool_choice: str = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
@@ -1739,6 +1739,8 @@ class ResponsesResponse(BaseModel):
     truncation: Optional[str] = None
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    _qwen_exo_memory_key_id: Optional[str] = PrivateAttr(default=None)
+    _qwen_exo_memory_scope: str = PrivateAttr(default="shared")
 
     @classmethod
     def from_request(
@@ -1790,13 +1792,31 @@ class ResponsesResponse(BaseModel):
 
         text_format = {"format": {"type": "text"}} if _is_text_only(output) else None
 
-        return cls(
+        response = cls(
             id=request.request_id,
             created_at=created_time,
             model=model_name,
             output=output,
             status=status,
-            usage=usage,
+            usage=(
+                ResponseUsage(
+                    input_tokens=usage.prompt_tokens,
+                    input_tokens_details={
+                        "cached_tokens": (
+                            usage.prompt_tokens_details.cached_tokens
+                            if usage.prompt_tokens_details is not None
+                            else 0
+                        )
+                    },
+                    output_tokens=usage.completion_tokens or 0,
+                    output_tokens_details={
+                        "reasoning_tokens": usage.reasoning_tokens or 0
+                    },
+                    total_tokens=usage.total_tokens,
+                )
+                if usage is not None
+                else None
+            ),
             parallel_tool_calls=(
                 request.parallel_tool_calls
                 if request.parallel_tool_calls is not None
@@ -1831,6 +1851,9 @@ class ResponsesResponse(BaseModel):
             user=request.user,
             metadata=request.metadata or {},
         )
+        response._qwen_exo_memory_key_id = request._qwen_exo_memory_key_id
+        response._qwen_exo_memory_scope = request._qwen_exo_memory_scope
+        return response
 
 
 class RequestResponseMetadata(BaseModel):

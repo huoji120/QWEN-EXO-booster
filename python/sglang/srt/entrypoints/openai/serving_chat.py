@@ -880,6 +880,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if raw_request is None:
             return adapted_request
+        principal = getattr(raw_request.state, "qwen_exo_api_key", None)
+        memory_scope = principal["memory_scope"] if principal else "shared"
+        memory_key_id = principal["id"] if principal and memory_scope != "shared" else None
         try:
             runtime = raw_request.app.state.qwen_exo_runtime
             sampling_params = adapted_request.sampling_params
@@ -889,13 +892,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 runtime,
                 custom_params=dict(sampling_params.get("custom_params") or {}),
                 extra_key=adapted_request.extra_key,
+                memory_key_id=memory_key_id,
+                memory_scope=memory_scope,
             )
             editor_request = runtime.activation_editor_request(
-                custom_params.get("qwen_exo_activation_editor")
+                custom_params.get("qwen_exo_activation_editor"),
+                memory_scope=memory_scope,
             )
             editor_spec = editor_request["spec"]
             editor_marker = f"qwen-exo-editor={editor_request['cache_identity']}"
         except Exception as exc:
+            if memory_scope != "shared":
+                raise ValueError("Private memory controls are unavailable") from exc
             logger.warning(
                 "QWEN_EXO_CHAT_RUNTIME_PARAMS_SKIPPED reason=%s",
                 type(exc).__name__,
@@ -904,6 +912,8 @@ class OpenAIServingChat(OpenAIServingBase):
         custom_params["qwen_exo_kind"] = "user"
         if editor_spec is not None:
             custom_params["qwen_exo_activation_editor"] = editor_spec
+        else:
+            custom_params.pop("qwen_exo_activation_editor", None)
         sampling_params["custom_params"] = custom_params
         adapted_request.sampling_params = sampling_params
         adapted_request.extra_key = f"{extra_key}|{editor_marker}"

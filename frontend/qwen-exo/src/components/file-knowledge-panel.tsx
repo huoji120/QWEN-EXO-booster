@@ -8,18 +8,11 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-  createKnowledgeFolder,
-  deleteKnowledgeFile,
-  deleteKnowledgeFolder,
-  generateKnowledgeSummaries,
-  getKnowledgeTree,
-  getSummaryStatus,
-  listKnowledgeFiles,
-  moveKnowledgeEntry,
-} from "@/lib/api";
+import { createKnowledgeApi, getKnowledgeMemorySpaces } from "@/lib/api";
+import { KnowledgeScope, useKnowledgeApi } from "@/components/knowledge/knowledge-scope";
 import { translate as t } from "@/lib/i18n";
 import type {
+  KnowledgeMemorySpace,
   KnowledgeFile,
   KnowledgeFilePage,
   KnowledgeFileQuery,
@@ -44,6 +37,8 @@ import { KnowledgeSummaryToolbar } from "@/components/knowledge/knowledge-summar
 import { KnowledgeUploadCard } from "@/components/knowledge/knowledge-upload-card";
 import { KnowledgeDreamCard } from "@/components/knowledge/knowledge-dream-card";
 import { KnowledgeWorkTrash } from "@/components/knowledge/knowledge-work-trash";
+import { KnowledgeDragProvider, type TransferSelection } from "@/components/knowledge/knowledge-drag";
+import { KnowledgeTransferDialog } from "@/components/knowledge/knowledge-transfer-dialog";
 import { useDreamStatus } from "@/components/knowledge/use-dream-status";
 import { useKnowledgeViewer } from "@/components/knowledge/knowledge-viewer-dialog";
 import {
@@ -66,6 +61,66 @@ const PAGE_SIZE = 100;
 type FileQuery = KnowledgeFileQuery & { area: MemoryArea };
 
 export function FileKnowledgePanel() {
+  const [scope, setScope] = useState<{ keyId?: string; area: MemoryArea; folder: string }>({
+    area: "imported", folder: "",
+  });
+  const [spaces, setSpaces] = useState<KnowledgeMemorySpace[]>([]);
+  const [spacesError, setSpacesError] = useState<string | null>(null);
+  const [sharedTree, setSharedTree] = useState<KnowledgeTree | null>(null);
+  const spacesController = useRef<AbortController | null>(null);
+  const refreshSpaces = useCallback(async () => {
+    spacesController.current?.abort();
+    const controller = new AbortController();
+    spacesController.current = controller;
+    try {
+      const next = await getKnowledgeMemorySpaces(controller.signal);
+      if (!controller.signal.aborted) {
+        setSpaces(next.spaces);
+        setSpacesError(null);
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) setSpacesError(errorText(error, t("未知错误")));
+    }
+  }, []);
+  useEffect(() => {
+    void refreshSpaces();
+    return () => spacesController.current?.abort();
+  }, [refreshSpaces]);
+  return (
+    <>
+      {spacesError ? <div role="alert" className="mb-3 text-sm text-destructive">
+        {t("私有记忆列表加载失败")}：{spacesError}
+        <Button variant="ghost" size="sm" onClick={() => void refreshSpaces()}>{t("重试")}</Button>
+      </div> : null}
+      <KnowledgeScope key={scope.keyId ?? "shared"} memoryKeyId={scope.keyId}>
+        <ScopedFileKnowledgePanel
+          initialArea={scope.area}
+          initialFolder={scope.folder}
+          spaces={spaces}
+          sharedTree={sharedTree}
+          onSharedTree={setSharedTree}
+          onScopeChange={(keyId, area, folder) => setScope({ keyId, area, folder })}
+          onRefreshSpaces={refreshSpaces}
+        />
+      </KnowledgeScope>
+    </>
+  );
+}
+
+function ScopedFileKnowledgePanel({ initialArea, initialFolder, spaces, sharedTree, onSharedTree, onScopeChange, onRefreshSpaces }: {
+  initialArea: MemoryArea;
+  initialFolder: string;
+  spaces: KnowledgeMemorySpace[];
+  sharedTree: KnowledgeTree | null;
+  onSharedTree: (tree: KnowledgeTree) => void;
+  onScopeChange: (keyId: string | undefined, area: MemoryArea, folder: string) => void;
+  onRefreshSpaces: () => Promise<void>;
+}) {
+  const api = useKnowledgeApi();
+  const { createKnowledgeFolder, deleteKnowledgeFile, deleteKnowledgeFolder,
+    generateKnowledgeSummaries, getKnowledgeTree, getSummaryStatus,
+    listKnowledgeFiles, moveKnowledgeEntry, memoryKeyId, signal } = api;
+  const privateMemory = Boolean(memoryKeyId);
   const [tree, setTree] = useState<KnowledgeTree>({
     directories: [],
     counts: {},
@@ -75,7 +130,7 @@ export function FileKnowledgePanel() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [page, setPage] = useState<KnowledgeFilePage | null>(null);
   const [query, setQuery] = useState<FileQuery>({
-    area: "imported", folder: "", nested: true, q: "", offset: 0, limit: PAGE_SIZE,
+    area: initialArea, folder: initialFolder, nested: true, q: "", offset: 0, limit: PAGE_SIZE,
   });
   // Updated synchronously by navigation, so delayed mutations always reload the
   // current query, not the render in which their callbacks were created.
@@ -100,12 +155,17 @@ export function FileKnowledgePanel() {
 
   const [entryRequest, setEntryRequest] = useState<EntryRequest | null>(null);
   const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(null);
+  const [transfer, setTransfer] = useState<TransferSelection | null>(null);
   const [summaryPath, setSummaryPath] = useState<string | null>(null);
   const [searchResetKey, setSearchResetKey] = useState(0);
 
   const [trashKey, setTrashKey] = useState(0);
 
-  const viewer = useKnowledgeViewer();
+  const viewer = useKnowledgeViewer(() => {
+    setSearchResetKey((key) => key + 1);
+    void load();
+    void refreshStatus();
+  });
 
   const invalidatePage = useCallback(() => {
     pageGeneration.current += 1;
@@ -138,7 +198,7 @@ export function FileKnowledgePanel() {
     pageController.current = controller;
     const current = queryRef.current;
     try {
-      const next = await listKnowledgeFiles(current, controller.signal);
+      const next = await listKnowledgeFiles({ ...current, area: privateMemory ? "all" : current.area }, controller.signal);
       if (controller.signal.aborted || generation !== pageGeneration.current) return;
       const lastOffset = Math.max(0, Math.ceil(next.total / PAGE_SIZE) - 1) * PAGE_SIZE;
       if (current.offset > lastOffset) {
@@ -156,7 +216,7 @@ export function FileKnowledgePanel() {
         setLoading(false);
       }
     }
-  }, [invalidatePage, updateQuery]);
+  }, [invalidatePage, updateQuery, listKnowledgeFiles, privateMemory]);
 
   const load = useCallback(async () => {
     treeController.current?.abort();
@@ -169,16 +229,17 @@ export function FileKnowledgePanel() {
       const next = await getKnowledgeTree(controller.signal);
       if (controller.signal.aborted) return;
       const current = queryRef.current;
-      const root = areaRoot(current.area);
+      const root = privateMemory ? "" : areaRoot(current.area);
       const known = new Set(next.directories);
       let nextFolder = current.folder;
-      if (areaOf(nextFolder) !== current.area) nextFolder = root;
+      if (!privateMemory && areaOf(nextFolder) !== current.area) nextFolder = root;
       while (nextFolder && nextFolder !== root && !known.has(nextFolder)) {
         nextFolder = parentOf(nextFolder);
       }
       if (nextFolder !== current.folder) updateQuery({ folder: nextFolder, offset: 0 });
       areaFolders.current[current.area] = nextFolder;
       setTree(next);
+      if (!privateMemory) onSharedTree(next);
       setLoadError(null);
       treeReady.current = true;
       setTreeRevision((revision) => revision + 1);
@@ -190,7 +251,7 @@ export function FileKnowledgePanel() {
     } finally {
       if (!controller.signal.aborted) treePending.current = false;
     }
-  }, [invalidatePage, updateQuery]);
+  }, [invalidatePage, updateQuery, getKnowledgeTree, privateMemory, onSharedTree]);
 
   useEffect(() => {
     void load();
@@ -219,6 +280,7 @@ export function FileKnowledgePanel() {
     null,
   );
   const refreshStatus = useCallback(async () => {
+    if (privateMemory || signal.aborted) return;
     try {
       const next = await getSummaryStatus();
       setStatus(next);
@@ -240,7 +302,7 @@ export function FileKnowledgePanel() {
     } catch {
       // Keep the last known status; the next poll retries.
     }
-  }, [refreshPage]);
+  }, [refreshPage, getSummaryStatus, privateMemory, signal]);
 
   useEffect(() => {
     void refreshStatus();
@@ -251,10 +313,11 @@ export function FileKnowledgePanel() {
     void load();
     void refreshStatus();
     setTrashKey((key) => key + 1);
-  });
+  }, !privateMemory, signal);
 
   const summaryBusy = Boolean(status?.current) || Boolean(status?.queued?.length);
   useEffect(() => {
+    if (privateMemory) return;
     const timer = window.setInterval(
       () => void refreshStatus(),
       summaryBusy ? BUSY_POLL_MS : IDLE_POLL_MS,
@@ -265,27 +328,32 @@ export function FileKnowledgePanel() {
       window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [refreshStatus, summaryBusy]);
+  }, [refreshStatus, summaryBusy, privateMemory]);
 
-  const rootPath = areaRoot(area);
-  const areaCount = tree.areas[area];
+  const rootPath = privateMemory ? "" : areaRoot(area);
+  const areaCount = privateMemory ? {
+    files: tree.areas.imported.files + tree.areas.work.files,
+    bytes: tree.areas.imported.bytes + tree.areas.work.bytes,
+  } : tree.areas[area];
   const { root, folders } = useMemo(
     () =>
       buildFolderTree(
-        tree.directories.filter((path) => areaOf(path) === area),
+        tree.directories.filter((path) => privateMemory || areaOf(path) === area),
         tree.counts,
         rootPath,
         areaCount.files,
       ),
-    [tree.directories, tree.counts, areaCount.files, area, rootPath],
+    [tree.directories, tree.counts, areaCount.files, area, rootPath, privateMemory],
   );
-  // Move targets may lie in either area.
-  const allFolders = useMemo(
-    () => buildFolderTree(tree.directories, tree.counts).folders,
-    [tree],
-  );
-
+  const space = spaces.find((item) => item.key_id === memoryKeyId);
+  const currentLabel = privateMemory
+    ? space?.label || memoryKeyId || t("私有记忆")
+    : t(AREA_LABELS[area]);
   const switchArea = (next: MemoryArea, nextFolder?: string) => {
+    if (privateMemory) {
+      onScopeChange(undefined, next, nextFolder ?? areaRoot(next));
+      return;
+    }
     const current = queryRef.current;
     areaFolders.current[current.area] = current.folder;
     let destination = nextFolder ?? areaFolders.current[next];
@@ -301,7 +369,8 @@ export function FileKnowledgePanel() {
   };
 
   /** Select ``path``, switching to the area that owns it. */
-  const focusFolder = (path: string) => switchArea(areaOf(path), path);
+  const focusFolder = (path: string) => privateMemory
+    ? updateQuery({ folder: path, offset: 0 }) : switchArea(areaOf(path), path);
 
   const visibleFiles = page?.files ?? [];
 
@@ -324,10 +393,11 @@ export function FileKnowledgePanel() {
   };
 
   const generate = async (paths: string[], force = false) => {
-    if (generating) return;
+    if (generating || privateMemory || signal.aborted) return;
     setGenerating(true);
     try {
       const next = await generateKnowledgeSummaries(paths, force);
+      if (signal.aborted) return;
       setStatus(next);
       toast.success(
         paths.length
@@ -335,6 +405,7 @@ export function FileKnowledgePanel() {
           : t("已开始生成缺失的总结"),
       );
     } catch (error) {
+      if (signal.aborted) return;
       toast.error(t("生成总结失败"), { description: errorText(error, t("未知错误")) });
     } finally {
       setGenerating(false);
@@ -346,19 +417,22 @@ export function FileKnowledgePanel() {
     if (request.kind === "create") {
       try {
         const result = await createKnowledgeFolder(destination);
+        if (signal.aborted) return;
         toast.success(t("文件夹已创建"));
         if (queryRef.current === submittedQuery) focusFolder(result.path || destination);
         await load();
       } catch (error) {
+        if (signal.aborted) return;
         reportError(t("创建文件夹失败"), error);
       }
       return;
     }
     try {
       const result = await moveKnowledgeEntry(request.path, destination);
+      if (signal.aborted) return;
       const target = result.to || destination;
       toast.success(
-        request.kind === "rename" ? t("已重命名") : t("已移动"),
+        t("已重命名"),
         {
           description: request.isFolder
             ? t("{to}（{count} 个文件）", { to: target, count: result.files })
@@ -376,7 +450,8 @@ export function FileKnowledgePanel() {
       setSummaryPath((current) => (current ? rebasePath(current, request.path, target) : current));
       await load();
     } catch (error) {
-      reportError(request.kind === "rename" ? t("重命名失败") : t("移动失败"), error);
+      if (signal.aborted) return;
+      reportError(t("重命名失败"), error);
     }
   };
 
@@ -384,6 +459,7 @@ export function FileKnowledgePanel() {
     try {
       if (request.kind === "folder") {
         const result = await deleteKnowledgeFolder(request.path);
+        if (signal.aborted) return;
         toast.success(t("文件夹已删除"), {
           description: t("共删除 {count} 个文件", { count: result.files }),
         });
@@ -392,13 +468,35 @@ export function FileKnowledgePanel() {
         }
       } else {
         await deleteKnowledgeFile(request.path);
+        if (signal.aborted) return;
         toast.success(t("知识库文件已删除"));
       }
       await load();
       void refreshStatus();
     } catch (error) {
+      if (signal.aborted) return;
       reportError(t("删除失败"), error);
     }
+  };
+
+  const requestMove = (path: string, kind: "file" | "folder", keyId = memoryKeyId ?? null) => {
+    setTransfer({ source: { keyId, path, kind }, destinationKeyId: keyId, folder: parentOf(path) });
+  };
+
+  const refreshAfterTransfer = async (selection: TransferSelection) => {
+    setSearchResetKey((key) => key + 1);
+    setSummaryPath(null);
+    setTrashKey((key) => key + 1);
+    await Promise.all([load(), onRefreshSpaces(), refreshStatus()]);
+    if (signal.aborted) return;
+    // The sidebar retains the shared counts across scope remounts. Refresh both
+    // physical endpoints; destination picker reads are never reused across KEYs.
+    const owners = new Set([selection.source.keyId, selection.destinationKeyId]);
+    owners.delete(memoryKeyId ?? null);
+    await Promise.all(Array.from(owners, async (keyId) => {
+      const next = await createKnowledgeApi(keyId ?? undefined, signal).getKnowledgeTree();
+      if (!signal.aborted && keyId === null) onSharedTree(next);
+    }));
   };
 
   const onFolderAction = (action: FolderAction, path: string) => {
@@ -411,6 +509,8 @@ export function FileKnowledgePanel() {
         fileCount: tree.counts[path]?.files ?? 0,
         folderCount: folders.filter((item) => item.startsWith(`${path}/`)).length,
       });
+    } else if (action === "move") {
+      requestMove(path, "folder");
     } else {
       setEntryRequest({ kind: action, path, isFolder: true });
     }
@@ -422,10 +522,12 @@ export function FileKnowledgePanel() {
     else if (action === "summary") setSummaryPath(path);
     else if (action === "generate") void generate([path], true);
     else if (action === "delete") setDeleteRequest({ kind: "file", path });
+    else if (action === "move") requestMove(path, "file");
     else setEntryRequest({ kind: action, path, isFolder: false });
   };
 
   return (
+    <KnowledgeDragProvider onTransfer={setTransfer}>
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
@@ -435,14 +537,14 @@ export function FileKnowledgePanel() {
                 <BookOpen className="h-3.5 w-3.5" />
                 {t(AREA_LABELS.imported)}
                 <span className="font-mono text-[11px] text-muted-foreground">
-                  {formatNumber(tree.areas.imported.files)}
+                  {formatNumber((privateMemory ? sharedTree : tree)?.areas.imported.files ?? 0)}
                 </span>
               </TabsTrigger>
               <TabsTrigger value="work" className="gap-1.5">
                 <NotebookPen className="h-3.5 w-3.5" />
                 {t(AREA_LABELS.work)}
                 <span className="font-mono text-[11px] text-muted-foreground">
-                  {formatNumber(tree.areas.work.files)}
+                  {formatNumber((privateMemory ? sharedTree : tree)?.areas.work.files ?? 0)}
                 </span>
               </TabsTrigger>
             </TabsList>
@@ -462,6 +564,7 @@ export function FileKnowledgePanel() {
             void load();
             void refreshStatus();
             void dream.refresh();
+            void onRefreshSpaces();
             setTrashKey((key) => key + 1);
           }}
         >
@@ -470,9 +573,10 @@ export function FileKnowledgePanel() {
         </Button>
       </div>
 
-      {area === "imported" ? (
+      {area === "imported" || privateMemory ? (
         <KnowledgeUploadCard
-          targetDirectory={areaOf(folder) === "imported" ? folder : ""}
+          targetDirectory={folder}
+          rootLabel={currentLabel}
           onImported={async () => {
             setSearchResetKey((key) => key + 1);
             await load();
@@ -483,12 +587,12 @@ export function FileKnowledgePanel() {
         <KnowledgeDreamCard state={dream} />
       )}
 
-      <KnowledgeSearchCard resetKey={searchResetKey} onOpen={(path) => void viewer.open(path)} />
+      <KnowledgeSearchCard key={searchResetKey} resetKey={searchResetKey} onOpen={(path) => void viewer.open(path)} />
 
       <Card>
         <CardContent className="p-0">
             <div className="grid lg:grid-cols-[17rem_minmax(0,1fr)]">
-              <aside className="border-b p-3 lg:border-b-0 lg:border-r">
+              <aside className="min-w-0 border-b p-3 lg:border-b-0 lg:border-r">
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <span className="text-xs font-medium text-muted-foreground">
                     {t("文件夹")}
@@ -502,14 +606,35 @@ export function FileKnowledgePanel() {
                     {t("新建文件夹")}
                   </Button>
                 </div>
-                <div className="max-h-[60vh] overflow-auto">
-                  <KnowledgeFolderTree
-                    key={area}
-                    root={root}
-                    rootLabel={AREA_LABELS[area]}
-                    selected={folder}
-                    onSelect={(path) => updateQuery({ folder: path, offset: 0 })}
-                    onAction={onFolderAction}
+                <div className="space-y-1 border-b pb-2">
+                  {(["imported", "work"] as const).map((memoryArea) => {
+                    const shared = privateMemory ? sharedTree : tree;
+                    const path = areaRoot(memoryArea);
+                    return <KnowledgeFolderTree key={memoryArea}
+                      root={{ path, name: AREA_LABELS[memoryArea], fileCount: shared?.areas[memoryArea].files ?? 0, children: [] }}
+                      rootLabel={t(AREA_LABELS[memoryArea])}
+                      rootTitle={t("共享记忆") + " / " + (path || "/")}
+                      selected={!privateMemory && area === memoryArea ? path : "\u0000"}
+                      onSelect={() => privateMemory ? onScopeChange(undefined, memoryArea, path) : switchArea(memoryArea, path)}
+                      onAction={!privateMemory ? onFolderAction : undefined}
+                      onMigrate={memoryArea === "work" ? () => requestMove(path, "folder", null) : undefined}
+                    />;
+                  })}
+                  {spaces.map((owner) => <KnowledgeFolderTree key={owner.key_id}
+                    root={{ path: "", name: owner.label, fileCount: owner.files, children: [] }}
+                    rootLabel={owner.label || owner.key_id}
+                    rootTitle={`${owner.label || owner.key_id}\n${owner.key_id}\n${t("私有记忆")} · ${owner.memory_scope}${owner.deleted ? ` · ${t("已删除")}` : owner.revoked ? ` · ${t("已撤销")}` : ""}`}
+                    memoryKeyId={owner.key_id}
+                    selected={owner.key_id === memoryKeyId ? "" : "\u0000"}
+                    onSelect={() => owner.key_id === memoryKeyId ? focusFolder("") : onScopeChange(owner.key_id, "work", "")}
+                    onAction={owner.key_id === memoryKeyId ? onFolderAction : undefined}
+                    onMigrate={() => setTransfer({ source: { keyId: owner.key_id, path: "", kind: "folder" }, destinationKeyId: null, folder: "work-memory" })}
+                  />)}
+                </div>
+                <div className="max-h-[50vh] overflow-auto pt-2">
+                  <KnowledgeFolderTree key={`${memoryKeyId ?? "shared"}:${area}`}
+                    root={root} rootLabel={currentLabel} selected={folder} memoryKeyId={memoryKeyId}
+                    onSelect={focusFolder} onAction={onFolderAction} hideRoot
                   />
                 </div>
               </aside>
@@ -517,9 +642,9 @@ export function FileKnowledgePanel() {
                 <div className="flex flex-wrap items-center gap-2">
                   <span
                     className="min-w-0 truncate font-mono text-sm"
-                    title={folder || t(AREA_LABELS[area])}
+                    title={currentLabel + (folder !== rootPath ? ` / ${folder}` : "")}
                   >
-                    {folder !== rootPath ? `${folder}/` : t(AREA_LABELS[area])}
+                    {folder !== rootPath ? `${currentLabel} / ${folder}/` : currentLabel}
                   </span>
                   <Badge variant="outline">
                     {t("{count} 个文件", { count: formatNumber(page?.total ?? 0) })}
@@ -546,14 +671,14 @@ export function FileKnowledgePanel() {
                     }}
                   />
                 </div>
-                <KnowledgeSummaryToolbar
+                {!privateMemory ? <KnowledgeSummaryToolbar
                   status={status}
                   selectedCount={selected.size}
                   busy={generating}
                   onGenerateMissing={() => void generate([])}
                   onGenerateSelected={() => void generate(Array.from(selected))}
                   onClearSelection={() => setSelected(new Set())}
-                />
+                /> : null}
                 {loading ? (
                   <div className="space-y-2 py-5" aria-busy="true">
                     {Array.from({ length: 4 }).map((_, index) => (
@@ -577,6 +702,7 @@ export function FileKnowledgePanel() {
                   <div className="rounded-md border">
                     <KnowledgeFileTable
                       files={visibleFiles}
+                      allowGenerate={!privateMemory}
                       folder={folder}
                       views={views}
                       selected={selected}
@@ -610,17 +736,13 @@ export function FileKnowledgePanel() {
                   <EmptyState
                     icon={NotebookPen}
                     title={t("还没有日常工作记忆")}
-                    description={t(
-                      "模型在对话中通过服务端工具写下的工作笔记会保存在 work-memory/ 下并显示在这里；每晚的记忆整理会归并和清理它们。",
-                    )}
+                    description={t("上传文件或在对话中写入笔记。")}
                   />
                 ) : (
                   <EmptyState
                     icon={FileText}
                     title={t("知识库还是空的")}
-                    description={t(
-                      "导入文本文件后，模型会通过服务端工具 qwen_exo_memory_search / qwen_exo_memory_read 按需搜索和读取原文。",
-                    )}
+                    description={t("上传文件或在对话中写入笔记。")}
                   />
                 )}
                 <nav className="flex flex-wrap items-center justify-between gap-2">
@@ -668,6 +790,7 @@ export function FileKnowledgePanel() {
       {viewer.dialog}
 
       <KnowledgeSummaryDialog
+        key={summaryPath ?? "closed"}
         path={summaryPath}
         view={summaryPath ? views.get(summaryPath) ?? null : null}
         onClose={() => setSummaryPath(null)}
@@ -677,10 +800,14 @@ export function FileKnowledgePanel() {
         }}
       />
 
+      {transfer ? <KnowledgeTransferDialog
+        selection={transfer} spaces={spaces} signal={signal}
+        onClose={() => setTransfer(null)} onTransferred={refreshAfterTransfer}
+      /> : null}
+
       <KnowledgeEntryDialog
         key={entryRequest ? `${entryRequest.kind}:${entryRequest.path}` : "closed"}
         request={entryRequest}
-        folders={allFolders}
         onClose={() => setEntryRequest(null)}
         onSubmit={submitEntry}
       />
@@ -691,5 +818,6 @@ export function FileKnowledgePanel() {
         onConfirm={confirmDelete}
       />
     </div>
+    </KnowledgeDragProvider>
   );
 }

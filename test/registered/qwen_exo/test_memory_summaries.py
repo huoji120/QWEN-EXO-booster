@@ -65,7 +65,10 @@ def test_summaries_read_only_the_head_and_never_overwrite_manual_edits(tmp_path)
     (index.root / "notes.md").write_text("changed line\n" * 600, encoding="utf-8")
     index.refresh()
     assert service.missing_paths() == ["notes.md"]  # stale automatic summary
-    index.store_summary("notes.md", sha256="old", summary="标题：手写", sampled=False, origin="manual")
+    current_sha, _ = index.read_text("notes.md")
+    index.store_summary("notes.md", sha256=current_sha, summary="标题：手写", sampled=False, origin="manual")
+    (index.root / "notes.md").write_text("changed again\n" * 600, encoding="utf-8")
+    index.refresh()
     assert service.missing_paths() == []
     assert asyncio.run(service.summarize("notes.md"))["title"] == "手写"
     assert asyncio.run(service.summarize("notes.md", force=True))["origin"] == "auto"

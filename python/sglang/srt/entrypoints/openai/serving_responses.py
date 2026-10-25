@@ -72,7 +72,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
     MessageProcessingResult,
-    PromptTokenUsageInfo,
+    PromptTokensDetails,
     RequestResponseMetadata,
     ResponseReasoningParam,
     ResponsesRequest,
@@ -335,6 +335,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if previous_response is None:
                     return self._make_not_found_error(previous_response_id)
                 if (
+                    previous_response._qwen_exo_memory_key_id != request._qwen_exo_memory_key_id
+                    or previous_response._qwen_exo_memory_scope != request._qwen_exo_memory_scope
+                ):
+                    return self._make_not_found_error(previous_response_id)
+                if (
                     previous_response.status != "completed"
                     or previous_response_id not in self.msg_store
                 ):
@@ -407,7 +412,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         return response
 
     async def register_pending_cancelled_response(
-        self, response_id: str
+        self, response_id: str, *, memory_key_id: str | None = None,
+        memory_scope: str = "shared",
     ) -> ResponsesResponse:
         response = ResponsesResponse(
             id=str(response_id),
@@ -416,6 +422,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             store=True,
             metadata={},
         )
+        response._qwen_exo_memory_key_id = memory_key_id
+        response._qwen_exo_memory_scope = memory_scope
         async with self.response_store_lock:
             existing = self.response_store.get(response.id)
             if existing is not None:
@@ -430,6 +438,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         model_name: str | None,
         user_items: Iterable[dict[str, Any]],
         summary: str,
+        memory_key_id: str | None = None,
+        memory_scope: str = "shared",
     ) -> ResponsesResponse:
         summary = str(summary).strip()
         if not summary:
@@ -460,6 +470,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             store=True,
             metadata={},
         )
+        response._qwen_exo_memory_key_id = memory_key_id
+        response._qwen_exo_memory_scope = memory_scope
         async with self.response_store_lock:
             self.msg_store[response.id] = public_messages
             self.response_store[response.id] = response
@@ -574,6 +586,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 prev_response = self.response_store.get(prev_response_id)
             if prev_response is None:
                 return self._make_not_found_error(prev_response_id)
+            if (
+                prev_response._qwen_exo_memory_key_id != request._qwen_exo_memory_key_id
+                or prev_response._qwen_exo_memory_scope != request._qwen_exo_memory_scope
+            ):
+                return self._make_not_found_error(prev_response_id)
         else:
             prev_response = None
         qwen_exo_runtime = (
@@ -605,6 +622,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request.request_id,
                     blocked_reason=self._memory_tools_blocked_reason(request),
                     query_text=self._memory_query_text(request, prev_response),
+                    memory_key_id=request._qwen_exo_memory_key_id,
+                    memory_scope=request._qwen_exo_memory_scope,
                 )
             )
 
@@ -894,6 +913,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                             extra_key=self._compute_extra_key(request),
                             previous_response_id=request.previous_response_id,
                             response_id=request.request_id,
+                            memory_key_id=request._qwen_exo_memory_key_id,
+                            memory_scope=request._qwen_exo_memory_scope,
                         )
                         # Radix matching is exact-token, so shared heads (system
                         # prompt, tools, a forked subagent's inherited context)
@@ -946,12 +967,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 custom_params["qwen_exo_latent_transplant"] = (
                                     latent_transplant
                                 )
+                            elif request._qwen_exo_memory_scope == "private_only":
+                                custom_params.pop("qwen_exo_latent_transplant", None)
                         editor_request = qwen_exo_runtime.activation_editor_request(
-                            custom_params.get("qwen_exo_activation_editor")
+                            custom_params.get("qwen_exo_activation_editor"),
+                            memory_scope=request._qwen_exo_memory_scope,
                         )
                         editor_spec = editor_request["spec"]
                         if editor_spec is not None:
                             custom_params["qwen_exo_activation_editor"] = editor_spec
+                        else:
+                            custom_params.pop("qwen_exo_activation_editor", None)
                         editor_cache_identity = str(editor_request["cache_identity"])
                         sampling_params["custom_params"] = custom_params
                     effective_extra_key = self._compute_extra_key(request)
@@ -1348,10 +1374,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=num_prompt_tokens + num_generated_tokens,
             reasoning_tokens=num_reasoning_tokens,
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=num_cached_tokens
-            )
+        # Responses always exposes cached input usage, independent of the
+        # optional Chat Completions prompt-details flag.
+        usage.prompt_tokens_details = PromptTokensDetails(
+            cached_tokens=num_cached_tokens
+        )
         request_metadata.final_usage_info = usage
 
         response_status, incomplete_details = self._response_terminal_status(
@@ -1698,7 +1725,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self._memory_tools_active(request):
             chat_tools.extend(
                 Tool.model_validate(schema)
-                for schema in self.tool_server.chat_tool_schemas
+                for schema in self.tool_server.chat_tool_schemas_for_memory_scope(
+                    request._qwen_exo_memory_key_id, request._qwen_exo_memory_scope
+                )
             )
         return chat_tools
 
@@ -2834,21 +2863,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # OpenAI SDK's Tool union may not know extended types; drop echo.
         response_dict["tools"] = []
 
-        # Convert UsageInfo to ResponseUsage format
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
-
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
                 type="response.completed",
@@ -3558,10 +3572,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
             reasoning_tokens=total_reasoning_tokens,
         )
-        if self.enable_prompt_tokens_details and cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=cached_tokens
-            )
+        usage.prompt_tokens_details = PromptTokensDetails(cached_tokens=cached_tokens)
         request_metadata.final_usage_info = usage
 
         response_status, incomplete_details = self._response_terminal_status(
@@ -3592,19 +3603,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.response_store[final_response.id] = final_response
 
         response_dict = _sanitize_response_dict(final_response.model_dump())
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": cached_tokens,
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": total_reasoning_tokens,
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
 
         if response_status == "incomplete":
             yield _send_event(
@@ -3846,16 +3844,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         return split_memory_calls(calls)
 
     async def _run_memory_round(
-        self, memory_calls: list[Any], *, limit_reached: bool
+        self, memory_calls: list[Any], *, limit_reached: bool,
+        memory_key_id: str | None = None,
+        memory_scope: str = "shared",
     ) -> list[dict[str, Any]]:
         calls = []
+        executor = self.tool_server.executor_for_memory_scope(memory_key_id, memory_scope)
         for parsed in memory_calls:
             call = new_memory_call(parsed.name, parsed.parameters)
             if limit_reached:
                 call["output"] = ROUND_LIMIT_OUTPUT
             else:
                 started = time.perf_counter()
-                ok, output = await self.tool_server.executor.run(
+                ok, output = await executor.run(
                     call["name"], call["arguments"]
                 )
                 call["duration_ms"] = (time.perf_counter() - started) * 1000.0
@@ -4006,7 +4007,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             if round_index > MAX_MEMORY_TOOL_ROUNDS:
                 return
             calls = await self._run_memory_round(
-                memory_calls, limit_reached=round_index == MAX_MEMORY_TOOL_ROUNDS
+                memory_calls, limit_reached=round_index == MAX_MEMORY_TOOL_ROUNDS,
+                memory_key_id=response_request._qwen_exo_memory_key_id,
+                memory_scope=response_request._qwen_exo_memory_scope,
             )
             logger.info(
                 "QWEN_EXO_MEMORY_TOOL_ROUND request_id=%s round=%d calls=%s ok=%s "

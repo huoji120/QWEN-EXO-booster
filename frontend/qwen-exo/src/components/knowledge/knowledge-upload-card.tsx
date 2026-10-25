@@ -3,9 +3,11 @@ import { Folder, FolderUp, LoaderCircle, Upload, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { ApiError, uploadKnowledgeArchiveRaw, uploadKnowledgeFileRaw } from "@/lib/api";
+import { ApiError } from "@/lib/api";
+import { useKnowledgeApi } from "./knowledge-scope";
 import { translate as t } from "@/lib/i18n";
 import { cn, formatBytes } from "@/lib/utils";
+import { KNOWLEDGE_DRAG_TYPE } from "./knowledge-drag";
 import {
   collectDropped,
   errorText,
@@ -19,11 +21,14 @@ import {
 /** Upload files, folders or ZIPs into the selected folder (no size limit). */
 export function KnowledgeUploadCard({
   targetDirectory,
+  rootLabel,
   onImported,
 }: {
   targetDirectory: string;
+  rootLabel: string;
   onImported: () => void | Promise<void>;
 }) {
+  const { uploadKnowledgeArchiveRaw, uploadKnowledgeFileRaw, signal, memoryKeyId } = useKnowledgeApi();
   const [pending, setPending] = useState<PendingFile[]>([]);
   const [importing, setImporting] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -47,11 +52,13 @@ export function KnowledgeUploadCard({
     let succeeded = 0;
     try {
       for (const item of pending) {
+        if (signal.aborted) return;
         const relativePath = joinPath(targetDirectory, item.relativePath);
         try {
           if (isZip(item)) {
             // The server unpacks the archive; each text member is one file.
             const result = await uploadKnowledgeArchiveRaw(item.file, parentOf(relativePath));
+            if (signal.aborted) return;
             succeeded += result.files.length;
             if (result.skipped.length) {
               toast.warning(
@@ -69,9 +76,11 @@ export function KnowledgeUploadCard({
             }
           } else {
             await uploadKnowledgeFileRaw(relativePath, item.file);
+            if (signal.aborted) return;
             succeeded += 1;
           }
         } catch (error) {
+          if (signal.aborted) return;
           if (error instanceof ApiError && error.status === 507) {
             // Disk would drop below the reserve; the rest would fail too.
             toast.error(t("服务器磁盘空间不足，已停止导入"), {
@@ -102,12 +111,20 @@ export function KnowledgeUploadCard({
       className={cn(dragging && "border-primary ring-1 ring-primary")}
       onDragOver={(event) => {
         event.preventDefault();
+        event.stopPropagation();
+        if (event.dataTransfer.types.includes(KNOWLEDGE_DRAG_TYPE) || !event.dataTransfer.types.includes("Files")) {
+          event.dataTransfer.dropEffect = "none";
+          setDragging(false);
+          return;
+        }
         setDragging(true);
       }}
       onDragLeave={() => setDragging(false)}
       onDrop={(event) => {
         event.preventDefault();
         setDragging(false);
+        event.stopPropagation();
+        if (event.dataTransfer.types.includes(KNOWLEDGE_DRAG_TYPE) || !event.dataTransfer.types.includes("Files")) return;
         void collectDropped(event.dataTransfer.items).then((picked) => {
           if (picked.length) setPending(picked);
         });
@@ -141,8 +158,8 @@ export function KnowledgeUploadCard({
           <span className="flex min-w-0 items-center gap-1 text-sm text-muted-foreground">
             <Folder className="h-4 w-4 shrink-0" />
             {t("导入到")}
-            <span className="truncate font-mono text-xs text-foreground">
-              {targetDirectory ? `${targetDirectory}/` : t("导入的记忆（根目录）")}
+            <span className="truncate font-mono text-xs text-foreground" title={targetDirectory ? `${rootLabel} / ${targetDirectory}/` : rootLabel}>
+              {targetDirectory ? `${rootLabel} / ${targetDirectory}/` : rootLabel}
             </span>
           </span>
           <div className="ml-auto flex items-center gap-2">
@@ -175,10 +192,8 @@ export function KnowledgeUploadCard({
             </div>
           </div>
         ) : null}
-        <p className="text-xs text-muted-foreground">
-          {t(
-            "可拖拽文件、文件夹或 ZIP 到这里，导入到左侧选中的文件夹。支持任意 UTF-8 文本（文档、代码、日志、配置），不限大小；ZIP 会在服务端解压，每个文本文件各存一份。同路径文件会被覆盖。导入后服务端会在后台生成总结。",
-          )}
+        <p className="text-xs text-muted-foreground" title={memoryKeyId ? t("私有记忆支持手动总结；自动总结和夜间整理暂不可用。") : t("导入后服务端会在后台生成总结。") }>
+          {t("拖入文件、文件夹或 ZIP。支持 UTF-8 文本；同路径文件会覆盖。")}
         </p>
       </CardContent>
     </Card>

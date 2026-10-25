@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from http import HTTPStatus
 from typing import (
     Annotated,
@@ -1926,6 +1926,38 @@ async def v1_systemone_request(raw_request: Request):
         return ORJSONResponse(error.public_dict(), status_code=error.status_code)
 
 
+def _authenticated_memory_key_id(raw_request: Request) -> str | None:
+    principal = getattr(raw_request.state, "qwen_exo_api_key", None)
+    if principal is None or principal["memory_scope"] == "shared":
+        return None
+    return principal["id"]
+
+
+def _authenticated_memory_scope(raw_request: Request) -> str:
+    principal = getattr(raw_request.state, "qwen_exo_api_key", None)
+    return principal["memory_scope"] if principal is not None else "shared"
+
+
+async def _response_memory_access_error(
+    raw_request: Request, response_id: str, *, require_known: bool = False
+):
+    """Protect retained tool outputs and pending work with the same memory scope."""
+    serving = raw_request.app.state.openai_serving_responses
+    key_id = _authenticated_memory_key_id(raw_request)
+    memory_scope = _authenticated_memory_scope(raw_request)
+    async with serving.response_store_lock:
+        response = serving.response_store.get(response_id)
+    if response is not None:
+        if (response._qwen_exo_memory_key_id, response._qwen_exo_memory_scope) != (key_id, memory_scope):
+            return serving._make_not_found_error(response_id)
+        return None
+    runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
+    known, owner, mode = runtime.response_memory_scope(response_id) if runtime else (False, None, "shared")
+    if (known and (owner, mode) != (key_id, memory_scope)) or (require_known and not known):
+        return serving._make_not_found_error(response_id)
+    return None
+
+
 @app.post(
     "/qwen-exo/console/v1/responses",
     dependencies=[Depends(validate_json_request)],
@@ -1936,6 +1968,13 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
     serving = raw_request.app.state.openai_serving_responses
     qwen_exo_runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
+    request._qwen_exo_memory_key_id = _authenticated_memory_key_id(raw_request)
+    request._qwen_exo_memory_scope = _authenticated_memory_scope(raw_request)
+    for response_id in (request.request_id, request.previous_response_id):
+        if response_id:
+            error = await _response_memory_access_error(raw_request, response_id)
+            if error is not None:
+                return error
     if qwen_exo_runtime is not None:
         validation_error = await serving.prevalidate_qwen_exo_request(request)
         if validation_error is not None:
@@ -1953,10 +1992,15 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
             raise
         except Exception as exc:
             from qwen_exo_booster.runtime import (
+                MemoryScopeError,
                 QwenExoCapacityConflict,
                 QwenExoRequestConflict,
             )
 
+            if isinstance(exc, MemoryScopeError):
+                return serving.create_error_response(
+                    str(exc), err_type="memory_scope_forbidden", status_code=403
+                )
             if isinstance(exc, QwenExoRequestConflict):
                 return serving.create_error_response(
                     str(exc),
@@ -1972,6 +2016,11 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
                 )
                 response.headers["Retry-After"] = "1"
                 return response
+            if request._qwen_exo_memory_key_id is not None:
+                return serving.create_error_response(
+                    "Private memory preparation failed; no generation was started",
+                    err_type="memory_scope_unavailable", status_code=503,
+                )
             # Private context is optional; serve the original request.
             logger.exception("QWEN-EXO request preparation failed closed")
 
@@ -2022,6 +2071,13 @@ async def v1_responses_compact_request(
 ):
     """Compact a Responses conversation without creating a user generation."""
     runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
+    request._qwen_exo_memory_key_id = _authenticated_memory_key_id(raw_request)
+    request._qwen_exo_memory_scope = _authenticated_memory_scope(raw_request)
+    for response_id in (request.request_id, request.previous_response_id):
+        if response_id:
+            error = await _response_memory_access_error(raw_request, response_id)
+            if error is not None:
+                return error
     if runtime is None:
         return JSONResponse(
             status_code=501,
@@ -2043,11 +2099,19 @@ async def v1_responses_compact_request(
                 model_name=request.model,
                 user_items=user_items,
                 summary=summary,
+                memory_key_id=request._qwen_exo_memory_key_id,
+                memory_scope=request._qwen_exo_memory_scope,
             )
         )
         return result
     except Exception as exc:
         from qwen_exo_booster.compaction import ResponseCompactionError
+        from qwen_exo_booster.runtime import MemoryScopeError
+
+        if isinstance(exc, MemoryScopeError):
+            return raw_request.app.state.openai_serving_responses.create_error_response(
+                str(exc), err_type="memory_scope_forbidden", status_code=403
+            )
 
         if isinstance(exc, ResponseCompactionError):
             status_code = 409 if exc.code == "compaction_disabled" else 400
@@ -2079,6 +2143,9 @@ async def v1_responses_compact_request(
 @app.get("/v1/responses/{response_id}")
 async def v1_retrieve_responses(response_id: str, raw_request: Request):
     """Retrieve a response by ID."""
+    error = await _response_memory_access_error(raw_request, response_id, require_known=True)
+    if error is not None:
+        return error
     return await raw_request.app.state.openai_serving_responses.retrieve_responses(
         response_id
     )
@@ -2092,6 +2159,9 @@ async def v1_retrieve_responses(response_id: str, raw_request: Request):
 async def v1_cancel_responses(response_id: str, raw_request: Request):
     """Cancel a background response."""
     serving = raw_request.app.state.openai_serving_responses
+    error = await _response_memory_access_error(raw_request, response_id, require_known=True)
+    if error is not None:
+        return error
     result = await serving.cancel_responses(response_id)
     qwen_exo_runtime = getattr(raw_request.app.state, "qwen_exo_runtime", None)
     pending_cancelled = False
@@ -2112,7 +2182,10 @@ async def v1_cancel_responses(response_id: str, raw_request: Request):
     ):
         await qwen_exo_runtime.cancel_request(response_id)
     if pending_cancelled and getattr(result, "status", None) != "cancelled":
-        result = await serving.register_pending_cancelled_response(response_id)
+        result = await serving.register_pending_cancelled_response(
+            response_id, memory_key_id=_authenticated_memory_key_id(raw_request),
+            memory_scope=_authenticated_memory_scope(raw_request),
+        )
     return result
 
 
@@ -2353,6 +2426,26 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+@contextmanager
+def _managed_warmup_headers(server_args: ServerArgs, request_name: str, headers: dict):
+    """Use the same dynamic authentication as clients, without a startup bypass."""
+    store_path = getattr(server_args, "qwen_exo_api_key_store", None)
+    if not store_path:
+        yield headers
+        return
+    from qwen_exo_booster.api_keys import ApiKeyStore
+
+    store = ApiKeyStore(store_path)
+    if store.authorize_request("POST", request_name, None) is None:
+        yield headers
+        return
+    key = store.create("internal-server-warmup")
+    try:
+        yield {**headers, "Authorization": f"Bearer {key['token']}"}
+    finally:
+        store.delete([key["id"]])
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2459,13 +2552,14 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
-            )
+            with _managed_warmup_headers(server_args, request_name, headers) as warmup_headers:
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=warmup_headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
@@ -2685,12 +2779,13 @@ def _setup_and_run_http_server(
         # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
         #   admin_api_key is not configured.
         dynamic_authorizer = None
+        dynamic_identity_resolver = None
         if server_args.qwen_exo_api_key_store:
             from qwen_exo_booster.api_keys import ApiKeyStore
 
-            dynamic_authorizer = ApiKeyStore(
-                server_args.qwen_exo_api_key_store
-            ).authorize_request
+            managed_keys = ApiKeyStore(server_args.qwen_exo_api_key_store)
+            dynamic_authorizer = managed_keys.authorize_request
+            dynamic_identity_resolver = managed_keys.resolve_authorization
         if (
             server_args.api_key
             or server_args.admin_api_key
@@ -2704,6 +2799,7 @@ def _setup_and_run_http_server(
                 api_key=server_args.api_key,
                 admin_api_key=server_args.admin_api_key,
                 dynamic_authorizer=dynamic_authorizer,
+                dynamic_identity_resolver=dynamic_identity_resolver,
             )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory

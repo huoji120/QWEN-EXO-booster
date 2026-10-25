@@ -709,11 +709,11 @@ def test_new_memory_refresh_runs_in_background_and_coalesces():
 
     async def scenario():
         for _ in range(3):
-            await runtime._on_reflection_memory_stored(SimpleNamespace())
+            await runtime._on_reflection_memory_stored(SimpleNamespace(conversation_key="shared"))
         await asyncio.sleep(0)
         assert reasons == ["new_memory"]
         for _ in range(3):
-            await runtime._on_reflection_memory_stored(SimpleNamespace())
+            await runtime._on_reflection_memory_stored(SimpleNamespace(conversation_key="shared"))
         release.set()
         await runtime._session_initial_gdn_refresh_task
         assert reasons == ["new_memory", "new_memory"]
@@ -747,7 +747,7 @@ def test_new_memory_refresh_waits_for_user_turns_and_reflections():
     async def scenario():
         reflection = asyncio.create_task(asyncio.sleep(3600))
         runtime._server_session_reflections = {reflection}
-        await runtime._on_reflection_memory_stored(SimpleNamespace())
+        await runtime._on_reflection_memory_stored(SimpleNamespace(conversation_key="shared"))
         await asyncio.sleep(0.05)
         assert reasons == []
         runtime._request_questions.clear()

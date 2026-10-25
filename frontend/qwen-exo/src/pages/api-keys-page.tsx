@@ -30,6 +30,13 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Table,
   TableBody,
   TableCell,
@@ -42,18 +49,33 @@ import {
   deleteApiKeys,
   getApiKeys,
   revokeApiKey,
+  updateApiKeyMemoryScope,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
-import type { ApiKeyInfo, ApiKeyListing, CreatedApiKey } from "@/lib/types";
+import type {
+  ApiKeyInfo,
+  ApiKeyListing,
+  ApiKeyMemoryScope,
+  CreatedApiKey,
+} from "@/lib/types";
 import { formatTime } from "@/lib/utils";
 
 const CHECKBOX_CLASS = "h-4 w-4 cursor-pointer accent-slate-900";
+
+const MEMORY_SCOPE_DESCRIPTIONS: Record<ApiKeyMemoryScope, string> = {
+  shared: "读写共享记忆，不读取任何私有记忆。",
+  private: "只写本密钥的私有记忆，读取本密钥的私有记忆和共享记忆。",
+  private_only: "仅读写本密钥的私有记忆，不读取共享记忆、共享提示或共享原生记忆。",
+  super: "读取共享记忆和所有密钥的私有记忆（包括已撤销或已删除密钥的保留记忆），只写本密钥的私有记忆；不能修改其他密钥的记忆，也不授予密钥管理权限。",
+};
 
 export function ApiKeysPage() {
   const { t } = useI18n();
   const [listing, setListing] = useState<ApiKeyListing | null>(null);
   const [loading, setLoading] = useState(true);
   const [label, setLabel] = useState("");
+  const [memoryScope, setMemoryScope] = useState<ApiKeyMemoryScope>("shared");
+  const [updatingScope, setUpdatingScope] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<CreatedApiKey | null>(null);
   const [copied, setCopied] = useState(false);
@@ -91,9 +113,10 @@ export function ApiKeysPage() {
     if (!normalized) return;
     setCreating(true);
     try {
-      const key = await createApiKey(normalized);
+      const key = await createApiKey(normalized, memoryScope);
       setCreated(key);
       setLabel("");
+      setMemoryScope("shared");
       setCopied(false);
       await load();
       toast.success(t("API 密钥已签发"));
@@ -103,6 +126,32 @@ export function ApiKeysPage() {
       });
     } finally {
       setCreating(false);
+    }
+  };
+
+  const changeMemoryScope = async (key: ApiKeyInfo, scope: ApiKeyMemoryScope) => {
+    if (scope === key.memory_scope || updatingScope) return;
+    setUpdatingScope(key.id);
+    try {
+      const updated = await updateApiKeyMemoryScope(key.id, scope);
+      setListing((current) =>
+        current
+          ? {
+              ...current,
+              revision: updated.revision,
+              keys: current.keys.map((item) =>
+                item.id === updated.id ? updated : item,
+              ),
+            }
+          : current,
+      );
+      toast.success(t("记忆模式已更新"), { description: key.label });
+    } catch (error) {
+      toast.error(t("记忆模式更新失败"), {
+        description: error instanceof Error ? error.message : t("未知错误"),
+      });
+    } finally {
+      setUpdatingScope(null);
     }
   };
 
@@ -192,6 +241,12 @@ export function ApiKeysPage() {
                 <CardDescription>
                   {t("服务每次请求读取持久化密钥表；签发和吊销无需重启模型。")}
                 </CardDescription>
+                <CardDescription className="mt-2">
+                  {t("共享：只读写共享记忆；私有＋共享：读取共享及本密钥私有记忆，只写自己的私有记忆；仅私有：仅读写自己的私有记忆，不读取共享记忆、共享提示或共享原生记忆；超级读取：读取共享及所有私有记忆，只写自己的私有记忆，不授予其他记忆的修改权或密钥管理权限。")}
+                </CardDescription>
+                <CardDescription className="mt-2">
+                  {t("切换模式仅影响后续请求，不迁移或公开已有私有记忆；旧模式下的历史响应可能无法继续或重放。密钥 ID 和令牌保持不变。")}
+                </CardDescription>
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Badge variant="secondary">
@@ -235,6 +290,7 @@ export function ApiKeysPage() {
                   <TableHead>{t("密钥 ID")}</TableHead>
                   <TableHead>{t("创建时间")}</TableHead>
                   <TableHead>{t("状态")}</TableHead>
+                  <TableHead>{t("记忆模式")}</TableHead>
                   <TableHead className="text-right">{t("操作")}</TableHead>
                 </TableRow>
               </TableHeader>
@@ -242,7 +298,7 @@ export function ApiKeysPage() {
                 {loading ? (
                   <TableRow>
                     <TableCell
-                      colSpan={6}
+                      colSpan={7}
                       className="h-28 text-center text-muted-foreground"
                     >
                       <LoaderCircle className="mx-auto h-5 w-5 animate-spin" />
@@ -282,6 +338,33 @@ export function ApiKeysPage() {
                             {active ? t("有效") : t("已吊销")}
                           </Badge>
                         </TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-2">
+                            <Select
+                              value={key.memory_scope}
+                              disabled={!active || updatingScope !== null}
+                              onValueChange={(value) =>
+                                void changeMemoryScope(key, value as ApiKeyMemoryScope)
+                              }
+                            >
+                              <SelectTrigger
+                                className="w-36"
+                                aria-label={t("{name} 的记忆模式", { name: key.label })}
+                              >
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="shared">{t("共享")}</SelectItem>
+                                <SelectItem value="private">{t("私有＋共享")}</SelectItem>
+                                <SelectItem value="private_only">{t("仅私有")}</SelectItem>
+                                <SelectItem value="super">{t("超级读取")}</SelectItem>
+                              </SelectContent>
+                            </Select>
+                            {updatingScope === key.id && (
+                              <LoaderCircle className="h-4 w-4 animate-spin" />
+                            )}
+                          </div>
+                        </TableCell>
                         <TableCell className="text-right">
                           <Button
                             variant="ghost"
@@ -306,7 +389,7 @@ export function ApiKeysPage() {
                 ) : (
                   <TableRow>
                     <TableCell
-                      colSpan={6}
+                      colSpan={7}
                       className="h-28 text-center text-muted-foreground"
                     >
                       {t("尚未签发 API 密钥")}
@@ -338,6 +421,29 @@ export function ApiKeysPage() {
                 if (event.key === "Enter") void issue();
               }}
             />
+            <div className="space-y-2">
+              <label htmlFor="new-key-memory-scope" className="text-sm font-medium">
+                {t("记忆模式")}
+              </label>
+              <Select
+                value={memoryScope}
+                disabled={creating}
+                onValueChange={(value) => setMemoryScope(value as ApiKeyMemoryScope)}
+              >
+                <SelectTrigger id="new-key-memory-scope">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="shared">{t("共享")}</SelectItem>
+                  <SelectItem value="private">{t("私有＋共享")}</SelectItem>
+                  <SelectItem value="private_only">{t("仅私有")}</SelectItem>
+                  <SelectItem value="super">{t("超级读取")}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs leading-5 text-muted-foreground">
+                {t(MEMORY_SCOPE_DESCRIPTIONS[memoryScope])}
+              </p>
+            </div>
             <Button
               className="w-full"
               disabled={creating || !label.trim()}

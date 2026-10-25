@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { searchKnowledge } from "@/lib/api";
+import { useKnowledgeApi } from "./knowledge-scope";
 import { translate as t } from "@/lib/i18n";
 import type { KnowledgeSearchResponse } from "@/lib/types";
 import { formatNumber } from "@/lib/utils";
@@ -21,6 +21,7 @@ export function KnowledgeSearchCard({
   /** Changing this clears stale results (e.g. after an import). */
   resetKey: number;
 }) {
+  const { searchKnowledge, signal } = useKnowledgeApi();
   const [pattern, setPattern] = useState("");
   const [pathGlob, setPathGlob] = useState("**/*");
   const [caseSensitive, setCaseSensitive] = useState(false);
@@ -42,8 +43,10 @@ export function KnowledgeSearchCard({
         caseSensitive,
         regex,
       });
+      if (signal.aborted) return;
       setResult({ key: resetKey, response });
     } catch (error) {
+      if (signal.aborted) return;
       toast.error(t("搜索失败"), { description: errorText(error, t("未知错误")) });
     } finally {
       setSearching(false);

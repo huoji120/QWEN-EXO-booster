@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import codecs
 import fnmatch
+from functools import wraps
 import hashlib
 import os
 import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISREG
@@ -38,6 +40,19 @@ MAX_LINE_CHARS = 2_000
 MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
 _SNIFF_BYTES = 65_536
 _COPY_CHUNK = 1024 * 1024
+
+# One process-wide lock keeps multi-root transfers and ordinary filesystem
+# mutations ordered before SQLite transactions. Reentrant for upsert→refresh,
+# work-note read/modify/write, and attached-index transfer/recovery operations.
+MEMORY_MUTATION_LOCK = threading.RLock()
+
+
+def memory_mutation(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with MEMORY_MUTATION_LOCK:
+            return function(*args, **kwargs)
+    return locked
 
 
 class FileKnowledgeError(ValueError):
@@ -206,6 +221,7 @@ class FileKnowledgeIndex:
 
     table_name = "knowledge_files"
 
+    @memory_mutation
     def __init__(self, root: str | os.PathLike[str], state_directory: str | os.PathLike[str]):
         root_path = Path(root).expanduser()
         state_path = Path(state_directory).expanduser()
@@ -449,6 +465,7 @@ class FileKnowledgeIndex:
                     parent = parent.rpartition("/")[0]
         return {"directories": sorted(directories), "counts": counts, "areas": areas}
 
+    @memory_mutation
     def refresh(self) -> dict[str, int]:
         """Incrementally refresh metadata and remove entries for deleted files."""
         discovered = self._iter_regular_files()
@@ -1003,6 +1020,7 @@ class FileKnowledgeIndex:
 
     # --- writes ---------------------------------------------------------------------
 
+    @memory_mutation
     def upsert_bytes(self, path: str, data: bytes | bytearray | memoryview) -> dict[str, Any]:
         ensure_free_space(self.root, len(data))
         relative = self._write_atomic(path, bytes(data))
@@ -1012,6 +1030,7 @@ class FileKnowledgeIndex:
             raise FileKnowledgeError("upserted file was not indexed")
         return {key: row[key] for key in row.keys()}
 
+    @memory_mutation
     def store_upload(self, path: str, source: IO[bytes]) -> dict[str, Any]:
         """Stream one uploaded text file into place (validated while copying)."""
         relative = self._write_stream(path, source)
@@ -1021,6 +1040,7 @@ class FileKnowledgeIndex:
             raise FileKnowledgeError("uploaded file was not indexed")
         return {key: row[key] for key in row.keys()}
 
+    @memory_mutation
     def import_archive(
         self, data: bytes | IO[bytes] | os.PathLike[str] | str, *, directory: str = ""
     ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -1055,6 +1075,7 @@ class FileKnowledgeIndex:
         rows = [row for relative in written if (row := self._row(relative)) is not None]
         return [{key: row[key] for key in row.keys()} for row in rows], skipped
 
+    @memory_mutation
     def _write_stream(self, path: str, source: IO[bytes], *, expected_bytes: int = 0) -> str:
         relative, destination = self._safe_path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1080,6 +1101,7 @@ class FileKnowledgeIndex:
                     pass
         return relative
 
+    @memory_mutation
     def _write_atomic(self, path: str, raw: bytes) -> str:
         relative, destination = self._safe_path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1119,6 +1141,7 @@ class FileKnowledgeIndex:
         connection.execute("DELETE FROM knowledge_segments WHERE relative_path = ?", (relative,))
         connection.execute("DELETE FROM knowledge_summaries WHERE relative_path = ?", (relative,))
 
+    @memory_mutation
     def delete(self, path: str) -> None:
         """Delete a source file; raises ``FileNotFoundError`` when it is absent."""
         relative, target = self._safe_path(path)
@@ -1135,6 +1158,7 @@ class FileKnowledgeIndex:
         with self._connect() as connection:
             self._forget(connection, relative)
 
+    @memory_mutation
     def make_directory(self, path: str) -> str:
         relative, target = self._safe_path(path)
         if target.exists() and not target.is_dir():
@@ -1143,6 +1167,7 @@ class FileKnowledgeIndex:
         self._safe_path(relative)
         return relative
 
+    @memory_mutation
     def delete_directory(self, path: str) -> int:
         """Remove a folder with everything inside; returns the files removed."""
         relative, target = self._safe_path(path)
@@ -1162,6 +1187,7 @@ class FileKnowledgeIndex:
                 self._forget(connection, item)
         return len(inside)
 
+    @memory_mutation
     def move(self, source: str, destination: str) -> dict[str, Any]:
         """Rename or move a file or folder; index rows and summaries follow it."""
         source_relative, source_path = self._safe_path(source)
@@ -1319,6 +1345,7 @@ class FileKnowledgeIndex:
             ).fetchone()
         return None if row is None else {key: row[key] for key in row.keys()}
 
+    @memory_mutation
     def store_summary(
         self, path: str, *, sha256: str, summary: str, sampled: bool, origin: str
     ) -> dict[str, Any]:
@@ -1327,6 +1354,30 @@ class FileKnowledgeIndex:
         if not text:
             raise FileKnowledgeError("summary is empty")
         with self._connect() as connection:
+            # Serialize publication with ownership transfers. An already-running
+            # generator must not recreate a shared summary after its source moved.
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                f"SELECT * FROM {self.table_name} WHERE relative_path = ?", (relative,)
+            ).fetchone()
+            if row is None or row["sha256"] != sha256:
+                raise StaleFileError("summary source changed or moved")
+            _relative, source = self._safe_path(relative)
+            digest = hashlib.sha256()
+            try:
+                before = source.stat()
+                with source.open("rb") as stream:
+                    while block := stream.read(_COPY_CHUNK):
+                        digest.update(block)
+                after = source.stat()
+            except OSError as exc:
+                raise StaleFileError("summary source changed or moved") from exc
+            if (
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or digest.hexdigest() != sha256
+            ):
+                raise StaleFileError("summary source changed or moved")
             connection.execute(
                 """
                 INSERT INTO knowledge_summaries
@@ -1341,6 +1392,7 @@ class FileKnowledgeIndex:
             )
         return self.summary(relative) or {}
 
+    @memory_mutation
     def delete_summary(self, path: str) -> bool:
         relative = self._validate_relative_path(path)
         with self._connect() as connection:
@@ -1380,6 +1432,8 @@ __all__ = [
     "MAX_READ_LINES",
     "MAX_SEARCH_RESULTS",
     "MIN_FREE_BYTES",
+    "MEMORY_MUTATION_LOCK",
+    "memory_mutation",
     "copy_validated_text",
     "ensure_free_space",
     "extract_text_archive",

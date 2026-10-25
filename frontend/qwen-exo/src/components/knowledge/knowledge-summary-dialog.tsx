@@ -13,12 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  deleteKnowledgeSummary,
-  generateKnowledgeSummaries,
-  getKnowledgeSummary,
-  saveKnowledgeSummary,
-} from "@/lib/api";
+import { useKnowledgeApi } from "./knowledge-scope";
 import { translate as t } from "@/lib/i18n";
 import type { KnowledgeSummaryRecord } from "@/lib/types";
 import { formatTime } from "@/lib/utils";
@@ -38,6 +33,8 @@ export function KnowledgeSummaryDialog({
   onClose: () => void;
   onChanged: () => void;
 }) {
+  const { deleteKnowledgeSummary, generateKnowledgeSummaries, getKnowledgeSummary,
+    saveKnowledgeSummary, memoryKeyId, signal } = useKnowledgeApi();
   const [record, setRecord] = useState<KnowledgeSummaryRecord | null>(null);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(false);
@@ -47,9 +44,11 @@ export function KnowledgeSummaryDialog({
     setLoading(true);
     try {
       const next = await getKnowledgeSummary(target);
+      if (signal.aborted) return;
       setRecord(next);
       setDraft(next?.summary ?? "");
     } catch (error) {
+      if (signal.aborted) return;
       toast.error(t("总结读取失败"), { description: errorText(error, t("未知错误")) });
     } finally {
       setLoading(false);
@@ -74,25 +73,29 @@ export function KnowledgeSummaryDialog({
   }, [running]);
 
   const act = async (kind: Exclude<Busy, null>) => {
-    if (!path || busy) return;
+    if (!path || busy || signal.aborted || (memoryKeyId && kind === "generate")) return;
     setBusy(kind);
     try {
       if (kind === "save") {
         const saved = await saveKnowledgeSummary(path, draft);
+        if (signal.aborted) return;
         setRecord(saved);
         setDraft(saved.summary);
         toast.success(t("总结已保存"));
       } else if (kind === "generate") {
         await generateKnowledgeSummaries([path], true);
+        if (signal.aborted) return;
         toast.success(t("已加入总结队列"));
       } else {
         await deleteKnowledgeSummary(path);
+        if (signal.aborted) return;
         setRecord(null);
         setDraft("");
         toast.success(t("总结已删除"));
       }
       onChanged();
     } catch (error) {
+      if (signal.aborted) return;
       toast.error(
         kind === "save"
           ? t("保存失败")
@@ -127,7 +130,7 @@ export function KnowledgeSummaryDialog({
                   </span>
                 </>
               ) : loading ? null : (
-                <span>{t("这个文件还没有总结；可以手动填写，或让模型生成。")}</span>
+                <span>{memoryKeyId ? t("这个文件还没有总结；可以手动填写。") : t("这个文件还没有总结；可以手动填写，或让模型生成。")}</span>
               )}
               {view && (view.state === "running" || view.state === "queued") ? (
                 <Badge variant={view.variant}>
@@ -172,7 +175,7 @@ export function KnowledgeSummaryDialog({
             {t("删除总结")}
           </Button>
           <div className="flex flex-col-reverse gap-2 sm:flex-row">
-            <Button
+            {!memoryKeyId ? <Button
               variant="outline"
               disabled={Boolean(busy) || running}
               onClick={() => void act("generate")}
@@ -185,7 +188,7 @@ export function KnowledgeSummaryDialog({
                 <Sparkles />
               )}
               {record ? t("重新生成") : t("生成总结")}
-            </Button>
+            </Button> : null}
             <Button
               disabled={!draft.trim() || !dirty || Boolean(busy) || loading}
               onClick={() => void act("save")}

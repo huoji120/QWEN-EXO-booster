@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import {
   FileText,
   FolderInput,
@@ -31,6 +32,14 @@ import { translate as t } from "@/lib/i18n";
 import type { KnowledgeFile } from "@/lib/types";
 import { formatBytes, formatNumber, formatTime, shortHash } from "@/lib/utils";
 import { kindLabel, relativeTo, type SummaryView } from "./knowledge-utils";
+import { useMemoryDrag } from "./knowledge-drag";
+import { useKnowledgeApi } from "./knowledge-scope";
+
+function MemoryFileRow({ path, selected, children }: { path: string; selected: boolean; children: ReactNode }) {
+  const { memoryKeyId } = useKnowledgeApi();
+  const drag = useMemoryDrag({ keyId: memoryKeyId ?? null, path, kind: "file" });
+  return <TableRow {...drag} data-state={selected ? "selected" : undefined}>{children}</TableRow>;
+}
 
 export type FileAction =
   | "view"
@@ -63,6 +72,7 @@ export function SummaryBadge({ view }: { view: SummaryView }) {
 
 export function KnowledgeFileTable({
   files,
+  allowGenerate = true,
   folder,
   views,
   selected,
@@ -72,6 +82,7 @@ export function KnowledgeFileTable({
   onAction,
 }: {
   files: KnowledgeFile[];
+  allowGenerate?: boolean;
   folder: string;
   views: Map<string, SummaryView>;
   selected: Set<string>;
@@ -115,7 +126,7 @@ export function KnowledgeFileTable({
           const readable = file.encoding === "utf-8";
           const hasSummary = Boolean(file.summary);
           return (
-            <TableRow key={path} data-state={selected.has(path) ? "selected" : undefined}>
+            <MemoryFileRow key={path} path={path} selected={selected.has(path)}>
               <TableCell>
                 <input
                   type="checkbox"
@@ -126,7 +137,7 @@ export function KnowledgeFileTable({
                 />
               </TableCell>
               <TableCell
-                className="break-all font-mono text-xs"
+                className="max-w-[22rem] truncate whitespace-nowrap font-mono text-xs"
                 title={`${path}\nSHA-256 ${shortHash(file.sha256, 16)}\n${t("索引时间")} ${formatTime(file.indexed_ns / 1_000_000_000)}`}
               >
                 {relativeTo(path, folder)}
@@ -168,10 +179,10 @@ export function KnowledgeFileTable({
                     variant="ghost"
                     size="sm"
                     disabled={!readable}
-                    onClick={() => onAction(hasSummary ? "summary" : "generate", file)}
+                    onClick={() => onAction(hasSummary || !allowGenerate ? "summary" : "generate", file)}
                   >
-                    {hasSummary ? <ScrollText /> : <Sparkles />}
-                    {hasSummary ? t("查看总结") : t("生成总结")}
+                    {hasSummary || !allowGenerate ? <ScrollText /> : <Sparkles />}
+                    {hasSummary ? t("查看总结") : allowGenerate ? t("生成总结") : t("编辑总结")}
                   </Button>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -207,7 +218,7 @@ export function KnowledgeFileTable({
                   </DropdownMenu>
                 </div>
               </TableCell>
-            </TableRow>
+            </MemoryFileRow>
           );
         })}
       </TableBody>

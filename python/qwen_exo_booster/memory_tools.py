@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from typing import Any, Mapping
 
@@ -493,12 +494,44 @@ def _format_read_bytes(result: Mapping[str, Any]) -> str:
     return f"{result['text']}\n{footer}"
 
 
+class MemoryWriteWindow:
+    """One authenticated owner's write budget, shared across mode executors."""
+
+    def __init__(self):
+        self.timestamps: list[float] = []
+        self.lock = threading.Lock()
+
+
 class MemoryToolExecutor:
     """Run memory tool calls against a knowledge index; never raises."""
 
-    def __init__(self, index: FileKnowledgeIndex):
+    def __init__(self, index: FileKnowledgeIndex, *, shared_index: FileKnowledgeIndex | None = None,
+                 key_id: str | None = None, memory_scope: str = "shared",
+                 write_window: MemoryWriteWindow | None = None):
         self.index = index
-        self._writes: list[float] = []
+        self.memory_scope = memory_scope
+        self.private = memory_scope != "shared"
+        if not self.private:
+            if shared_index is not None:
+                raise FileKnowledgeError("shared mode cannot bind a private index")
+            self.read_index = index
+        else:
+            from qwen_exo_booster.scoped_memory import ScopedMemoryReadView
+
+            if shared_index is None or key_id is None:
+                raise FileKnowledgeError("private memory requires an authenticated owner and shared index")
+            self.read_index = ScopedMemoryReadView(
+                shared_index, index, key_id=key_id, memory_scope=memory_scope,
+            )
+        self._write_window = write_window if write_window is not None else MemoryWriteWindow()
+
+    def _output_path(self, path: str) -> str:
+        return "private/" + path if self.private else path
+
+    def _check_shared_path(self, path: str) -> None:
+        raw = path.strip().replace("\\", "/").strip("/")
+        if not self.private and raw.split("/", 1)[0] in {"private", "private-keys"}:
+            raise FileKnowledgeError("private memory is not available in shared mode")
 
     def _search(self, arguments: Mapping[str, Any]) -> str:
         pattern = arguments.get("pattern")
@@ -507,10 +540,12 @@ class MemoryToolExecutor:
         path = arguments.get("path") or None
         if path is not None and not isinstance(path, str):
             raise FileKnowledgeError("path must be a string")
+        if path is not None:
+            self._check_shared_path(path)
         exclude = arguments.get("exclude") or ""
         if not isinstance(exclude, str):
             raise FileKnowledgeError("exclude must be a string")
-        result = self.index.grep(
+        result = self.read_index.grep(
             pattern,
             path=path,
             context=_int_argument(arguments, "context", 2),
@@ -527,17 +562,18 @@ class MemoryToolExecutor:
         path = arguments.get("path")
         if not isinstance(path, str):
             raise FileKnowledgeError("path must be a string")
-        path = path.strip().lstrip("/")
+        self._check_shared_path(path)
+        path = path.strip() if self.private else path.strip().lstrip("/")
         if arguments.get("byte_offset") not in (None, ""):
             return _format_read_bytes(
-                self.index.read_bytes(
+                self.read_index.read_bytes(
                     path,
                     byte_offset=_int_argument(arguments, "byte_offset", 0),
                     max_bytes=_int_argument(arguments, "max_bytes", 8192),
                 )
             )
         return _format_read(
-            self.index.read_lines(
+            self.read_index.read_lines(
                 path,
                 offset=_int_argument(arguments, "offset", 1),
                 limit=_int_argument(arguments, "limit", 200),
@@ -546,8 +582,9 @@ class MemoryToolExecutor:
 
     def _write(self, arguments: Mapping[str, Any]) -> str:
         now = time.monotonic()
-        self._writes = [stamp for stamp in self._writes if now - stamp < WRITE_WINDOW_SECONDS]
-        if len(self._writes) >= MAX_WRITES_PER_WINDOW:
+        stamps = self._write_window.timestamps
+        stamps[:] = [stamp for stamp in stamps if now - stamp < WRITE_WINDOW_SECONDS]
+        if len(stamps) >= MAX_WRITES_PER_WINDOW:
             raise FileKnowledgeError("too many memory writes recently; finish the task first")
         mode = str(arguments.get("mode") or "create")
         if mode not in _WRITE_MODES:
@@ -558,11 +595,22 @@ class MemoryToolExecutor:
         for key in required:
             if not isinstance(arguments.get(key), str):
                 raise FileKnowledgeError(f"{key} must be a string for mode={mode}")
+        path = arguments["path"]
+        self._check_shared_path(path)
+        path = self.index._validate_relative_path(path)
+        if self.private and path.startswith("private/"):
+            path = path[len("private/"):]
+        self.index._validate_relative_path(path)
+        # Reject the virtual other-owner namespace even if hidden beneath the
+        # optional own/work-memory prefixes; never reinterpret it as a note.
+        if path.split("/", 1)[0] == "private" or "private-keys" in path.split("/"):
+            raise FileKnowledgeError("writes may target only your own work-memory notes")
+        arguments = {**arguments, "path": path}
         if mode in {"create", "append"}:
             text = self._save_note(arguments, mode)
         else:
             text = self._change_note(arguments, mode)
-        self._writes.append(now)
+        stamps.append(now)
         return text
 
     def _save_note(self, arguments: Mapping[str, Any], mode: str) -> str:
@@ -577,7 +625,7 @@ class MemoryToolExecutor:
         )
         verb = "Appended to" if result["mode"] == "append" else "Saved"
         return (
-            f"{verb} {result['path']} ({result['bytes']} bytes). It is searchable "
+            f"{verb} {self._output_path(result['path'])} ({result['bytes']} bytes). It is searchable "
             "from now on; future sessions will find it with qwen_exo_memory_search."
         )
 
@@ -594,9 +642,13 @@ class MemoryToolExecutor:
         relative = existing_note(self.index, arguments["path"])
         trash = WorkMemoryTrash(self.index)
         batch = f"model-{time.time_ns()}"
+        if self.private:
+            from qwen_exo_booster.scoped_memory import ensure_no_links
+
+            ensure_no_links(trash.root / batch / relative)
         if mode == "delete":
             trash.discard(relative, batch=batch)
-            return f"Deleted {relative}; it is in the work-memory trash and the user can restore it."
+            return f"Deleted {self._output_path(relative)}; it is in the work-memory trash and the user can restore it."
         previous = self.index.path_of(relative).read_bytes()
         if mode == "edit":
             result = edit_note(
@@ -617,7 +669,7 @@ class MemoryToolExecutor:
         trash.keep_copy(relative, batch=batch, data=previous)
         verb = "Edited" if mode == "edit" else "Rewrote"
         return (
-            f"{verb} {result['path']} ({result['bytes']} bytes); the previous version "
+            f"{verb} {self._output_path(result['path'])} ({result['bytes']} bytes); the previous version "
             "is in the work-memory trash."
         )
 
@@ -650,7 +702,8 @@ class MemoryToolExecutor:
             if name == MEMORY_READ_TOOL:
                 return True, _clip_output(self._read(arguments))
             if name == MEMORY_WRITE_TOOL:
-                return True, self._write(arguments)
+                with self._write_window.lock:
+                    return True, self._write(arguments)
             raise FileKnowledgeError(f"unknown memory tool {name!r}")
         except json.JSONDecodeError:
             return False, "Error: arguments are not valid JSON."
@@ -684,4 +737,5 @@ __all__ = [
     "MEMORY_TOOL_SCHEMAS",
     "MEMORY_WRITE_TOOL",
     "MemoryToolExecutor",
+    "MemoryWriteWindow",
 ]

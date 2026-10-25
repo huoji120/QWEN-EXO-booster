@@ -554,10 +554,21 @@ class FullResponseUsageTestCase(unittest.TestCase):
             )
         )
 
-        self.assertEqual(response.usage.prompt_tokens, 11)
-        self.assertEqual(response.usage.completion_tokens, 7)
-        self.assertEqual(response.usage.reasoning_tokens, 2)
-        self.assertEqual(metadata.final_usage_info, response.usage)
+        from openai.types.responses import Response
+
+        parsed = Response.model_validate_json(response.model_dump_json())
+        self.assertEqual(parsed.usage.model_dump(), {
+            "input_tokens": 11,
+            "input_tokens_details": {"cached_tokens": 3},
+            "output_tokens": 7,
+            "output_tokens_details": {"reasoning_tokens": 2},
+            "total_tokens": 18,
+        })
+        self.assertEqual(metadata.final_usage_info.prompt_tokens, 11)
+        self.assertEqual(metadata.final_usage_info.completion_tokens, 7)
+        self.assertEqual(metadata.final_usage_info.prompt_tokens_details.cached_tokens, 3)
+        self.assertEqual(metadata.final_usage_info.reasoning_tokens, 2)
+        self.assertEqual(metadata.final_usage_info.total_tokens, 18)
 
     def test_length_finish_returns_incomplete_response(self):
         serving = make_serving()
@@ -815,7 +826,9 @@ class HarmonyResponsesTestCase(unittest.TestCase):
 
     def test_cancelled_previous_response_is_not_replayable(self):
         serving = make_serving()
-        serving.response_store["resp_cancelled"] = Mock(status="cancelled")
+        serving.response_store["resp_cancelled"] = Mock(
+            status="cancelled", _qwen_exo_memory_key_id=None, _qwen_exo_memory_scope="shared"
+        )
         request = ResponsesRequest(
             model="x",
             input="continue",
@@ -1524,7 +1537,7 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
             memory_block_for_turn=_no_memory_block,
             has_restored_capsule=lambda _request_id: False,
             initial_gdn_selection=lambda **_kwargs: None,
-            activation_editor_request=lambda _spec: {"spec": None, "cache_identity": "off"},
+            activation_editor_request=lambda _spec, **_kwargs: {"spec": None, "cache_identity": "off"},
             track_generation=lambda _request_id, generator: generator,
             register_generation_prompt=lambda *_args, **_kwargs: None,
             observe_generation_result=lambda *_args, **_kwargs: None,
@@ -1643,7 +1656,7 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
         self.assertEqual(
             getattr(response, "status", None), "completed", getattr(response, "body", b"")
         )
-        self.assertEqual(response.usage.prompt_tokens, 3)
+        self.assertEqual(response.usage.input_tokens, 3)
         self.assertEqual(list(tokenized[request.request_id].input_ids), [1, 2, 4])
 
         encoding = _ResponsePromptEncoding(tokenizer)
@@ -1671,7 +1684,7 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
         self.assertEqual(
             getattr(response, "status", None), "completed", getattr(response, "body", b"")
         )
-        self.assertEqual(response.usage.prompt_tokens, 3)
+        self.assertEqual(response.usage.input_tokens, 3)
         self.assertEqual(list(tokenized[request.request_id].input_ids), [1, 2, 4])
 
     def test_changed_tool_output_and_history_are_isolated_across_requests(self):
@@ -1709,7 +1722,7 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
                 self.assertEqual(
                     getattr(response, "status", None), "completed", getattr(response, "body", b"")
                 )
-                self.assertEqual(response.usage.prompt_tokens, 5)
+                self.assertEqual(response.usage.input_tokens, 5)
                 self.assertEqual(
                     list(tokenized[response.id].input_ids), tokenizer.encode(expected)
                 )
@@ -1733,7 +1746,7 @@ class ResponsePromptEncodingRegressionTestCase(CustomTestCase):
                     self.assertEqual(
                         getattr(response, "status", None), "completed", getattr(response, "body", b"")
                     )
-                    self.assertEqual(response.usage.prompt_tokens, 5)
+                    self.assertEqual(response.usage.input_tokens, 5)
                     self.assertEqual(list(tokenized[request.request_id].input_ids), [1, 2, 9, 10, 10])
                 else:
                     self.assertEqual(response.status_code, 400)

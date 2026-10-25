@@ -72,10 +72,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
         sampling_params = adapted_request.sampling_params
         if not isinstance(sampling_params, dict):
             return adapted_request
+        principal = getattr(raw_request.state, "qwen_exo_api_key", None)
+        memory_scope = principal["memory_scope"] if principal else "shared"
+        memory_key_id = principal["id"] if principal and memory_scope != "shared" else None
         custom_params, extra_key = bind_initial_gdn_request(
             runtime,
             custom_params=dict(sampling_params.get("custom_params") or {}),
             extra_key=adapted_request.extra_key,
+            memory_key_id=memory_key_id,
+            memory_scope=memory_scope,
         )
         custom_params["qwen_exo_kind"] = "user"
         sampling_params["custom_params"] = custom_params

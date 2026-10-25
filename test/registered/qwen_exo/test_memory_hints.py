@@ -75,6 +75,38 @@ def test_refresh_drops_removed_and_reindexes_changed_files(tmp_path):
     assert set(index.indexed_files()) == {"ops/nginx.md", "notes/frontend.md", "noise/blob.json"}
 
 
+def test_transfer_invalidation_fences_captured_summary_refresh(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    index = MemoryHintIndex(tmp_path / "kb", tmp_path / "state" / "hints.sqlite3")
+    background = _rows(tmp_path / "kb", {"background.md": "Unrelated gardening flowers and soil."})
+    rows = [{"relative_path": "secret.md.summary.md", "sha256": "old",
+             "text": "Private transport client evidence must not remain shared."}, *background]
+    index.refresh(rows)
+    assert index.lookup("private transport client evidence")
+    generation = index.generation
+    captured, resume = Event(), Event()
+
+    def stale_refresh():
+        captured.set()
+        assert resume.wait(5)
+        return index.refresh(rows, generation=generation)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(stale_refresh)
+        try:
+            assert captured.wait(5)
+            index.invalidate()
+        finally:
+            resume.set()
+        assert future.result()["indexed"] == 0
+    assert index.indexed_files() == {}
+    assert index.lookup("private transport client evidence") == []
+    index.refresh([], generation=index.generation)
+    assert index.indexed_files() == {}
+
+
 def test_lookup_skips_term_rows_whose_chunk_vanished(tmp_path):
     """Prod: a refresh committed between the FTS match and the chunk fetch, the
     fetch returned None and the memory block lookup raised TypeError."""

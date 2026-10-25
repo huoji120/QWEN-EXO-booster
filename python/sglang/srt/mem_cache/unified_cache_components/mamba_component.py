@@ -63,17 +63,23 @@ class MambaComponent(TreeComponent):
         node: UnifiedTreeNode,
         root_node: UnifiedTreeNode,
     ) -> None:
-        # A match consumes only best_match_node's mamba state (cf. inc_lock_ref,
-        # which locks just this node's mamba value), unlike Full whose whole matched
-        # path is reused as prefix. Refreshing ancestors would keep a whole session's
-        # states adjacent in the mamba LRU and evict cold sessions wholesale, so touch
-        # only the used state. New leaf states enter the LRU via
-        # commit_insert_component_data, so the insert walk (WALKDOWN) is a no-op here.
+        # Keep ordinary intermediate states cold. A previously materialized branch
+        # anchor is useful when a temporary suffix changes again, so refresh at
+        # most the nearest live anchor as well as the consumed endpoint. Neither
+        # is pinned; unrelated requests can still reclaim both under pressure.
         ct = self.component_type
         match phase:
             case LRURefreshPhase.WALKDOWN:
                 return
             case LRURefreshPhase.MATCH_END:
+                ancestor = node.parent
+                while ancestor is not None and ancestor is not root_node:
+                    if (
+                        ancestor.mamba_branch_checkpoint or len(ancestor.children) > 1
+                    ) and ancestor.component_data[ct].value is not None:
+                        self.cache.lru_lists[ct].reset_node_mru(ancestor)
+                        break
+                    ancestor = ancestor.parent
                 if node.component_data[ct].value is not None:
                     self.cache.lru_lists[ct].reset_node_mru(node)
             case LRURefreshPhase.INSERT_END:
@@ -156,6 +162,7 @@ class MambaComponent(TreeComponent):
     ) -> None:
         assert params.mamba_value is not None
         if is_new_leaf:
+            node.prefill_checkpoint_rid = None
             node.component_data[self.component_type].value = params.mamba_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(
@@ -163,6 +170,7 @@ class MambaComponent(TreeComponent):
             )
             return
         if node.component_data[self.component_type].value is None:
+            node.prefill_checkpoint_rid = None
             node.component_data[self.component_type].value = params.mamba_value
             # move from host LRU to device LRU
             host_lru = self.cache.host_lru_lists[self.component_type]
@@ -203,6 +211,8 @@ class MambaComponent(TreeComponent):
             freed = len(cd.value)
             self.cache.component_evictable_size_[self.component_type] -= freed
             cd.value = None
+            node.prefill_checkpoint_rid = None
+            node.mamba_branch_checkpoint = False
 
         # Host layer
         host_lru = self.cache.host_lru_lists[self.component_type]

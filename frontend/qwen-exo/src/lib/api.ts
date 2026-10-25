@@ -3,6 +3,7 @@ import type {
   ApiKeyDeletion,
   ApiKeyListing,
   ApiKeyInfo,
+  ApiKeyMemoryScope,
   CreatedApiKey,
   EditorInfo,
   EditorTrainingStatus,
@@ -15,12 +16,15 @@ import type {
   KnowledgeFile,
   KnowledgeFilePage,
   KnowledgeFileQuery,
+  KnowledgeMemorySpace,
   KnowledgeMoveResult,
   KnowledgeReadResponse,
   KnowledgeSearchResponse,
   KnowledgeSummaryRecord,
   KnowledgeSummaryStatus,
   KnowledgeTree,
+  KnowledgeTransferRequest,
+  KnowledgeTransferResult,
   RequestTraceListing,
   MemoryToolCall,
   PendingReflectionMemory,
@@ -416,7 +420,57 @@ export async function getMemoryToolCalls(
   ).json()) as { calls: MemoryToolCall[] };
 }
 
-export async function listKnowledgeFiles(
+export interface KnowledgeApi {
+  memoryKeyId?: string;
+  signal: AbortSignal;
+  listKnowledgeFiles(query: KnowledgeFileQuery, signal?: AbortSignal): Promise<KnowledgeFilePage>;
+  uploadKnowledgeFile(path: string, contentBase64: string): Promise<{ file: KnowledgeFile }>;
+  uploadKnowledgeFileRaw(path: string, file: Blob): Promise<{ file: KnowledgeFile }>;
+  uploadKnowledgeArchiveRaw(file: Blob, targetDirectory: string): Promise<{ files: KnowledgeFile[]; skipped: { path: string; reason: string }[] }>;
+  deleteKnowledgeFile(path: string): Promise<void>;
+  getKnowledgeTree(signal?: AbortSignal): Promise<KnowledgeTree>;
+  createKnowledgeFolder(path: string): Promise<{ path: string }>;
+  deleteKnowledgeFolder(path: string): Promise<{ deleted: boolean; path?: string; files: number }>;
+  moveKnowledgeEntry(source: string, destination: string): Promise<KnowledgeMoveResult>;
+  getSummaryStatus(signal?: AbortSignal): Promise<KnowledgeSummaryStatus>;
+  getKnowledgeSummary(path: string): Promise<KnowledgeSummaryRecord | null>;
+  saveKnowledgeSummary(path: string, summary: string): Promise<KnowledgeSummaryRecord>;
+  deleteKnowledgeSummary(path: string): Promise<{ deleted: boolean }>;
+  generateKnowledgeSummaries(paths: string[], force?: boolean): Promise<KnowledgeSummaryStatus>;
+  searchKnowledge(options: { pattern: string; pathGlob?: string; caseSensitive?: boolean; regex?: boolean; maxResults?: number; context?: number }): Promise<KnowledgeSearchResponse>;
+  getWorkTrash(signal?: AbortSignal): Promise<{ entries: WorkTrashEntry[] }>;
+  restoreWorkTrash(batch: string, path: string): Promise<{ restored: string }>;
+  readKnowledge(path: string, offset?: number, limit?: number): Promise<KnowledgeReadResponse>;
+}
+
+
+export async function getKnowledgeMemorySpaces(signal?: AbortSignal) {
+  return (await (await apiFetch("/knowledge/memory-spaces", { signal })).json()) as {
+    spaces: KnowledgeMemorySpace[];
+  };
+}
+
+/** Explicit admin ownership transfer, independent of the currently selected KEY. */
+export async function transferKnowledgeEntry(request: KnowledgeTransferRequest, signal: AbortSignal) {
+  return (await (await apiFetch("/knowledge/transfer", {
+    method: "POST", body: JSON.stringify(request), signal,
+  })).json()) as KnowledgeTransferResult;
+}
+
+function fetchScopedKnowledge(path: string, init: RequestInit, keyId: string | undefined, signal: AbortSignal) {
+  const query = keyId ? `${path.includes("?") ? "&" : "?"}memory_key_id=${encodeURIComponent(keyId)}` : "";
+  return apiFetch(path + query, {
+    ...init,
+    signal: init.signal ? AbortSignal.any([signal, init.signal]) : signal,
+  });
+}
+
+/** One immutable admin scope; never changes public request ownership. */
+export function createKnowledgeApi(memoryKeyId: string | undefined, signal: AbortSignal): KnowledgeApi {
+  const apiFetch = (path: string, init: RequestInit = {}) =>
+    fetchScopedKnowledge(path, init, memoryKeyId, signal);
+
+async function listKnowledgeFiles(
   query: KnowledgeFileQuery,
   signal?: AbortSignal,
 ) {
@@ -433,7 +487,7 @@ export async function listKnowledgeFiles(
   ).json()) as KnowledgeFilePage;
 }
 
-export async function uploadKnowledgeFile(
+async function uploadKnowledgeFile(
   relativePath: string,
   contentBase64: string,
 ) {
@@ -450,7 +504,7 @@ export async function uploadKnowledgeFile(
 
 /** Raw-byte upload of one text file (no base64, no client-side size limit;
  * the server answers 507 only when its disk would run low). */
-export async function uploadKnowledgeFileRaw(relativePath: string, file: Blob) {
+async function uploadKnowledgeFileRaw(relativePath: string, file: Blob) {
   return (await (
     await apiFetch(`/knowledge/upload?${new URLSearchParams({ path: relativePath })}`, {
       method: "POST",
@@ -461,7 +515,7 @@ export async function uploadKnowledgeFileRaw(relativePath: string, file: Blob) {
 }
 
 /** Raw-byte ZIP upload; the server stores each text member as its own file. */
-export async function uploadKnowledgeArchiveRaw(file: Blob, targetDirectory: string) {
+async function uploadKnowledgeArchiveRaw(file: Blob, targetDirectory: string) {
   const params = new URLSearchParams({ target_directory: targetDirectory });
   return (await (
     await apiFetch(`/knowledge/upload-archive?${params}`, {
@@ -475,19 +529,19 @@ export async function uploadKnowledgeArchiveRaw(file: Blob, targetDirectory: str
   };
 }
 
-export async function deleteKnowledgeFile(relativePath: string) {
+async function deleteKnowledgeFile(relativePath: string) {
   await apiFetch(`/knowledge/files/${encodeSourcePath(relativePath)}`, {
     method: "DELETE",
   });
 }
 
-export async function getKnowledgeTree(signal?: AbortSignal) {
+async function getKnowledgeTree(signal?: AbortSignal) {
   return (await (
     await apiFetch("/knowledge/tree", { signal })
   ).json()) as KnowledgeTree;
 }
 
-export async function createKnowledgeFolder(path: string) {
+async function createKnowledgeFolder(path: string) {
   return (await (
     await apiFetch("/knowledge/folders", {
       method: "POST",
@@ -497,7 +551,7 @@ export async function createKnowledgeFolder(path: string) {
 }
 
 /** Removes a folder and everything inside it. */
-export async function deleteKnowledgeFolder(path: string) {
+async function deleteKnowledgeFolder(path: string) {
   return (await (
     await apiFetch(`/knowledge/folders/${encodeSourcePath(path)}`, {
       method: "DELETE",
@@ -506,7 +560,7 @@ export async function deleteKnowledgeFolder(path: string) {
 }
 
 /** Renames or moves a file or folder; summaries follow it. */
-export async function moveKnowledgeEntry(source: string, destination: string) {
+async function moveKnowledgeEntry(source: string, destination: string) {
   return (await (
     await apiFetch("/knowledge/move", {
       method: "POST",
@@ -515,14 +569,14 @@ export async function moveKnowledgeEntry(source: string, destination: string) {
   ).json()) as KnowledgeMoveResult;
 }
 
-export async function getSummaryStatus(signal?: AbortSignal) {
+async function getSummaryStatus(signal?: AbortSignal) {
   return (await (
     await apiFetch("/knowledge/summaries", { signal })
   ).json()) as KnowledgeSummaryStatus;
 }
 
 /** Returns ``null`` when the file has no summary yet. */
-export async function getKnowledgeSummary(path: string) {
+async function getKnowledgeSummary(path: string) {
   try {
     return (await (
       await apiFetch(`/knowledge/summary?${new URLSearchParams({ path })}`)
@@ -534,7 +588,7 @@ export async function getKnowledgeSummary(path: string) {
 }
 
 /** Stores a hand-edited summary (origin manual; never auto-overwritten). */
-export async function saveKnowledgeSummary(path: string, summary: string) {
+async function saveKnowledgeSummary(path: string, summary: string) {
   return (await (
     await apiFetch("/knowledge/summary", {
       method: "PUT",
@@ -543,7 +597,7 @@ export async function saveKnowledgeSummary(path: string, summary: string) {
   ).json()) as KnowledgeSummaryRecord;
 }
 
-export async function deleteKnowledgeSummary(path: string) {
+async function deleteKnowledgeSummary(path: string) {
   return (await (
     await apiFetch(`/knowledge/summary?${new URLSearchParams({ path })}`, {
       method: "DELETE",
@@ -552,7 +606,7 @@ export async function deleteKnowledgeSummary(path: string) {
 }
 
 /** Queues summaries for ``paths`` (empty = every file still missing one). */
-export async function generateKnowledgeSummaries(paths: string[], force = false) {
+async function generateKnowledgeSummaries(paths: string[], force = false) {
   return (await (
     await apiFetch("/knowledge/summaries/generate", {
       method: "POST",
@@ -561,7 +615,7 @@ export async function generateKnowledgeSummaries(paths: string[], force = false)
   ).json()) as KnowledgeSummaryStatus;
 }
 
-export async function searchKnowledge(options: {
+async function searchKnowledge(options: {
   pattern: string;
   pathGlob?: string;
   caseSensitive?: boolean;
@@ -583,33 +637,15 @@ export async function searchKnowledge(options: {
   ).json()) as KnowledgeSearchResponse;
 }
 
-export async function getDreamStatus(signal?: AbortSignal) {
-  return (await (
-    await apiFetch("/memory/dream", { signal })
-  ).json()) as DreamStatus;
-}
 
-/** Start a manual dream run; 409 when one is running or dream is off. */
-export async function runDream() {
-  return (await (
-    await apiFetch("/memory/dream/run", { method: "POST" })
-  ).json()) as DreamStatus;
-}
-
-export async function getDreamRun(id: number, signal?: AbortSignal) {
-  return (await (
-    await apiFetch(`/memory/dream/runs/${encodeURIComponent(String(id))}`, { signal })
-  ).json()) as DreamRunDetail;
-}
-
-export async function getWorkTrash(signal?: AbortSignal) {
+async function getWorkTrash(signal?: AbortSignal) {
   return (await (
     await apiFetch("/memory/work-trash", { signal })
   ).json()) as { entries: WorkTrashEntry[] };
 }
 
 /** Restore one deleted work note; 400 when the original path exists again. */
-export async function restoreWorkTrash(batch: string, path: string) {
+async function restoreWorkTrash(batch: string, path: string) {
   return (await (
     await apiFetch("/memory/work-trash/restore", {
       method: "POST",
@@ -618,7 +654,7 @@ export async function restoreWorkTrash(batch: string, path: string) {
   ).json()) as { restored: string };
 }
 
-export async function readKnowledge(path: string, offset = 0, limit = 262_144) {
+async function readKnowledge(path: string, offset = 0, limit = 262_144) {
   const params = new URLSearchParams({
     path,
     offset: String(offset),
@@ -629,6 +665,36 @@ export async function readKnowledge(path: string, offset = 0, limit = 262_144) {
   ).json()) as KnowledgeReadResponse;
 }
 
+  return {
+    memoryKeyId, signal,
+    listKnowledgeFiles, uploadKnowledgeFile, uploadKnowledgeFileRaw,
+    uploadKnowledgeArchiveRaw, deleteKnowledgeFile, getKnowledgeTree,
+    createKnowledgeFolder, deleteKnowledgeFolder, moveKnowledgeEntry,
+    getSummaryStatus, getKnowledgeSummary, saveKnowledgeSummary,
+    deleteKnowledgeSummary, generateKnowledgeSummaries, searchKnowledge,
+    getWorkTrash, restoreWorkTrash, readKnowledge,
+  };
+}
+
+
+export async function getDreamStatus(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/memory/dream", { signal })
+  ).json()) as DreamStatus;
+}
+
+/** Start a manual dream run; 409 when one is running or dream is off. */
+export async function runDream(signal?: AbortSignal) {
+  return (await (
+    await apiFetch("/memory/dream/run", { method: "POST", signal })
+  ).json()) as DreamStatus;
+}
+
+export async function getDreamRun(id: number, signal?: AbortSignal) {
+  return (await (
+    await apiFetch(`/memory/dream/runs/${encodeURIComponent(String(id))}`, { signal })
+  ).json()) as DreamRunDetail;
+}
 export async function listEditors() {
   return (await (await apiFetch("/editors")).json()) as {
     editors: EditorInfo[];
@@ -764,13 +830,28 @@ export async function getApiKeys() {
   return (await (await apiFetch("/api-keys")).json()) as ApiKeyListing;
 }
 
-export async function createApiKey(label: string) {
+export async function createApiKey(
+  label: string,
+  memoryScope: ApiKeyMemoryScope = "shared",
+) {
   return (await (
     await apiFetch("/api-keys", {
       method: "POST",
-      body: JSON.stringify({ label }),
+      body: JSON.stringify({ label, memory_scope: memoryScope }),
     })
   ).json()) as CreatedApiKey;
+}
+
+export async function updateApiKeyMemoryScope(
+  keyId: string,
+  memoryScope: ApiKeyMemoryScope,
+) {
+  return (await (
+    await apiFetch(`/api-keys/${encodeURIComponent(keyId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ memory_scope: memoryScope }),
+    })
+  ).json()) as ApiKeyInfo & { revision: string };
 }
 
 export async function revokeApiKey(keyId: string) {

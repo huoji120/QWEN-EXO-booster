@@ -882,6 +882,52 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_text, is_cross_encoder_request
                 )
 
+        option_score_tail = None
+        option_score_prompt_limit = None
+        custom_params = obj.sampling_params.get("custom_params") or {}
+        if (
+            "qwen_exo_option_score_tail_tokens" in custom_params
+            or "qwen_exo_option_score_max_prompt_tokens" in custom_params
+        ):
+            option_score_prompt_limit = custom_params.get(
+                "qwen_exo_option_score_max_prompt_tokens"
+            )
+            tail_tokens = custom_params.get("qwen_exo_option_score_tail_tokens")
+            if (
+                not isinstance(obj, GenerateReqInput)
+                or custom_params.get("qwen_exo_kind") != "internal"
+                or custom_params.get("qwen_exo_job_type") != "system_one"
+                or custom_params.get("qwen_exo_dflash") != "target_only"
+                or type(tail_tokens) is not int
+                or tail_tokens != 2
+                or type(obj.sampling_params.get("max_new_tokens")) is not int
+                or obj.sampling_params["max_new_tokens"] != 0
+                or not obj.return_logprob
+                or not obj.token_ids_logprob
+                or input_text is not None
+                or input_embeds is not None
+                or input_ids is None
+                or len(input_ids) < 2
+                or input_ids[-1] != 0
+                or obj.logprob_start_len != len(input_ids) - 2
+                or not obj.image_data
+                or obj.video_data
+                or obj.audio_data
+                or (
+                    option_score_prompt_limit is not None
+                    and (
+                        type(option_score_prompt_limit) is not int
+                        or option_score_prompt_limit < 1
+                    )
+                )
+            ):
+                raise ValueError("Invalid internal multimodal option-score contract")
+            if self.mm_processor is None:
+                raise ValueError("Image option scoring requires a multimodal processor")
+            # Snapshot before the processor can expand or mutate input_ids.
+            option_score_tail = tuple(input_ids[-2:])
+            option_score_raw_length = len(input_ids)
+
         contains_mm_input = obj.contains_mm_input()
         is_mossvl = (
             "MossVLForConditionalGeneration"
@@ -990,6 +1036,54 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         item.set_pad_value()
         else:
             mm_inputs = None
+
+        if option_score_tail is not None:
+            if (
+                mm_inputs is None
+                or mm_inputs.input_ids is None
+                or not mm_inputs.mm_items
+                or len(mm_inputs.mm_items) != len(obj.image_data)
+                or any(
+                    not isinstance(item, MultimodalDataItem)
+                    or not item.is_image()
+                    or (
+                        item.feature is None
+                        and item.precomputed_embeddings is None
+                    )
+                    for item in mm_inputs.mm_items
+                )
+            ):
+                raise ValueError("Image option scoring produced missing visual inputs")
+            if (
+                len(input_ids) < option_score_raw_length
+                or tuple(input_ids[-2:]) != option_score_tail
+                or (
+                    mm_inputs.padded_input_ids is not None
+                    and (
+                        len(mm_inputs.padded_input_ids) != len(input_ids)
+                        or tuple(mm_inputs.padded_input_ids[-2:]) != option_score_tail
+                    )
+                )
+            ):
+                raise ValueError("Image option scoring changed the scoring suffix")
+            # Never let auto-truncation remove visual evidence or the sentinel.
+            if (
+                (
+                    option_score_prompt_limit is not None
+                    and len(input_ids) - 1 > option_score_prompt_limit
+                )
+                or len(input_ids) + self.num_reserved_tokens >= self.context_len
+                or (
+                    self.max_req_input_len is not None
+                    and len(input_ids) >= self.max_req_input_len
+                )
+            ):
+                from qwen_exo_booster.internal_jobs import InternalOptionScoreContextError
+
+                raise InternalOptionScoreContextError(
+                    "Image option scoring exceeds the expanded prompt limit"
+                )
+            obj.logprob_start_len = len(input_ids) - 2
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(

@@ -152,6 +152,7 @@ def add_api_key_middleware(
     api_key: Optional[str],
     admin_api_key: Optional[str],
     dynamic_authorizer=None,
+    dynamic_identity_resolver=None,
 ):
     """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
@@ -162,12 +163,14 @@ def add_api_key_middleware(
         """ASGI-native middleware to preserve client disconnect events."""
 
         def __init__(
-            self, app, *, api_key, admin_api_key, dynamic_authorizer, fastapi_app
+            self, app, *, api_key, admin_api_key, dynamic_authorizer,
+            dynamic_identity_resolver, fastapi_app
         ):
             self.app = app
             self.api_key = api_key
             self.admin_api_key = admin_api_key
             self.dynamic_authorizer = dynamic_authorizer
+            self.dynamic_identity_resolver = dynamic_identity_resolver
             self.fastapi_app = fastapi_app
 
         async def __call__(self, scope, receive, send):
@@ -178,6 +181,10 @@ def add_api_key_middleware(
             request = Request(scope, receive=receive)
             path = request.url.path
             authz = request.headers.get("Authorization")
+            if not authz and path in {"/v1/messages", "/v1/messages/count_tokens"}:
+                anthropic_key = request.headers.get("x-api-key")
+                if anthropic_key:
+                    authz = f"Bearer {anthropic_key}"
             dynamic_decision = (
                 self.dynamic_authorizer(request.method, path, authz)
                 if self.dynamic_authorizer is not None
@@ -195,6 +202,15 @@ def add_api_key_middleware(
                 )
             else:
                 decision = AuthDecision(allowed=bool(dynamic_decision))
+            # Resolve only authenticated managed identities, never request JSON
+            # or a client-supplied scope header. A revoke between checks fails closed.
+            principal = None
+            if decision.allowed and dynamic_decision is True and request.method != "OPTIONS":
+                if self.dynamic_identity_resolver is not None:
+                    principal = self.dynamic_identity_resolver(authz)
+                    if principal is None:
+                        decision = AuthDecision(allowed=False)
+            request.state.qwen_exo_api_key = principal
 
             if not decision.allowed:
                 response = ORJSONResponse(
@@ -217,5 +233,6 @@ def add_api_key_middleware(
         api_key=api_key,
         admin_api_key=admin_api_key,
         dynamic_authorizer=dynamic_authorizer,
+        dynamic_identity_resolver=dynamic_identity_resolver,
         fastapi_app=app,
     )

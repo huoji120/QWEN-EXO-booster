@@ -204,9 +204,7 @@ export function KnowledgePage() {
     <div className="page-frame">
       <PageHeader
         title={t("知识库")}
-        description={t(
-          "服务端知识库原文文件。模型在需要时通过服务端工具 qwen_exo_memory_search / qwen_exo_memory_read 搜索和读取；文件内容只作参考，从不执行。",
-        )}
+        description={t("管理共享与私有记忆，拖动文件或文件夹即可迁移。")}
       />
       <div className="mb-4 border-b pb-4">
         <Tabs value={lane} onValueChange={(value) => setLane(value as SourceView)}>

@@ -16,64 +16,36 @@ import { formatNumber } from "@/lib/utils";
 import { baseName, joinPath, normalizePath, parentOf } from "./knowledge-utils";
 
 export type EntryRequest = {
-  kind: "create" | "rename" | "move";
+  kind: "create" | "rename";
   /** Parent folder for ``create``; the entry itself otherwise. */
   path: string;
   isFolder: boolean;
 };
 
-function initialValue(request: EntryRequest) {
-  if (request.kind === "rename") return baseName(request.path);
-  if (request.kind === "move") return parentOf(request.path);
-  return "";
-}
 
-function destinationFor(request: EntryRequest, value: string) {
-  if (request.kind === "create") return joinPath(request.path, value);
-  if (request.kind === "rename") return joinPath(parentOf(request.path), value);
-  return joinPath(value, baseName(request.path));
-}
-
-/** New folder / rename / move dialog; ``onSubmit`` gets the final path. */
+/** New folder / rename dialog; ``onSubmit`` gets the final path. */
 export function KnowledgeEntryDialog({
   request,
-  folders,
   onClose,
   onSubmit,
 }: {
   request: EntryRequest | null;
-  folders: string[];
   onClose: () => void;
   onSubmit: (request: EntryRequest, destination: string) => Promise<void>;
 }) {
   const inputId = useId();
-  const listId = useId();
   // Callers remount via ``key`` per request, so the prefill is computed once.
-  const [value, setValue] = useState(() => (request ? initialValue(request) : ""));
+  const [value, setValue] = useState(() => request?.kind === "rename" ? baseName(request.path) : "");
   const [busy, setBusy] = useState(false);
 
   if (!request) return null;
 
-  const destination = destinationFor(request, value);
+  const destination = joinPath(request.kind === "create" ? request.path : parentOf(request.path), value);
   const unchanged = request.kind !== "create" && destination === request.path;
-  const invalid =
-    !destination ||
-    unchanged ||
-    (request.kind !== "move" && !normalizePath(value)) ||
-    (request.isFolder &&
-      request.kind === "move" &&
-      (destination === request.path || destination.startsWith(`${request.path}/`)));
+  const invalid = !destination || unchanged || !normalizePath(value);
 
-  const title =
-    request.kind === "create"
-      ? t("新建文件夹")
-      : request.kind === "rename"
-        ? request.isFolder
-          ? t("重命名文件夹")
-          : t("重命名文件")
-        : request.isFolder
-          ? t("移动文件夹")
-          : t("移动文件");
+  const title = request.kind === "create" ? t("新建文件夹")
+    : request.isFolder ? t("重命名文件夹") : t("重命名文件");
 
   const submit = async () => {
     if (invalid || busy) return;
@@ -98,9 +70,7 @@ export function KnowledgeEntryDialog({
               ? t("在 {folder} 下创建；可用 / 一次创建多级。", {
                   folder: request.path || t("导入的记忆"),
                 })
-              : request.kind === "rename"
-                ? t("只修改名称，位置不变；已有总结会随之保留。")
-                : t("选择或输入目标文件夹（留空为根目录）；不存在的文件夹会自动创建。")}
+              : t("只修改名称，位置不变；已有总结会随之保留。")}
           </DialogDescription>
         </DialogHeader>
         {request.kind !== "create" ? (
@@ -109,33 +79,16 @@ export function KnowledgeEntryDialog({
           </div>
         ) : null}
         <div className="space-y-2">
-          <Label htmlFor={inputId}>
-            {request.kind === "move" ? t("目标文件夹") : t("名称")}
-          </Label>
+          <Label htmlFor={inputId}>{t("名称")}</Label>
           <Input
             id={inputId}
             autoFocus
             value={value}
-            list={request.kind === "move" ? listId : undefined}
-            placeholder={request.kind === "move" ? t("留空表示根目录") : undefined}
             onChange={(event) => setValue(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") void submit();
             }}
           />
-          {request.kind === "move" ? (
-            <datalist id={listId}>
-              {folders
-                .filter(
-                  (folder) =>
-                    !request.isFolder ||
-                    (folder !== request.path && !folder.startsWith(`${request.path}/`)),
-                )
-                .map((folder) => (
-                  <option key={folder} value={folder} />
-                ))}
-            </datalist>
-          ) : null}
         </div>
         <p className="break-all text-xs text-muted-foreground">
           {t("新路径")}：<span className="font-mono">{destination || "—"}</span>

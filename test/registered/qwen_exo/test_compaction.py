@@ -10,6 +10,7 @@ from qwen_exo_booster.compaction import (
 from qwen_exo_booster.runtime import QwenExoRuntime
 
 try:
+    from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
     from sglang.srt.entrypoints.openai.serving_responses import (
         OpenAIServingResponses,
     )
@@ -242,7 +243,7 @@ class TestResponseCompaction(CustomTestCase):
                 summary="GOAL: preserve the task",
             )
             replay = serving._construct_input_messages(
-                SimpleNamespace(instructions=None, input="continue"), response
+                ResponsesRequest(model="model", instructions=None, input="continue"), response
             )
             return serving, response, replay
 
@@ -251,12 +252,14 @@ class TestResponseCompaction(CustomTestCase):
         assert response.status == "completed"
         assert serving.response_store[response.id] is response
         assert response.id in serving.msg_store
-        assert [message["role"] for message in replay] == [
-            "user",
-            "assistant",
-            "user",
+        assert {"role": "user", "content": "original task"} in replay
+        assistant_content = [message["content"] for message in replay if message["role"] == "assistant"]
+        assistant_text = [
+            content if isinstance(content, str) else "".join(part.get("text", "") for part in content)
+            for content in assistant_content
         ]
-        assert replay[1]["content"] == "GOAL: preserve the task"
+        assert assistant_text == ["GOAL: preserve the task"]
+        assert replay[-1] == {"role": "user", "content": "continue"}
 
     def test_runtime_rejects_empty_compaction_input(self):
         runtime = object.__new__(QwenExoRuntime)

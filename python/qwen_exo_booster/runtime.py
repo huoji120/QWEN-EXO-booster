@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import zlib
 from collections import Counter, OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -26,6 +29,7 @@ from qwen_exo_booster.activation_editor import (
     parse_activation_editor_spec,
     resolve_default_activation_editor_spec,
 )
+from qwen_exo_booster.api_keys import is_valid_api_key_id
 from qwen_exo_booster.capsule import (
     CapsuleRecord,
     CapsuleUpdateInput,
@@ -53,6 +57,9 @@ from qwen_exo_booster.document_ingest import (
 )
 from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
 from qwen_exo_booster.memory_hints import MemoryHintIndex, render_memory_block
+from qwen_exo_booster.scoped_memory import (
+    ScopedMemoryReadView, ensure_no_links, get_private_memory_index,
+)
 from qwen_exo_booster.memory_dream import MemoryDreamService
 from qwen_exo_booster.memory_summaries import MemorySummaryService
 from qwen_exo_booster.memory_tool_log import MemoryToolLog
@@ -188,6 +195,68 @@ class QwenExoCapacityConflict(RuntimeError):
     pass
 
 
+class MemoryScopeError(ValueError):
+    """A retained response belongs to a different authenticated memory scope."""
+
+
+def _memory_identity_from_conversation(conversation_key: str) -> tuple[str | None, str]:
+    value = str(conversation_key)
+    prefix = value.split(":", 1)[0]
+    if prefix not in ("memory-private", "memory-private_only", "memory-super"):
+        return None, "shared"
+    parts = value.split(":", 2)
+    if len(parts) != 3 or not is_valid_api_key_id(parts[1]):
+        raise MemoryScopeError("Invalid persisted private memory owner")
+    return parts[1], prefix[len("memory-"):]
+
+
+def _memory_key_from_conversation(conversation_key: str) -> str | None:
+    return _memory_identity_from_conversation(conversation_key)[0]
+
+
+def _memory_scope_for_owner(memory_key_id: str | None, memory_scope: str | None) -> str:
+    scope = memory_scope if memory_scope is not None else ("private" if memory_key_id else "shared")
+    if scope not in ("shared", "private", "private_only", "super"):
+        raise MemoryScopeError("Invalid authenticated memory scope")
+    if (scope == "shared") != (memory_key_id is None):
+        raise MemoryScopeError("Memory scope does not match authenticated owner")
+    if memory_key_id is not None and not is_valid_api_key_id(memory_key_id):
+        raise MemoryScopeError("Invalid authenticated memory owner")
+    return scope
+
+
+def _request_memory_key(request: Any) -> str | None:
+    key_id = getattr(request, "_qwen_exo_memory_key_id", None)
+    _memory_scope_for_owner(key_id, getattr(request, "_qwen_exo_memory_scope", None))
+    return key_id
+
+
+def _request_memory_scope(request: Any) -> str:
+    return _memory_scope_for_owner(
+        getattr(request, "_qwen_exo_memory_key_id", None),
+        getattr(request, "_qwen_exo_memory_scope", None),
+    )
+
+
+def _scope_conversation_key(
+    key: str, memory_key_id: str | None, memory_scope: str | None = None
+) -> str:
+    scope = _memory_scope_for_owner(memory_key_id, memory_scope)
+    return f"memory-{scope}:{memory_key_id}:{key}" if memory_key_id else key
+
+
+class _PrivateReflectionRepository(KnowledgeRepository):
+    """Keep the legacy Markdown repository behind the private-root guards."""
+
+    def refresh(self):
+        ensure_no_links(self.root)
+        return super().refresh()
+
+    def _contains_symlink(self, path: Path) -> bool:
+        ensure_no_links(path)
+        return super()._contains_symlink(path)
+
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +376,9 @@ class QwenExoRuntime:
         )
         self._memory_hints_fingerprint: str | None = None
         self._memory_hints_refresh: asyncio.Task[None] | None = None
+        self._memory_transfer_generation = 0
+        self._memory_transfer_owners: set[str | None] = set()
+        self._session_initial_gdn_generation = 0
         self.document_categories = DocumentCategoryStore(
             config.state_directory / "document-categories.sqlite3"
         )
@@ -598,11 +670,28 @@ class QwenExoRuntime:
         Records are never cut mid-record: a record that does not fit is
         skipped and older, smaller records may still be included after it.
         """
+        transfer_generation = getattr(self, "_session_initial_gdn_generation", 0)
+        if None in getattr(self, "_memory_transfer_owners", ()):
+            return None
         tokenizer = self.tokenizer_manager.tokenizer
         if tokenizer is None:
             return None
         admitted_records = []
         for record in self.reflection_memory_store.list():
+            if record.get("memory_transfer_detached"):
+                continue
+            if _memory_key_from_conversation(record.get("conversation_key", "")):
+                continue
+            document_path = record.get("document_path")
+            if document_path:
+                try:
+                    digest = hashlib.sha256(
+                        (self.config.knowledge_directory / document_path).read_bytes()
+                    ).hexdigest()
+                except OSError:
+                    continue
+                if digest != record.get("document_sha256"):
+                    continue
             if not record.get("causal_schema"):
                 admitted_records.append(record)
                 continue
@@ -673,6 +762,7 @@ class QwenExoRuntime:
             stable_digest(prompt),
         )
         return {
+            "memory_transfer_generation": transfer_generation,
             "prompt": prompt,
             "prompt_tokens": len(prompt_ids),
             "source_tokens": max(0, len(prompt_ids) - len(empty_ids)),
@@ -836,6 +926,12 @@ class QwenExoRuntime:
             **(generation or {}),
         }
         with self._session_initial_gdn_value_lock:
+            if (
+                prompt.get("memory_transfer_generation", 0)
+                != getattr(self, "_session_initial_gdn_generation", 0)
+                or None in getattr(self, "_memory_transfer_owners", ())
+            ):
+                raise RuntimeError("Initial GDN source changed during memory transfer")
             self._session_initial_gdn_value = value
             self._session_initial_gdn_status = {
                 **value,
@@ -1162,7 +1258,8 @@ class QwenExoRuntime:
             self._session_initial_gdn_refresh_requested = None
 
     async def _on_reflection_memory_stored(self, _reflection: ReflectionMemory) -> None:
-        self._schedule_session_initial_gdn_refresh(reason="new_memory")
+        if _memory_key_from_conversation(_reflection.conversation_key) is None:
+            self._schedule_session_initial_gdn_refresh(reason="new_memory")
 
     async def start(self, *, run_startup_warmup: bool = True) -> None:
         async with self._lifecycle_lock:
@@ -1442,6 +1539,9 @@ class QwenExoRuntime:
         *,
         previous_response_id: str | None = None,
         response_id: str | None = None,
+        memory_key_id: str | None = None,
+        memory_scope: str | None = None,
+        disabled: bool = False,
     ) -> dict[str, Any] | None:
         """Return the initial GDN snapshot a request must start from.
 
@@ -1452,22 +1552,38 @@ class QwenExoRuntime:
         mid-conversation; only new conversations pick up the refreshed state.
         The chosen selection is pinned under ``response_id`` for the next turn.
         """
+        scope = _memory_scope_for_owner(memory_key_id, memory_scope)
+        self._check_response_memory_scope(previous_response_id, memory_key_id, scope)
+        self._check_response_memory_scope(response_id, memory_key_id, scope)
         with self._session_initial_gdn_value_lock:
+            if None in getattr(self, "_memory_transfer_owners", ()):
+                return None
             pinned = (
                 self._session_initial_gdn_pins.get(str(previous_response_id))
                 if previous_response_id
                 else None
             )
             if pinned is not None:
+                pinned_owner = pinned.get("memory_key_id")
+                pinned_scope = _memory_scope_for_owner(pinned_owner, pinned.get("memory_scope"))
+                if (pinned_owner, pinned_scope) != (memory_key_id, scope):
+                    raise MemoryScopeError("Initial GDN belongs to a different memory scope")
+                if disabled or scope == "private_only":
+                    return None
                 self._session_initial_gdn_pins.move_to_end(str(previous_response_id))
                 selection = dict(pinned)
             else:
+                if disabled or scope == "private_only":
+                    return None
                 value = self._session_initial_gdn_value
                 selection = (
                     self._session_initial_gdn_selection_for(value)
                     if value is not None
                     else None
                 )
+            if selection is not None:
+                selection["memory_key_id"] = memory_key_id
+                selection["memory_scope"] = scope
             if response_id and selection is not None:
                 self._session_initial_gdn_pins[str(response_id)] = dict(selection)
                 while (
@@ -1558,7 +1674,10 @@ class QwenExoRuntime:
         request = self._enable_default_response_thinking(request)
         request = self._attach_cognition_text(request)
         api_previous_response_id = getattr(request, "previous_response_id", None)
-        compaction_envelope = self._verified_response_compaction_envelope(request.input)
+        compaction_envelope = self._verified_response_compaction_envelope(
+            request.input, memory_key_id=_request_memory_key(request),
+            memory_scope=_request_memory_scope(request),
+        )
         compaction_context = (
             str(compaction_envelope["summary"])
             if compaction_envelope is not None
@@ -1585,6 +1704,9 @@ class QwenExoRuntime:
             if compaction_envelope is not None
             else None
         )
+        self._check_response_memory_scope(
+            previous_response_id, _request_memory_key(request), _request_memory_scope(request)
+        )
         first_user = request_text.first_user_text(request.input)
         current_user = request_text.latest_user_text(request.input)
         current_request_question = request_text.request_question(request.input)
@@ -1603,6 +1725,9 @@ class QwenExoRuntime:
             if self.state is not QwenExoRuntimeState.READY:
                 raise RuntimeError("QWEN-EXO runtime is not ready")
             self._raise_if_cancelled(request.request_id)
+            self._check_response_memory_scope(
+                request.request_id, _request_memory_key(request), _request_memory_scope(request)
+            )
             if self.owns_request(request.request_id):
                 raise QwenExoRequestConflict(
                     f"QWEN-EXO request_id {request.request_id!r} is already active"
@@ -1827,7 +1952,7 @@ class QwenExoRuntime:
         while True:
             checkpoint = await self._compaction_reflection_queue.get()
             try:
-                service = getattr(self, "reflection_memory_service", None)
+                service = self._reflection_service_for_conversation(checkpoint.conversation_key)
                 if service is None:
                     self.telemetry.emit(
                         checkpoint.response_id,
@@ -2062,7 +2187,13 @@ class QwenExoRuntime:
             compact_id = "resp_compact_" + stable_digest(time.time_ns())[:32]
         previous_response_id = getattr(request, "previous_response_id", None)
         original_items = self._compaction_items(getattr(request, "input", None))
-        previous_envelope = self._verified_response_compaction_envelope(original_items)
+        memory_key_id = _request_memory_key(request)
+        memory_scope = _request_memory_scope(request)
+        self._check_response_memory_scope(compact_id, memory_key_id, memory_scope)
+        self._check_response_memory_scope(previous_response_id, memory_key_id, memory_scope)
+        previous_envelope = self._verified_response_compaction_envelope(
+            original_items, memory_key_id=memory_key_id, memory_scope=memory_scope
+        )
         if previous_envelope is not None:
             original_items = self._compaction_items(
                 self._normalize_response_compaction_input(
@@ -2118,6 +2249,8 @@ class QwenExoRuntime:
         source_digest = stable_digest(
             "response-compaction-source-v1",
             compact_id,
+            memory_key_id or "shared",
+            memory_scope,
             json.dumps(kept_items, ensure_ascii=False, sort_keys=True, default=str),
             json.dumps(dropped_items, ensure_ascii=False, sort_keys=True, default=str),
         )
@@ -2214,6 +2347,8 @@ class QwenExoRuntime:
             },
         ]
         self._compaction_summaries[response_id] = {
+            "memory_key_id": memory_key_id,
+            "memory_scope": memory_scope,
             "summary": summary.summary,
             "source_digest": source_digest,
             "memory": memory_payload,
@@ -2455,6 +2590,9 @@ class QwenExoRuntime:
         return restored
 
     def _restore_execution_capsule(self, request: Any, trajectory_id: str) -> Any:
+        self._check_response_memory_scope(
+            trajectory_id, _request_memory_key(request), _request_memory_scope(request)
+        )
         record = self.capsule_store.get(trajectory_id)
         if record is None or self.capsules is None:
             return request
@@ -2819,6 +2957,8 @@ class QwenExoRuntime:
         return True
 
     def latent_transplant_payload(self, request: Any) -> dict[str, object] | None:
+        if _request_memory_scope(request) == "private_only":
+            return None
         metadata = getattr(request, "metadata", None) or {}
         if "qwen_exo_latent_transplant" in metadata:
             raw = metadata.get("qwen_exo_latent_transplant")
@@ -3885,7 +4025,8 @@ class QwenExoRuntime:
         return str(payload.get("summary") or "").strip() if payload else ""
 
     def _verified_response_compaction_envelope(
-        self, value: Any
+        self, value: Any, *, memory_key_id: str | None = None,
+        memory_scope: str | None = None,
     ) -> dict[str, Any] | None:
         payload = self._response_compaction_envelope(value)
         if payload is None:
@@ -3893,6 +4034,11 @@ class QwenExoRuntime:
         record = self._compaction_summaries.get(str(payload["response_id"]))
         if record is None:
             return None
+        scope = _memory_scope_for_owner(memory_key_id, memory_scope)
+        owner = record.get("memory_key_id")
+        retained_scope = _memory_scope_for_owner(owner, record.get("memory_scope"))
+        if (owner, retained_scope) != (memory_key_id, scope):
+            raise MemoryScopeError("Compaction belongs to a different memory scope")
         if (
             str(record.get("source_digest") or "") != payload["source_digest"]
             or str(record.get("summary") or "") != payload["summary"]
@@ -4174,6 +4320,33 @@ class QwenExoRuntime:
     def _canonical_identity_text(value: Any) -> str:
         return request_text.response_item_text(value).replace("\r\n", "\n")
 
+    def response_memory_scope(self, response_id: str) -> tuple[bool, str | None, str]:
+        response_id = str(response_id)
+        for name in ("_request_conversation_keys", "_conversation_keys_by_response_id"):
+            conversation_key = getattr(self, name, {}).get(response_id)
+            if conversation_key is not None:
+                owner, scope = _memory_identity_from_conversation(conversation_key)
+                return True, owner, scope
+        record = getattr(self, "_compaction_summaries", {}).get(response_id)
+        if record is not None:
+            owner = record.get("memory_key_id")
+            return True, owner, _memory_scope_for_owner(owner, record.get("memory_scope"))
+        return False, None, "shared"
+
+    def _check_response_memory_scope(
+        self, response_id: str | None, memory_key_id: str | None,
+        memory_scope: str | None = None,
+    ) -> None:
+        scope = _memory_scope_for_owner(memory_key_id, memory_scope)
+        if response_id is not None:
+            known, owner, retained_scope = self.response_memory_scope(response_id)
+            if known and (owner, retained_scope) != (memory_key_id, scope):
+                raise MemoryScopeError("Response belongs to a different memory scope")
+            if not known:
+                store = getattr(self, "capsule_store", None)
+                if store is not None and store.get(str(response_id)) is not None:
+                    raise MemoryScopeError("Retained capsule has no authenticated memory scope")
+
     @classmethod
     def _canonical_response_identity(
         cls, request: Any, *, input_value: Any | None = None
@@ -4245,7 +4418,10 @@ class QwenExoRuntime:
         first_lines_digest = hashlib.sha256(first_lines_payload).hexdigest()
         return ResponseConversationIdentity(
             conversation_key=(
-                f"responses-first-lines-v1:{first_lines_digest}:{payload_digest}"
+                _scope_conversation_key(
+                    f"responses-first-lines-v1:{first_lines_digest}:{payload_digest}",
+                    _request_memory_key(request), _request_memory_scope(request),
+                )
             ),
             crc32=crc32,
             first_lines_digest=first_lines_digest,
@@ -4258,15 +4434,21 @@ class QwenExoRuntime:
         prompt_cache_key = str(getattr(request, "prompt_cache_key", None) or "").strip()
         if not prompt_cache_key:
             return None
-        return "responses-prompt-cache:" + stable_digest(
-            "responses-prompt-cache-v1", prompt_cache_key
+        return _scope_conversation_key(
+            "responses-prompt-cache:" + stable_digest(
+                "responses-prompt-cache-v1", prompt_cache_key
+            ),
+            _request_memory_key(request), _request_memory_scope(request),
         )
 
     @staticmethod
     def _response_call_association_key(request: Any, call_id: str) -> str:
         user = str(getattr(request, "user", None) or "").strip()
         session_id = str(getattr(request, "session_id", None) or "").strip()
-        return stable_digest("responses-call-association-v2", user, session_id, call_id)
+        return _scope_conversation_key(
+            stable_digest("responses-call-association-v2", user, session_id, call_id),
+            _request_memory_key(request), _request_memory_scope(request),
+        )
 
     def _remember_call_associations(
         self, request: Any, call_ids: Iterable[str], conversation_key: str
@@ -4295,6 +4477,10 @@ class QwenExoRuntime:
         call_ids: Iterable[str] = (),
     ) -> str:
         request_id = str(request_id)
+        memory_key_id = _request_memory_key(request)
+        memory_scope = _request_memory_scope(request)
+        self._check_response_memory_scope(request_id, memory_key_id, memory_scope)
+        self._check_response_memory_scope(previous_response_id, memory_key_id, memory_scope)
         previous_response_id = (
             str(previous_response_id) if previous_response_id is not None else None
         )
@@ -4315,8 +4501,8 @@ class QwenExoRuntime:
             self._conversation_keys_by_call_association = call_associations
         max_conversation_keys = int(getattr(self, "_max_conversation_keys", 512))
         if previous_response_id is not None:
-            conversation_key = response_keys.get(previous_response_id) or stable_digest(
-                "response-lineage", previous_response_id
+            conversation_key = response_keys.get(previous_response_id) or _scope_conversation_key(
+                stable_digest("response-lineage", previous_response_id), memory_key_id, memory_scope
             )
         elif (
             request is not None
@@ -4336,10 +4522,13 @@ class QwenExoRuntime:
                 existing_digest is not None
                 and existing_digest != canonical_identity.payload_digest
             ):
-                conversation_key = stable_digest(
-                    "canonical-payload-collision-fail-closed",
-                    request_id,
-                    canonical_identity.payload_digest,
+                conversation_key = _scope_conversation_key(
+                    stable_digest(
+                        "canonical-payload-collision-fail-closed",
+                        request_id,
+                        canonical_identity.payload_digest,
+                    ),
+                    memory_key_id, memory_scope,
                 )
             else:
                 canonical_digests[conversation_key] = canonical_identity.payload_digest
@@ -4363,7 +4552,9 @@ class QwenExoRuntime:
             if not unknown and learned and len(set(learned)) == 1:
                 conversation_key = learned[0]
             else:
-                conversation_key = stable_digest("response-lineage", request_id)
+                conversation_key = _scope_conversation_key(
+                    stable_digest("response-lineage", request_id), memory_key_id, memory_scope
+                )
         response_keys[request_id] = conversation_key
         response_keys.move_to_end(request_id)
         while len(response_keys) > max_conversation_keys:
@@ -4441,7 +4632,14 @@ class QwenExoRuntime:
         return self._reasoning_end_token_id
 
 
-    def activation_editor_request(self, raw_custom: object = None) -> dict[str, object]:
+    def activation_editor_request(
+        self, raw_custom: object = None, *, memory_scope: str = "shared"
+    ) -> dict[str, object]:
+        if memory_scope == "private_only":
+            return {
+                "spec": None,
+                "cache_identity": stable_digest("activation-editor-v1", "private-only-disabled"),
+            }
         if not self.config.feature_flags.activation_training:
             return {
                 "spec": None,
@@ -5222,7 +5420,8 @@ class QwenExoRuntime:
             if producers is None:
                 producers = self._server_session_reflections = set()
             producers.add(asyncio.current_task())
-            reflection = await self.reflection_memory_service.reflect(
+            service = self._reflection_service_for_conversation(conversation_key)
+            reflection = await service.reflect(
                 trajectory_id=trajectory_id,
                 conversation_key=conversation_key,
                 original_task=original_task,
@@ -5475,14 +5674,60 @@ class QwenExoRuntime:
             )
         )
 
+    def _private_memory_resources(
+        self, memory_key_id: str
+    ) -> tuple[FileKnowledgeIndex, KnowledgeRepository, MemoryHintIndex]:
+        resources = getattr(self, "_private_memory_cache", None)
+        if resources is None:
+            resources = self._private_memory_cache = {}
+        if memory_key_id not in resources:
+            index = get_private_memory_index(
+                self.config.knowledge_directory, self.config.state_directory, memory_key_id
+            )
+            repository = _PrivateReflectionRepository(index.root)
+            repository.refresh()
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                ensure_no_links(index.state_directory / ("memory-hints.sqlite3" + suffix))
+            hints = MemoryHintIndex(index.root, index.state_directory / "memory-hints.sqlite3")
+            resources[memory_key_id] = (index, repository, hints)
+        index, _, hints = resources[memory_key_id]
+        ensure_no_links(index.root)
+        ensure_no_links(index.state_directory)
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            ensure_no_links(Path(str(hints.database) + suffix))
+        return resources[memory_key_id]
+
+    def _reflection_service_for_conversation(
+        self, conversation_key: str
+    ) -> ReflectionMemoryService | None:
+        service = getattr(self, "reflection_memory_service", None)
+        memory_key_id = _memory_key_from_conversation(conversation_key)
+        if service is None or memory_key_id is None:
+            return service
+        # A per-invocation callback captures immutable ownership. Never mutate
+        # the shared service while concurrent idle/checkpoint jobs are running.
+        scoped = copy.copy(service)
+        scoped.retrieve_similar = lambda parent_id, query: self._retrieve_reflection_memory_candidates(
+            parent_id, query, memory_key_id=memory_key_id
+        )
+        return scoped
+
     async def _retrieve_reflection_memory_candidates(
-        self, parent_id: str, query: str
+        self, parent_id: str, query: str, *, memory_key_id: str | None = None
     ) -> tuple[ReflectionMemoryCandidate, ...]:
         """Published reflection memories sharing terms with a new issue, so the
         model can update one instead of inserting a near-duplicate."""
+        repository = self.knowledge
+        prefix = ""
+        if memory_key_id is not None:
+            _, repository, _ = self._private_memory_resources(memory_key_id)
+            await asyncio.to_thread(repository.refresh)
+            prefix = f"private/{memory_key_id}/"
+        # These are writable consolidation targets, not the tool read union.
+        # Private clients still read shared memories through search/read/hints.
         documents = tuple(
             document
-            for document in self.knowledge.snapshot.documents
+            for document in repository.snapshot.documents
             if is_compatible_reflection_memory(document)
         )
         scored = sorted(
@@ -5495,13 +5740,13 @@ class QwenExoRuntime:
         )
         candidates = tuple(
             ReflectionMemoryCandidate(
-                document_path=document.relative_path,
+                document_path=prefix + document.relative_path,
                 document_sha256=document.sha256,
                 title=str(document.title or document.relative_path),
                 content=document.normalized_content,
                 tensor_score=round(score, 4),
                 causal_entries=self._stored_causal_entries(
-                    document.relative_path, document.sha256
+                    prefix + document.relative_path, document.sha256
                 ),
             )
             for score, document in scored[:_REFLECTION_SIMILAR_LIMIT]
@@ -5539,6 +5784,8 @@ class QwenExoRuntime:
     def _reflection_regeneration_target(
         self, record: dict[str, Any], expected_document_sha256: str
     ) -> ReflectionMemoryCandidate:
+        if record.get("memory_transfer_detached"):
+            raise RuntimeError("Reflection document was detached by an admin memory transfer")
         document_path = str(record.get("document_path") or "")
         record_sha256 = str(record.get("document_sha256") or "")
         if not document_path or not record_sha256:
@@ -5554,24 +5801,33 @@ class QwenExoRuntime:
             )
         if str(expected_document_sha256) != record_sha256:
             raise RuntimeError("Reflection memory changed; refresh before regenerating")
+        memory_key_id = _memory_key_from_conversation(record.get("conversation_key", ""))
+        repository = self.knowledge
+        prefix = ""
+        if memory_key_id is not None:
+            _, repository, _ = self._private_memory_resources(memory_key_id)
+            prefix = f"private/{memory_key_id}/"
+            if not document_path.startswith(prefix):
+                raise MemoryScopeError("Reflection document does not belong to its owner")
+        repository.refresh()
         document = next(
             (
                 item
-                for item in self.knowledge.snapshot.documents
-                if item.relative_path == document_path
+                for item in repository.snapshot.documents
+                if prefix + item.relative_path == document_path
             ),
             None,
         )
         if document is None or document.sha256 != record_sha256:
             raise RuntimeError("Associated Reflection memory document is stale")
         return ReflectionMemoryCandidate(
-            document_path=document.relative_path,
+            document_path=document_path,
             document_sha256=document.sha256,
             title=str(document.title or record.get("title") or document.relative_path),
             content=document.normalized_content,
             tensor_score=0.0,
             causal_entries=self._stored_causal_entries(
-                document.relative_path, document.sha256
+                document_path, document.sha256
             ),
         )
 
@@ -5580,6 +5836,10 @@ class QwenExoRuntime:
     ) -> ReflectionSourceSnapshot | None:
         digest = str(record.get("source_snapshot_digest") or record["source_digest"])
         snapshot = self.reflection_source_store.get(digest)
+        if snapshot is not None and _memory_identity_from_conversation(
+            snapshot.conversation_key
+        ) != _memory_identity_from_conversation(record.get("conversation_key", "")):
+            raise MemoryScopeError("Reflection source belongs to a different memory scope")
         if (
             snapshot is None
             or snapshot.source_audit.get("capture") != "journal_references"
@@ -5760,7 +6020,8 @@ class QwenExoRuntime:
             if str(row.get("kind") or "") == "tool_observation"
         )
         try:
-            reflection = await self.reflection_memory_service.reflect(
+            service = self._reflection_service_for_conversation(snapshot.conversation_key)
+            reflection = await service.reflect(
                 trajectory_id=snapshot.trajectory_id,
                 conversation_key=snapshot.conversation_key,
                 original_task=snapshot.original_task,
@@ -5841,12 +6102,30 @@ class QwenExoRuntime:
     ) -> dict[str, Any]:
         if reflection.memory_action not in {"insert", "update"}:
             raise ValueError("Reflection memory publication action is invalid")
+        memory_key_id = _memory_key_from_conversation(reflection.conversation_key)
+        repository, file_index, prefix = self.knowledge, self.file_knowledge, ""
+        if memory_key_id is not None:
+            file_index, repository, _ = self._private_memory_resources(memory_key_id)
+            prefix = f"private/{memory_key_id}/"
+
+        def storage_path(path: str) -> str:
+            if prefix and not path.startswith(prefix):
+                raise MemoryScopeError("Private reflection cannot modify shared or foreign memory")
+            return path[len(prefix):]
+
         # Published reflections are plain text memory files: the knowledge
         # directory is what qwen_exo_memory_search/read serve.
         async with self._reflection_publish_lock:
+            for digest in (reflection.source_digest, reflection.replaces_source_digest):
+                record = self.reflection_memory_store.get(digest) if digest else None
+                if record and record.get("memory_transfer_detached"):
+                    raise RuntimeError("Reflection source was detached by an admin memory transfer")
+            # Shared repositories also need fresh on-disk targets: a cached
+            # snapshot must never recreate a file moved into another space.
+            await asyncio.to_thread(repository.refresh)
             snapshot_by_path = {
-                document.relative_path: document
-                for document in self.knowledge.snapshot.documents
+                prefix + document.relative_path: document
+                for document in repository.snapshot.documents
             }
             if reflection.memory_action == "update":
                 relative_path = str(reflection.target_document_path or "")
@@ -5864,6 +6143,8 @@ class QwenExoRuntime:
                     or set(expected_sha256s) != set(merge_paths)
                 ):
                     raise ValueError("Reflection memory update targets are incomplete")
+                for path in merge_paths:
+                    storage_path(path)
                 previous_documents = {
                     path: snapshot_by_path.get(path) for path in merge_paths
                 }
@@ -5881,7 +6162,7 @@ class QwenExoRuntime:
                 if reflection.merge_document_paths or reflection.merge_document_sha256s:
                     raise ValueError("Reflection memory insert cannot merge documents")
                 relative_path = (
-                    "reflection-memory/"
+                    prefix + "reflection-memory/"
                     + stable_digest(reflection.title, reflection.source_digest)[:32]
                     + ".md"
                 )
@@ -5904,6 +6185,8 @@ class QwenExoRuntime:
                     if (
                         not candidate_record
                         or candidate_record.get("publication_status") != "candidate"
+                        or _memory_key_from_conversation(candidate_record.get("conversation_key", ""))
+                        != memory_key_id
                     ):
                         raise RuntimeError(
                             "Private causal candidate changed before publication"
@@ -5934,8 +6217,8 @@ class QwenExoRuntime:
             try:
                 document = None
                 if has_active_entries:
-                    document = self.knowledge.upsert(
-                        relative_path,
+                    document = repository.upsert(
+                        storage_path(relative_path),
                         markdown,
                         tags=["reflection-memory", f"outcome-{reflection.outcome}"],
                     )
@@ -5944,20 +6227,24 @@ class QwenExoRuntime:
                             "Published reflection memory schema is incompatible"
                         )
                 elif previous is not None:
-                    self.knowledge.delete(relative_path)
+                    repository.delete(storage_path(relative_path))
                 for merged_path in previous_documents:
                     if merged_path != relative_path:
-                        self.knowledge.delete(merged_path)
-                await asyncio.to_thread(self.file_knowledge.refresh)
-                text_memory_digest = self._file_knowledge_digest()
-                if effective_category:
+                        repository.delete(storage_path(merged_path))
+                await asyncio.to_thread(file_index.refresh)
+                text_memory_digest = (
+                    stable_digest(memory_key_id, repository.snapshot.source_digest)
+                    if memory_key_id is not None else self._file_knowledge_digest()
+                )
+                if effective_category and memory_key_id is None:
                     self.document_categories.ensure(
                         effective_category,
                         title=f"反思任务：{reflection.title}"[:128],
                         parent_id="reflection-memory",
                         origin="observed",
                     )
-                self._sync_document_categories()
+                if memory_key_id is None:
+                    self._sync_document_categories()
                 if reflection.causal_schema:
                     self.reflection_memory_store.append(
                         replace(
@@ -5979,20 +6266,20 @@ class QwenExoRuntime:
                         current = next(
                             (
                                 item
-                                for item in self.knowledge.snapshot.documents
-                                if item.relative_path == affected_path
+                                for item in repository.snapshot.documents
+                                if prefix + item.relative_path == affected_path
                             ),
                             None,
                         )
                         if current is not None:
-                            self.knowledge.delete(affected_path)
+                            repository.delete(storage_path(affected_path))
                     for previous_document in previous_documents.values():
                         if previous_document is not None:
-                            self.knowledge.upsert(
+                            repository.upsert(
                                 previous_document.relative_path,
                                 previous_document.content,
                             )
-                    await asyncio.to_thread(self.file_knowledge.refresh)
+                    await asyncio.to_thread(file_index.refresh)
                 except Exception as rollback_error:
                     self.telemetry.emit(
                         "admin",
@@ -6023,7 +6310,8 @@ class QwenExoRuntime:
             "reflection_memory_schema": REFLECTION_MEMORY_SCHEMA,
             "compact_card_characters": len(reflection.compact_content),
             "compact_card_digest": stable_digest(reflection.compact_content),
-            "document_count": len(self.knowledge.snapshot.documents),
+            "document_count": len(repository.snapshot.documents),
+            "memory_key_id": memory_key_id,
         }
         self.telemetry.emit("admin", "reflection_memory.published", payload)
         return payload
@@ -6414,6 +6702,81 @@ class QwenExoRuntime:
             "relative_path": relative_path, "retrieval_mode": "file",
         })
 
+    @asynccontextmanager
+    async def memory_transfer_guard(self, payload: dict[str, Any]):
+        """Serialize admin moves with reflection publication and fence derived state.
+
+        Existing prompts, KV and client histories already containing a memory
+        cannot be unlearned. This revokes fresh hints and initial-state bindings;
+        original reflection/source history stays owned by its original space.
+        """
+        owners = {payload.get("source_key_id"), payload.get("destination_key_id")}
+        async with self._reflection_publish_lock:
+            resources = []
+            for owner in owners:
+                if owner is None:
+                    resources.append((owner, self.file_knowledge, self.knowledge, self.memory_hints))
+                else:
+                    index, repository, hints = self._private_memory_resources(owner)
+                    resources.append((owner, index, repository, hints))
+            self._memory_transfer_generation = getattr(self, "_memory_transfer_generation", 0) + 1
+            self._memory_transfer_owners = owners
+            if None in owners:
+                with self._session_initial_gdn_value_lock:
+                    self._session_initial_gdn_generation = getattr(self, "_session_initial_gdn_generation", 0) + 1
+                    self._session_initial_gdn_value = None
+                    self._session_initial_gdn_pins.clear()
+                    self._session_initial_gdn_status = {
+                        **self._session_initial_gdn_status,
+                        "status": "invalidated", "reason": "memory_transfer",
+                    }
+            # Recovery may finish an earlier journal for the same owner pair;
+            # compare all their published records, not just this payload path.
+            records = [record for record in self.reflection_memory_store.list()
+                       if _memory_key_from_conversation(record.get("conversation_key", "")) in owners
+                       and record.get("document_path")]
+            try:
+                for _, _, _, hints in resources:
+                    await asyncio.to_thread(hints.invalidate)
+                yield
+            finally:
+                async def finalize() -> None:
+                    # Do not cancel to_thread refreshes: cancellation does not
+                    # stop their workers. Fence their captured rows instead.
+                    for _, index, repository, hints in resources:
+                        await asyncio.to_thread(hints.invalidate)
+                        await asyncio.to_thread(index.refresh)
+                        await asyncio.to_thread(repository.refresh)
+                    current = {}
+                    for owner, _, repository, _ in resources:
+                        prefix = f"private/{owner}/" if owner is not None else ""
+                        current.update({prefix + document.relative_path: document.sha256
+                                        for document in repository.snapshot.documents})
+                    self.reflection_memory_store.detach_documents({
+                        record["document_path"] for record in records
+                        if current.get(record["document_path"]) != record.get("document_sha256")
+                    })
+                    self._memory_hints_fingerprint = None
+                    self._memory_transfer_generation += 1
+                    self._memory_transfer_owners = set()
+                    if None in owners:
+                        self._refresh_memory_hints_if_stale()
+                        self._schedule_session_initial_gdn_refresh(reason="memory_transfer")
+
+                # Keep publication locked until *all* cleanup completes, even
+                # under repeated request cancellation. A cleanup exception
+                # leaves the affected owners fenced rather than reopening them.
+                finalizer = asyncio.create_task(finalize(), name="qwen-exo-memory-transfer-finalize")
+                cancelled = False
+                while not finalizer.done():
+                    try:
+                        await asyncio.shield(finalizer)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                finalizer.result()
+                if cancelled:
+                    raise asyncio.CancelledError
+
     async def record_memory_tool_round(
         self, request_id: str, round_index: int, calls: list[dict[str, Any]]
     ) -> None:
@@ -6441,17 +6804,45 @@ class QwenExoRuntime:
                 },
             )
 
+    def _private_memory_hints(
+        self, memory_key_id: str, hints: MemoryHintIndex, query: str,
+        shown: frozenset[tuple[str, int]], prefix: str = "private/",
+    ) -> list[dict[str, Any]]:
+        index, _, _ = self._private_memory_resources(memory_key_id)
+        return self._memory_hints_for_index(index, hints, query, shown, prefix)
+
+    @staticmethod
+    def _memory_hints_for_index(
+        index: FileKnowledgeIndex, hints: MemoryHintIndex, query: str,
+        shown: frozenset[tuple[str, int]], prefix: str,
+    ) -> list[dict[str, Any]]:
+        generation = hints.generation
+        index.refresh()
+        hints.refresh(index.metadata(), generation=generation)
+        excluded = frozenset(
+            (path[len(prefix):], line)
+            for path, line in shown if path.startswith(prefix)
+        )
+        return [
+            {**hint, "path": prefix + hint["path"]}
+            for hint in hints.lookup(query, exclude=excluded)
+        ]
+
     async def memory_block_for_turn(
         self,
         request_id: str,
         *,
         blocked_reason: str | None,
         query_text: str,
+        memory_key_id: str | None = None,
+        memory_scope: str | None = None,
     ) -> str | None:
         """Count whether this turn offers the memory tools (metadata only) and,
         when it does, return the server-side memory block for the prompt: the
         honest "these are recollections" note, BM25 hits not yet shown in this
         conversation, and a prompt to search memory."""
+        scope = _memory_scope_for_owner(memory_key_id, memory_scope)
+        self._check_response_memory_scope(request_id, memory_key_id, scope)
         self._memory_tool_stats["turns"] += 1
         if blocked_reason is not None:
             self._memory_tool_stats[f"not_offered:{blocked_reason}"] += 1
@@ -6461,20 +6852,54 @@ class QwenExoRuntime:
             return None
         self._memory_tool_stats["offered"] += 1
         conversation_key = self._request_conversation_keys.get(request_id)
-        self._refresh_memory_hints_if_stale()
+        if scope != "private_only":
+            self._refresh_memory_hints_if_stale()
         shown_hints = (
             self._memory_block_hints.get(conversation_key, frozenset())
             if conversation_key is not None
             else frozenset()
         )
         hints: list[dict[str, Any]] = []
+        transfer_generation = getattr(self, "_memory_transfer_generation", 0)
         if query_text:
             try:
-                hints = await asyncio.to_thread(
-                    self.memory_hints.lookup, query_text, exclude=shown_hints
-                )
+                if scope != "private_only":
+                    hints = await asyncio.to_thread(
+                        self.memory_hints.lookup, query_text, exclude=shown_hints
+                    )
+                if memory_key_id is not None:
+                    hints = [hint for hint in hints if not hint["path"].startswith(("private/", "private-keys/"))]
+                    _, _, private_hints = self._private_memory_resources(memory_key_id)
+                    hints += await asyncio.to_thread(
+                        self._private_memory_hints, memory_key_id, private_hints,
+                        query_text, shown_hints,
+                    )
+                if scope == "super":
+                    own_index, _, _ = self._private_memory_resources(memory_key_id)
+                    view = ScopedMemoryReadView(
+                        self.file_knowledge, own_index,
+                        key_id=memory_key_id, memory_scope=scope,
+                    )
+                    sources = await asyncio.to_thread(lambda: tuple(view.read_sources()))
+                    for prefix, index in sources:
+                        if not prefix.startswith("private-keys/"):
+                            continue
+                        owner = prefix.split("/")[1]
+                        database = own_index.state_directory / "read-hints" / f"{owner}.sqlite3"
+                        for suffix in ("", "-wal", "-shm", "-journal"):
+                            ensure_no_links(Path(str(database) + suffix))
+                        owner_hints = MemoryHintIndex(index.root, database)
+                        hints += await asyncio.to_thread(
+                            self._memory_hints_for_index, index, owner_hints,
+                            query_text, shown_hints, prefix,
+                        )
             except Exception:
                 logger.exception("memory hint lookup failed")
+        if (
+            transfer_generation != getattr(self, "_memory_transfer_generation", 0)
+            or getattr(self, "_memory_transfer_owners", ())
+        ):
+            hints = []
         if conversation_key is not None:
             self._memory_block_hints[conversation_key] = shown_hints | {
                 (hint["path"], hint["line"]) for hint in hints
@@ -6498,6 +6923,9 @@ class QwenExoRuntime:
     def _refresh_memory_hints_if_stale(self) -> None:
         """Re-index in the background when the knowledge files changed (any
         upload/delete path); lookups use the previous index meanwhile."""
+        if None in getattr(self, "_memory_transfer_owners", ()):
+            return
+        generation = self.memory_hints.generation
         task = self._memory_hints_refresh
         if task is not None and not task.done():
             return
@@ -6517,9 +6945,13 @@ class QwenExoRuntime:
 
         async def refresh() -> None:
             try:
-                result = await asyncio.to_thread(self.memory_hints.refresh, rows)
+                result = await asyncio.to_thread(
+                    self.memory_hints.refresh, rows, generation=generation
+                )
             except Exception:
                 logger.exception("memory hint index refresh failed")
+                return
+            if generation != self.memory_hints.generation:
                 return
             self._memory_hints_fingerprint = fingerprint
             self.telemetry.emit("runtime", "memory_hints.indexed", result)

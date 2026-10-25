@@ -18,6 +18,10 @@ _DFLASH_ELIGIBLE_JOB_TYPES = frozenset(
 )
 
 
+class InternalOptionScoreContextError(ValueError):
+    """An image option-score prompt exceeds a limit after visual expansion."""
+
+
 def _internal_custom_params(
     job: InternalJob,
     base_custom: dict[str, Any],
@@ -393,6 +397,9 @@ class InternalJobRunner:
         jobs: Iterable[InternalJob],
         input_ids: Iterable[Iterable[int]],
         option_token_ids: Iterable[int],
+        *,
+        image_data: Iterable[Iterable[str]] | None = None,
+        max_prompt_tokens: int | None = None,
     ) -> tuple[InternalOptionScoreResult, ...]:
         """Read N>=2 next-token scores from one target-only prefill per job."""
         job_list = tuple(jobs)
@@ -400,6 +407,29 @@ class InternalJobRunner:
         options = tuple(option_token_ids)
         if not job_list or len(job_list) != len(prefixes):
             raise ContractViolation("Option score batch requires one prefix per job")
+        if max_prompt_tokens is not None and (
+            type(max_prompt_tokens) is not int or max_prompt_tokens < 1
+        ):
+            raise ContractViolation("Option score prompt limit must be positive")
+        if image_data is None:
+            images = ((),) * len(job_list)
+        else:
+            image_rows = tuple(image_data)
+            if len(image_rows) != len(job_list) or any(
+                isinstance(row, (str, bytes)) for row in image_rows
+            ):
+                raise ContractViolation("Option scores require one image list per job")
+            images = tuple(tuple(row) for row in image_rows)
+            if any(
+                not isinstance(image, str) or not image
+                for row in images
+                for image in row
+            ):
+                raise ContractViolation("Option score images must be non-empty strings")
+        if any(images) and any(
+            job.job_type != InternalJobType.SYSTEM_ONE for job in job_list
+        ):
+            raise ContractViolation("Image option scores require System One jobs")
         if (
             len(options) < 2
             or any(type(token) is not int or token < 0 for token in options)
@@ -438,7 +468,11 @@ class InternalJobRunner:
                 end = start + lane_limit
                 results.extend(
                     await self.run_option_score_batch(
-                        job_list[start:end], prefixes[start:end], options
+                        job_list[start:end],
+                        prefixes[start:end],
+                        options,
+                        image_data=images[start:end] if any(images) else None,
+                        max_prompt_tokens=max_prompt_tokens,
                     )
                 )
             return tuple(results)
@@ -452,6 +486,11 @@ class InternalJobRunner:
             request = self._make_request(
                 rid=[job.job_id for job in job_list],
                 input_ids=[[*tokens, 0] for tokens in prefixes],
+                **(
+                    {"image_data": [list(row) for row in images]}
+                    if any(images)
+                    else {}
+                ),
                 sampling_params=[
                     {
                         "max_new_tokens": 0,
@@ -459,11 +498,21 @@ class InternalJobRunner:
                         "custom_params": _internal_custom_params(
                             job,
                             {},
-                            {"qwen_exo_dflash": "target_only"},
+                            {
+                                "qwen_exo_dflash": "target_only",
+                                **(
+                                    {
+                                        "qwen_exo_option_score_tail_tokens": 2,
+                                        "qwen_exo_option_score_max_prompt_tokens": max_prompt_tokens,
+                                    }
+                                    if images[index]
+                                    else {}
+                                ),
+                            },
                             allow_dflash=False,
                         ),
                     }
-                    for job in job_list
+                    for index, job in enumerate(job_list)
                 ],
                 return_logprob=True,
                 logprob_start_len=[len(tokens) - 1 for tokens in prefixes],
@@ -492,8 +541,18 @@ class InternalJobRunner:
                 )
             elapsed = time.perf_counter() - started
             return tuple(
-                self._option_score_result(job, tokens, options, output, elapsed)
-                for job, tokens, output in zip(job_list, prefixes, outputs)
+                self._option_score_result(
+                    job,
+                    tokens,
+                    options,
+                    output,
+                    elapsed,
+                    has_images=bool(images[index]),
+                    max_prompt_tokens=max_prompt_tokens,
+                )
+                for index, (job, tokens, output) in enumerate(
+                    zip(job_list, prefixes, outputs)
+                )
             )
         except (asyncio.CancelledError, Exception):
             self._abort_jobs(job_list)
@@ -508,6 +567,9 @@ class InternalJobRunner:
         options: tuple[int, ...],
         output: dict[str, Any],
         latency_seconds: float,
+        *,
+        has_images: bool = False,
+        max_prompt_tokens: int | None = None,
     ) -> InternalOptionScoreResult:
         def sequence(value: Any, size: int) -> bool:
             return isinstance(value, (list, tuple)) and len(value) == size
@@ -538,7 +600,16 @@ class InternalJobRunner:
             raise RuntimeError("Option score result contains generated tokens")
         if (
             type(meta.get("prompt_tokens")) is not int
-            or meta["prompt_tokens"] != len(prefix) + 1
+            or (
+                meta["prompt_tokens"] < len(prefix) + 1
+                if has_images
+                else meta["prompt_tokens"] != len(prefix) + 1
+            )
+            or (
+                has_images
+                and max_prompt_tokens is not None
+                and meta["prompt_tokens"] - 1 > max_prompt_tokens
+            )
         ):
             raise RuntimeError("Option score result prompt length is misaligned")
         token_rows = meta.get("input_token_logprobs")

@@ -136,6 +136,99 @@ class ResponsesSamplingParamsTestCase(unittest.TestCase):
 
 
 class ResponsesResponseFromRequestTestCase(unittest.TestCase):
+    def test_usage_json_is_sdk_compatible_and_roundtrips_without_loss(self):
+        from openai.types.responses import Response
+        from sglang.srt.entrypoints.openai.protocol import (
+            PromptTokensDetails,
+            ResponsesResponse,
+        )
+
+        for cached_tokens in (0, 9):
+            with self.subTest(cached_tokens=cached_tokens):
+                usage = UsageInfo(
+                    prompt_tokens=11,
+                    completion_tokens=7,
+                    total_tokens=18,
+                    prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_tokens),
+                    reasoning_tokens=2,
+                )
+                response = ResponsesResponse.from_request(
+                    ResponsesRequest(model="x", input="hi", store=False),
+                    {}, "x", 123, [], "completed", usage,
+                )
+                expected = {
+                    "input_tokens": 11,
+                    "input_tokens_details": {"cached_tokens": cached_tokens},
+                    "output_tokens": 7,
+                    "output_tokens_details": {"reasoning_tokens": 2},
+                    "total_tokens": 18,
+                }
+                self.assertEqual(response.model_dump()["usage"], expected)
+                parsed = Response.model_validate_json(response.model_dump_json())
+                self.assertEqual(parsed.usage.model_dump(), expected)
+                restored = ResponsesResponse.model_validate_json(response.model_dump_json())
+                self.assertEqual(restored.model_dump()["usage"], expected)
+                self.assertEqual(usage.prompt_tokens, 11)
+                self.assertNotIn("input_tokens", usage.model_dump())
+
+    def test_absent_optional_usage_details_become_zero_not_null(self):
+        from openai.types.responses import Response
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        response = ResponsesResponse.from_request(
+            ResponsesRequest(model="x", input="hi", store=False),
+            {}, "x", 123, [], "completed",
+            UsageInfo(prompt_tokens=11, completion_tokens=None, reasoning_tokens=None,
+                      total_tokens=11),
+        )
+        parsed = Response.model_validate_json(response.model_dump_json())
+        self.assertEqual(parsed.usage.input_tokens_details.cached_tokens, 0)
+        self.assertEqual(parsed.usage.output_tokens, 0)
+        self.assertEqual(parsed.usage.output_tokens_details.reasoning_tokens, 0)
+
+    def test_unfinished_response_usage_stays_null(self):
+        from openai.types.responses import Response
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        for status in ("queued", "in_progress", "cancelled", "failed"):
+            with self.subTest(status=status):
+                response = ResponsesResponse.from_request(
+                    ResponsesRequest(model="x", input="hi", store=False),
+                    {}, "x", 123, [], status, None,
+                )
+                self.assertIsNone(response.model_dump()["usage"])
+                self.assertIsNone(Response.model_validate_json(response.model_dump_json()).usage)
+
+    def test_openapi_exposes_responses_usage_not_chat_usage(self):
+        from fastapi import FastAPI
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        app = FastAPI()
+
+        @app.get("/responses/{response_id}", response_model=ResponsesResponse)
+        def retrieve_response(response_id: str):
+            raise NotImplementedError("Schema-only route")
+
+        schemas = app.openapi()["components"]["schemas"]
+        usage_ref = next(
+            item["$ref"]
+            for item in schemas["ResponsesResponse"]["properties"]["usage"]["anyOf"]
+            if "$ref" in item
+        )
+        usage_schema = schemas[usage_ref.rsplit("/", 1)[-1]]
+        fields = {
+            "input_tokens", "input_tokens_details", "output_tokens",
+            "output_tokens_details", "total_tokens",
+        }
+        self.assertEqual(set(usage_schema["properties"]), fields)
+        self.assertEqual(set(usage_schema["required"]), fields)
+        for name, detail in (
+            ("input_tokens_details", "cached_tokens"),
+            ("output_tokens_details", "reasoning_tokens"),
+        ):
+            detail_ref = usage_schema["properties"][name]["$ref"]
+            self.assertIn(detail, schemas[detail_ref.rsplit("/", 1)[-1]]["required"])
+
     def test_parallel_tool_calls_false_preserved(self):
         from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
 

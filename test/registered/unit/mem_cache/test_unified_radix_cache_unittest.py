@@ -4056,12 +4056,8 @@ class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
 
 
 class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
-    """A prefix-cache hit must refresh only best_match_node's mamba state in the
-    mamba LRU, not its ancestors. The base TreeComponent refresh is whole-chain
-    (reset_node_and_parents_mru), which clusters a session's states so that under
-    mamba-pool pressure eviction drops whole cold sessions instead of the
-    intermediate states reuse never needs. Guards MambaComponent.refresh_lru's
-    single-node MATCH_END override.
+    """Refresh the consumed state and at most one real shared anchor, never the
+    full chain of disposable intermediate states under bounded Mamba pressure.
     """
 
     cfg = CacheConfig(page_size=1, components=(ComponentType.FULL, ComponentType.MAMBA))
@@ -4174,6 +4170,192 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
         # Tombstoned checkpoints keep their KV: the prompt still matches in full.
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prompt))))
         self.assertEqual(len(match.device_indices), len(prompt))
+        cache.sanity_check()
+
+    def test_match_refreshes_only_nearest_shared_branch(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+
+        def insert(tokens):
+            state = pool.mamba_allocator.alloc(1)
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens)),
+                    value=allocator.alloc(len(tokens)),
+                    mamba_value=state,
+                )
+            )
+            return cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).best_match_node
+
+        insert([1, 2])
+        insert([1, 2, 90])
+        insert([1, 2, 3, 4])
+        insert([1, 2, 3, 4, 91])
+        insert([1, 2, 3, 4, 5, 6])
+        insert([100, 101])
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 5, 6])))
+        )
+        evicted = cache.evict(EvictParams(num_tokens=0, mamba_num=3))
+        self.assertEqual(evicted.mamba_num_evicted, 3)
+        # Only the nearest branch anchor was reused. The farther ancestor is
+        # reclaimable, while another replacement at the inner branch still hits.
+        for tokens, expected_prefix in (
+            ([1, 2, 92], 0),
+            ([1, 2, 3, 4, 92], 4),
+            ([1, 2, 3, 4, 5, 6], 6),
+            ([100, 101], 2),
+        ):
+            with self.subTest(tokens=tokens):
+                result = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                )
+                self.assertEqual(len(result.device_indices), expected_prefix)
+        cache.sanity_check()
+
+
+class TestUnifiedMambaBranchRetention(CustomTestCase):
+    """Exercise real tracked-state donation, branch learning and bounded eviction."""
+
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        mamba_cache_size=12,
+        kv_size=8192,
+        max_context_len=4096,
+    )
+
+    def _new_req(self, cache, pool, rid, branching_seqlen=None):
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        self.assertIsNotNone(pool.alloc([req]))
+        req.last_node = cache.root_node
+        req.cache_protected_len = 0
+        req.mamba_branching_seqlen = branching_seqlen
+        return req
+
+    def _chunk(self, cache, allocator, pool, req, tokens):
+        start = req.cache_protected_len
+        values = allocator.alloc(len(tokens) - start)
+        self.assertIsNotNone(values)
+        pool.write((req.req_pool_idx, slice(start, len(tokens))), values)
+        req.origin_input_ids = array("q", tokens)
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(start, len(tokens))
+        req.kv_committed_len = len(tokens)
+        req.mamba_last_track_seqlen = len(tokens)
+        cache.cache_unfinished_req(req, chunked=True)
+        return req.last_node
+
+    def _release(self, cache, pool, req):
+        cache.cache_finished_req(
+            req, is_insert=False, kv_len_to_handle=len(req.origin_input_ids)
+        )
+        pool.free(req)
+
+    def test_learned_branch_survives_cold_prefill_and_remains_evictable(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        chunk = get_server_args().mamba_cache_chunk_size
+        branch_len = 2 * chunk
+        common = list(range(branch_len + 7))
+        old_tokens = common + [9000] * (2 * chunk - 7)
+        new_tokens = common + [9001] * (2 * chunk - 7)
+        old = self._new_req(cache, pool, "old")
+        old_leaf = self._chunk(cache, allocator, pool, old, old_tokens)
+        self._release(cache, pool, old)
+
+        # First suffix replacement splits Full KV but MUST NOT synthesize a GDN
+        # state for the new parent. The scheduler asks to track an aligned prefix.
+        miss = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", new_tokens)))
+        )
+        self.assertEqual(len(miss.device_indices), 0)
+        self.assertEqual(miss.mamba_branching_seqlen, branch_len)
+        self.assertIsNone(old_leaf.parent.component_data[ComponentType.MAMBA].value)
+
+        learned = self._new_req(cache, pool, "learned", miss.mamba_branching_seqlen)
+        anchor = self._chunk(
+            cache, allocator, pool, learned, new_tokens[:branch_len]
+        )
+        state = anchor.component_data[ComponentType.MAMBA].value
+        self.assertEqual(len(anchor.children), 1)
+        self.assertNotIn(state.item(), learned.mamba_ping_pong_track_buffer.tolist())
+        self.assertNotEqual(state.item(), learned.mamba_pool_idx.item())
+        leaf = self._chunk(cache, allocator, pool, learned, new_tokens)
+        self._release(cache, pool, learned)
+        self.assertIs(anchor.component_data[ComponentType.MAMBA].value, state)
+        # The first allocation pressure after learning must not discard this
+        # newly useful anchor ahead of the older suffix state. Before the fix,
+        # extending learned's prefix demoted this exact state to the LRU tail.
+        evicted = cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertEqual(evicted.mamba_num_evicted, 1)
+        self.assertIs(anchor.component_data[ComponentType.MAMBA].value, state)
+
+        # A long unrelated request recycles its disposable intermediate states;
+        # it cannot sweep the learned branch out just because it was chunked.
+        cold = self._new_req(cache, pool, "cold")
+        cold_tokens = []
+        for index in range(24):
+            cold_tokens.extend([10000 + index] * chunk)
+            self._chunk(cache, allocator, pool, cold, cold_tokens)
+        self._release(cache, pool, cold)
+        replacement = common + [9002] * (2 * chunk - 7)
+        hit = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", replacement)))
+        )
+        self.assertEqual(len(hit.device_indices), branch_len)
+        self.assertIs(hit.best_match_node, anchor)
+        self.assertIs(anchor.component_data[ComponentType.MAMBA].value, state)
+        self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].value)
+        exact = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", new_tokens)))
+        )
+        self.assertEqual(len(exact.device_indices), len(new_tokens))
+        cache.sanity_check()
+
+        # Anchors are ordinary evictable states, not permanent reservations.
+        cache.evict(EvictParams(num_tokens=self.cfg.kv_size, mamba_num=12))
+        self.assertEqual(allocator.available_size(), self.cfg.kv_size)
+        self.assertEqual(
+            pool.mamba_allocator.available_size(), self.cfg.mamba_cache_size
+        )
+        cache.sanity_check()
+
+    def test_duplicate_donation_reclaims_only_uninserted_slot(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = list(range(get_server_args().mamba_cache_chunk_size))
+        req = self._new_req(cache, pool, "first", len(tokens))
+        anchor = self._chunk(cache, allocator, pool, req, tokens)
+        self._release(cache, pool, req)
+        state = anchor.component_data[ComponentType.MAMBA].value
+        available = pool.mamba_allocator.available_size()
+        duplicate = self._new_req(cache, pool, "duplicate", len(tokens))
+        self._chunk(cache, allocator, pool, duplicate, tokens)
+        self._release(cache, pool, duplicate)
+        self.assertEqual(pool.mamba_allocator.available_size(), available)
+        self.assertIs(anchor.component_data[ComponentType.MAMBA].value, state)
+        cache.sanity_check()
+
+    def test_split_does_not_inherit_materialized_anchor_state(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        chunk = get_server_args().mamba_cache_chunk_size
+        tokens = list(range(2 * chunk))
+        req = self._new_req(cache, pool, "anchor", len(tokens))
+        anchor = self._chunk(cache, allocator, pool, req, tokens)
+        self._release(cache, pool, req)
+        state = anchor.component_data[ComponentType.MAMBA].value
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens[:chunk] + [9000])))
+        )
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertFalse(anchor.parent.mamba_branch_checkpoint)
+        self.assertIsNone(anchor.parent.component_data[ComponentType.MAMBA].value)
+        self.assertIs(anchor.component_data[ComponentType.MAMBA].value, state)
         cache.sanity_check()
 
 

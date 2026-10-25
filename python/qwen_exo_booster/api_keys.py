@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import secrets
+import re
 import tempfile
 import threading
 from collections.abc import Iterable
@@ -13,11 +14,20 @@ from typing import Any
 
 _API_KEY_SCHEMA = 1
 _TOKEN_PREFIX = "qxk"
+MEMORY_SCOPES = ("shared", "private", "private_only", "super")
+# Early installations used named IDs rather than random hex. Keep those tokens
+# valid while limiting IDs to one lowercase, filesystem-safe path component.
+_KEY_ID_PATTERN = re.compile(r"qxk_[a-z0-9_-]{1,128}")
+_RESPONSE_ENDPOINT_PATTERN = re.compile(r"/v1/responses/[^/]+(?:/cancel)?")
 _PROTECTED_ENDPOINTS = frozenset(
     {
         "/v1/models",
         "/v1/responses",
         "/v1/responses/compact",
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/messages/count_tokens",
         "/v1/systemone",
     }
 )
@@ -65,13 +75,25 @@ def _validate_label(value: object) -> str:
     return label
 
 
+def is_valid_api_key_id(value: object) -> bool:
+    return isinstance(value, str) and _KEY_ID_PATTERN.fullmatch(value) is not None
+
+
+def validate_memory_scope(value: object) -> str:
+    if not isinstance(value, str) or value not in MEMORY_SCOPES:
+        raise ApiKeyStoreError(
+            "invalid_memory_scope", "记忆模式必须为 shared、private、private_only 或 super"
+        )
+    return value
+
+
 class ApiKeyStore:
     """Atomic, hashed bearer-key registry shared by QWEN-EXO and SGLang auth."""
 
     def __init__(self, path: Path | str):
         self.path = Path(path).expanduser().resolve()
         self._lock = threading.RLock()
-        self._cached_signature: tuple[int, int] | None = None
+        self._cached_signature: tuple[int, int, int, int] | None = None
         self._cached_records: tuple[dict[str, Any], ...] = ()
 
     def _empty_document(self) -> dict[str, Any]:
@@ -91,8 +113,10 @@ class ApiKeyStore:
             raise ApiKeyStoreError(
                 "key_store_unreadable", f"无法读取 API 密钥存储：{exc}"
             ) from exc
-        if payload.get("schema") != _API_KEY_SCHEMA or not isinstance(
-            payload.get("keys"), list
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != _API_KEY_SCHEMA
+            or not isinstance(payload.get("keys"), list)
         ):
             raise ApiKeyStoreError(
                 "key_store_schema_mismatch", "API 密钥存储 schema 不受支持"
@@ -105,7 +129,7 @@ class ApiKeyStore:
             key_id = str(record.get("id") or "")
             digest = str(record.get("digest") or "")
             if (
-                not key_id.startswith(f"{_TOKEN_PREFIX}_")
+                not is_valid_api_key_id(key_id)
                 or len(digest) != 64
                 or key_id in ids
             ):
@@ -113,6 +137,7 @@ class ApiKeyStore:
                     "key_store_invalid", "API 密钥存储包含无效或重复记录"
                 )
             ids.add(key_id)
+            validate_memory_scope(record.get("memory_scope", "shared"))
         expected_revision = _revision(records)
         if payload.get("revision") != expected_revision:
             raise ApiKeyStoreError(
@@ -153,7 +178,11 @@ class ApiKeyStore:
     @staticmethod
     def _public_record(record: dict[str, Any]) -> dict[str, Any]:
         return {
-            key: record.get(key) for key in ("id", "label", "created_at", "revoked_at")
+            **{
+                key: record.get(key)
+                for key in ("id", "label", "created_at", "revoked_at")
+            },
+            "memory_scope": record.get("memory_scope", "shared"),
         }
 
     def listing(self) -> dict[str, Any]:
@@ -166,8 +195,9 @@ class ApiKeyStore:
                 "keys": [self._public_record(record) for record in document["keys"]],
             }
 
-    def create(self, label: object) -> dict[str, Any]:
+    def create(self, label: object, memory_scope: str = "shared") -> dict[str, Any]:
         normalized_label = _validate_label(label)
+        normalized_scope = validate_memory_scope(memory_scope)
         with self._lock:
             document = self._read_document()
             records = list(document["keys"])
@@ -176,6 +206,7 @@ class ApiKeyStore:
             record = {
                 "id": key_id,
                 "label": normalized_label,
+                "memory_scope": normalized_scope,
                 "digest": _token_digest(token),
                 "created_at": _utc_now(),
                 "revoked_at": None,
@@ -187,6 +218,23 @@ class ApiKeyStore:
                 "token": token,
                 "revision": updated["revision"],
             }
+
+    def update_memory_scope(self, key_id: str, memory_scope: str) -> dict[str, Any]:
+        normalized_scope = validate_memory_scope(memory_scope)
+        if not is_valid_api_key_id(key_id):
+            raise ApiKeyStoreError("invalid_key_id", "API 密钥 ID 无效")
+        with self._lock:
+            document = self._read_document()
+            records = list(document["keys"])
+            for record in records:
+                if secrets.compare_digest(record["id"], key_id):
+                    record["memory_scope"] = normalized_scope
+                    updated = self._write_document(records)
+                    return {
+                        **self._public_record(record),
+                        "revision": updated["revision"],
+                    }
+            raise ApiKeyStoreError("key_not_found", "API 密钥不存在")
 
     def revoke(self, key_id: str) -> dict[str, Any]:
         with self._lock:
@@ -249,7 +297,7 @@ class ApiKeyStore:
             self._cached_signature = None
             self._cached_records = ()
             return ()
-        signature = (stat.st_mtime_ns, stat.st_size)
+        signature = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
         if signature != self._cached_signature:
             document = self._read_document()
             self._cached_records = tuple(
@@ -268,10 +316,26 @@ class ApiKeyStore:
                 for record in self._active_records()
             )
 
+    def resolve_authorization(
+        self, authorization_header: str | None
+    ) -> dict[str, Any] | None:
+        token = _parse_bearer(authorization_header)
+        if token is None:
+            return None
+        supplied_digest = _token_digest(token)
+        with self._lock:
+            for record in self._active_records():
+                if secrets.compare_digest(supplied_digest, str(record["digest"])):
+                    return self._public_record(record)
+        return None
+
     def authorize_request(
         self, method: str, path: str, authorization_header: str | None
     ) -> bool | None:
-        if path not in _PROTECTED_ENDPOINTS:
+        if (
+            path not in _PROTECTED_ENDPOINTS
+            and _RESPONSE_ENDPOINT_PATTERN.fullmatch(path) is None
+        ):
             return None
         if method.upper() == "OPTIONS":
             return True

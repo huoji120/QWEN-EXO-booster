@@ -96,6 +96,8 @@ class UnifiedTreeNode:
         # rid of the request whose chunked prefill donated this node's mamba state
         # as an intermediate checkpoint; None for every other node.
         self.prefill_checkpoint_rid: Optional[str] = None
+        # Set only when a real tracked state is donated at a known branch boundary.
+        self.mamba_branch_checkpoint = False
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
         )
@@ -778,6 +780,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.key = radix_key
             insert_params.value = values
             result = self.insert(insert_params)
+            branching_seqlen = getattr(req, "mamba_branching_seqlen", None)
+            if branching_seqlen is not None and page_aligned_len == branching_seqlen:
+                branch_match = self.match_prefix(MatchPrefixParams(key=radix_key))
+                self._mark_prefill_checkpoint(
+                    branch_match.best_match_node,
+                    insert_params,
+                    None,
+                    branching_seqlen,
+                )
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
@@ -875,10 +886,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        if chunked:
-            self._mark_prefill_checkpoint(
-                match_result.best_match_node, insert_params, req.rid
-            )
+        self._mark_prefill_checkpoint(
+            match_result.best_match_node,
+            insert_params,
+            req.rid if chunked else None,
+            getattr(req, "mamba_branching_seqlen", None),
+        )
         self._demote_superseded_prefill_checkpoint(req.last_node, req.rid)
         self.dec_lock_ref(
             req.last_node,
@@ -911,16 +924,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     # ---- Internal Helpers ----
 
     def _mark_prefill_checkpoint(
-        self, node: UnifiedTreeNode, insert_params: InsertParams, rid: str
+        self,
+        node: UnifiedTreeNode,
+        insert_params: InsertParams,
+        rid: Optional[str],
+        branching_seqlen: Optional[int] = None,
     ) -> None:
-        """Tag the node holding the mamba state this chunk just donated."""
+        """Classify only the exact state donated by this prefill."""
         if (
             ComponentType.MAMBA in self.tree_components
             and insert_params.mamba_value is not None
             and node.component_data[ComponentType.MAMBA].value
             is insert_params.mamba_value
         ):
-            node.prefill_checkpoint_rid = rid
+            if (
+                branching_seqlen is not None
+                and len(insert_params.key) == branching_seqlen
+            ):
+                node.mamba_branch_checkpoint = True
+            node.prefill_checkpoint_rid = None if node.mamba_branch_checkpoint else rid
 
     def _demote_superseded_prefill_checkpoint(
         self, node: UnifiedTreeNode, rid: str
@@ -930,10 +952,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         Chunked prefill donates one mamba state per chunk; left at MRU, a single
         long cold prompt evicts every other session's leaf (and its KV) from the
-        small mamba pool. Demoted checkpoints stay reusable (e.g. a shared system
-        prompt) until there is pressure, and are then tombstoned before any leaf.
+        small mamba pool. Known branch states instead age under ordinary LRU:
+        they are reusable anchors, not disposable chunks, but are never pinned.
         """
-        if node.prefill_checkpoint_rid != rid or len(node.children) == 0:
+        if (
+            node.prefill_checkpoint_rid != rid
+            or len(node.children) != 1
+            or node.mamba_branch_checkpoint
+        ):
             return
         lru = self.lru_lists[ComponentType.MAMBA]
         if node.component_data[ComponentType.MAMBA].value is not None and lru.in_list(

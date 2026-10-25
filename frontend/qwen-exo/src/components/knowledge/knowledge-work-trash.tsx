@@ -11,7 +11,7 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { getWorkTrash, restoreWorkTrash } from "@/lib/api";
+import { useKnowledgeApi } from "./knowledge-scope";
 import { translate as t } from "@/lib/i18n";
 import type { WorkTrashEntry } from "@/lib/types";
 import { formatBytes, formatNumber } from "@/lib/utils";
@@ -32,6 +32,7 @@ export function KnowledgeWorkTrash({
   refreshKey: number;
   onRestored: () => void | Promise<void>;
 }) {
+  const { getWorkTrash, restoreWorkTrash, signal } = useKnowledgeApi();
   const [open, setOpen] = useState(false);
   const [entries, setEntries] = useState<WorkTrashEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -48,7 +49,7 @@ export function KnowledgeWorkTrash({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [getWorkTrash]);
 
   useEffect(() => {
     void load();
@@ -69,10 +70,12 @@ export function KnowledgeWorkTrash({
     setRestoring(key);
     try {
       const result = await restoreWorkTrash(entry.batch, entry.path);
+      if (signal.aborted) return;
       toast.success(t("已恢复"), { description: result.restored || entry.path });
       await load();
       await onRestored();
     } catch (cause) {
+      if (signal.aborted) return;
       toast.error(t("恢复失败"), { description: errorText(cause, t("未知错误")) });
     } finally {
       setRestoring(null);

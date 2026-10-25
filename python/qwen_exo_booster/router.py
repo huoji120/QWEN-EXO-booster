@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Literal
 
@@ -22,6 +24,8 @@ from qwen_exo_booster.activation_training import (
     ActivationTrainingStore,
 )
 from qwen_exo_booster.api_keys import ApiKeyStore, ApiKeyStoreError
+from qwen_exo_booster.admin_memory import memory_spaces, private_work_trash, select_memory_index, transfer_memory, validate_memory_transfer
+from qwen_exo_booster.memory_transfer import TransferConflict, TransferRecoveryRequired
 from qwen_exo_booster.attention_diagnostic import (
     MAX_UPLOAD_BYTES,
     AttentionDiagnosticError,
@@ -79,6 +83,15 @@ class KnowledgeFolderRequest(BaseModel):
 class KnowledgeMoveRequest(BaseModel):
     source: str = Field(min_length=1, max_length=1024)
     destination: str = Field(min_length=1, max_length=1024)
+
+
+class KnowledgeTransferRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    source_key_id: str | None = Field(default=None, min_length=1, max_length=128)
+    destination_key_id: str | None = Field(default=None, min_length=1, max_length=128)
+    source: str = Field(max_length=1024)
+    destination: str = Field(min_length=1, max_length=1024)
+    confirm_publish: StrictBool = False
 
 
 class KnowledgeSummaryWriteRequest(BaseModel):
@@ -159,6 +172,11 @@ class ReflectionRegenerationRequest(BaseModel):
 
 class ApiKeyCreateRequest(BaseModel):
     label: str = Field(min_length=1, max_length=80)
+    memory_scope: Literal["shared", "private", "private_only", "super"] = "shared"
+
+
+class ApiKeyUpdateRequest(BaseModel):
+    memory_scope: Literal["shared", "private", "private_only", "super"]
 
 
 class ApiKeyDeleteRequest(BaseModel):
@@ -254,9 +272,24 @@ async def list_api_keys():
 @router.post("/api-keys", status_code=201)
 async def create_api_key(payload: ApiKeyCreateRequest):
     try:
-        return await asyncio.to_thread(_api_key_store().create, payload.label)
+        return await asyncio.to_thread(
+            _api_key_store().create, payload.label, payload.memory_scope
+        )
     except ApiKeyStoreError as exc:
         return JSONResponse(status_code=422, content={"detail": exc.public_dict()})
+
+
+@router.patch("/api-keys/{key_id}")
+async def update_api_key(key_id: str, payload: ApiKeyUpdateRequest):
+    try:
+        return await asyncio.to_thread(
+            _api_key_store().update_memory_scope, key_id, payload.memory_scope
+        )
+    except ApiKeyStoreError as exc:
+        status_code = 404 if exc.code == "key_not_found" else 422
+        return JSONResponse(
+            status_code=status_code, content={"detail": exc.public_dict()}
+        )
 
 
 @router.post("/api-keys/delete")
@@ -643,6 +676,46 @@ async def telemetry_stream(
 
 
 
+def _admin_memory_index(request: Request):
+    """Scope only control-plane routes; never change runtime/tool ownership."""
+    shared = _runtime(request).file_knowledge
+    if "memory_key_id" not in request.query_params:
+        return shared
+    values = request.query_params.getlist("memory_key_id")
+    if len(values) != 1:
+        raise HTTPException(status_code=400, detail="one memory_key_id is required")
+    try:
+        return select_memory_index(shared, _api_key_store(), values[0])
+    except ApiKeyStoreError as exc:
+        raise HTTPException(status_code=500, detail=exc.public_dict()) from exc
+    except (ValueError, OSError) as exc:
+        raise _knowledge_error(exc) from exc
+
+
+def _private_automation_unavailable(request: Request) -> bool:
+    if "memory_key_id" not in request.query_params:
+        return False
+    _admin_memory_index(request)
+    return True
+
+
+def _require_shared_automation(request: Request) -> None:
+    if _private_automation_unavailable(request):
+        raise HTTPException(status_code=409, detail="private_memory_automation_unavailable")
+
+
+@router.get("/knowledge/memory-spaces")
+async def knowledge_memory_spaces(request: Request):
+    try:
+        return await asyncio.to_thread(
+            memory_spaces, _runtime(request).file_knowledge, _api_key_store()
+        )
+    except ApiKeyStoreError as exc:
+        raise HTTPException(status_code=500, detail=exc.public_dict()) from exc
+    except (ValueError, OSError) as exc:
+        raise _knowledge_error(exc) from exc
+
+
 @router.get("/knowledge/files")
 async def list_knowledge_files(
     request: Request,
@@ -655,7 +728,7 @@ async def list_knowledge_files(
 ):
     try:
         return await asyncio.to_thread(
-            _runtime(request).file_knowledge.page_files,
+            _admin_memory_index(request).page_files,
             folder=folder,
             nested=nested,
             q=q,
@@ -676,7 +749,7 @@ def _knowledge_error(exc: Exception) -> HTTPException:
 async def _store_knowledge_file(request: Request, relative_path: str, raw: bytes):
     from qwen_exo_booster.file_knowledge import validate_text_upload
 
-    index = _runtime(request).file_knowledge
+    index = _admin_memory_index(request)
     try:
         validate_text_upload(raw)
         row = await asyncio.to_thread(index.upsert, relative_path, raw)
@@ -700,7 +773,7 @@ async def upload_knowledge_file_raw(
 ):
     """Raw-byte upload (``application/octet-stream``) of one text file, streamed
     to disk with no size limit."""
-    index = _runtime(request).file_knowledge
+    index = _admin_memory_index(request)
     spool = await _spool_body(request, index.state_directory)
     try:
         with spool:
@@ -717,7 +790,7 @@ async def upload_knowledge_archive_raw(
     request: Request, target_directory: str = Query(default="", max_length=512)
 ):
     """Raw-byte ZIP upload; each text member becomes its own knowledge file."""
-    index = _runtime(request).file_knowledge
+    index = _admin_memory_index(request)
     spool = await _spool_body(request, index.state_directory)
     try:
         with spool:
@@ -740,7 +813,7 @@ async def upload_knowledge_archive(
         raw = base64.b64decode(payload.content_base64, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    index = _runtime(request).file_knowledge
+    index = _admin_memory_index(request)
     try:
         imported, skipped = await asyncio.to_thread(
             index.import_archive, raw, directory=payload.target_directory
@@ -752,7 +825,7 @@ async def upload_knowledge_archive(
 
 @router.get("/knowledge/tree")
 async def knowledge_tree(request: Request):
-    index = _runtime(request).file_knowledge
+    index = _admin_memory_index(request)
     await asyncio.to_thread(index.refresh)
     return await asyncio.to_thread(index.directory_summary)
 
@@ -761,7 +834,7 @@ async def knowledge_tree(request: Request):
 async def create_knowledge_folder(payload: KnowledgeFolderRequest, request: Request):
     try:
         path = await asyncio.to_thread(
-            _runtime(request).file_knowledge.make_directory, payload.path
+            _admin_memory_index(request).make_directory, payload.path
         )
     except (ValueError, OSError) as exc:
         raise _knowledge_error(exc) from exc
@@ -772,7 +845,7 @@ async def create_knowledge_folder(payload: KnowledgeFolderRequest, request: Requ
 async def delete_knowledge_folder(path: str, request: Request):
     try:
         removed = await asyncio.to_thread(
-            _runtime(request).file_knowledge.delete_directory, path
+            _admin_memory_index(request).delete_directory, path
         )
     except (ValueError, OSError) as exc:
         raise _knowledge_error(exc) from exc
@@ -784,14 +857,56 @@ async def move_knowledge_entry(payload: KnowledgeMoveRequest, request: Request):
     """Rename or move a file or folder (summaries follow it)."""
     try:
         return await asyncio.to_thread(
-            _runtime(request).file_knowledge.move, payload.source, payload.destination
+            _admin_memory_index(request).move, payload.source, payload.destination
         )
+    except (ValueError, OSError) as exc:
+        raise _knowledge_error(exc) from exc
+
+
+@router.post("/knowledge/transfer")
+async def transfer_knowledge_entry(payload: KnowledgeTransferRequest, request: Request):
+    """Change physical ownership, independently of the browsing scope selector."""
+    runtime = _runtime(request)
+    values = payload.model_dump()
+    try:
+        store = _api_key_store()
+        await asyncio.to_thread(validate_memory_transfer, runtime.file_knowledge, store, **values)
+        async with runtime.memory_transfer_guard(values):
+            operation = asyncio.create_task(asyncio.to_thread(
+                transfer_memory, runtime.file_knowledge, store, **values
+            ))
+            cancelled = False
+            while True:
+                try:
+                    result = await asyncio.shield(operation)
+                    break
+                except asyncio.CancelledError:
+                    # A disconnected HTTP waiter cannot cancel a filesystem
+                    # thread or release the invalidation fence while it runs.
+                    cancelled = True
+                    if operation.cancelled():
+                        raise
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+    except ApiKeyStoreError as exc:
+        raise HTTPException(status_code=500, detail=exc.public_dict()) from exc
+    except TransferRecoveryRequired as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "memory_transfer_recovery_required", "message": str(exc),
+        }) from exc
+    except TransferConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail="memory transfer metadata transaction failed") from exc
     except (ValueError, OSError) as exc:
         raise _knowledge_error(exc) from exc
 
 
 @router.get("/knowledge/summaries")
 async def knowledge_summary_status(request: Request):
+    if _private_automation_unavailable(request):
+        return {"available": False, "reason": "private_memory_automation_unavailable"}
     return await asyncio.to_thread(_runtime(request).memory_summary_status)
 
 
@@ -800,7 +915,7 @@ async def read_knowledge_summary(
     request: Request, path: str = Query(min_length=1, max_length=1024)
 ):
     try:
-        summary = await asyncio.to_thread(_runtime(request).file_knowledge.summary, path)
+        summary = await asyncio.to_thread(_admin_memory_index(request).summary, path)
     except ValueError as exc:
         raise _knowledge_error(exc) from exc
     if summary is None:
@@ -811,7 +926,7 @@ async def read_knowledge_summary(
 @router.put("/knowledge/summary")
 async def write_knowledge_summary(payload: KnowledgeSummaryWriteRequest, request: Request):
     """Store a hand-edited summary; automatic generation never overwrites it."""
-    index = _runtime(request).file_knowledge
+    index = _admin_memory_index(request)
     try:
         sha256, _text = await asyncio.to_thread(index.read_text, payload.path)
         return await asyncio.to_thread(
@@ -832,7 +947,7 @@ async def delete_knowledge_summary(
 ):
     try:
         deleted = await asyncio.to_thread(
-            _runtime(request).file_knowledge.delete_summary, path
+            _admin_memory_index(request).delete_summary, path
         )
     except ValueError as exc:
         raise _knowledge_error(exc) from exc
@@ -841,12 +956,15 @@ async def delete_knowledge_summary(
 
 @router.get("/memory/dream")
 async def memory_dream_status(request: Request):
+    if _private_automation_unavailable(request):
+        return {"available": False, "reason": "private_memory_automation_unavailable"}
     return await asyncio.to_thread(_runtime(request).memory_dream_status)
 
 
 @router.post("/memory/dream/run", status_code=202)
 async def run_memory_dream(request: Request):
     """Start the work-memory dream now (it also runs nightly at 00:00)."""
+    _require_shared_automation(request)
     try:
         return _runtime(request).start_memory_dream()
     except RuntimeError as exc:
@@ -855,6 +973,7 @@ async def run_memory_dream(request: Request):
 
 @router.get("/memory/dream/runs/{run_id}")
 async def memory_dream_run(run_id: int, request: Request):
+    _require_shared_automation(request)
     try:
         run = await asyncio.to_thread(_runtime(request).memory_dream_run, run_id)
     except RuntimeError as exc:
@@ -867,17 +986,30 @@ async def memory_dream_run(run_id: int, request: Request):
 @router.get("/memory/work-trash")
 async def work_memory_trash(request: Request):
     try:
+        if "memory_key_id" in request.query_params:
+            index = _admin_memory_index(request)
+            return {"entries": await asyncio.to_thread(lambda: private_work_trash(index).entries())}
         return {"entries": await asyncio.to_thread(_runtime(request).work_memory_trash)}
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise _knowledge_error(exc) from exc
 
 
 @router.post("/memory/work-trash/restore")
 async def restore_work_memory(payload: WorkMemoryRestoreRequest, request: Request):
     try:
-        path = await asyncio.to_thread(
-            _runtime(request).restore_work_memory, payload.batch, payload.path
-        )
+        if "memory_key_id" in request.query_params:
+            index = _admin_memory_index(request)
+            if payload.batch in (".", ".."):
+                raise ValueError("invalid trash batch")
+            path = await asyncio.to_thread(
+                lambda: private_work_trash(index).restore(payload.batch, payload.path)
+            )
+        else:
+            path = await asyncio.to_thread(
+                _runtime(request).restore_work_memory, payload.batch, payload.path
+            )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (ValueError, OSError) as exc:
@@ -890,6 +1022,7 @@ async def generate_knowledge_summaries(
     payload: KnowledgeSummaryGenerateRequest, request: Request
 ):
     """Queue summaries for ``paths`` (or every file still missing one)."""
+    _require_shared_automation(request)
     try:
         return _runtime(request).queue_memory_summaries(payload.paths, force=payload.force)
     except RuntimeError as exc:
@@ -899,7 +1032,7 @@ async def generate_knowledge_summaries(
 @router.delete("/knowledge/files/{relative_path:path}")
 async def delete_knowledge_file(relative_path: str, request: Request):
     try:
-        await asyncio.to_thread(_runtime(request).file_knowledge.delete, relative_path)
+        await asyncio.to_thread(_admin_memory_index(request).delete, relative_path)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="知识库文件不存在")
     except ValueError as exc:
@@ -918,7 +1051,7 @@ async def search_knowledge_files(
     context_before: int = Query(default=0, ge=0, le=20),
     context_after: int = Query(default=0, ge=0, le=20),
 ):
-    index = _runtime(request).file_knowledge
+    index = _admin_memory_index(request)
     try:
         return await asyncio.to_thread(
             index.search,
@@ -941,7 +1074,7 @@ async def read_knowledge_file(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=65536, ge=1, le=1_048_576),
 ):
-    index = _runtime(request).file_knowledge
+    index = _admin_memory_index(request)
     try:
         return await asyncio.to_thread(index.read, path, offset=offset, limit=limit)
     except ValueError as exc:
@@ -963,13 +1096,19 @@ async def memory_tool_calls(
 
 @router.get("/knowledge/index")
 async def knowledge_index(request: Request):
-    runtime = _runtime(request)
-    await asyncio.to_thread(runtime.file_knowledge.refresh)
-    rows = await asyncio.to_thread(runtime.file_knowledge.metadata)
+    index = _admin_memory_index(request)
+    await asyncio.to_thread(index.refresh)
+    rows = await asyncio.to_thread(index.metadata)
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(str(row["relative_path"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(row["sha256"]).encode("ascii"))
+        digest.update(b"\0")
     return {
         "file_count": len(rows),
         "total_bytes": sum(int(row["byte_count"]) for row in rows),
-        "source_digest": runtime._file_knowledge_digest(),
+        "source_digest": digest.hexdigest(),
         "indexed_ns": max((int(row["indexed_ns"]) for row in rows), default=None),
     }
 

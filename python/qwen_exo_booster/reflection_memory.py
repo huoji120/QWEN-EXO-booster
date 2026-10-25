@@ -359,6 +359,13 @@ class ReflectionMemoryStore:
 
     def append(self, reflection: ReflectionMemory) -> dict[str, Any]:
         key = stable_digest(reflection.conversation_key, reflection.source_digest)
+        previous = self._records.get(key)
+        if previous and previous.get("memory_transfer_detached"):
+            raise RuntimeError("Reflection source was detached by an admin memory transfer")
+        if reflection.replaces_source_digest:
+            replaced = self.get(reflection.replaces_source_digest)
+            if replaced and replaced.get("memory_transfer_detached"):
+                raise RuntimeError("Reflection update target was detached by an admin memory transfer")
         previous_records = self._records.copy()
         if reflection.publication_status == "analysis_only" and reflection.coverage:
             analyzed = {
@@ -412,6 +419,21 @@ class ReflectionMemoryStore:
             if value.get("source_digest") == expected:
                 return dict(value)
         return None
+
+    def detach_documents(self, document_paths: set[str]) -> None:
+        """Retain original provenance, but revoke regeneration and aggregate use."""
+        previous_records = self._records.copy()
+        changed = False
+        for key, record in tuple(self._records.items()):
+            if record.get("document_path") in document_paths:
+                self._records[key] = {**record, "memory_transfer_detached": True}
+                changed = True
+        if changed:
+            try:
+                self._save()
+            except BaseException:
+                self._records = previous_records
+                raise
 
     def delete_document(self, document_path: str) -> bool:
         matching = tuple(

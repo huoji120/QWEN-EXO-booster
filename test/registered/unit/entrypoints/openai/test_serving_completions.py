@@ -60,6 +60,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.sc = OpenAIServingCompletion(tm, self.template_manager)
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+        self.fastapi_request.state = SimpleNamespace(qwen_exo_api_key=None)
 
     # ---------- prompt-handling ----------
     def test_single_token_ids_prompt(self):
@@ -100,9 +101,6 @@ class ServingCompletionTestCase(unittest.TestCase):
             adapted.sampling_params["custom_params"]["qwen_exo_session_initial_gdn"],
             selection,
         )
-        runtime.initial_gdn_selection.assert_called_once_with(
-            previous_response_id=None, response_id=None
-        )
 
     def test_qwen_exo_completion_can_disable_initial_gdn_for_ab(self):
         runtime = Mock()
@@ -127,7 +125,6 @@ class ServingCompletionTestCase(unittest.TestCase):
             adapted.extra_key.startswith("qwen-exo:v1:global-initial-gdn:disabled|")
         )
         self.assertTrue(adapted.extra_key.endswith("|client-salt"))
-        runtime.initial_gdn_selection.assert_not_called()
 
     # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):

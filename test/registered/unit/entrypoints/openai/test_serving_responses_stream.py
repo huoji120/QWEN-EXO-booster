@@ -62,6 +62,137 @@ def _engine_chunk(text, completion_tokens, *, finish=False, finish_reason=None):
 
 
 class NonHarmonyStreamTestCase(unittest.TestCase):
+    def test_terminal_usage_matches_json_and_internal_accounting(self):
+        from openai.types.responses import (
+            Response,
+            ResponseCompletedEvent,
+            ResponseIncompleteEvent,
+        )
+        from sglang.srt.entrypoints.context import SimpleContext
+
+        for details_enabled in (False, True):
+            for cached_tokens in (0, 3):
+                for finish_type in ("stop", "length"):
+                    with self.subTest(
+                        details_enabled=details_enabled,
+                        cached_tokens=cached_tokens,
+                        finish_type=finish_type,
+                    ):
+                        serving = make_serving()
+                        serving.enable_prompt_tokens_details = details_enabled
+                        serving.reasoning_parser = None
+                        serving.tool_call_parser = None
+                        chunk = _engine_chunk(
+                            "done", 7, finish_reason={"type": finish_type}
+                        )
+                        chunk["meta_info"].update(
+                            prompt_tokens=11, cached_tokens=cached_tokens,
+                            reasoning_tokens=2,
+                        )
+                        request = ResponsesRequest(
+                            model="x", input="hi", stream=True, store=True,
+                        )
+                        fixture = _StreamFixture(serving, request)
+                        payloads = event_payloads(fixture.run([chunk]))
+                        self.assertIsNone(payloads[0]["response"]["usage"])
+                        self.assertIsNone(payloads[1]["response"]["usage"])
+                        event_type = (
+                            ResponseIncompleteEvent if finish_type == "length"
+                            else ResponseCompletedEvent
+                        )
+                        terminal = event_type.model_validate(payloads[-1])
+                        stored_stream_usage = serving.response_store[
+                            request.request_id
+                        ].model_dump()["usage"]
+
+                        context = SimpleContext()
+                        context.last_output = chunk
+                        metadata = RequestResponseMetadata(request_id=request.request_id)
+
+                        async def empty_generator():
+                            for _ in ():
+                                yield None
+
+                        response = asyncio.run(serving.responses_full_generator(
+                            request.model_copy(update={"stream": False}),
+                            sampling_params={}, result_generator=empty_generator(),
+                            context=context, model_name="x",
+                            tokenizer=serving.tokenizer_manager.tokenizer,
+                            request_metadata=metadata,
+                        ))
+                        parsed = Response.model_validate_json(response.model_dump_json())
+                        expected = {
+                            "input_tokens": 11,
+                            "input_tokens_details": {"cached_tokens": cached_tokens},
+                            "output_tokens": 7,
+                            "output_tokens_details": {"reasoning_tokens": 2},
+                            "total_tokens": 18,
+                        }
+                        self.assertEqual(terminal.response.usage.model_dump(), expected)
+                        self.assertEqual(parsed.usage.model_dump(), expected)
+                        self.assertEqual(stored_stream_usage, expected)
+                        self.assertEqual(
+                            serving.response_store[request.request_id].model_dump()["usage"],
+                            expected,
+                        )
+                        self.assertEqual(
+                            fixture.request_metadata.final_usage_info,
+                            metadata.final_usage_info,
+                        )
+                        self.assertEqual(metadata.final_usage_info.prompt_tokens, 11)
+                        self.assertEqual(metadata.final_usage_info.completion_tokens, 7)
+
+    def test_harmony_terminal_usage_preserves_nested_cached_tokens(self):
+        from openai.types.responses import Response, ResponseCompletedEvent
+        from sglang.srt.entrypoints.context import StreamingHarmonyContext
+
+        for details_enabled in (False, True):
+            with self.subTest(details_enabled=details_enabled):
+                serving = make_serving()
+                serving.use_harmony = True
+                serving.enable_prompt_tokens_details = details_enabled
+                # No generated content is needed to exercise terminal accounting;
+                # avoid loading a Harmony tokenizer for this CPU-only boundary test.
+                with patch(
+                    "sglang.srt.entrypoints.context.get_streamable_parser_for_assistant",
+                    return_value=Mock(current_content="", messages=[]),
+                ):
+                    context = StreamingHarmonyContext(messages=[], tool_sessions={})
+                context.num_prompt_tokens = 11
+                context.num_output_tokens = 7
+                context.num_cached_tokens = 3
+                context.num_reasoning_tokens = 2
+                request = ResponsesRequest(model="x", input="hi", store=False)
+                metadata = RequestResponseMetadata(request_id=request.request_id)
+
+                async def empty_generator():
+                    for _ in ():
+                        yield None
+
+                async def collect():
+                    return await collect_stream_events(serving.responses_stream_generator(
+                        request, {}, empty_generator(), context, "x",
+                        serving.tokenizer_manager.tokenizer, metadata,
+                    ))
+
+                events = asyncio.run(collect())
+                terminal = ResponseCompletedEvent.model_validate(find_completed_event(events))
+                response = asyncio.run(serving.responses_full_generator(
+                    request, {}, empty_generator(), context, "x",
+                    serving.tokenizer_manager.tokenizer, metadata,
+                ))
+                parsed = Response.model_validate_json(response.model_dump_json())
+                expected = {
+                    "input_tokens": 11,
+                    "input_tokens_details": {"cached_tokens": 3},
+                    "output_tokens": 7,
+                    "output_tokens_details": {"reasoning_tokens": 2},
+                    "total_tokens": 18,
+                }
+                self.assertEqual(terminal.response.usage.model_dump(), expected)
+                self.assertEqual(parsed.usage.model_dump(), expected)
+                self.assertEqual(metadata.final_usage_info.prompt_tokens_details.cached_tokens, 3)
+
     def test_emits_typed_sse_events_in_order(self):
         serving = make_serving()
         serving.reasoning_parser = None

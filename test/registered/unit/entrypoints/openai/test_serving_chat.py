@@ -121,6 +121,7 @@ class ServingChatTestCase(CustomTestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+        self.fastapi_request.state = SimpleNamespace(qwen_exo_api_key=None)
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
@@ -157,7 +158,7 @@ class ServingChatTestCase(CustomTestCase):
         runtime = SimpleNamespace(
             initial_gdn_selection=lambda **_kwargs: selection,
             personality_instructions=lambda: personality,
-            activation_editor_request=lambda _spec: {
+            activation_editor_request=lambda _spec, **_kwargs: {
                 "spec": None,
                 "cache_identity": "none",
             },
@@ -165,6 +166,7 @@ class ServingChatTestCase(CustomTestCase):
         self.fastapi_request.app = SimpleNamespace(
             state=SimpleNamespace(qwen_exo_runtime=runtime)
         )
+        self.fastapi_request.state = SimpleNamespace(qwen_exo_api_key=None)
         return runtime
 
     def test_convert_to_internal_request_binds_qwen_exo_initial_gdn(self):

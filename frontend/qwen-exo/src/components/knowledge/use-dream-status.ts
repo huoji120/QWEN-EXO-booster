@@ -22,7 +22,7 @@ export type DreamState = {
  * Poll the dream agent: every 5 s while a run is active, every 60 s otherwise.
  * ``onFinished`` fires once each time a run stops (work notes may have changed).
  */
-export function useDreamStatus(onFinished: () => void): DreamState {
+export function useDreamStatus(onFinished: () => void, enabled = true, signal?: AbortSignal): DreamState {
   const [status, setStatus] = useState<DreamStatus | null>(null);
   const [fetchedAt, setFetchedAt] = useState(() => Date.now());
   const [error, setError] = useState<string | null>(null);
@@ -32,34 +32,39 @@ export function useDreamStatus(onFinished: () => void): DreamState {
   finished.current = onFinished;
 
   const apply = useCallback((next: DreamStatus) => {
+    if (!enabled || signal?.aborted) return;
     setStatus(next);
     setFetchedAt(Date.now());
     setError(null);
     const running = Boolean(next.running);
     if (wasRunning.current && !running) finished.current();
     wasRunning.current = running;
-  }, []);
+  }, [enabled, signal]);
 
   const refresh = useCallback(async () => {
+    if (!enabled || signal?.aborted) return;
     try {
-      apply(await getDreamStatus());
+      apply(await getDreamStatus(signal));
     } catch (cause) {
       setError(errorText(cause, t("未知错误")));
     }
-  }, [apply]);
+  }, [apply, enabled, signal]);
 
   const start = useCallback(async () => {
+    if (!enabled || signal?.aborted) return;
     setStarting(true);
     try {
-      apply(await runDream());
+      apply(await runDream(signal));
+      if (signal?.aborted) return;
       toast.success(t("已开始整理工作记忆"));
     } catch (cause) {
+      if (signal?.aborted) return;
       toast.error(t("无法开始整理"), { description: errorText(cause, t("未知错误")) });
       void refresh();
     } finally {
       setStarting(false);
     }
-  }, [apply, refresh]);
+  }, [apply, refresh, enabled, signal]);
 
   useEffect(() => {
     void refresh();
@@ -67,12 +72,13 @@ export function useDreamStatus(onFinished: () => void): DreamState {
 
   const running = Boolean(status?.running);
   useEffect(() => {
+    if (!enabled) return;
     const timer = window.setInterval(
       () => void refresh(),
       running ? RUNNING_POLL_MS : IDLE_POLL_MS,
     );
     return () => window.clearInterval(timer);
-  }, [refresh, running]);
+  }, [refresh, running, enabled]);
 
   return { status, fetchedAt, error, starting, refresh, start };
 }

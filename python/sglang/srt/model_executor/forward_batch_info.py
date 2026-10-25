@@ -541,6 +541,8 @@ def _qwen_exo_active_editor_spec() -> dict[str, object] | None:
 
 def _qwen_exo_activation_editor(req) -> dict[str, object] | None:
     custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+    if custom_params.get("qwen_exo_disable_activation_editor") is True:
+        return None
     raw_custom = custom_params.get("qwen_exo_activation_editor")
     if isinstance(raw_custom, list):
         return None

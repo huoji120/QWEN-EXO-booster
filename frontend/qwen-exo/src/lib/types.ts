@@ -364,9 +364,12 @@ export type ServiceConfig = {
   restart_requested?: boolean;
 };
 
+export type ApiKeyMemoryScope = "shared" | "private" | "private_only" | "super";
+
 export type ApiKeyInfo = {
   id: string;
   label: string;
+  memory_scope: ApiKeyMemoryScope;
   created_at: string;
   revoked_at: string | null;
 };
@@ -570,6 +573,15 @@ export type KnowledgeFileSummaryInfo = {
 
 export type KnowledgeFolderCount = { files: number; bytes: number };
 
+export type KnowledgeMemorySpace = {
+  key_id: string;
+  label: string;
+  memory_scope: ApiKeyMemoryScope;
+  revoked: boolean;
+  deleted: boolean;
+  files: number;
+  bytes: number;
+};
 export type KnowledgeTree = {
   /** Every folder, including empty folders and indexed file parents. */
   directories: string[];
@@ -598,6 +610,19 @@ export type KnowledgeMoveResult = {
   from: string;
   to: string;
   files: number;
+};
+
+export type KnowledgeTransferRequest = {
+  source_key_id: string | null;
+  destination_key_id: string | null;
+  source: string;
+  destination: string;
+  confirm_publish: boolean;
+};
+
+export type KnowledgeTransferResult = KnowledgeMoveResult & {
+  source_key_id: string | null;
+  destination_key_id: string | null;
 };
 
 /** Background summary worker state; only ``available`` exists when it is off. */

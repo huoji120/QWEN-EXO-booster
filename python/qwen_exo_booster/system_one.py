@@ -13,6 +13,9 @@ is generated and every answer is a calibrated probability distribution:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import math
 import time
@@ -27,11 +30,18 @@ from qwen_exo_booster.contracts import (
     InternalJobType,
     stable_digest,
 )
-from qwen_exo_booster.internal_jobs import InternalJobRunner
+from qwen_exo_booster.internal_jobs import (
+    InternalJobRunner,
+    InternalOptionScoreContextError,
+)
 
 SYSTEM_ONE_MODEL = "qwen-exo-jev"
 QUESTION_TYPES = ("noul", "choice", "score")
 _OPTION_LABELS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_MAX_IMAGES = 4
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+_MAX_TOTAL_IMAGE_BYTES = 16 * 1024 * 1024
+_IMAGE_MIME_TYPES = frozenset(("image/jpeg", "image/png", "image/webp", "image/gif"))
 
 # A STATE at least this long is scored by one question alone to seed the prefix cache.
 _STATE_WARMUP_MIN_TOKENS = 512
@@ -171,6 +181,50 @@ def parse_system_one_request(
     return model.strip(), state, parsed
 
 
+def parse_system_one_images(
+    payload: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return validated data URLs and ordered content identities, without fetching."""
+    images = payload.get("images", [])
+    if not isinstance(images, list):
+        raise _bad_request("images must be an array of base64 image data URLs")
+    if len(images) > _MAX_IMAGES:
+        raise _bad_request(f"images may contain at most {_MAX_IMAGES} entries")
+    identities = []
+    total_bytes = 0
+    for index, image in enumerate(images):
+        name = f"images[{index}]"
+        if not isinstance(image, str):
+            raise _bad_request(f"{name} must be a base64 image data URL")
+        header, separator, encoded = image.partition(",")
+        if (
+            not separator
+            or not header.startswith("data:")
+            or not header.endswith(";base64")
+            or header[5:-7] not in _IMAGE_MIME_TYPES
+        ):
+            raise _bad_request(
+                f"{name} must be a JPEG, PNG, WebP, or GIF base64 data URL"
+            )
+        if len(encoded) > 4 * ((_MAX_IMAGE_BYTES + 2) // 3):
+            raise SystemOneError(413, "image_too_large", f"{name} exceeds 8 MiB")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise _bad_request(f"{name} contains invalid base64") from None
+        if not decoded:
+            raise _bad_request(f"{name} must not be empty")
+        if len(decoded) > _MAX_IMAGE_BYTES:
+            raise SystemOneError(413, "image_too_large", f"{name} exceeds 8 MiB")
+        total_bytes += len(decoded)
+        if total_bytes > _MAX_TOTAL_IMAGE_BYTES:
+            raise SystemOneError(
+                413, "images_too_large", "images exceed 16 MiB in total"
+            )
+        identities.append(stable_digest(header[5:-7], hashlib.sha256(decoded).hexdigest()))
+    return tuple(images), tuple(identities)
+
+
 def _render_value(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -259,7 +313,28 @@ class SystemOneEvaluator:
             raise ValueError("System One option labels must map to distinct tokens")
         return tuple(ids)
 
-    def _render_prompt(self, state: Any, question: _Question) -> str:
+    def _image_token_id(self) -> int:
+        manager = getattr(self.runner, "tokenizer_manager", None)
+        processor = getattr(manager, "mm_processor", None)
+        token_id = getattr(getattr(processor, "mm_tokens", None), "image_token_id", None)
+        if token_id is None:
+            token_id = getattr(manager, "image_token_id", None)
+        if (
+            not getattr(getattr(manager, "model_config", None), "is_multimodal", False)
+            or not callable(getattr(processor, "process_mm_data_async", None))
+            or type(token_id) is not int
+            or token_id < 0
+        ):
+            raise SystemOneError(
+                400,
+                "images_unsupported",
+                "The active model or processor does not support System One images",
+            )
+        return token_id
+
+    def _render_prompt(
+        self, state: Any, question: _Question, images: tuple[str, ...] = ()
+    ) -> str:
         instructions = question.instructions
         if instructions is None:
             instructions = _DEFAULT_INSTRUCTIONS[question.question_type]
@@ -279,15 +354,44 @@ class SystemOneEvaluator:
             "",
             "Answer with exactly one option letter.",
         ]
-        return self.tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": "\n".join(lines)},
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
+        text = "\n".join(lines)
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ]
+        template_options = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": False,
+        }
+        if not images:
+            return self.tokenizer.apply_chat_template(messages, **template_options)
+        image_token_id = self._image_token_id()
+        content = [{"type": "image", "image": image} for image in images]
+        content.append({"type": "text", "text": text})
+        messages[1]["content"] = content
+        try:
+            rendered = self.tokenizer.apply_chat_template(messages, **template_options)
+            messages[1]["content"] = [content[-1]]
+            text_rendered = self.tokenizer.apply_chat_template(messages, **template_options)
+            rendered_ids = self.tokenizer.encode(rendered, add_special_tokens=False)
+            text_ids = self.tokenizer.encode(text_rendered, add_special_tokens=False)
+        except Exception:
+            raise SystemOneError(
+                400,
+                "images_unsupported",
+                "The active chat template cannot render System One images",
+            ) from None
+        if (
+            rendered_ids.count(image_token_id) != len(images)
+            or text_ids.count(image_token_id) != 0
+        ):
+            raise SystemOneError(
+                400,
+                "images_unsupported",
+                "The active chat template did not render unambiguous image placeholders",
+            )
+        return rendered
 
     def _waves(self, pending, *, state_tokens: int):
         """Yield (offset, wave) batches bounded by the runner fanout.
@@ -310,10 +414,14 @@ class SystemOneEvaluator:
         _, state, questions = parse_system_one_request(
             payload, max_questions=min(self.max_questions, self.runner.max_tokens_per_parent)
         )
+        images, image_identities = parse_system_one_images(payload)
+        if images:
+            self._image_token_id()
         parent_request_id = "systemone-" + uuid.uuid4().hex
-        shared_prefix_key = "qwen-exo:v1:system-one:" + stable_digest(
-            self.model_name, _SYSTEM_PROMPT, _render_value(state)
-        )[:24]
+        prefix_identity = (self.model_name, _SYSTEM_PROMPT, _render_value(state))
+        if images:
+            prefix_identity += ("images", *image_identities)
+        shared_prefix_key = "qwen-exo:v1:system-one:" + stable_digest(*prefix_identity)[:24]
         deadline = time.monotonic() + self.timeout_seconds
         answers: dict[str, dict[str, Any]] = {}
         pending: list[tuple[_Question, tuple[int, ...]]] = []
@@ -323,7 +431,7 @@ class SystemOneEvaluator:
                 continue
             prefix = tuple(
                 self.tokenizer.encode(
-                    self._render_prompt(state, question), add_special_tokens=False
+                    self._render_prompt(state, question, images), add_special_tokens=False
                 )
             )
             if len(prefix) > self.max_prompt_tokens:
@@ -341,6 +449,10 @@ class SystemOneEvaluator:
             state_tokens = len(
                 self.tokenizer.encode(_render_value(state), add_special_tokens=False)
             )
+            if images:
+                # Image expansion is deferred to the processor. Seed its shared
+                # visual prefix with one question before parallel question waves.
+                state_tokens = max(state_tokens, _STATE_WARMUP_MIN_TOKENS)
             for offset, wave in self._waves(pending, state_tokens=state_tokens):
                 jobs = tuple(
                     InternalJob(
@@ -362,9 +474,18 @@ class SystemOneEvaluator:
                     )
                     for index, (question, _) in enumerate(wave)
                 )
-                results = await self.runner.run_option_score_batch(
-                    jobs, [prefix for _, prefix in wave], self._label_token_ids
-                )
+                if images:
+                    results = await self.runner.run_option_score_batch(
+                        jobs,
+                        [prefix for _, prefix in wave],
+                        self._label_token_ids,
+                        image_data=[images for _ in wave],
+                        max_prompt_tokens=self.max_prompt_tokens,
+                    )
+                else:
+                    results = await self.runner.run_option_score_batch(
+                        jobs, [prefix for _, prefix in wave], self._label_token_ids
+                    )
                 for (question, prefix), result in zip(wave, results):
                     scores = tuple(
                         float(value)
@@ -377,10 +498,16 @@ class SystemOneEvaluator:
                     answers[question.question_id] = _answer(
                         question, _distribution(scores)
                     )
-                    input_tokens += len(prefix)
+                    input_tokens += result.prompt_tokens - 1
                     cached_tokens += int(
                         getattr(result, "metadata", {}).get("cached_tokens", 0) or 0
                     )
+        except InternalOptionScoreContextError as exc:
+            raise SystemOneError(
+                413,
+                "context_length_exceeded",
+                "The image-expanded prompt exceeds the System One or model context limit",
+            ) from exc
         except asyncio.TimeoutError as exc:
             raise SystemOneError(
                 504, "timeout", "System One evaluation exceeded its deadline"
