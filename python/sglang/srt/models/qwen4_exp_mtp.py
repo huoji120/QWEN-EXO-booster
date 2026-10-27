@@ -70,6 +70,54 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         )
         self.logits_processor = LogitsProcessor(config)
 
+    def configure_draft_head_vocab(
+        self, path: str, *, model_path: str, tokenizer_path: str
+    ) -> None:
+        """Install a draft-owned BF16 shortlist after the target head is shared.
+
+        The target module and full-vocabulary Graph/sampler contract stay intact.
+        This startup-only operation must precede draft graph capture.
+        """
+        from sglang.srt.layers.qwen4_draft_head import (
+            DraftVocabLogitsProcessor,
+            load_draft_vocab_map,
+        )
+
+        args = get_server_args()
+        parallel = get_parallel()
+        if (
+            self.tp_size != 1
+            or parallel.pp_size != 1
+            or parallel.attn_dp_size != 1
+            or args.enable_dp_lm_head
+            or args.enable_lora
+            or args.speculative_eagle_topk != 1
+            or args.speculative_algorithm != "EAGLE"
+            or args.speculative_accept_threshold_single != 1.0
+            or args.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "Qwen4 draft vocabulary requires native EAGLE, TP/PP/attention-DP=1, "
+                "top-k=1, acceptance thresholds=1 and no LoRA or DP LM head"
+            )
+        if not self.lm_head.weight.is_cuda:
+            raise ValueError("Qwen4 selected-row draft head requires CUDA")
+        token_ids = load_draft_vocab_map(
+            path, model_path=model_path, tokenizer_path=tokenizer_path
+        )
+        processor = DraftVocabLogitsProcessor(
+            self.config,
+            self.lm_head,
+            token_ids,
+            logit_scale=self.logits_processor.logit_scale,
+        )
+        self.logits_processor = processor
+        logger.info(
+            "QWEN4_DRAFT_VOCAB_READY selected_rows=%d target_vocab=%d "
+            "dtype=bf16 target_head_unchanged=true",
+            token_ids.numel(), self.config.vocab_size,
+        )
+
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps

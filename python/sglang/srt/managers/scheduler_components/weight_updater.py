@@ -85,6 +85,21 @@ class SchedulerWeightUpdaterManager:
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
 
+    def _draft_vocab_update_error(self) -> Optional[str]:
+        runner = _get_draft_model_runner(self.draft_worker)
+        if runner is None:
+            return None
+        from sglang.srt.layers.qwen4_draft_head import DraftVocabLogitsProcessor
+
+        if isinstance(
+            getattr(runner.model, "logits_processor", None), DraftVocabLogitsProcessor
+        ):
+            return (
+                "Weight updates are disabled while the Qwen4 draft vocabulary "
+                "snapshot is active; restart with the new checkpoint and bound map"
+            )
+        return None
+
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
@@ -109,6 +124,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if error := self._draft_vocab_update_error():
+            return UpdateWeightFromDiskReqOutput(
+                success=False, message=error, num_paused_requests=0
+            )
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -140,6 +159,8 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        if error := self._draft_vocab_update_error():
+            return UpdateWeightsFromDistributedReqOutput(success=False, message=error)
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -152,6 +173,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        if error := self._draft_vocab_update_error():
+            return UpdateWeightsFromTensorReqOutput(success=False, message=error)
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -167,6 +190,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if error := self._draft_vocab_update_error():
+            return UpdateWeightsFromIPCReqOutput(success=False, message=error)
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success

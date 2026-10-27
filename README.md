@@ -396,6 +396,19 @@ CPU 专家库准入按 `memory.stat` 扣除可回收的干净文件缓存，而�
 
 原生 MTP 使用同一 profile 的 `EAGLE` 路径，可设置 `QWEN_EXO_SPECULATIVE_NUM_STEPS=3`、`QWEN_EXO_SPECULATIVE_EAGLE_TOPK=1`、`QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS=4`。草稿路径指向同一 profile，草稿量化为 `QWEN_EXO_SPECULATIVE_DRAFT_MODEL_QUANTIZATION=modelopt_mixed`，其 block-FP8 专家后端为 `QWEN_EXO_SPECULATIVE_MOE_RUNNER_BACKEND=triton`；主模型仍用 FlashInfer CUTLASS。Qwen4 GR 的推测隐藏缓冲宽度必须取 `hidden_size × hc_count`（当前为 10240），不能错误地按 2560 分配。必须以真实接受长度和请求延迟验证加速，配置存在不是性能证据。
 
+原生 Qwen4 EAGLE 可显式启用 **draft-only BF16 选行 Head 实验**。`--speculative-token-map /path/draft-vocab.json`（启动器环境变量 `QWEN_EXO_SPECULATIVE_TOKEN_MAP`，默认空）为 Qwen4 使用绑定目标 config/tokenizer SHA256 的 JSON，不是通用草稿模型的压缩词表 `.pt`。选中行是草稿独立 BF16 副本，目标 Head 不修改；草稿 logits 仍为完整目标词表宽度，未选行填 `-inf`，不二次映射 token ID。所有 tokenizer special token 与配置的 BOS/EOS 必须保留。要求 TP/PP/attention-DP=1、top-k=1、接受阈值均为 1、无 LoRA／DP LM Head／FP32 Head／softcap；不满足时启动明确失败，不偷偷改变目标精度。
+
+离线准备（仅读 JSON，不加载权重、不使用 GPU、不启动服务）：
+
+```bash
+python scripts/qwen_exo/prepare_draft_vocab_map.py \
+  --model-path "$MODEL" --tokenizer-path "$TOKENIZER" \
+  --token-ids-json /path/reviewed-token-ids.json \
+  --output /path/draft-vocab.json
+```
+
+输入是已审查的整数 ID 数组；工具去重排序、补齐 special token，并记录来源文件 SHA256；可用 `--source-url`、`--source-revision` 添加来源信息。输出默认禁止覆盖，配置或 tokenizer 变化需重新准备。97,800 行、hidden=2560 的 BF16 副本额外占用 500,736,000 bytes，**不是释放目标 Head 显存**；需给初始化和 Graph 留出空间。启用后在线 disk/distributed/tensor/IPC 权重更新在修改目标前被拒绝；换 checkpoint 要重启并重建选行快照。CPU 回归只验证映射、目标权重不变、全宽输出和启用边界；`test/registered/kernels/test_qwen4_draft_head.py` 与 `test/registered/jit/benchmark/bench_qwen4_draft_head.py` 是独立 GPU 验收入口。尚无该实验的整模型加速保证：须另测接受率、每验证步耗时、实际 tokens/s、Graph/overlap 和目标词表外输出，不能把减少的词表行数当作提速百分比。
+
 压缩 QSA 的 `draft_extend_cuda_graph=false` 是动态接受长度的能力边界，MTP 草稿 extend 保持 eager；目标 TARGET_VERIFY 和草稿 decode 捕获 full Graph。QSA 不导入未使用的 DeepSeek DSV4/FlashMLA 依赖。MTP LM head 的 `enable_dp_lm_head` 来自运行 `ServerArgs`，不是 `ParallelContext` 字段。
 
 js4090 的真实组合验收：固定空闲单请求、相同原生 prompt、温度 0、强制 128 token，原 eager 总耗时 `10.412s`（TTFT `0.237s`，decode `12.48 token/s`）；full Graph + 原生 MTP 两次为 `1.397s`/`1.209s`（decode `105.52`/`121.86 token/s`）。MTP 草稿接受率 `0.644`/`0.699`，每次验证输出长度 `2.909`/`3.122`；真实日志有 `cuda graph: True`。这是固定短请求的组合收益，不是 Graph/MTP 独立归因，也不是所有任务或 200K 长窗吞吐承诺；混合精度下前后及重复生成非逐 token 一致，不宣称 bit-exact。

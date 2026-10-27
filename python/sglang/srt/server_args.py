@@ -1797,7 +1797,9 @@ class ServerArgs:
     ] = False
     speculative_token_map: A[
         Optional[str],
-        "The path of the draft model's small vocab table.",
+        "Draft vocabulary map. Native Qwen4 EAGLE uses a local provenance-bound "
+        "qwen4-draft-vocab-v1 JSON prepared by prepare_draft_vocab_map.py, with "
+        "full target-coordinate logits. Other draft models use their small-vocab table.",
     ] = None
     speculative_attention_mode: A[
         str,

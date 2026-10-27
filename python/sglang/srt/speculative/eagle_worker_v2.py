@@ -307,6 +307,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     "Speculative token map specified, but EAGLE3 models already have this. Ignoring the specified token map."
                 )
             self.hot_token_id = None
+        elif self.server_args.speculative_token_map is not None and callable(
+            getattr(self.draft_runner.model, "configure_draft_head_vocab", None)
+        ):
+            if self.speculative_algorithm != SpeculativeAlgorithm.EAGLE:
+                raise ValueError("Qwen4 draft vocabulary maps require native EAGLE")
+            # The Qwen4 draft computes selected weight rows but returns logits
+            # in full target-ID coordinates. Never apply hot-ID remapping or
+            # shrink Graph/proposal buffers for this model-specific path.
+            self.hot_token_id = None
         elif self.server_args.speculative_token_map is not None:
             self.hot_token_id = load_token_map(self.server_args.speculative_token_map)
             self.server_args.override(
@@ -358,6 +367,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+            configure_vocab = getattr(
+                self.draft_runner.model, "configure_draft_head_vocab", None
+            )
+            if self.server_args.speculative_token_map is not None and callable(
+                configure_vocab
+            ):
+                configure_vocab(
+                    self.server_args.speculative_token_map,
+                    model_path=self.server_args.model_path,
+                    tokenizer_path=self.server_args.tokenizer_path,
+                )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners

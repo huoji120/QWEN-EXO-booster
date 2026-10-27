@@ -41,6 +41,7 @@ fi
 : "${QWEN_EXO_SPECULATIVE_NUM_STEPS:=}"
 : "${QWEN_EXO_SPECULATIVE_EAGLE_TOPK:=}"
 : "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS:=}"
+: "${QWEN_EXO_SPECULATIVE_TOKEN_MAP:=}"
 # "decode" routes target verify to the decode backend (needed for NVFP4 KV,
 # whose FlashInfer prefill path would dequantize every context per step).
 : "${QWEN_EXO_SPECULATIVE_ATTENTION_MODE:=}"
@@ -509,6 +510,9 @@ if [[ -n "${QWEN_EXO_SPECULATIVE_ALGORITHM}" ]]; then
   fi
   if [[ -n "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS}" ]]; then
     server_args+=( --speculative-num-draft-tokens "${QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS}" )
+  fi
+  if [[ -n "${QWEN_EXO_SPECULATIVE_TOKEN_MAP}" ]]; then
+    server_args+=( --speculative-token-map "${QWEN_EXO_SPECULATIVE_TOKEN_MAP}" )
   fi
   if [[ -n "${QWEN_EXO_SPECULATIVE_ATTENTION_MODE}" ]]; then
     server_args+=( --speculative-attention-mode "${QWEN_EXO_SPECULATIVE_ATTENTION_MODE}" )

@@ -396,6 +396,19 @@ With the main model GPU-resident, disk PLE supports `QWEN_EXO_CUDA_GRAPH_BACKEND
 
 Native MTP uses `EAGLE` with the same profile, for example `QWEN_EXO_SPECULATIVE_NUM_STEPS=3`, `QWEN_EXO_SPECULATIVE_EAGLE_TOPK=1`, and `QWEN_EXO_SPECULATIVE_NUM_DRAFT_TOKENS=4`. Point the draft path at the same profile, set `QWEN_EXO_SPECULATIVE_DRAFT_MODEL_QUANTIZATION=modelopt_mixed` and `QWEN_EXO_SPECULATIVE_MOE_RUNNER_BACKEND=triton` for its block-FP8 experts; the target remains FlashInfer CUTLASS. Qwen4 GR speculative hidden buffers require `hidden_size × hc_count` (10240 here), not 2560. Validate actual acceptance length and request latency; enabled flags are not acceleration evidence.
 
+Native Qwen4 EAGLE has an explicitly opt-in **draft-only BF16 selected-row Head experiment**. `--speculative-token-map /path/draft-vocab.json` (launcher variable `QWEN_EXO_SPECULATIVE_TOKEN_MAP`, empty by default) uses a JSON map bound to the target config/tokenizer SHA256 for Qwen4, not the generic reduced-vocabulary `.pt` map. Selected weights are independent draft-owned BF16 copies; the target Head is unchanged. Draft logits retain the full target vocabulary width, with `-inf` outside selected rows and no second token-ID remap. All tokenizer special IDs and configured BOS/EOS must remain. The path requires TP/PP/attention-DP=1, speculative top-k=1, both acceptance thresholds=1, and no LoRA, DP LM Head, FP32 Head or softcap; incompatible activation fails explicitly rather than changing target precision.
+
+Offline preparation (JSON only; no weights, GPU or server startup):
+
+```bash
+python scripts/qwen_exo/prepare_draft_vocab_map.py \
+  --model-path "$MODEL" --tokenizer-path "$TOKENIZER" \
+  --token-ids-json /path/reviewed-token-ids.json \
+  --output /path/draft-vocab.json
+```
+
+Input is a reviewed integer-ID array. Preparation sorts/deduplicates, adds special tokens and records the source-file SHA256; optional `--source-url` and `--source-revision` record provenance. Existing output is not overwritten by default, and config/tokenizer changes require regeneration. A 97,800-row BF16 copy at hidden=2560 costs an additional 500,736,000 bytes; it does **not free the target Head**, and initialization/Graph headroom remains necessary. While active, disk/distributed/tensor/IPC weight updates are rejected before target mutation; checkpoint changes require restart and a rebuilt snapshot. CPU regressions cover mapping, unchanged target weights, full-width outputs and activation boundaries. `test/registered/kernels/test_qwen4_draft_head.py` and `test/registered/jit/benchmark/bench_qwen4_draft_head.py` are isolated GPU acceptance entrypoints. No whole-model speedup is established: separately measure acceptance, verify-step time, actual tokens/s, Graph/overlap behavior and outputs outside the draft map; fewer vocabulary rows are not a speedup percentage.
+
 Compressed QSA declares `draft_extend_cuda_graph=false` because accepted lengths are dynamic. MTP draft-extend stays eager while target TARGET_VERIFY and draft decode use full graphs. QSA does not import unused DeepSeek DSV4/FlashMLA dependencies. MTP's `enable_dp_lm_head` belongs to runtime `ServerArgs`, not `ParallelContext`.
 
 Real js4090 combination acceptance: the same idle single-request native prompt, temperature 0, and forced 128 tokens took `10.412s` under eager execution (TTFT `0.237s`, decode `12.48 token/s`). Full Graph + native MTP took `1.397s`/`1.209s` (decode `105.52`/`121.86 token/s`), with draft acceptance `0.644`/`0.699` and output per verify `2.909`/`3.122`. Live logs show `cuda graph: True`. These are short-request combined gains, not separate Graph/MTP attribution, all-task throughput, or 200K-window evidence. Mixed-precision outputs differ across before/after and repeated runs; bit-exact parity is not claimed.
