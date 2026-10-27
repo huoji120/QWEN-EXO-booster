@@ -19,12 +19,7 @@ from qwen_exo_booster.memory_tools import MEMORY_SERVER_LABEL, MEMORY_TOOL_NAMES
 from sglang.srt.entrypoints.openai.serving_chat import _normalize_model_reasoning_effort
 from sglang.srt.utils import random_uuid
 
-MAX_MEMORY_TOOL_ROUNDS = 4
 MEMORY_ROUND_META_KEY = "qwen_exo_server_tool_round"
-ROUND_LIMIT_OUTPUT = (
-    "Memory tool limit reached for this turn. Continue with what you already "
-    "found and answer directly."
-)
 _SENTINEL = "QWEN_EXO_TOOL_RESULT_SENTINEL_{index}_7f3a"
 # Chat-control markers a tool result must never smuggle into the prompt as
 # special tokens (ChatML roles, tool/think tags).
@@ -224,9 +219,7 @@ def mcp_item_to_chat_messages(item: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 __all__ = [
-    "MAX_MEMORY_TOOL_ROUNDS",
     "MEMORY_ROUND_META_KEY",
-    "ROUND_LIMIT_OUTPUT",
     "ToolResponseTemplate",
     "generation_prompt_ids",
     "is_memory_tool",

@@ -343,6 +343,8 @@ class MemoryToolRoundsTestCase(CustomTestCase):
                 },
             },
         ]
+        rounds = 8
+        outputs = [outputs[0]] * rounds + [outputs[1]]
         serving = make_serving(self.tool_server, outputs)
         # Multimodal-capable models (prod Qwen4Exp) hand over a text prompt,
         # not input_ids; the loop must still continue on exact token ids.
@@ -374,7 +376,7 @@ class MemoryToolRoundsTestCase(CustomTestCase):
 
         chunks = asyncio.run(run())
         sent = serving.tokenizer_manager.requests
-        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent), rounds + 1)
         self.assertEqual(list(sent[0].input_ids), prompt)
         second_prompt = list(sent[1].input_ids)
         self.assertEqual(second_prompt[: len(prompt) + len(call_ids)], prompt + call_ids)
@@ -392,16 +394,20 @@ class MemoryToolRoundsTestCase(CustomTestCase):
         self.assertEqual(sent[1].sampling_params["max_new_tokens"], 5000 - len(call_ids))
 
         markers = [c for c in chunks if MEMORY_ROUND_META_KEY in (c.get("meta_info") or {})]
-        self.assertEqual(len(markers), 1)
-        (call,) = markers[0]["meta_info"][MEMORY_ROUND_META_KEY]["calls"]
-        self.assertEqual((call["name"], call["ok"]), ("qwen_exo_memory_search", True))
-        self.assertEqual(json.loads(call["arguments"]), {"pattern": "nginx"})
-        self.assertEqual(len(context.qwen_exo_memory_rounds), 1)
+        self.assertEqual(len(markers), rounds)
+        for marker in markers:
+            (call,) = marker["meta_info"][MEMORY_ROUND_META_KEY]["calls"]
+            self.assertEqual((call["name"], call["ok"]), ("qwen_exo_memory_search", True))
+            self.assertEqual(json.loads(call["arguments"]), {"pattern": "nginx"})
+            self.assertIn("ops.md:2: reload nginx after edits", call["output"])
+        self.assertEqual(len(context.qwen_exo_memory_rounds), rounds)
+        self.assertEqual(sent[-1].sampling_params["max_new_tokens"], 5000 - rounds * len(call_ids))
         final_meta = context.last_output["meta_info"]
         self.assertEqual(
             (final_meta["prompt_tokens"], final_meta["cached_tokens"], final_meta["completion_tokens"]),
-            (40, 32, len(call_ids) + len(answer_ids)),
+            (40, 32, rounds * len(call_ids) + len(answer_ids)),
         )
+        self.assertEqual(context.last_output["text"], "found</think>\n\nReload nginx.")
 
 
 if __name__ == "__main__":

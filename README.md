@@ -62,6 +62,8 @@ flowchart LR
 
 把技术文档、项目规范、API 资料或团队经验写成 Markdown 上传，它们以原文件形式留在知识库目录，SQLite 只存文件身份、标题、重复样板识别和每文件摘要，不需要编译入库。每轮开头用 BM25 给出至多三条片段提示（词、代码标识符及其 camelCase/snake_case 拆分、中日韩字符 bigram，中文不需分词器），模型自己决定要不要调 `qwen_exo_memory_search` 换词再搜、要不要用 `qwen_exo_memory_read` 读完整上下文——**知识库越大，不等于每轮多注入多少字**。
 
+服务端记忆工具不设每轮调用轮数上限；模型可以连续搜索、读取和写入，直到正常回答或交还客户端工具。请求原有的输出 token 预算、上下文窗口和单次工具执行保护仍然有效。
+
 ![知识库](images/1.png)
 
 ### 反思记忆：让一次失败变成下一次的起点
@@ -160,6 +162,8 @@ chunked-prefill 准入按实际请求槽位计数：继续执行的 chunk 复用
 QSA 的 decode／固定宽度 verify metadata 合并 layout 与页表更新；兼容的多步 MTP draft metadata 一次提交，仍为每一步保留独立输出，padding 使用保留槽 0。不兼容的 pool／布局继续逐步刷新。decode indexer 的 CTA 档位按 SM 数与行数选择，再遍历实际压缩上下文；512-block fast-topk 对全部候选必选的短行省略评分，只有不读取省略区域的消费者才能使用未初始化 logits，batch-invariant 模式保留完整评分与初始化。MTP draft decode 已复用 sparse selection 的路径不会重复运行 indexer。
 
 FlashInfer CUTLASS MoE 的调优范围覆盖配置的 prefill buffer × attention-DP 大小，常规调优上限为 8192 行，同时保证不小于本次实际输入；PD decode 保留按当前行数向上取 2 次幂的行为。不改变模型精度、采样或服务容量，代价可能是更长的首次调优。未引入 `autotune_v2` 或升级 FlashInfer；CPU 回归和 kernel 解释器检查不代表真实 CUDA 数值、Graph replay 或端到端加速已经验收。
+
+SM120 的原生 BF16 HC 在 `hc_count=4`、hidden=2560、rank=320、连续 CUDA 张量且恰好 1024 行时，保留 cuBLAS down 投影，将 up 投影、sigmoid、分支乘法和求平均合成一个 Triton kernel，避免物化 `[M,10240]` 的 up 输出。SiLU 单独计算一次；保留编译路径的 BF16 投影边界、FP32 激活／乘法和从左到右的四分支求和，不转换权重精度。仅启用实测稳定获益的 1024 行 specialization；小行数 decode、其他形状／设备／dtype／布局保持原路径，临时张量由当前 stream／Graph 独立持有。回归覆盖原编译实现、FP32 参考、换输入 Graph replay 和 residual 不变性；可用 `test/registered/jit/benchmark/bench_hc_prefill_triton.py` 复测完整 HC，而不是只计单个 GEMM。组件收益不等于端到端收益。
 
 js4090 的这组改动已通过 143 项真实 GPU 检查（含 QSA 边界、CUDA Graph replay、MTP metadata、host KV 和 CUTLASS）及 126 项 CPU 检查、59 个 subtests。停服隔离、相同合成输入的组件 A/B 中，三步 MTP metadata 刷新在 batch 1／4 约从 `0.125ms` 降到 `0.023ms`，QSA indexer 四组样本约降低 `1.6%–4.6%`；这是组件时间，不是整体推理提速倍数。重启后两轮 14814-token 合成序列请求均正确输出相同的 404 tokens：冷请求首字 `2.82s`、首字后约 `113 token/s`；热请求命中 14400 tokens，首字 `0.386s`、首字后约 `138 token/s`。没有旧服务的同输入端到端对照，不据此声称端到端加速倍率。证据与回滚文件位于 `inference-opt-20261020/`，不随源码发布。
 

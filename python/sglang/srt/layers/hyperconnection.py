@@ -6,6 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.layers.hc_prefill_triton import (
+    hc_prefill_mix,
+    hc_prefill_mix_supported,
+)
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -372,6 +376,16 @@ class GatedResidual(HyperConnectionBase):
                 self.input_mix_weight_up.weight,
                 self.hc_count,
                 self.hidden_size,
+            ).to(self.params_dtype)
+        elif self.hc_count == 4 and self.hidden_size == 2560 and hc_prefill_mix_supported(
+            hyper_input_normed,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+        ):
+            mixed_input = hc_prefill_mix(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
             ).to(self.params_dtype)
         else:
             mixed_input = self._mix_compute(

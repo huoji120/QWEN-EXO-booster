@@ -82,9 +82,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.bounded_store import BoundedStore
 from sglang.srt.entrypoints.openai.memory_tool_rounds import (
-    MAX_MEMORY_TOOL_ROUNDS,
     MEMORY_ROUND_META_KEY,
-    ROUND_LIMIT_OUTPUT,
     ToolResponseTemplate,
     generation_prompt_ids,
     is_memory_tool,
@@ -3844,7 +3842,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         return split_memory_calls(calls)
 
     async def _run_memory_round(
-        self, memory_calls: list[Any], *, limit_reached: bool,
+        self, memory_calls: list[Any], *,
         memory_key_id: str | None = None,
         memory_scope: str = "shared",
     ) -> list[dict[str, Any]]:
@@ -3852,16 +3850,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         executor = self.tool_server.executor_for_memory_scope(memory_key_id, memory_scope)
         for parsed in memory_calls:
             call = new_memory_call(parsed.name, parsed.parameters)
-            if limit_reached:
-                call["output"] = ROUND_LIMIT_OUTPUT
-            else:
-                started = time.perf_counter()
-                ok, output = await executor.run(
-                    call["name"], call["arguments"]
-                )
-                call["duration_ms"] = (time.perf_counter() - started) * 1000.0
-                call["ok"] = ok
-                call["output"] = neutralize_control_markers(output)
+            started = time.perf_counter()
+            ok, output = await executor.run(call["name"], call["arguments"])
+            call["duration_ms"] = (time.perf_counter() - started) * 1000.0
+            call["ok"] = ok
+            call["output"] = neutralize_control_markers(output)
             calls.append(call)
         return calls
 
@@ -3937,7 +3930,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         first_usage: dict[str, Any] = {}
         prior_completion = 0
         prior_reasoning = 0
-        for round_index in range(MAX_MEMORY_TOOL_ROUNDS + 2):
+        round_index = 0
+        while True:
             pass_ids: list[int] = []
             pass_text = ""
             final_meta: dict[str, Any] = {}
@@ -4004,10 +3998,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     len(memory_calls),
                 )
                 return
-            if round_index > MAX_MEMORY_TOOL_ROUNDS:
-                return
             calls = await self._run_memory_round(
-                memory_calls, limit_reached=round_index == MAX_MEMORY_TOOL_ROUNDS,
+                memory_calls,
                 memory_key_id=response_request._qwen_exo_memory_key_id,
                 memory_scope=response_request._qwen_exo_memory_scope,
             )
@@ -4060,6 +4052,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 input_ids=prompt_ids,
                 sampling_params=pass_sampling_params,
             )
+            round_index += 1
 
     async def _generate_with_builtin_tools(
         self,
