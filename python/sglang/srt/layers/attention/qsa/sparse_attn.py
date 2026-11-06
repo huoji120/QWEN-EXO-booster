@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.qsa.nvfp4 import _load_nvfp4
+
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
     (64, (64, 8, 2)),
@@ -164,7 +166,7 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["LOCATION_COUNT"])
 def _sparse_gqa_chunk_prefill(
     q,
     k,
@@ -205,7 +207,7 @@ def _sparse_gqa_chunk_prefill(
     HAS_HOST: tl.constexpr = False,
     GPU_ROWS: tl.constexpr = 0,
     HOST_ROWS: tl.constexpr = 0,
-    LOCATION_COUNT: tl.constexpr = 0,
+    LOCATION_COUNT=0,
     sl_n: tl.constexpr = 1,
     scq_n: tl.constexpr = 1,
     sck_n: tl.constexpr = 1,
@@ -218,6 +220,18 @@ def _sparse_gqa_chunk_prefill(
     shv_d: tl.constexpr = 0,
     SCALE_K: tl.constexpr = False,
     SCALE_V: tl.constexpr = False,
+    NVFP4: tl.constexpr = False,
+    k_scales=None,
+    v_scales=None,
+    host_k_scales=0,
+    host_v_scales=0,
+    KSS: tl.constexpr = (0, 0, 0),
+    VSS: tl.constexpr = (0, 0, 0),
+    HKDS: tl.constexpr = (0, 0, 0),
+    HVDS: tl.constexpr = (0, 0, 0),
+    HKSS: tl.constexpr = (0, 0, 0),
+    HVSS: tl.constexpr = (0, 0, 0),
+    CAUSAL_GUARD: tl.constexpr = False,
 ):
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
@@ -272,45 +286,60 @@ def _sparse_gqa_chunk_prefill(
                 other=-1,
             ).to(tl.int64)
             valid = valid & (slot >= 0) & (slot < GPU_ROWS + HOST_ROWS)
-            gpu_valid = valid & (slot < GPU_ROWS)
-            # FP32 is exact for stored FP8 and avoids unsupported direct FP8
-            # conversions on SM120. Round to q.dtype before applying scales.
-            keys = tl.load(
-                k_base + slot[None, :] * sk_n + offs_d[:, None] * sk_d,
-                mask=gpu_valid[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            values = tl.load(
-                v_base + slot[:, None] * sv_n + offs_d[None, :] * sv_d,
-                mask=gpu_valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            if HAS_HOST:
-                host_valid = valid & (slot >= GPU_ROWS)
-                host_slot = slot - GPU_ROWS
-                host_keys = tl.load(
-                    host_k_base
-                    + host_slot[None, :] * shk_n
-                    + offs_d[:, None] * shk_d,
-                    mask=host_valid[None, :],
+            if NVFP4:
+                valid = valid & (token < visible)
+                keys = _load_nvfp4(
+                    k, k_scales, host_k, host_k_scales,
+                    slot[None, :], group, offs_d[:, None], valid[None, :],
+                    k_scale, GPU_ROWS, HOST_ROWS, (sk_n, sk_h, sk_d), KSS, HKDS, HKSS,
+                ).to(q_values.dtype)
+                values = _load_nvfp4(
+                    v, v_scales, host_v, host_v_scales,
+                    slot[:, None], group, offs_d[None, :], valid[:, None],
+                    v_scale, GPU_ROWS, HOST_ROWS, (sv_n, sv_h, sv_d), VSS, HVDS, HVSS,
+                ).to(q_values.dtype)
+            else:
+                gpu_valid = valid & (slot < GPU_ROWS)
+                # FP32 is exact for stored FP8 and avoids unsupported direct FP8
+                # conversions on SM120. Round to q.dtype before applying scales.
+                keys = tl.load(
+                    k_base + slot[None, :] * sk_n + offs_d[:, None] * sk_d,
+                    mask=gpu_valid[None, :],
                     other=0.0,
                 ).to(tl.float32)
-                host_values = tl.load(
-                    host_v_base
-                    + host_slot[:, None] * shv_n
-                    + offs_d[None, :] * shv_d,
-                    mask=host_valid[:, None],
+                values = tl.load(
+                    v_base + slot[:, None] * sv_n + offs_d[None, :] * sv_d,
+                    mask=gpu_valid[:, None],
                     other=0.0,
                 ).to(tl.float32)
-                keys = tl.where(host_valid[None, :], host_keys, keys)
-                values = tl.where(host_valid[:, None], host_values, values)
-            keys = keys.to(q_values.dtype)
-            values = values.to(q_values.dtype)
-            if SCALE_K:
-                keys = (keys.to(tl.float32) * k_scale).to(q_values.dtype)
-            if SCALE_V:
-                values = (values.to(tl.float32) * v_scale).to(q_values.dtype)
+                if HAS_HOST:
+                    host_valid = valid & (slot >= GPU_ROWS)
+                    host_slot = slot - GPU_ROWS
+                    host_keys = tl.load(
+                        host_k_base
+                        + host_slot[None, :] * shk_n
+                        + offs_d[:, None] * shk_d,
+                        mask=host_valid[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    host_values = tl.load(
+                        host_v_base
+                        + host_slot[:, None] * shv_n
+                        + offs_d[None, :] * shv_d,
+                        mask=host_valid[:, None],
+                        other=0.0,
+                    ).to(tl.float32)
+                    keys = tl.where(host_valid[None, :], host_keys, keys)
+                    values = tl.where(host_valid[:, None], host_values, values)
+                keys = keys.to(q_values.dtype)
+                values = values.to(q_values.dtype)
+                if SCALE_K:
+                    keys = (keys.to(tl.float32) * k_scale).to(q_values.dtype)
+                if SCALE_V:
+                    values = (values.to(tl.float32) * v_scale).to(q_values.dtype)
         else:
+            if CAUSAL_GUARD:
+                valid = valid & (token < visible) & (token < kv_len)
             keys = tl.load(
                 k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
                 mask=valid[None, :],
@@ -323,14 +352,23 @@ def _sparse_gqa_chunk_prefill(
             )
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.math.exp2(scores - next_max[:, None])
+        if NVFP4 or CAUSAL_GUARD:
+            # A tile (or the entire row) may have no valid physical selections.
+            safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
+            alpha = tl.math.exp2(max_value - safe_max)
+            probabilities = tl.math.exp2(scores - safe_max[:, None])
+        else:
+            alpha = tl.math.exp2(max_value - next_max)
+            probabilities = tl.math.exp2(scores - next_max[:, None])
         accumulator = tl.dot(
             probabilities.to(values.dtype), values, accumulator * alpha[:, None]
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
-    output = accumulator / normalizer[:, None]
+    if NVFP4 or CAUSAL_GUARD:
+        output = accumulator / tl.where(normalizer > 0, normalizer, 1.0)[:, None]
+    else:
+        output = accumulator / normalizer[:, None]
     tl.store(
         out
         + query * so_m
@@ -342,8 +380,10 @@ def _sparse_gqa_chunk_prefill(
 
 
 def sparse_gqa_fwd_interface_triton_ck(
-    q, k, v, indices, cu_q, cu_k, kv_lens, scale, *, max_q: int
+    q, k, v, indices, cu_q, cu_k, kv_lens, scale, *, max_q: int,
+    causal_guard: bool = False,
 ):
+    """Attend to decoded KV; optionally mask future/out-of-range and empty rows."""
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
@@ -382,6 +422,7 @@ def sparse_gqa_fwd_interface_triton_ck(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        CAUSAL_GUARD=causal_guard,
         num_warps=warps,
         num_stages=stages,
     )

@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.benchmark import marker
-from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostFP8KVPool
+from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostKVPool
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
@@ -49,7 +49,7 @@ def benchmark(batch, verify_width, topk, host_fraction, read_set, implementation
     size = 32768
     if heads * dim > 4096:
         raise ValueError("Geometry exceeds the bounded benchmark allocation")
-    pool = QwenHostFP8KVPool(
+    pool = QwenHostKVPool(
         size=size, gpu_size=size // 2, page_size=64,
         dtype=torch.float8_e4m3fn, head_num=heads, head_dim=dim,
         v_head_dim=dim, layer_num=1, device="cuda", enable_memory_saver=False,

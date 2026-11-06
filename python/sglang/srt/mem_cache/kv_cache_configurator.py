@@ -210,10 +210,16 @@ class KVCacheConfigurator:
         quant_name = resolve_kv_cache_quant(self.server_args.kv_cache_dtype)
         if quant_name is None:
             return None
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        kwargs = {}
+        if quant_name == "nvfp4" and is_qwen_qsa(self.model_config.hf_config):
+            kwargs["attention_backend"] = "qsa"
         quant_method = get_kv_cache_quant_method(
             quant_name,
             num_layers=num_layers,
             device=self.device,
+            **kwargs,
         )
         quant_method.load_scales_from_model(self.model)
         return quant_method
@@ -1319,8 +1325,8 @@ class KVCacheConfigurator:
             else mha_pool_class
         )
         if self.server_args.qwen4_host_kv_cache:
-            from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostFP8KVPool
-            full_pool_class = QwenHostFP8KVPool
+            from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostKVPool
+            full_pool_class = QwenHostKVPool
             extra_args["full_kv_pool_gpu_size"] = gpu_kv_tokens
         from sglang.srt.layers.attention.qsa.config import (
             QSA_VARIANT_TOKENWISE,

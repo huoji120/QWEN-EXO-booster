@@ -840,6 +840,7 @@ def test_qsa_extend_matches_with_and_without_dp_attention_padding(monkeypatch):
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.is_nvfp4 = False
     backend.forward_metadata = metadata
 
     class Pool:
@@ -890,6 +891,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
         qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.is_nvfp4 = False
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
@@ -942,9 +944,12 @@ def _make_paged_extend_backend():
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.is_nvfp4 = False
     backend.forward_metadata = metadata
 
     class Pool:
+        full_kv_pool = None
+
         def set_kv_buffer(self, layer, loc, k, v):
             pass
 
@@ -1084,6 +1089,7 @@ def test_qsa_trtllm_graph_gathers_only_active_rows_and_preserves_tail():
     torch.manual_seed(19)
     device = torch.device("cuda")
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.is_nvfp4 = False
     backend._cuda_graph_max_tokens = 4
     backend._fa2_scratch = {}
     backend._trtllm_sparse_tables = {}
@@ -1098,7 +1104,8 @@ def test_qsa_trtllm_graph_gathers_only_active_rows_and_preserves_tail():
     keys[0].zero_()
     values[0].zero_()
     layer = SimpleNamespace(
-        layer_id=0, scaling=128**-0.5, k_scale_float=2.0, v_scale_float=3.0
+        layer_id=0, tp_k_head_num=1, head_dim=128,
+        scaling=128**-0.5, k_scale_float=2.0, v_scale_float=3.0
     )
     query = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=device)
     requests = torch.tensor([1, 0], dtype=torch.int32, device=device)
@@ -1330,6 +1337,9 @@ def test_qsa_tokenwise_decode_metadata_skips_compressed_precompute():
         qsa_token_topk = 2048
         qsa_block_topk = 2048
 
+        def get_kv_cache_quant_method(self):
+            return None
+
     pool = _TokenwisePool()
     req_to_token = torch.stack(
         [torch.arange(i * 64, (i + 1) * 64, dtype=torch.int32) for i in range(4)]
@@ -1445,6 +1455,9 @@ class _FakeQSAPool:
     qsa_compress_ratio = COMPRESS_RATIO
     qsa_token_topk = TOKEN_TOPK
     qsa_block_topk = BLOCK_TOPK
+
+    def get_kv_cache_quant_method(self):
+        return None
 
     def __init__(self, capacity=32):
         self.token_k = torch.zeros(capacity, 1, 128, dtype=torch.bfloat16)

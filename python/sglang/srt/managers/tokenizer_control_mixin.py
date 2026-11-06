@@ -420,6 +420,8 @@ class TokenizerControlMixin:
         obj: UpdateWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        if getattr(self, "qwen_exo_native_mid_lora", None) is not None:
+            return False, "Native mid-layer LoRA weight changes require a model-profile restart"
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
@@ -478,6 +480,8 @@ class TokenizerControlMixin:
         obj: UpdateWeightsFromTensorReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        if getattr(self, "qwen_exo_native_mid_lora", None) is not None:
+            return False, "Native mid-layer LoRA weight changes require a model-profile restart"
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
@@ -512,6 +516,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         """Update weights via IPC for checkpoint-engine integration."""
+        if getattr(self, "qwen_exo_native_mid_lora", None) is not None:
+            return False, "Native mid-layer LoRA weight changes require a model-profile restart"
         self.auto_create_handle_loop()
         try:
             # For now, we only support single data parallel instance
@@ -569,7 +575,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if self.qwen_exo_runtime_lora is not None:
+            if self.qwen_exo_runtime_lora is not None or getattr(self, "qwen_exo_native_mid_lora", None) is not None:
                 raise ValueError("Fixed runtime LoRA changes require a model-profile restart")
             if not self.server_args.enable_lora:
                 raise ValueError(
@@ -649,7 +655,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if self.qwen_exo_runtime_lora is not None:
+            if self.qwen_exo_runtime_lora is not None or getattr(self, "qwen_exo_native_mid_lora", None) is not None:
                 raise ValueError("Fixed runtime LoRA changes require a model-profile restart")
             if not self.server_args.enable_lora:
                 raise ValueError(
@@ -721,7 +727,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if self.qwen_exo_runtime_lora is not None:
+            if self.qwen_exo_runtime_lora is not None or getattr(self, "qwen_exo_native_mid_lora", None) is not None:
                 raise ValueError("Fixed runtime LoRA changes require a model-profile restart")
             if not self.server_args.enable_lora:
                 raise ValueError(

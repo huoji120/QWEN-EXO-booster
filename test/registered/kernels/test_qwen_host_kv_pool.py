@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostFP8KVPool
+from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostKVPool
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
@@ -18,7 +18,7 @@ def make_pool():
 
     def create(dtype=torch.float8_e4m3fn, *, size=64, gpu_size=0, page_size=4,
                layers=2, k_dim=256, v_dim=128):
-        pool = QwenHostFP8KVPool(
+        pool = QwenHostKVPool(
             size=size, gpu_size=gpu_size, page_size=page_size, dtype=dtype, head_num=2,
             head_dim=k_dim, v_head_dim=v_dim, layer_num=layers, device="cuda",
             enable_memory_saver=False, enable_alt_stream=False,

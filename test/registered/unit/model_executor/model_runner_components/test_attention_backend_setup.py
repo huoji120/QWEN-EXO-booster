@@ -26,6 +26,9 @@ class _FakeBackend:
 def test_split_full_attention_applies_model_wrapper_once():
     runner = SimpleNamespace(
         server_args=SimpleNamespace(speculative_attention_mode="prefill"),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="qwen3", architectures=["Qwen3ForCausalLM"])
+        ),
         kv_cache_dtype=None,
         token_to_kv_pool=object(),
         req_to_token_pool=object(),

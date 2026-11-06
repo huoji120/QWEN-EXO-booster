@@ -226,7 +226,9 @@ class TestHostQwenKVConfigurator(unittest.TestCase):
     RAW_BYTES = 13 * 2 * (256 + 256)
     QSA_BYTES = 13 * 128 * 2 // 4
 
-    def _from_budget(self, budget, *, tokens=None, cap_tokens=None, draft=True, host=True):
+    def _from_budget(self, budget, *, tokens=None, cap_tokens=None, draft=True, host=True, nvfp4=False):
+        from transformers import PretrainedConfig
+
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
         mr = _make_model_runner(
@@ -236,17 +238,25 @@ class TestHostQwenKVConfigurator(unittest.TestCase):
         mr.server_args.qwen4_host_kv_cache = host
         mr.server_args.max_total_tokens = tokens or self.LOGICAL_TOKENS
         mr.server_args.pp_size = 1
-        mr.model_config.hf_text_config = SimpleNamespace(
+        mr.model_config.hf_text_config = PretrainedConfig(
             model_type="qwen4_exp_text", indexer_n_heads=4, indexer_kv_heads=1,
             indexer_head_dim=128, indexer_budget=2048, indexer_compress_ratio=4,
         )
+        if nvfp4:
+            mr.server_args.kv_cache_dtype = "nvfp4"
+            mr.kv_cache_dtype = torch.float4_e2m1fn_x2
+            mr.model_config.hf_config = mr.model_config.hf_text_config
         mr.spec_algorithm.is_eagle.return_value = draft
         mr.spec_algorithm.is_none.return_value = not draft
         mr.spec_aux_config.eagle_draft_num_layers = 1 if draft else None
         mr._apply_token_constraints = lambda n: (
             KVCacheConfigurator._apply_token_constraints(mr, n)
         )
-        with mock_cpu_env(kv_size=1):
+        # The production dtype predicate also checks CUDA availability.
+        with mock_cpu_env(kv_size=1), patch(
+            "sglang.srt.model_executor.pool_configurator.is_float4_e2m1fn_x2",
+            return_value=nvfp4,
+        ):
             return KVCacheConfigurator.config_from_budget(
                 mr, budget, cap_tokens=cap_tokens
             )
@@ -332,6 +342,30 @@ class TestHostQwenKVConfigurator(unittest.TestCase):
         result = self._from_budget(budget, tokens=4096)
         self.assertEqual(result.max_total_num_tokens, 4096 - self.PAGE_SIZE)
         self.assertEqual(result.qwen4_gpu_kv_tokens, 0)
+
+    def test_nvfp4_host_prefix_prices_block_scales_and_native_draft(self):
+        for draft in (False, True):
+            layers = 13 if draft else 12
+            tokens, gpu_tokens = 8192, 512
+            metadata = (tokens + self.PAGE_SIZE) * layers * 64
+            raw = layers * 2 * 2 * (256 // 2 + 256 // 16)
+            budget = metadata + (gpu_tokens + self.PAGE_SIZE) * raw
+            for delta, expected in ((-1, 448), (0, 512)):
+                with self.subTest(draft=draft, delta=delta):
+                    result = self._from_budget(
+                        budget + delta, tokens=tokens, draft=draft, nvfp4=True
+                    )
+                    self.assertEqual(result.max_total_num_tokens, tokens)
+                    self.assertEqual(result.qwen4_gpu_kv_tokens, expected)
+
+    def test_nvfp4_resident_budget_has_no_dense_dequant_workspace(self):
+        tokens = 8192
+        # Target's 12 layers plus one native MTP layer; QSA indexes remain BF16.
+        per_token = 13 * (2 * 2 * (256 // 2 + 256 // 16) + 64)
+        result = self._from_budget(
+            tokens * per_token, tokens=tokens, host=False, nvfp4=True
+        )
+        self.assertEqual(result.max_total_num_tokens, tokens)
 
 
 class TestMixedQwenKVAllocator(unittest.TestCase):

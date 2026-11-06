@@ -51,7 +51,7 @@ class MemoryPoolConfig:
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
 
-    # Shared valid-token CUDA prefix of Qwen4 raw FP8 K/V (dummy page excluded).
+    # Shared valid-token CUDA prefix of Qwen4 FP8/NVFP4 K/V (dummy page excluded).
     qwen4_gpu_kv_tokens: int = 0
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
@@ -172,6 +172,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * num_layers
                 * torch._utils._element_size(kvc.kv_cache_dtype)
             )
+            if kvc.server_args.kv_cache_dtype == "nvfp4":
+                # Packed nibbles plus one E4M3 scale per 16 values, on both banks.
+                self._host_raw_cell_size = (
+                    self._host_raw_cell_size // 2 + self._host_raw_cell_size // 16
+                )
         self._cell_size = self._compute_cell_size(kvc, num_layers)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -332,8 +337,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
-                # FP4 prefill uses one shared FP8 dequant workspace across layers.
-                cell_size += n * k * 2 * kv_size
+                from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+                # QSA dequantizes selected values in the sparse kernel/gather;
+                # unlike dense FlashInfer it has no full-span FP8 workspace.
+                if not (
+                    kvc.server_args.kv_cache_dtype == "nvfp4"
+                    and is_qwen_qsa(model_config.hf_config)
+                ):
+                    cell_size += n * k * 2 * kv_size
             elif kvc.server_args.kv_cache_dtype == "mxfp8":
                 scale_block_size = 32
                 n = model_config.get_num_kv_heads(tp_size)

@@ -267,6 +267,10 @@ CUDA 单阶段、非 speculative 调度在后台 prefill 分块边界交替让�
 
 未合并 LoRA 可作为固定模型 profile 运行：在独立模型目录的 `config.json` 中设置 `qwen_exo_runtime_lora`，字段为 `schema: 1`、adapter 的 `name`、相对模型目录的 `path`、以及 `file_hashes`（`adapter_config.json` 与 `adapter_model.bin` 或 `adapter_model.safetensors` 的 SHA-256）。不修改原始权重；使用硬链接组织 checkpoint 时，不得原地修改链接文件。配置内容参与模型指纹，adapter 哈希在启动时校验。`service_launcher` 自动加载单个 adapter，TokenizerManager 在批处理规范化前给所有外部与内部请求绑定该 adapter；禁止请求另一个 adapter，以及动态加载/卸载绕过 profile 身份。更换 adapter 要切换 profile 并重启，原生状态重新构建，不能沿用另一 adapter 的 GDN/KV。已验证单卡 Dense Qwen 的原始底模在线 FP8 + 独立 rank-4 LoRA、FlashInfer、六请求 Decode Graph 捕获；这不是量化精度或模型能力提升证明。
 
+Flash-Next 原生中层训练检查点使用独立的 `qwen_exo_native_mid_lora` profile，不走通用 PEFT 加载器。schema 为 `1`，声明 `name`、绝对路径 `adapter_path` / `base_profile`、`adapter_sha256`、`base_config_sha256`、`base_index_sha256`，以及检查点元数据中的 `base_identity`。候选目录必须使用原始权重分片的硬链接和独立 config；除该字段外不得改变底模配置。当前仅支持 TP=PP=1、48 层 Qwen4Exp 主模型第 16–31 层的非融合 `shared_expert.down_proj`，rank=8、alpha=16。启动时验证完整 FP32 adapter，并以 FP32 计算残差、转回 BF16 后缩放相加；不修改原始权重，也不注入 MTP draft。所有推理路径共享固定残差，拒绝请求另选 adapter、动态 LoRA 和原地权重更新。更换检查点须切换 profile、重启并重建对应原生状态；draft 词表映射须重新绑定候选 config 哈希，但保留 token IDs。真实验证覆盖普通/流式 Responses、六行生成、零生成评分和 target/draft Decode Graph 捕获；训练 W4A16 与线上量化路径仍有差异，这些检查不证明质量提升。
+
+原生 adapter 为显式可选：加载后的外层配置没有 `qwen_exo_native_mid_lora` 时，不访问本地 adapter profile，普通 Hugging Face 模型 ID 保持可用；字段存在但格式无效、缺少 QWEN-EXO 隔离或磁盘声明消失时明确拒绝。
+
 ### 可选 Engram 外挂表
 
 `QWEN_EXO_ENGRAM_PATH` 指向预先打包的 Engram artifact；这是 Qwen3.5 路径的额外残差注入，与 Flash-Next 的原生 PLE 不同。冻结的基表和 reader 不原地修改；额外训练的稀疏表及 reader 可独立打包，未写入行读取为零。数字、符号和格式 token 不参与注入，字母 token 使用白名单门控。
@@ -292,6 +296,53 @@ Responses 请求可设置 `qwen_exo_engram=false` 关闭全部 Engram，或仅�
 CUDA 训练现使用三个独立快速路径：QSA 的压缩 key／RoPE 只算一次，按 query chunk 批量评分和因果 Top-K；NVFP4 packed 权重直接传入 GPU 用 Triton 解码，256MiB 有界 packed LRU 不缓存整套 BF16 权重，路由排序避免逐专家同步；GDN 与短卷积绑定既有 FLA 的可反向 chunk／Triton 内核。只在独立训练进程绑定，不修改已安装 HF 或在线服务。FLA 必须可从训练解释器导入，缺失时拒绝悄悄回退慢路径；复用包时仅暴露 FLA 包路径，不能把另一环境整套 site-packages 放在训练环境之前。
 
 QSA 仅接收无 padding、无缓存的完整因果窗口；非因果／非连续 mask 明确拒绝。原始 block budget 与不完整尾块保留；完全等分的 Top-K 可选择不同但等分的块，因此不宣称 tie 情况逐位一致。验证覆盖 109 项 CPU 检查、41 项 GPU codec 检查，真实专家的解码／前向／输入梯度最大误差均为 0；FLA GDN 与卷积前后向通过 BF16 容差检查。SM120 上单个热专家投影 GPU 解码约 0.036ms，32K QSA 单层索引约 0.081s；这些是组件数据，不是整轮训练时间。训练进度另记录完整窗口耗时、GPU 峰值与实际 optimizer steps，不能用短检查代替完整窗口验收。
+
+### Flash-Next 中间层 LoRA：准备与受控实验
+
+`PYTHONPATH=python /path/to/isolated/python scripts/qwen_exo/prepare_mid_lora.py --profile PROFILE --output PRIVATE_PLAN` 默认只做 CPU 配置／原生 checkpoint 清单检查，计划为 **32768 tokens、batch 1、零起始层号 16–31（含两端）**，rank 8、alpha 16；输出必须位于源码目录外。它不读取语料、不加载真实完整主模型、不分配 GPU、不安装包、不改在线服务，也不自动训练；`--start-training` 会明确拒绝。
+
+加 `--verify-code` 可运行合成小型原生混合 checkpoint 的 CPU 检查：完整 HC 前缀状态与完整前向的一致性、经过上层冻结 suffix 和分块 LM loss 的 LoRA 梯度、冻结参数／原始文件不变，以及 adapter 保存／重载。只在每个选定层的 `mlp.shared_expert.down_proj` 上添加 adapter；router、routed experts、其他主模型权重、PLE、reader 和 LM head 全部冻结，32–47 层仍须传递输入梯度。零初始化 B 时 A 的初始梯度为零是正常的；检查不执行 optimizer step。缓存需要完整四分支 HC 和对应因果／PLE 状态，不能只保存混合后的 2560 维 hidden；仅对相同输入和初始状态的新序列复用，不支持 recurrent／KV 续接。
+
+这是原始 NVFP4 专家按需解码的 **W4A16 参考后端**，不是在线 W4A4 的逐位复现，也不是所有专家常驻的训练实现。CPU 准备检查不证明真实 profile 或 32K 的 GPU 容量；必须先以实际 checkpoint 逐级运行短序列、4K、8K、32K forward/backward，记录峰值显存、cgroup RAM 和耗时。HC 字节估算不包含反向激活、mask、workspace 和优化器状态，不能当作容量证明。
+
+`prepare_mid_lora_self_think.py --profile PROFILE --source REPAIRED_JSONL --output PRIVATE_DATA` 用真实 tokenizer/Jinja 为每个 assistant 目标保留完整因果前缀，去掉源 assistant Think，先预留完整答案与边界，再分配 Think 预算；总长度不超过 32768，不截断标准答案，不拼接脱离上下文的工具结果。任务根分组隔离 train/heldout；超长样本明确排除，实验采样上限不会截短完整准备索引。`--verify-only --output PRIVATE_RECEIPT` 是不占 GPU 的模板、答案隔离、mask 和边界检查。
+
+`run_mid_lora_experiment.py` 提供 `--mode verify-cpu|capacity|experiment`。真实 GPU 需要 `--authorize-gpu`，优化器更新还需要 `--authorize-training --data PREPARED_JSONL`。实验从同一零 adapter 比较底座、空 Think 的答案 SFT、自生成 Think 的答案 SFT；两种训练使用相同模板、相同接受样本和相同更新数。生成函数只接收问题 token，按当前 adapter 每样本重新生成 Think；未闭合或越界的 Think 被拒绝。重放时问题和 Think 的 labels 为 `-100`，但整个 suffix 的 Think 计算保持 autograd，使答案 loss 可经过其状态回传。普通反向不穿过离散采样；没有 GRPO、Think token loss 或线上 adapter 接入。
+
+训练分支仅支持 `--arms self_think_sft`，或按 `self_think_sft ordinary_sft` 顺序执行匹配对照；单独 ordinary 或倒序配置会在模型分配前拒绝，避免使用尚未产生的接受样本集合。
+
+共享专家 LoRA 的 A/B 参数与 Adam 状态使用 FP32，残差结果仍保持底座激活精度；这降低 BF16 小更新舍入风险，但不保证 MoE 路由或行为不会退化。路由权重冻结不等于路由选择不变，因此报告同时保留每层专家计数与逐 token 路由哈希。FP32 adapter 使用独立版本元数据，旧 dtype／身份不匹配的文件明确拒绝。
+
+默认解码可用 fresh 完整前向；`--generation-mode native-cache` 只在 tiny 与当前实际前缀通过 fresh/cached logits 和 greedy 一致性门禁后启用。缓存仅存在于一次 no-grad 生成，原生 NGram/GDN/QSA 状态不跨样本或 adapter 版本复用；训练仍是 fresh 全序列。持久训练模式保留冻结下层以支持下一次生成，其显存不能套用释放下层的准备估算。每次 optimizer step 保存独立 adapter，以及同名 `.training.pt` 优化器状态：包含 AdamW 参数组、动量／方差／步数、参数顺序、Torch CPU/CUDA 与 Python/NumPy RNG、下一数据游标、数据 SHA 和训练参数，并绑定 adapter SHA。两份文件持久化后才发布带状态 SHA 的 checkpoint 事件；不要把孤立 adapter 或 `.partial` 当成完整恢复点。CPU 实测保存／恢复后的下一 AdamW 更新与不中断路径逐位一致。仅指定 `--initial-adapter --initial-optimizer-steps --start-sample-index` 是 adapter-only warm-start；额外指定 `--resume-training-state COMPANION` 才恢复优化器和 RNG，当前限单独的 `self_think_sft` arm。恢复前校验 adapter／数据 SHA、底模路径、训练配置、参数顺序、Adam 超参数／张量／步数和数据游标；CUDA RNG 设备数也必须一致，失败不回退到重新初始化。累计 adapter 步数、延续的 Adam 步数和本次新增更新数分开记录，旧检查点不覆盖。这是训练状态恢复能力，不是跨硬件或不同内核的逐位复现承诺。
+
+换训练集但保留已训练 adapter 和 Adam/RNG 时，显式追加 `--transfer-dataset`，并设置新数据 `--start-sample-index 0`；必须配套 `--resume-training-state`。仅允许数据 SHA 改变及新数据游标归零，底模／训练数值配置／优化器校验仍生效。同一数据 SHA、非零迁移游标或缺少状态文件均拒绝；旧 accepted-index 历史不带入新数据集。迁移事件和后续检查点记录新旧数据 SHA 与父状态文件，累计 adapter/Adam 步数延续。后续在新数据上的普通断点恢复不再加迁移标记。CPU smoke 覆盖实际 Adam 状态一致、迁移后下一步逐位一致、非法迁移拒绝及新数据检查点的普通恢复；这不证明换数据后没有遗忘或质量下降。
+
+`scripts/qwen_exo/pregenerate_mid_lora_think.py --source PREPARED_JSONL --output PRIVATE_DIR --base-profile PROFILE` 使用在线 SGLang 的 `/generate` 串行预生成 Think（并发固定为1，不改服务线程数）。只发送 `generation_plan` 选定的完整因果前缀：schema1 使用 `question_input_ids`，恢复样本 schema2 使用独立的 `generation_input_ids`，不发送目标答案、标签或未来结果。显式复制当前 `/server_info` 的 Think 压制／软收尾配置，通过 `custom_params.qwen_exo_think_shaping` 生效。逐请求前后校验模型指纹、adapter SHA、tokenizer 和配置，核对实际 prompt IDs，保存原始 output IDs 与真实闭合标记，不用解码再编码或补造 `</think>`。进程锁、逐样本原子保存和 manifest 支持断点续跑；`--limit` 可做小批验收，`stop.json` 在请求边界停止。超预算／边界异常保留 review，不进入 accepted 集。输出 `prepared.jsonl`（接受的原样本）、`think-cache.jsonl`（教师、压制策略和 token 哈希）、`train-ready.jsonl`（完整 input_ids/答案-only labels）及 receipt。输出可能包含私有原文或生成内容，不入 Git。
+
+预生成在写任何输出前检查输入与输出文件冲突，包括临时文件、符号链接和已有硬链接；不能把接受子集写回原始 prepared 数据。合法的独立输出目录仍可断点续跑。
+
+训练时使用 `--data PRIVATE_DIR/prepared.jsonl --precomputed-think PRIVATE_DIR/think-cache.jsonl --precomputed-think-source ORIGINAL_PREPARED_JSONL`；会验证接受子集与原样本完全一致及 cache 的完整覆盖。每步直接重放固定 Think，只监督原始答案／动作，不重新采样 Think；评测也使用同一固定 Think，仅生成后续动作，并标记非连续 rollout。改变缓存哈希不能伪装成同一训练断点；换到经过筛选的新数据集需显式迁移，保留 Adam但重设新数据游标。固定教师可能与后续 learner 行为不一致，线上量化与训练 W4A16 也不同；压制是概率偏置，不保证短 Think、正确推理或能力提升。
+
+已有 `reasoning_content` 的 OpenAI rollout 可用 `scripts/qwen_exo/prepare_supplied_mid_lora.py --source INPUT --output PRIVATE_DIR --profile PROFILE` 准备，不调用模型生成 Think。默认只监督答案；显式 `--supervise-reasoning` 则监督当前目标的原有 Think（含闭合边界）和答案／动作，历史上下文仍屏蔽。缺失推理保持空且不监督空 Think 边界，不补造内容。`native-supplied-think-v1` 绑定源文件／推理哈希、`supervision` 和 label 哈希；prepared provenance 必须声明相同策略，修改缓存不能悄悄改变 loss mask。此模式与普通 SGLang 固定 Think 的答案-only策略相互独立，可按数据集接续。改变监督策略应生成新数据视图并显式 dataset-transfer，继承最新权重和 Adam，不能回退到更早检查点；两种 loss 的数值不可直接比较。长训练上下文按既有工具输出隐藏／完整历史单元裁剪处理，原有 Think 和目标不截断。同一数据只选一种格式，避免重复训练；同任务多 rollout 可显式 `--heldout-limit 0`，不得声称独立评测收益。准备文件仅是已有数据的训练编码。
+
+即使训练监督原始 Think，固定 Think 评测仍按原始答案 suffix 和分隔符确定答案起点；`answer_nll` 仅计算答案 token，生成输入保留完整固定 Think，不修改训练 labels。
+
+`prepare_remaining_mid_lora.py --dataset gym|claude --receipt ORIGINAL_RECEIPT --output NEW_PRIVATE_DIR` 按已验证的训练分支排除真正更新过的目标，沿用原任务分组／train-heldout 切分，保留原短样本记录，去重后恢复超长目标。schema2 的完整生成前缀保留历史证据和可读历史 reasoning，不做工具隐藏或历史裁剪；训练侧先仅隐藏 native tool content／`<tool_response>` JSON 根 output/content，保留协议元数据、非工具文字和 assistant 调用；仍超长才移除最早完整历史单元，保护 system、首个任务、最近 user 和最后调用结果单元。目标答案不裁剪，无法容纳的保护核心／完整生成上下文超过模型上限均单独排除。生成前缀和训练前缀分别绑定哈希，训练序列含新 Think／答案后仍不超过32768；旧schema1仍原样可读。恢复样本必须先预生成 Think，直接现场 self-Think 训练会被拒绝，避免误用32K生成预算。Think不是无损记忆，此方案是有损上下文下的动作监督。准备和生成不启动训练或改动正在运行的训练；GPU容量、完整来源和最终mask仍须验收。
+
+长上下文预生成还须扣除 SGLang 的推测解码保留位：按在线参数计算 `max(speculative_eagle_topk × speculative_num_steps, max_speculative_num_draft_tokens)`。只缩小该请求的最大新 Think 预算，完整输入历史不变，调整记录到 `budget-adjustments.jsonl`；否则正好达到模型上限的样本会被总长度校验拒绝。辅助脚本不要命名为 `queue.py`，以免遮蔽 Python 标准库、触发意外重复执行；跨数据集队列和每个捕获进程都须验证唯一所有者。
+
+已验证数据可通过 `scripts/qwen_exo/train_remaining_sequence.py PRIVATE_ROOT` 生成 gym 续训参数；显式 `--authorize-training` 才按配置顺序运行 gym→Claude。每段开始前校验 source/cache 哈希、独立完整前缀验证凭据、最新提交的 adapter/Adam 配对及有限状态，随后以显式 dataset-transfer 从新数据游标0接续，保留累计步数与 Adam。`sequence-status.json` 记录当前真实训练子进程身份和输出目录；监控据此跟随两段训练。运行必须置于原有独立 GPU 窗口/恢复守护之内，中间不重启推理；失败不跳过当前数据继续下一段，结束后恢复启动前的模型。`stop-training.json` 阻止下一段；立即停止仍通过外层已验证 PID 的控制器完成。
+
+`--cache-gate-policy each-prefix` 默认逐实际前缀验证；显式选择 `adapter-revision` 时，只复用绑定底座身份、设备／dtype、adapter Tensor 版本的成功门禁。每个新版本仍先验证一个实际前缀，优化器更新、reset、load、roundtrip 会使门禁失效；失败不能被旧成功结果掩盖。这是代表性前缀验证，不宣称覆盖该版本所有后续前缀，也不消除 QSA 同分选择风险；KV 本身仍不跨生成复用。
+
+生成专家可显式选择 `--generation-expert-backend nvfp4-gemv --fp32-linear-accumulation`，默认仍为 `reference`。这是独立训练参考后端的 no-grad 单 token 路径，不调用 SGLang 服务、不导入其推理运行时，也不使用 Marlin 重量化布局。它借鉴多专家分组执行：直接读取原始 NVFP4 压缩权重，在 GPU 上融合解码与 FP32 GEMV，不物化完整 BF16/FP32 专家矩阵；保留 BF16 解码、SiLU／乘法、down 输出、路由加权和按专家升序累加的舍入边界。流式权重仍需每层一次路由 ID 回传；没有宣称全 GPU 调度。只在当前生成上下文、CUDA BF16 `[1,2560]`、中间维度 640、1–10 个不同专家且原始 NVFP4 权重时启用，多 token prefill、重复专家、其他格式以及梯度路径保持原实现。切换后端会使 cache gate 失效，异常退出恢复上下文；不支持 CUDA Graph。分块 FP32 规约与 cuBLAS 顺序不同，不能宣称逐位等价。独立 GPU 窗口已通过 62 项 codec／生成内核／实际梯度隔离回归。真实 checkpoint 第16/24/31层、每层10个固定专家的交替 A/B 中，热缓存约快6.95–7.44倍，冷上传约快2.10–2.14倍，最大绝对输出误差1.53e-5；这些仅是专家组件结果。第161步完整模型在同一合成问题上两条路径连续24个 greedy token一致。完整模型单次先旧后新的耗时受到预热影响，不作为端到端加速倍数；现有探索性 fresh/cache 数值漂移限制仍保留。GPU测试入口为 `test/registered/qwen_exo/test_native_mid_lora_decode.py`；长上下文/整轮训练质量和吞吐不能由组件数据推断。
+
+CUDA 生成与训练现在共用 cache-aware chunked QSA：全量 `[B,1,N,N]` 与后缀 `[B,1,Q,N]` 使用同一因果选择算术，同分块按较小索引稳定排序。该规则有意替代上游未指定的同分 Top-K 顺序，必须在同一后端上比较训练前后；不能把该参考实现等同线上 W4A4。真实长前缀曾在“训练 chunked QSA／生成 upstream QSA”切换时、尚未使用缓存就出现分歧，因此不能靠放宽 logits 容差跳过验证。GPU native-cache 实验必须提供 `--cpu-validation-receipt` 指向先前隔离 CPU 验证结果；不能在导入 GPU FLA 的进程里重新让 CPU 小模型运行 GPU-only 内核。
+
+`--allow-numeric-drift-research` 仅允许在显式 `experiment + native-cache` 中使用：必须保持完整 prefill hidden/logits 逐位一致、缓存布局/长度/位置正确、张量与 logits 有限、输入未变；随后单 token 解码的逐位置数值差异会原样记录。数值等价失败仍是 `passed=false`，研究接受单独标记，不能包装成缓存正确性、训练重放等价或线上收益。该探索性对照固定底座／普通 SFT／自 Think SFT 的解码策略；自 Think 评测在一次连续生成中跨越真实 `</think>` 产生答案，不在 Think 与动作之间重置缓存。训练依旧独立进行完整 gold replay，答案内容从不进入采样函数。
+
+实验记录答案 NLL、忽略调用 ID 的工具名/参数匹配、格式与重复输出、路由计数，以及同题底座 Think／异题 Think 的条件 NLL 对照。这些不是已执行工具的成功率，也不证明 verbal Think 忠实于内部决策。服务停机必须额外授权；`run_mid_lora_gpu_window.py --plan PRIVATE_PLAN --authorize-stop` 需通过独立 detached launcher 启动，使用退出恢复和独立 watchdog 恢复原 supervisor 服务，不改模型、软件包或服务配置。训练结束不会自动上线 adapter。
+
 
 ### Qwen3.8-Flash-Next NVFP4：隔离单卡路径
 

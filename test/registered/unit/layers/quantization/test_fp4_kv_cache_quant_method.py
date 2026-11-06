@@ -142,6 +142,47 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         # FP4: 8*64*4*2 = 4096, scales: 8*8*4*2 = 512, dq: 8*128*2 = 2048
         self.assertEqual(cell, 4096 + 512 + 2048)
 
+    def test_qsa_allocation_matches_packed_payload_without_full_span_workspace(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import NVFP4KVCacheMethod
+
+        method = NVFP4KVCacheMethod(12, "cpu", attention_backend="qsa")
+        buffers = method.create_buffers(68, 2, 256, 12, "cpu")
+        self.assertIsNone(buffers["dq_k_buffer"])
+        self.assertIsNone(buffers["dq_v_buffer"])
+        allocated = sum(
+            tensor.numel() * tensor.element_size()
+            for name in ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer")
+            for tensor in buffers[name]
+        )
+        self.assertEqual(allocated, 68 * 12 * 2 * 2 * (128 + 16))
+        self.assertEqual(allocated, 68 * method.compute_cell_size(2, 256, 12, 1))
+
+    def test_qsa_scales_use_original_hybrid_layer_ids_without_xqa_compensation(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import NVFP4KVCacheMethod
+
+        model = SimpleNamespace(layers=[
+            SimpleNamespace(),
+            SimpleNamespace(self_attn=SimpleNamespace(attn=SimpleNamespace(
+                layer_id=3, k_scale=.25, v_scale=2.0,
+            ))),
+            SimpleNamespace(self_attn=SimpleNamespace(attn=SimpleNamespace(
+                layer_id=11, k_scale=1.5, v_scale=.5,
+            ))),
+        ])
+        for sm100 in (False, True):
+            with self.subTest(sm100=sm100), patch(
+                "sglang.srt.layers.quantization.fp4_kv_cache_quant_method.is_sm100_supported",
+                return_value=sm100,
+            ):
+                method = NVFP4KVCacheMethod(2, "cpu", attention_backend="qsa")
+                method.load_scales_from_model(model)
+                self.assertEqual(method.get_bmm_scales(3), (.25, 2.0))
+                self.assertEqual(method.get_bmm_scales(11), (1.5, .5))
+                torch.testing.assert_close(method.k_scales_gpu[[3, 11]], torch.tensor([.25, 1.5]))
+                torch.testing.assert_close(method.v_scales_gpu[[3, 11]], torch.tensor([2., .5]))
+
     def test_scales_init(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,

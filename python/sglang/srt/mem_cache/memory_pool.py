@@ -1924,8 +1924,8 @@ class MHATokenToKVPool(KVCache):
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
-        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
-        if self.layer_num == 0:
+        # Packed caches use snapshot moves so overlapping data/scale rows are safe.
+        if self.layer_num == 0 or self.is_quantized_kv_cache:
             self._kv_copy_config = None
             return
 
@@ -2292,6 +2292,11 @@ class MHATokenToKVPool(KVCache):
                     "cpu", non_blocking=True
                 )
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
+                if self.is_quantized_kv_cache:
+                    kv_cache_cpu[-1][-1].extend([
+                        self.k_scale_buffer[layer_id][chunk_indices].to("cpu", non_blocking=True),
+                        self.v_scale_buffer[layer_id][chunk_indices].to("cpu", non_blocking=True),
+                    ])
         current_platform.synchronize()
         return kv_cache_cpu
 
@@ -2314,6 +2319,14 @@ class MHATokenToKVPool(KVCache):
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
+                if self.is_quantized_kv_cache:
+                    k_scale_cpu, v_scale_cpu = kv_cache_cpu[layer_id][i // chunk_size][2:]
+                    self.k_scale_buffer[layer_id][chunk_indices] = k_scale_cpu.to(
+                        self.k_scale_buffer[layer_id].device, non_blocking=True
+                    )
+                    self.v_scale_buffer[layer_id][chunk_indices] = v_scale_cpu.to(
+                        self.v_scale_buffer[layer_id].device, non_blocking=True
+                    )
         current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
@@ -2526,6 +2539,7 @@ class MHATokenToKVPool(KVCache):
             k_scale = self.quant_method.k_scales_gpu[
                 global_layer_id : global_layer_id + 1
             ]
+        if v_scale is None and hasattr(self.quant_method, "v_scales_gpu"):
             v_scale = self.quant_method.v_scales_gpu[
                 global_layer_id : global_layer_id + 1
             ]
@@ -2879,7 +2893,7 @@ class MHATokenToKVPool(KVCache):
         # Physical move strategy. Override for layouts that change buffer identity
         # (e.g. PageMajorMHATokenToKVPool always uses the native move). The 3-D
         # per-layer buffers here ignore page_size in move_kv_cache_native.
-        if self.use_native_move_kv_cache:
+        if self.use_native_move_kv_cache or self.is_quantized_kv_cache:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             if getattr(self, "k_scale_buffer", None) is not None:
                 move_kv_cache_native(
@@ -3888,8 +3902,8 @@ class HybridLinearKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
@@ -3940,7 +3954,9 @@ class HybridLinearKVPool(KVCache):
             )
 
     def get_v_head_dim(self):
-        return self.full_kv_pool.get_value_buffer(0).shape[-1]
+        if self.use_mla:
+            return self.full_kv_pool.get_value_buffer(0).shape[-1]
+        return self.full_kv_pool.v_head_dim
 
     def set_mla_kv_buffer(
         self,

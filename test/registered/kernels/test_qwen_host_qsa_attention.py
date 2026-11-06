@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostFP8KVPool
+from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -40,7 +40,7 @@ def _pair(*, gpu_size=0, dtype=torch.float8_e4m3fn):
         indexer_head_dim=128, indexer_budget=2048, indexer_compress_ratio=4,
     )
     layer = SimpleNamespace(
-        layer_id=11, tp_q_head_num=8, head_dim=128, scaling=128 ** -0.5,
+        layer_id=11, tp_q_head_num=8, tp_k_head_num=2, head_dim=128, scaling=128 ** -0.5,
         k_scale_float=0.75, v_scale_float=1.5,
     )
     layers = [SimpleNamespace(**{**vars(layer), "layer_id": 3}), layer]
@@ -53,7 +53,7 @@ def _pair(*, gpu_size=0, dtype=torch.float8_e4m3fn):
     for k, v in inputs:
         k[0].zero_()
         v[0].zero_()
-    for pool_class in (None, partial(QwenHostFP8KVPool, gpu_size=gpu_size)):
+    for pool_class in (None, partial(QwenHostKVPool, gpu_size=gpu_size)):
         pool = QSATokenToKVPool(
             size=256, dtype=dtype, page_size=4,
             head_num=2, head_dim=128, full_attention_layer_ids=[3, 11],
@@ -241,7 +241,7 @@ def test_host_qsa_chunk_prefill_reads_old_prefix_and_commits_current_chunk(
         backend.init_forward_metadata(batch)
         full_pool = backend.token_to_kv_pool.full_kv_pool
         with monkeypatch.context() as patch:
-            if isinstance(full_pool, QwenHostFP8KVPool) and gpu_size < full_pool.size:
+            if isinstance(full_pool, QwenHostKVPool) and gpu_size < full_pool.size:
                 # gpu_size=192 leaves a host suffix even though this batch's
                 # selected slots all fit on GPU. It must still materialize.
                 patch.setattr(
@@ -387,7 +387,7 @@ def test_paged_qsa_prefill_mapped_bank_matches_dense(
     storage_dtype, query_dtype, per_head, gpu_size
 ):
     inputs = _paged_prefill_inputs(storage_dtype, query_dtype, per_head)
-    pool = QwenHostFP8KVPool(
+    pool = QwenHostKVPool(
         size=768, page_size=4, dtype=storage_dtype, head_num=2, head_dim=128,
         layer_num=1, device="cuda", enable_memory_saver=False, gpu_size=gpu_size,
     )

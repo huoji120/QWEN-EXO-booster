@@ -354,14 +354,24 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     name = "nvfp4"
     SCALE_BLOCK_SIZE = 16
 
-    def __init__(self, num_layers: int, device: str):
+    def __init__(self, num_layers: int, device: str, *, attention_backend=None):
         self.num_layers = num_layers
         self.device = device
+        self.attention_backend = attention_backend
         # Per-layer global FP32 scales; filled by load_scales_from_model()
         self.k_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
         self.v_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
         self.k_scales_float = [1.0] * num_layers
         self.v_scales_float = [1.0] * num_layers
+
+    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
+        accesses = super().attention_accesses()
+        if self.attention_backend is None:
+            return accesses
+        return tuple(
+            access for access in accesses
+            if access.backend_matcher.matches(self.attention_backend, ())
+        )
 
     def needs_global_scale(self) -> bool:
         return True
@@ -431,7 +441,8 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             # The FP4 data type itself is identical on both architectures.
             # Reference: TRT-LLM FP8QDQLinearMethod.process_weights_after_loading_fused_qkv_linear
             # https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/linear.py
-            if is_sm100_supported():
+            # QSA explicitly decodes both scales and does not use packed XQA.
+            if is_sm100_supported() and self.attention_backend != "qsa":
                 k_scale *= E2M1_MAX
                 v_scale *= E2M1_MAX
             k_scales_cpu[layer_id] = k_scale
@@ -812,6 +823,8 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
     NVFP4KVCacheMethod.name: (
         _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
         _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
+        _native_fp4(_PREFILL, {"qsa"}, _NVFP4_SCALE, _BF16),
+        _native_fp4(_DECODE, {"qsa"}, _NVFP4_SCALE, _BF16),
     ),
     FP4MXBlock16KVCacheMethod.name: (
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),

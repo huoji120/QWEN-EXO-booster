@@ -123,7 +123,7 @@ def _diagnostic_backend():
             return None
         pool = pool.full_kv_pool
     if (
-        type(pool).__name__ not in ("MHATokenToKVPool", "QwenHostFP8KVPool")
+        type(pool).__name__ not in ("MHATokenToKVPool", "QwenHostKVPool")
         or getattr(pool, "use_hnd", False)
         or getattr(pool, "kv_cache_layout", None) == "vectorized_5d"
     ):

@@ -1,13 +1,12 @@
-"""GPU-first FP8 KV with CUDA-mapped pinned memory for overflow rows.
+"""GPU-first FP8/NVFP4 KV with CUDA-mapped pinned memory overflow.
 
 Logical slots address a page-aligned CUDA prefix and a disjoint host suffix.
-QSA index/state pools stay on CUDA. Stored K/V retain global FP8 scaling.
+NVFP4 retains packed data and block scales without a logical dequant workspace.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import weakref
 from pathlib import Path
@@ -16,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, unwrap_write_loc
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 logger = logging.getLogger(__name__)
@@ -67,7 +66,7 @@ def _reserve_host_bytes(owner, requested: int) -> None:
                 )
                 if committed + requested + _HOST_HEADROOM > limit:
                     raise MemoryError(
-                        "Qwen host FP8 KV exceeds cgroup memory.max with 8 GiB "
+                        "Qwen host KV exceeds cgroup memory.max with 8 GiB "
                         f"headroom: committed={committed}, requested={requested}, "
                         f"limit={limit}."
                     )
@@ -198,7 +197,7 @@ def _gather_selected_host_kv(
     tl.store(output_v + packed_row * V_DIM + offsets, v, mask=offsets < V_DIM)
 
 
-class QwenHostFP8KVPool(MHATokenToKVPool):
+class QwenHostKVPool(MHATokenToKVPool):
     """Disjoint CUDA prefix and allocator-owned pinned overflow bank.
 
     Device consumers gather by logical slot; moves are snapshot assignments.
@@ -211,57 +210,81 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
     def _create_buffers(self):
         device = torch.device(self.device)
         if device.type != "cuda":
-            raise ValueError("Qwen host FP8 KV requires CUDA mapped host memory.")
-        if self.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise ValueError("Qwen host KV supports only global-scaled CUDA FP8.")
-        if self.is_quantized_kv_cache or self.post_capture_active:
-            raise ValueError("Qwen host KV does not support quantized recipes or VA backing.")
+            raise ValueError("Qwen host KV requires CUDA mapped host memory.")
+        if self.is_quantized_kv_cache:
+            if self.quant_method.name != "nvfp4":
+                raise ValueError("Qwen host KV supports only FP8 or NVFP4.")
+            if self.head_dim != self.v_head_dim or self.head_dim % 16:
+                raise ValueError("NVFP4 host KV requires equal K/V head dimensions divisible by 16.")
+        elif self.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raise ValueError("Qwen host KV supports only FP8 or NVFP4.")
+        if self.post_capture_active:
+            raise ValueError("Qwen host KV does not support VA backing.")
         if self.use_hnd or self.kv_cache_layout != "nhd":
-            raise ValueError("Qwen host FP8 KV requires NHD layout.")
+            raise ValueError("Qwen host KV requires NHD layout.")
         self._host_cuda_device = torch.device(
             "cuda", device.index if device.index is not None else torch.cuda.current_device()
         )
-        super()._create_buffers()
+        self.store_dtype = torch.uint8
+        self.dq_k_buffer = self.dq_v_buffer = None
+        self._create_buffers_normal()
+        # No inherited pointer tables: they would describe only the host suffix
+        # as if it were a CUDA-addressable logical bank.
+        self._kv_buffer_descs = []
 
     def _create_buffers_normal(self):
         if not 0 <= self.gpu_size <= self.size or self.gpu_size % self.page_size:
             raise ValueError("GPU KV capacity must be page-aligned and within logical size.")
-        k_shape, v_shape = self._kv_buffer_shapes()
         self.gpu_rows = self.gpu_size + self.page_size if self.gpu_size else 0
         host_rows = self.size + self.page_size - self.gpu_rows
-        host_k_shape, host_v_shape = (host_rows, *k_shape[1:]), (host_rows, *v_shape[1:])
-        gpu_k_shape, gpu_v_shape = (self.gpu_rows, *k_shape[1:]), (self.gpu_rows, *v_shape[1:])
-        self.host_bytes = self.layer_num * (math.prod(host_k_shape) + math.prod(host_v_shape))
-        _reserve_host_bytes(self, self.host_bytes)
+        divisor = 2 if self.is_quantized_kv_cache else 1
+        self._raw_dims = (self.head_dim // divisor, self.v_head_dim // divisor)
+        if self.is_quantized_kv_cache:
+            self._raw_dims += (self.head_dim // 16, self.v_head_dim // 16)
         self.k_buffer, self.v_buffer = [], []
         self.gpu_k_buffer, self.gpu_v_buffer = [], []
+        self.k_scale_buffer = [] if self.is_quantized_kv_cache else None
+        self.v_scale_buffer = [] if self.is_quantized_kv_cache else None
+        self.gpu_k_scale_buffer = [] if self.is_quantized_kv_cache else None
+        self.gpu_v_scale_buffer = [] if self.is_quantized_kv_cache else None
+        host_banks, gpu_banks = self._raw_banks()
+        self.host_bytes = self.layer_num * host_rows * self.head_num * sum(self._raw_dims)
+        _reserve_host_bytes(self, self.host_bytes)
         try:
             for _ in range(self.layer_num):
-                self.k_buffer.append(torch.empty(host_k_shape, dtype=torch.uint8, device="cpu", pin_memory=True))
-                self.v_buffer.append(torch.empty(host_v_shape, dtype=torch.uint8, device="cpu", pin_memory=True))
-                self.gpu_k_buffer.append(torch.empty(gpu_k_shape, dtype=torch.uint8, device=self.device))
-                self.gpu_v_buffer.append(torch.empty(gpu_v_shape, dtype=torch.uint8, device=self.device))
+                for host, gpu, dim in zip(host_banks, gpu_banks, self._raw_dims):
+                    host.append(torch.empty((host_rows, self.head_num, dim), dtype=torch.uint8,
+                                            device="cpu", pin_memory=True))
+                    gpu.append(torch.empty((self.gpu_rows, self.head_num, dim), dtype=torch.uint8,
+                                           device=self.device))
             # Only the dummy page is readable before explicit KV writes.
-            dummy_buffers = (self.gpu_k_buffer + self.gpu_v_buffer) if self.gpu_rows else (self.k_buffer + self.v_buffer)
-            for buffer in dummy_buffers:
-                buffer[: self.page_size].zero_()
+            for bank in gpu_banks if self.gpu_rows else host_banks:
+                for buffer in bank:
+                    buffer[: self.page_size].zero_()
         except BaseException:
-            self.k_buffer.clear()
-            self.v_buffer.clear()
-            self.gpu_k_buffer.clear()
-            self.gpu_v_buffer.clear()
+            for bank in host_banks + gpu_banks:
+                bank.clear()
             with _HOST_RESERVATION_LOCK:
                 _HOST_RESERVATIONS.pop(self, None)
             raise
         self._host_lifetime = weakref.finalize(
             self, _finish_host_access, self._host_cuda_device,
-            tuple(self.k_buffer + self.v_buffer + self.gpu_k_buffer + self.gpu_v_buffer),
+            tuple(buffer for bank in host_banks + gpu_banks for buffer in bank),
         )
         logger.info(
-            "QWEN_HOST_KV_ALLOCATED tokens=%d layers=%d dtype=%s gpu_tokens=%d host_tokens=%d pinned_host_bytes=%d GPU_raw_KV_bytes=%d",
-            self.size, self.layer_num, self.dtype, self.gpu_size, self.size - self.gpu_size,
+            "QWEN_HOST_KV_ALLOCATED tokens=%d layers=%d dtype=%s recipe=%s gpu_tokens=%d host_tokens=%d pinned_host_bytes=%d GPU_raw_KV_bytes=%d",
+            self.size, self.layer_num, self.dtype, self.quant_method.name,
+            self.gpu_size, self.size - self.gpu_size,
             self.host_bytes, sum(self.get_kv_size_bytes()),
         )
+
+    def _raw_banks(self):
+        host = (self.k_buffer, self.v_buffer)
+        gpu = (self.gpu_k_buffer, self.gpu_v_buffer)
+        if self.is_quantized_kv_cache:
+            host += (self.k_scale_buffer, self.v_scale_buffer)
+            gpu += (self.gpu_k_scale_buffer, self.gpu_v_scale_buffer)
+        return host, gpu
 
     def _init_kv_copy_and_warmup(self):
         # A single-launch generic copy races on overlapping slot assignments.
@@ -272,12 +295,16 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
         super()._clear_buffers()
         del self.gpu_k_buffer
         del self.gpu_v_buffer
+        del self.gpu_k_scale_buffer
+        del self.gpu_v_scale_buffer
         with _HOST_RESERVATION_LOCK:
             _HOST_RESERVATIONS.pop(self, None)
 
     def get_kv_size_bytes(self):
         # QSA's wrapper separately adds its device index/state buffers.
-        return tuple(sum(buffer.numel() for buffer in buffers) for buffers in (self.gpu_k_buffer, self.gpu_v_buffer))
+        _, gpu = self._raw_banks()
+        return tuple(sum(buffer.nbytes for bank in gpu[kind::2] for buffer in bank)
+                     for kind in range(2))
 
     def _check_slots(self, slots):
         if slots.device != self._host_cuda_device or slots.ndim != 1:
@@ -291,40 +318,77 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
     ):
         if dcp_kv_mask is not None:
             raise ValueError("Qwen host KV does not support distributed context parallelism.")
+        if self.is_quantized_kv_cache:
+            from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+
+            loc, _, _ = unwrap_write_loc(loc_info)
+            self._check_slots(loc)
+            maybe_detect_oob(loc, 0, self.size + self.page_size, "set_host_nvfp4_kv")
+            pool_layer = layer.layer_id if layer_id_override is None else layer_id_override
+            local_layer = pool_layer - self.start_layer
+            global_layer = layer.layer_id if layer is not None else pool_layer
+            if not 0 <= local_layer < self.layer_num:
+                raise IndexError("Host KV local layer id is outside the pool.")
+            for value, dim in ((cache_k, self.head_dim), (cache_v, self.v_head_dim)):
+                if (value.device != loc.device or value.dtype not in (torch.bfloat16, torch.float16)
+                        or tuple(value.shape) != (loc.numel(), self.head_num, dim)):
+                    raise ValueError("NVFP4 writes require matching CUDA BF16/FP16 NHD inputs.")
+            if not loc.numel():
+                return
+            k_scale, v_scale = self._quantized_scales(global_layer, k_scale, v_scale)
+            key, ks, _ = NVFP4KVQuantizeUtil.quantize(cache_k.contiguous(), k_scale)
+            value, vs, _ = NVFP4KVQuantizeUtil.quantize(cache_v.contiguous(), v_scale)
+            self._store_raw_rows(local_layer, loc, tuple(
+                tensor.view(torch.uint8) for tensor in (key, value, ks, vs)
+            ))
+            return
         return super().set_kv_buffer(
             layer, loc_info, cache_k, cache_v, k_scale, v_scale,
             layer_id_override=layer_id_override,
         )
 
     def _store_kv_layer(self, layer_idx, loc, cache_k, cache_v):
+        self._store_raw_rows(layer_idx, loc, (cache_k, cache_v))
+
+    def _store_raw_rows(self, layer_idx, loc, payloads):
         self._check_slots(loc)
-        if cache_k.device != loc.device or cache_v.device != loc.device:
-            raise ValueError("Host KV writes require CUDA K/V inputs.")
-        if cache_k.dtype != torch.uint8 or cache_v.dtype != torch.uint8:
-            raise ValueError("Host KV writer expects inherited FP8 byte views.")
-        if (tuple(cache_k.shape) != (loc.numel(), self.head_num, self.head_dim)
-                or tuple(cache_v.shape) != (loc.numel(), self.head_num, self.v_head_dim)):
-            raise ValueError("Host KV writes must match the pool's NHD geometry.")
+        if not 0 <= layer_idx < self.layer_num:
+            raise IndexError("Host KV local layer id is outside the pool.")
+        if len(payloads) != len(self._raw_dims):
+            raise ValueError("Host KV writes must include data and all block scales.")
+        for payload, dim in zip(payloads, self._raw_dims):
+            if (payload.device != loc.device or payload.dtype != torch.uint8
+                    or tuple(payload.shape) != (loc.numel(), self.head_num, dim)):
+                raise ValueError("Host KV writes require matching CUDA NHD byte rows.")
         if not loc.numel():
             return
-        width = max(self.row_dim, self.head_num * self.v_head_dim)
-        _scatter_host_kv[(loc.numel(), triton.cdiv(width, 256))](
-            cache_k, cache_v,
-            self.k_buffer[layer_idx].data_ptr(), self.v_buffer[layer_idx].data_ptr(),
-            self.gpu_k_buffer[layer_idx], self.gpu_v_buffer[layer_idx], loc,
-            self.gpu_rows, loc.stride(0),
-            self.head_num, self.head_dim, self.v_head_dim,
-            *cache_k.stride(), *cache_v.stride(), self.size + self.page_size, 256,
-        )
+        host, gpu = self._raw_banks()
+        for pair in range(0, len(payloads), 2):
+            key, value = payloads[pair : pair + 2]
+            kd, vd = self._raw_dims[pair : pair + 2]
+            _scatter_host_kv[(loc.numel(), triton.cdiv(self.head_num * max(kd, vd), 256))](
+                key, value, host[pair][layer_idx].data_ptr(), host[pair + 1][layer_idx].data_ptr(),
+                gpu[pair][layer_idx], gpu[pair + 1][layer_idx], loc,
+                self.gpu_rows, loc.stride(0), self.head_num, kd, vd,
+                *key.stride(), *value.stride(), self.size + self.page_size, 256,
+            )
 
     def gather_selected_into(self, local_layer_id, req_to_token, req_indices,
-                             indices, seq_lens, cu_k, output_k, output_v):
-        """Map packed QSA selections and gather both banks in one launch.
+                             indices, seq_lens, cu_k, output_k, output_v, *, layer_id=None):
+        """Gather QSA selections; NVFP4 applies global scales, FP8 only casts.
 
-        Cast only: callers retain their existing dtype-rounded scale operation.
         cu_k is the same monotonic packed/page-padded prefix plan used by QSA.
         No scratch allocations or host synchronization occur during replay.
         """
+        if self.is_quantized_kv_cache:
+            from sglang.srt.layers.attention.qsa.nvfp4 import gather_nvfp4_selected
+
+            gather_nvfp4_selected(
+                *self._nvfp4_device_banks(local_layer_id),
+                req_to_token, req_indices, indices, seq_lens, cu_k, output_k, output_v,
+                **self._nvfp4_gather_kwargs(local_layer_id, layer_id),
+            )
+            return
         self._check_slots(req_indices)
         self._check_slots(seq_lens)
         self._check_slots(cu_k)
@@ -339,7 +403,7 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
         if any(s <= 0 for t in (req_to_token, req_indices, indices, seq_lens, cu_k)
                for s in t.stride()):
             raise ValueError("QSA mapping requires positive strides.")
-        self._check_gather_outputs(local_layer_id, output_k, output_v, 0, raw=False)
+        self._check_gather_outputs(local_layer_id, output_k, output_v, 0)
         rows = output_k.shape[0]
         if not rows:
             return
@@ -354,14 +418,12 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
             tl.float8e4nv if self.dtype == torch.float8_e4m3fn else tl.float8e5, 256,
         )
 
-    def _check_gather_outputs(self, local_layer_id, output_k, output_v, num_slots, *, raw):
+    def _check_gather_outputs(self, local_layer_id, output_k, output_v, num_slots):
         if not 0 <= local_layer_id < self.layer_num:
             raise IndexError("Host KV local layer id is outside the pool.")
         rows = output_k.shape[0]
-        allowed = (torch.uint8,) if raw else (
-            torch.float8_e4m3fn, torch.float8_e5m2, torch.bfloat16,
-            torch.float16, torch.float32,
-        )
+        allowed = (torch.float8_e4m3fn, torch.float8_e5m2, torch.bfloat16,
+                   torch.float16, torch.float32)
         for output, dim in ((output_k, self.head_dim), (output_v, self.v_head_dim)):
             if (output.device != self._host_cuda_device or not output.is_contiguous()
                     or output.ndim != 3 or tuple(output.shape[1:]) != (self.head_num, dim)):
@@ -371,15 +433,13 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
             if output.dtype not in allowed:
                 raise ValueError("Unsupported host KV gather output dtype.")
 
-    def _gather_rows(self, local_layer_id, slots, output_k, output_v, *, raw=False):
+    def _gather_rows(self, local_layer_id, slots, output_k, output_v):
         self._check_slots(slots)
-        self._check_gather_outputs(local_layer_id, output_k, output_v, slots.numel(), raw=raw)
+        self._check_gather_outputs(local_layer_id, output_k, output_v, slots.numel())
         rows = output_k.shape[0]
         if not rows:
             return
-        storage_type = tl.uint8 if raw else (
-            tl.float8e4nv if self.dtype == torch.float8_e4m3fn else tl.float8e5
-        )
+        storage_type = tl.float8e4nv if self.dtype == torch.float8_e4m3fn else tl.float8e5
         for buffer, gpu, output, dim in (
             (self.k_buffer[local_layer_id], self.gpu_k_buffer[local_layer_id], output_k, self.head_dim),
             (self.v_buffer[local_layer_id], self.gpu_v_buffer[local_layer_id], output_v, self.v_head_dim),
@@ -390,14 +450,53 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
                 self.head_num * dim, self.size + self.page_size, storage_type, 256,
             )
 
-    def gather_into(self, local_layer_id, slots, output_k, output_v):
-        """Gather stored values, casting only; -1 and padded tail become zero.
+    def _nvfp4_device_banks(self, local_layer_id):
+        if not 0 <= local_layer_id < self.layer_num:
+            raise IndexError("Host KV local layer id is outside the pool.")
+        return tuple(bank[local_layer_id] for bank in self._raw_banks()[1])
 
-        local_layer_id indexes backing lists (pool layer minus start_layer).
-        Callers apply the layer K/V global scales, as for the GPU FP8 pool.
-        This performs no allocation or host I/O, including graph replay.
+    def _nvfp4_gather_kwargs(self, local_layer_id, layer_id):
+        if layer_id is None:
+            raise ValueError("NVFP4 gathers require the original global layer_id.")
+        k_scale, v_scale = self.quant_method.get_bmm_scales(layer_id)
+        return dict(k_scale=k_scale, v_scale=v_scale,
+                    host_k=self.k_buffer[local_layer_id],
+                    host_v=self.v_buffer[local_layer_id],
+                    host_ks=self.k_scale_buffer[local_layer_id],
+                    host_vs=self.v_scale_buffer[local_layer_id])
+
+    def gather_into(self, local_layer_id, slots, output_k, output_v, *, layer_id=None):
+        """Gather selected rows without device allocations or synchronization.
+
+        NVFP4 outputs include global scales selected by original layer_id.
+        FP8 outputs are cast-only; their caller applies global scales as before.
+        Invalid slots and the unused output tail are zero.
         """
-        self._gather_rows(local_layer_id, slots, output_k, output_v)
+        if self.is_quantized_kv_cache:
+            from sglang.srt.layers.attention.qsa.nvfp4 import gather_nvfp4_rows
+
+            gather_nvfp4_rows(
+                *self._nvfp4_device_banks(local_layer_id), slots, output_k, output_v,
+                **self._nvfp4_gather_kwargs(local_layer_id, layer_id),
+            )
+        else:
+            self._gather_rows(local_layer_id, slots, output_k, output_v)
+
+    def _new_raw_rows(self, count):
+        return tuple(torch.empty((count, self.head_num, dim), dtype=torch.uint8,
+                                 device=self.device) for dim in self._raw_dims)
+
+    def _gather_raw_rows(self, local_layer_id, slots, outputs):
+        self._check_slots(slots)
+        if not slots.numel():
+            return
+        host, gpu = self._raw_banks()
+        for host_bank, gpu_bank, output, dim in zip(host, gpu, outputs, self._raw_dims):
+            _gather_host_rows[(slots.numel(), triton.cdiv(self.head_num * dim, 256))](
+                host_bank[local_layer_id].data_ptr(), gpu_bank[local_layer_id], slots,
+                output, slots.numel(), self.gpu_rows, slots.stride(0),
+                self.head_num * dim, self.size + self.page_size, tl.uint8, 256,
+            )
 
     def get_kv_tokens(self, layer_id, indices, dtype, *, layer_id_override=None):
         pool_layer_id = layer_id if layer_id_override is None else layer_id_override
@@ -405,7 +504,7 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
             self.layer_transfer_counter.wait_until(pool_layer_id - self.start_layer)
         key = torch.empty((indices.numel(), self.head_num, self.head_dim), dtype=dtype, device=self.device)
         value = torch.empty((indices.numel(), self.head_num, self.v_head_dim), dtype=dtype, device=self.device)
-        self.gather_into(pool_layer_id - self.start_layer, indices, key, value)
+        self.gather_into(pool_layer_id - self.start_layer, indices, key, value, layer_id=layer_id)
         return key, value
 
     def move_kv_cache(self, tgt_loc, src_loc):
@@ -420,11 +519,10 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
         maybe_detect_oob(src_loc, 0, capacity, "move_host_kv_cache source")
         # Snapshot every selected row before writing each layer. Chunked direct
         # copies would corrupt cycles that cross a chunk boundary.
-        key = torch.empty((src_loc.numel(), self.head_num, self.head_dim), dtype=torch.uint8, device=self.device)
-        value = torch.empty((src_loc.numel(), self.head_num, self.v_head_dim), dtype=torch.uint8, device=self.device)
+        payloads = self._new_raw_rows(src_loc.numel())
         for layer_id in range(self.layer_num):
-            self._gather_rows(layer_id, src_loc, key, value, raw=True)
-            self._store_kv_layer(layer_id, tgt_loc, key, value)
+            self._gather_raw_rows(layer_id, src_loc, payloads)
+            self._store_raw_rows(layer_id, tgt_loc, payloads)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         indices = indices.to(device=self._host_cuda_device, dtype=torch.int64)
@@ -433,10 +531,9 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
             chunks = []
             for offset in range(0, indices.numel(), self.cpu_offloading_chunk_size):
                 selected = indices[offset : offset + self.cpu_offloading_chunk_size]
-                key = torch.empty((selected.numel(), self.head_num, self.head_dim), dtype=torch.uint8, device=self.device)
-                value = torch.empty((selected.numel(), self.head_num, self.v_head_dim), dtype=torch.uint8, device=self.device)
-                self._gather_rows(layer_id, selected, key, value, raw=True)
-                chunks.append([key.cpu(), value.cpu()])
+                payloads = self._new_raw_rows(selected.numel())
+                self._gather_raw_rows(layer_id, selected, payloads)
+                chunks.append([payload.cpu() for payload in payloads])
             result.append(chunks)
         return result
 
@@ -447,12 +544,26 @@ class QwenHostFP8KVPool(MHATokenToKVPool):
         for layer_id in range(self.layer_num):
             for offset in range(0, indices.numel(), self.cpu_offloading_chunk_size):
                 selected = indices[offset : offset + self.cpu_offloading_chunk_size]
-                key_cpu, value_cpu = kv_cache_cpu[layer_id][offset // self.cpu_offloading_chunk_size]
-                for payload, dim in ((key_cpu, self.head_dim), (value_cpu, self.v_head_dim)):
+                payloads = kv_cache_cpu[layer_id][offset // self.cpu_offloading_chunk_size]
+                if len(payloads) != len(self._raw_dims):
+                    raise ValueError("KV snapshot must include data and all block scales.")
+                for payload, dim in zip(payloads, self._raw_dims):
                     if (payload.device.type != "cpu" or payload.dtype != torch.uint8
                             or tuple(payload.shape) != (selected.numel(), self.head_num, dim)):
                         raise ValueError("KV snapshot must contain matching CPU byte rows.")
-                self._store_kv_layer(layer_id, selected, key_cpu.to(self.device), value_cpu.to(self.device))
+                self._store_raw_rows(layer_id, selected, tuple(payload.to(self.device) for payload in payloads))
+
+    def _get_key_buffer(self, layer_id):
+        raise NotImplementedError("Split host KV requires selected-row gathers, not a logical key buffer.")
+
+    def _get_value_buffer(self, layer_id):
+        raise NotImplementedError("Split host KV requires selected-row gathers, not a logical value buffer.")
+
+    def get_raw_kv_buffer(self, layer_id):
+        raise NotImplementedError("Split host KV has no contiguous logical raw buffer.")
+
+    def _pd_registerable_tensors(self):
+        raise NotImplementedError("Disaggregated/HiCache transfer is not supported by Qwen host KV.")
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError("Prefix-valid scatter is not supported by Qwen host KV.")

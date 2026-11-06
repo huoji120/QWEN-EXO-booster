@@ -10,11 +10,13 @@ import torch
 def install_training_gdn(native):
     """Bind installed FLA kernels without changing serving or installed HF files."""
     from fla import __version__ as fla_version
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
     from fla.modules.conv import causal_conv1d
+    from fla.modules.l2norm import l2norm_fwd
 
     reference_gdn = inspect.unwrap(native.torch_chunk_gated_delta_rule)
     reference_conv = inspect.unwrap(native.causal_conv1d_fn)
+    reference_recurrent = inspect.unwrap(native.torch_recurrent_gated_delta_rule)
 
     @functools.wraps(reference_gdn)
     def training_gdn(query, key, value, g, beta, chunk_size=64, initial_state=None,
@@ -41,10 +43,31 @@ def install_training_gdn(native):
         )
         return output.transpose(1, 2)
 
+    @functools.wraps(reference_recurrent)
+    def recurrent_gdn(query, key, value, g, beta, initial_state=None,
+                      output_final_state=False, use_qk_l2norm_in_kernel=False, **kwargs):
+        if query.device.type != "cuda":
+            return reference_recurrent(query, key, value, g, beta,
+                initial_state=initial_state, output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs)
+        if torch.is_grad_enabled():
+            raise ValueError("Cached recurrent GDN is only valid for no-grad generation")
+        if use_qk_l2norm_in_kernel:
+            # The training chunk kernel stores normalized Q/K in their input
+            # dtype before recurrence. Fused recurrent's in-kernel normalization
+            # keeps FP32 intermediates instead, changing the BF16 state update.
+            query = l2norm_fwd(query)[0]
+            key = l2norm_fwd(key)[0]
+        return fused_recurrent_gated_delta_rule(query, key, value, g=g, beta=beta,
+            initial_state=initial_state, output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=False, cu_seqlens=kwargs.get("cu_seqlens"))
+
     native.torch_chunk_gated_delta_rule = training_gdn
     native.causal_conv1d_fn = training_conv
+    native.torch_recurrent_gated_delta_rule = recurrent_gdn
     return {"gdn": "fla_chunk_gated_delta_rule", "convolution": "fla_triton_causal_conv1d",
             "fla_version": fla_version, "activation_backward": True,
+            "recurrent_gdn": "fla_recurrent_with_chunk_dtype_qk_normalization",
             "gdn_source": inspect.getfile(chunk_gated_delta_rule)}
 
 

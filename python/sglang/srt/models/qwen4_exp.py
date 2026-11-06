@@ -76,7 +76,7 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_ple_nvme import NVMePLEEmbedding, PLESourceIdentity, is_nvme_ple_embedding
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -1725,8 +1725,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         from sglang.srt.runtime_context import get_server_args
 
         server_args = get_server_args()
-        if server_args.kv_cache_dtype == "nvfp4":
-            raise ValueError("Qwen4 QSA requires BF16/FP8 KV, not the old packed NVFP4 cache")
         if getattr(server_args, "enable_qwen_exo", False) and getattr(
             server_args, "qwen_exo_score_bias_mode", "off"
         ) != "off":
@@ -1918,6 +1916,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # Validate the model-bound numerical contract before VL/HC modules allocate.
         enforce_sm120_profile_runtime(config)
         super().__init__(config, quant_config, prefix, language_model_cls)
+        # The VL parent keeps only text_config; adapter declarations belong to
+        # the original outer profile, not the language-model configuration.
+        self._qwen4_original_config = config
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
@@ -2032,6 +2033,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if hasattr(self, "_qwen_exo_native_mid_lora"):
+            raise RuntimeError("Native mid-layer LoRA weight changes require a model-profile restart")
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -2398,6 +2401,22 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # Loading metadata must not retain pre-conversion GPU Parameters while
         # quantization postprocessing replaces their resident storage.
         params_dict.clear()
+        original_config = getattr(self, "_qwen4_original_config", None)
+        if hasattr(original_config, "qwen_exo_native_mid_lora"):
+            if not isinstance(original_config.qwen_exo_native_mid_lora, dict):
+                raise ValueError("native_mid_lora_manifest_schema_invalid")
+            server_args = get_server_args()
+            if not server_args.enable_qwen_exo:
+                raise RuntimeError("Native mid-layer LoRA requires QWEN-EXO profile state isolation")
+            from qwen_exo_booster.native_mid_lora_serving import install as install_native_mid_lora
+
+            native_adapter = install_native_mid_lora(
+                self, server_args.model_path,
+                tp_size=get_parallel().tp_size, pp_size=self.pp_group.world_size,
+            )
+            if native_adapter is None:
+                raise ValueError("native_mid_lora_declared_profile_missing_manifest")
+            logger.info("Native mid-layer LoRA installed: %s", native_adapter)
 
         return loaded_params
 

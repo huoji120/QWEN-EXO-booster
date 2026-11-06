@@ -173,6 +173,16 @@ def _build_resolved_backend(
     resolved: ResolvedAttentionBackendStr,
     init_new_workspace: bool,
 ) -> AttentionBackend:
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+    if is_qwen_qsa(model_runner.model_config.hf_config):
+        # QSA owns full-attention reads. Do not construct a dense backend first:
+        # its packed-KV/workspace requirements do not apply to the sparse pool.
+        return _build_backend_from_str(
+            model_runner=model_runner,
+            backend_str="qsa",
+            init_new_workspace=init_new_workspace,
+        )
     if resolved.is_draft_override:
         attn_backend = _build_backend_from_str(
             model_runner=model_runner,

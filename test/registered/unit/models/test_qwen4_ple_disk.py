@@ -5,6 +5,8 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -26,6 +28,90 @@ def load_checkpoint_scale(table, scale):
     model._load_qwen4_exp_ple_buffer(
         name, torch.tensor([scale], dtype=torch.bfloat16), dict(model.named_buffers()), set()
     )
+
+
+class TestOptionalNativeAdapterLoad(unittest.TestCase):
+    def make_model(self, **outer_fields):
+        from sglang.srt.models import qwen4_exp
+
+        config = SimpleNamespace(
+            _name_or_path="Qwen/adapter-free-repository",
+            text_config=SimpleNamespace(
+                num_experts=None, tie_word_embeddings=False, language_only=True
+            ),
+            **outer_fields,
+        )
+
+        def init_vl(model, outer_config, *args):
+            torch.nn.Module.__init__(model)
+            # Match Qwen3VL's ownership: self.config is the nested text config.
+            model.config = outer_config.text_config
+            model.model = torch.nn.Module()
+            model.model.start_layer = model.model.end_layer = 0
+            model.visual = None
+            model.pp_group = SimpleNamespace(world_size=1)
+
+        with (
+            patch.object(qwen4_exp.Qwen3VLForConditionalGeneration, "__init__", init_vl),
+            patch.object(qwen4_exp, "enforce_sm120_profile_runtime"),
+        ):
+            model = qwen4_exp.Qwen4ExpForConditionalGeneration(config)
+        self.assertIs(model.config, config.text_config)
+        model.weight = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+        return model
+
+    def test_adapter_free_repo_load_needs_no_local_path_or_server_context(self):
+        model = self.make_model()
+        with (
+            patch("sglang.srt.models.qwen4_exp.get_server_args",
+                  side_effect=AssertionError("adapter-free load accessed server context")),
+            patch("qwen_exo_booster.native_mid_lora_serving.install") as install,
+        ):
+            loaded = model.load_weights([("weight", torch.ones(2))])
+        install.assert_not_called()
+        self.assertIn("weight", loaded)
+        torch.testing.assert_close(model.weight, torch.ones(2))
+
+    def test_invalid_present_outer_declaration_is_rejected(self):
+        for declaration in (None, False, "", {}, {"schema": 2}):
+            with self.subTest(declaration=declaration), tempfile.TemporaryDirectory() as root:
+                (Path(root) / "config.json").write_text(json.dumps({
+                    "qwen_exo_native_mid_lora": declaration,
+                }))
+                model = self.make_model(qwen_exo_native_mid_lora=declaration)
+                with (
+                    patch("sglang.srt.models.qwen4_exp.get_server_args",
+                          return_value=SimpleNamespace(model_path=root, enable_qwen_exo=True)),
+                    patch("sglang.srt.models.qwen4_exp.get_parallel",
+                          return_value=SimpleNamespace(tp_size=1)),
+                    self.assertRaisesRegex(ValueError, "native_mid_lora_manifest_schema_invalid"),
+                ):
+                    model.load_weights([])
+                self.assertFalse(hasattr(model, "_qwen_exo_native_mid_lora"))
+
+    def test_declared_adapter_requires_exo_before_install(self):
+        model = self.make_model(qwen_exo_native_mid_lora={})
+        with (
+            patch("sglang.srt.models.qwen4_exp.get_server_args",
+                  return_value=SimpleNamespace(enable_qwen_exo=False)),
+            patch("qwen_exo_booster.native_mid_lora_serving.install") as install,
+            self.assertRaisesRegex(RuntimeError, "QWEN-EXO profile state isolation"),
+        ):
+            model.load_weights([])
+        install.assert_not_called()
+
+    def test_loaded_declaration_cannot_disappear_from_profile(self):
+        model = self.make_model(qwen_exo_native_mid_lora={})
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "config.json").write_text("{}")
+            with (
+                patch("sglang.srt.models.qwen4_exp.get_server_args",
+                      return_value=SimpleNamespace(model_path=root, enable_qwen_exo=True)),
+                patch("sglang.srt.models.qwen4_exp.get_parallel",
+                      return_value=SimpleNamespace(tp_size=1)),
+                self.assertRaisesRegex(ValueError, "declared_profile_missing_manifest"),
+            ):
+                model.load_weights([])
 
 
 class TestNativePLEDisk(unittest.TestCase):

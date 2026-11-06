@@ -2195,7 +2195,7 @@ class ServerArgs:
     ] = "pread"
     qwen4_host_kv_cache: A[
         bool,
-        "Keep active Qwen4 FP8 K/V GPU-first with pinned host overflow; retain QSA/GDN/PLE state on CUDA.",
+        "Keep active Qwen4 FP8/NVFP4 K/V GPU-first with pinned host overflow; retain QSA/GDN/PLE state on CUDA.",
     ] = False
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
@@ -3521,8 +3521,8 @@ class ServerArgs:
             return
         if self.device != "cuda" or (self.tp_size, self.ep_size, self.pp_size, self.dp_size, self.dcp_size) != (1, 1, 1, 1, 1):
             raise ValueError("Qwen4 host KV requires CUDA and TP/EP/PP/DP/DCP=1")
-        if self.kv_cache_dtype != "fp8_e4m3":
-            raise ValueError("Qwen4 host KV requires --kv-cache-dtype=fp8_e4m3")
+        if self.kv_cache_dtype not in {"fp8_e4m3", "nvfp4"}:
+            raise ValueError("Qwen4 host KV requires --kv-cache-dtype=fp8_e4m3 or nvfp4")
         if self.enable_unified_memory or self.enable_page_major_kv_layout or self.disaggregation_mode != "null":
             raise ValueError("Qwen4 host KV cannot use unified memory, page-major layout or disaggregation")
         from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED, parse_qsa_profile
@@ -5752,6 +5752,17 @@ class ServerArgs:
                     "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
                     "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
                 )
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+            if is_qwen_qsa(self.get_model_config().hf_config):
+                if self.kv_cache_dtype != "nvfp4":
+                    raise ValueError("Qwen QSA FP4 KV requires --kv-cache-dtype=nvfp4")
+                if (envs.SGLANG_USE_HND_KVCACHE.get() or self.enable_page_major_kv_layout
+                        or self.enable_unified_memory):
+                    raise ValueError("Qwen QSA NVFP4 KV requires non-unified NHD layout")
+                if self.disaggregation_mode != "null" or self.enable_hierarchical_cache:
+                    raise ValueError("Qwen QSA NVFP4 KV does not support disaggregation or HiCache")
+                return
             if (
                 prefill_backend != decode_backend and prefill_backend != "fa4"
             ):  # Take care of prefill=fa4 later

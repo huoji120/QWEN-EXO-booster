@@ -13,6 +13,8 @@ import mmap
 import struct
 import sys
 from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 import torch
@@ -31,6 +33,21 @@ _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
 _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+_GENERATION_EXPERT_BACKEND = ContextVar("native_generation_expert_backend", default="reference")
+
+
+@contextmanager
+def generation_expert_backend(backend):
+    """A generation-local switch; autograd and multi-token prefill stay reference."""
+    if backend not in {"reference", "nvfp4-gemv"}:
+        raise ValueError("Unsupported native generation expert backend")
+    token = _GENERATION_EXPERT_BACKEND.set(backend)
+    try:
+        yield
+    finally:
+        _GENERATION_EXPERT_BACKEND.reset(token)
+
 
 
 def _unique_object(pairs):
@@ -468,6 +485,10 @@ class _FrozenLinear(torch.autograd.Function):
         weight = checkpoint.decode_linear(prefix, inputs.device, inputs.dtype)
         ctx.checkpoint, ctx.prefix = checkpoint, prefix
         ctx.input_dtype, ctx.input_device = inputs.dtype, inputs.device
+        ctx.fp32_accumulation = bool(getattr(checkpoint, "fp32_accumulation", False))
+        if ctx.fp32_accumulation:
+            from qwen_exo_booster.native_mid_lora_precision import frozen_linear_fp32
+            return frozen_linear_fp32(inputs, weight)
         return F.linear(inputs, weight)
 
     @staticmethod
@@ -475,6 +496,8 @@ class _FrozenLinear(torch.autograd.Function):
         if not ctx.needs_input_grad[0]:
             return None, None, None
         weight = ctx.checkpoint.decode_linear(ctx.prefix, ctx.input_device, ctx.input_dtype)
+        if ctx.fp32_accumulation:
+            return grad_output.float().matmul(weight.float()).to(ctx.input_dtype), None, None
         return grad_output.matmul(weight), None, None
 
 
@@ -483,6 +506,9 @@ def frozen_linear(inputs, checkpoint: IndexedCheckpoint, prefix: str):
     if inputs.requires_grad and torch.is_grad_enabled():
         return _FrozenLinear.apply(inputs, checkpoint, prefix)
     weight = checkpoint.decode_linear(prefix, inputs.device, inputs.dtype)
+    if getattr(checkpoint, "fp32_accumulation", False):
+        from qwen_exo_booster.native_mid_lora_precision import frozen_linear_fp32
+        return frozen_linear_fp32(inputs, weight)
     return F.linear(inputs, weight)
 
 
@@ -542,6 +568,37 @@ class FrozenCheckpointExperts(nn.Module):
                 if checkpoint.linear_shape(f"{root}.{part}") != expected:
                     raise ValueError(f"{root}.{part}: checkpoint expert geometry mismatch")
 
+    def _generation_decode(self, hidden_states, top_k_index, top_k_weights):
+        if (_GENERATION_EXPERT_BACKEND.get() != "nvfp4-gemv" or torch.is_grad_enabled()
+                or not hidden_states.is_cuda or hidden_states.dtype != torch.bfloat16
+                or hidden_states.shape != (1, 2560) or self.intermediate_size != 640
+                or not hidden_states.is_contiguous() or not top_k_weights.is_contiguous()
+                or not 1 <= top_k_index.shape[1] <= 10
+                or not getattr(self.checkpoint, "fp32_accumulation", False)):
+            return None
+        # Streamed checkpoint weights require one host route transfer. Unlike
+        # the reference, avoid two route-range scalar synchronizations plus a
+        # 512-entry bincount transfer. Keep ascending expert accumulation order.
+        ids = top_k_index[0].tolist()
+        if any(expert < 0 or expert >= self.num_experts for expert in ids):
+            raise ValueError("Expert route is outside checkpoint expert range")
+        if len(set(ids)) != len(ids):
+            return None
+        prefixes = [(slot, [f"{self.prefix}.{expert}.{part}" for part in
+                            ("gate_proj", "up_proj", "down_proj")])
+                    for slot, expert in sorted(enumerate(ids), key=lambda item: item[1])]
+        for _, names in prefixes:
+            for name in names:
+                self.checkpoint.validate_linear(name)
+                if self.checkpoint._validated_linears[name][1] != torch.uint8:
+                    return None
+        from qwen_exo_booster.native_mid_lora_decode import grouped_nvfp4_decode
+        # These tuples own device tensors even when the bounded LRU evicts an
+        # earlier projection while loading the other selected experts.
+        projections = [(slot, *(self.checkpoint._cuda_tensors(name, hidden_states.device)
+                                 for name in names)) for slot, names in prefixes]
+        return grouped_nvfp4_decode(hidden_states, top_k_weights, projections)
+
     def forward(self, hidden_states, top_k_index, top_k_weights):
         if hidden_states.ndim != 2 or hidden_states.shape[1] != self.hidden_size:
             raise ValueError("Expert inputs require [tokens, hidden_size]")
@@ -554,6 +611,9 @@ class FrozenCheckpointExperts(nn.Module):
             raise ValueError("Expert indices must be integer and route tensors must share the input device")
         if not top_k_weights.is_floating_point():
             raise ValueError("Router weights must be floating point")
+        decoded = self._generation_decode(hidden_states, top_k_index, top_k_weights)
+        if decoded is not None:
+            return decoded
         if top_k_index.numel() and (bool((top_k_index < 0).any()) or bool((top_k_index >= self.num_experts).any())):
             raise ValueError("Expert route is outside checkpoint expert range")
         # This zero-valued path also keeps empty batches connected to autograd.

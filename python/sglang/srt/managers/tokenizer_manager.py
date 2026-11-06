@@ -526,8 +526,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A QWEN-EXO model profile may pin one runtime LoRA: every request is
         # bound to it and dynamic adapter changes are rejected.
         self.qwen_exo_runtime_lora = None
+        self.qwen_exo_native_mid_lora = None
         if not self.server_args.enable_qwen_exo:
             return
+        from qwen_exo_booster.native_mid_lora_serving import load_manifest
+        native_adapter = load_manifest(self.server_args.model_path)
+        if native_adapter is not None:
+            if self.enable_lora or self.server_args.lora_paths:
+                raise ValueError("Native mid-layer LoRA cannot be combined with dynamic LoRA")
+            self.qwen_exo_native_mid_lora = native_adapter.report()
         from qwen_exo_booster.runtime_lora import RuntimeLoRA
 
         adapter = RuntimeLoRA.from_model_path(self.server_args.model_path)
@@ -642,6 +649,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.auto_create_handle_loop()
         if self.qwen_exo_runtime_lora is not None:
             obj.lora_path = self.qwen_exo_runtime_lora.bind_request(obj.lora_path)
+        if self.qwen_exo_native_mid_lora is not None and obj.lora_path is not None:
+            if not isinstance(obj.lora_path, list) or any(value is not None for value in obj.lora_path):
+                raise ValueError("This model profile always uses its fixed native mid-layer LoRA")
+            obj.lora_path = None
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
@@ -1868,6 +1879,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: UpdateWeightFromDiskReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        if getattr(self, "qwen_exo_native_mid_lora", None) is not None:
+            return False, "Native mid-layer LoRA weight changes require a model-profile restart", 0
         self.auto_create_handle_loop()
 
         # default the load format to the server_args

@@ -23,6 +23,25 @@ from torch import nn
 from qwen_exo_booster.native_ple_knowledge import NativePLEIdentity, SparseNativePLEDelta
 
 _WINDOW = contextvars.ContextVar("native_ple_window", default=None)
+_GENERATION_CACHE = contextvars.ContextVar("native_ple_generation_cache", default=False)
+
+
+@contextmanager
+def native_generation_cache_context():
+    """Permit native-owned NGram history only during isolated no-grad generation.
+
+    Training forward still rejects caches. A new native cache owns the complete
+    causal prefix and previous NGram IDs; caller must never supply seeded history.
+    This is a capability boundary, not a claim of cached/full numerical parity.
+    """
+    if torch.is_grad_enabled():
+        raise ValueError("Native generation cache requires torch.no_grad")
+    token = _GENERATION_CACHE.set(True)
+    try:
+        with _window_context((None, "off", None)):
+            yield
+    finally:
+        _GENERATION_CACHE.reset(token)
 
 
 @contextmanager
@@ -189,10 +208,13 @@ class _DeltaRows(nn.Module):
 def _install_seeded_ngram(ngram, native):
     class SeededNativeNGram(type(ngram)):
         def forward(self, input_ids, past_key_values=None):
-            if past_key_values is not None:
-                raise ValueError("Native PLE training reference never retains a cache")
             state = _WINDOW.get()
             history = None if state is None else state[0]
+            if past_key_values is not None:
+                if (not _GENERATION_CACHE.get() or torch.is_grad_enabled()
+                        or history is not None or state is None or state[1] != "off"):
+                    raise ValueError("Native PLE training reference never retains a cache")
+                return super().forward(input_ids, past_key_values)
             if history is None:
                 return super().forward(input_ids, None)
             history = history.to(device=input_ids.device, dtype=torch.int64)
@@ -303,7 +325,8 @@ def _reference_class(native):
         def close(self):
             if hasattr(self, "native_checkpoint"):
                 self.native_checkpoint.close()
-            self.model.layers[self.ple_identity.layer_id].ple.ple_embedding.ngram_embedding.base.close()
+            if self.model.layers:
+                self.model.layers[self.ple_identity.layer_id].ple.ple_embedding.ngram_embedding.base.close()
     return NativePLETrainingModel
 
 
@@ -451,20 +474,16 @@ def load_native_ple_training_model(profile, delta, device="cpu", dtype=torch.bfl
         raise
 
 
-def verify_tiny_native_ple_backward():
-    """CPU-only packed-checkpoint -> native model -> sparse delta backward gate.
+@contextmanager
+def _tiny_native_ple_fixture():
+    """Yield an isolated CPU packed native model; never update an optimizer.
 
-    Synthetic fixture only: creates tiny ModelOpt-layout NVFP4 experts and a
-    separate bound BF16 PLE table, then exercises the actual strict loader.
-    No optimizer steps, downloads, GPU calls, or production files are involved.
-    Parent invokes once after integration.
+    Shared by the PLE and mid-layer LoRA backward-only acceptance checks.
     """
-    import hashlib
     import tempfile
     import msgspec
     from safetensors.torch import save_file
     from qwen_exo_booster.engram import EngramHashSpec
-    from qwen_exo_booster.native_ple_checkpoint import FrozenCheckpointExperts
     from qwen_exo_booster.native_ple_knowledge import native_ple_row_keys, sha256_file
     native, config_type = _hf_native()
     config = config_type(vocab_size=64, hidden_size=16, num_hidden_layers=3,
@@ -557,78 +576,86 @@ def verify_tiny_native_ple_backward():
         model = load_native_ple_training_model(root, delta, device="cpu", dtype=torch.float32,
                                                gradient_checkpointing=True)
         try:
-            if not all(isinstance(layer.mlp.experts, FrozenCheckpointExperts) for layer in model.model.layers):
-                raise AssertionError("Tiny loader retained dense original experts")
-            trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-            if len(trainable) != 1 or trainable[0] is not delta.weight:
-                raise AssertionError("Mixed native loader did not freeze every original weight")
-
-            def artifact_digest():
-                return {str(path.relative_to(root)): sha256_file(path)
-                        for path in root.rglob("*") if path.is_file()}
-
-            def frozen_digest():
-                digest = hashlib.sha256()
-                for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
-                    if ".ngram_embedding.delta." in name or tensor.device.type == "meta":
-                        continue
-                    digest.update(name.encode())
-                    digest.update(tensor.detach().cpu().numpy().tobytes())
-                return digest.hexdigest()
-
-            original_artifacts = artifact_digest()
-            original_tensors = frozen_digest()
-            with torch.no_grad():
-                baseline = model(ids, ple_history=history, ple_mode="off").logits.detach()
-                # Make off parity meaningful: a nonzero fixture control delta
-                # must remain disabled, but real mode must affect the reference.
-                delta.weight.copy_(torch.arange(delta.weight.numel(), dtype=torch.float32).reshape_as(delta.weight).sin() * .01)
-                off = model(ids, ple_history=history, ple_mode="off").logits.detach()
-                active = model(ids, ple_history=history, ple_mode="real").logits.detach()
-                active_difference = float((active - baseline).abs().max())
-                delta.weight.zero_()
-            if not torch.equal(off, baseline):
-                raise AssertionError("Disabled delta changed packed native-reference outputs")
-            if active_difference <= 0 or not bool(torch.isfinite(active).all()):
-                raise AssertionError("Nonzero delta did not affect the packed native reference")
-            result = model(ids, labels=ids.clone(), ple_history=history, ple_mode="real")
-            # A different window selection before backward tests checkpoint
-            # replay capture, without another forward or retained native cache.
-            model.set_ple_window(torch.tensor([[20, 21]]), mode="off")
-            result.loss.backward()
-            grad = delta.weight.grad
-            if grad is None or not grad.is_sparse:
-                raise AssertionError("Packed native causal loss did not reach sparse PLE delta")
-            values = grad.coalesce().values()
-            if not bool(torch.isfinite(result.loss)) or not bool(torch.isfinite(values).all()) or not bool((values != 0).any()):
-                raise AssertionError("Packed native causal loss->delta gradient is zero/nonfinite")
-            expected_gradient = grad.coalesce().to_dense()
-            delta.weight.grad = None
-            hidden = model.forward_hidden(ids, ple_history=history, ple_mode="real")
-            chunked = chunked_causal_cross_entropy(hidden, model.lm_head.weight, ids.clone(), chunk_size=3)
-            model.set_ple_window(torch.tensor([[30, 31]]), mode="off")
-            chunked.backward()
-            actual_gradient = delta.weight.grad.coalesce().to_dense()
-            torch.testing.assert_close(chunked.detach(), result.loss.detach(), rtol=1e-6, atol=1e-6)
-            torch.testing.assert_close(actual_gradient, expected_gradient, rtol=2e-5, atol=1e-7)
-            chunked_gradient_error = float((actual_gradient - expected_gradient).abs().max())
-            if any(p.grad is not None for p in model.parameters() if p is not delta.weight):
-                raise AssertionError("Original packed-reference weight acquired a gradient")
-            if frozen_digest() != original_tensors or artifact_digest() != original_artifacts:
-                raise AssertionError("Original native tensors or checkpoint/base-table artifacts changed")
-            if not torch.equal(delta.weight.detach(), torch.zeros_like(delta.weight)):
-                raise AssertionError("Backward-only gate mutated the independent delta")
-            return {"loss": float(result.loss.detach()), "delta_gradient_abs_max": float(values.abs().max()),
-                    "gradient_rows": int(grad.coalesce().indices().shape[1]), "off_parity_exact": True,
-                    "chunked_ce_loss_difference": float((chunked.detach() - result.loss.detach()).abs()),
-                    "chunked_ce_delta_gradient_max_difference": chunked_gradient_error,
-                    "nonzero_delta_control_max_difference": active_difference,
-                    "original_gradients": 0, "original_weights_unchanged": True,
-                    "original_artifact_bytes_unchanged": True,
-                    "streamed_expert_layers": len(model.model.layers),
-                    "fixture_loader": "load_native_ple_training_model",
-                    "fixture_weight_encoding": "ModelOpt NVFP4 packed E2M1/E4M3+F32 scales",
-                    "optimizer_steps": 0, "device": "cpu", "native_layers": ["GR4", "GDN", "QSA", "PLE"],
-                    "hf_source": native.__file__}
+            yield root, model, ids, history, delta
         finally:
             model.close()
+
+
+def verify_tiny_native_ple_backward():
+    """CPU-only packed-checkpoint -> native model -> sparse delta backward gate."""
+    import hashlib
+    from qwen_exo_booster.native_ple_checkpoint import FrozenCheckpointExperts
+    from qwen_exo_booster.native_ple_knowledge import sha256_file
+    native, _ = _hf_native()
+    with _tiny_native_ple_fixture() as (root, model, ids, history, delta):
+        if not all(isinstance(layer.mlp.experts, FrozenCheckpointExperts) for layer in model.model.layers):
+            raise AssertionError("Tiny loader retained dense original experts")
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        if len(trainable) != 1 or trainable[0] is not delta.weight:
+            raise AssertionError("Mixed native loader did not freeze every original weight")
+
+        def artifact_digest():
+            return {str(path.relative_to(root)): sha256_file(path)
+                    for path in root.rglob("*") if path.is_file()}
+
+        def frozen_digest():
+            digest = hashlib.sha256()
+            for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+                if ".ngram_embedding.delta." in name or tensor.device.type == "meta":
+                    continue
+                digest.update(name.encode())
+                digest.update(tensor.detach().cpu().numpy().tobytes())
+            return digest.hexdigest()
+
+        original_artifacts = artifact_digest()
+        original_tensors = frozen_digest()
+        with torch.no_grad():
+            baseline = model(ids, ple_history=history, ple_mode="off").logits.detach()
+            # Nonzero control proves off parity is not merely zero-delta parity.
+            delta.weight.copy_(torch.arange(delta.weight.numel(), dtype=torch.float32).reshape_as(delta.weight).sin() * .01)
+            off = model(ids, ple_history=history, ple_mode="off").logits.detach()
+            active = model(ids, ple_history=history, ple_mode="real").logits.detach()
+            active_difference = float((active - baseline).abs().max())
+            delta.weight.zero_()
+        if not torch.equal(off, baseline):
+            raise AssertionError("Disabled delta changed packed native-reference outputs")
+        if active_difference <= 0 or not bool(torch.isfinite(active).all()):
+            raise AssertionError("Nonzero delta did not affect the packed native reference")
+        result = model(ids, labels=ids.clone(), ple_history=history, ple_mode="real")
+        # Changing the selected window must not affect checkpoint recomputation.
+        model.set_ple_window(torch.tensor([[20, 21]]), mode="off")
+        result.loss.backward()
+        grad = delta.weight.grad
+        if grad is None or not grad.is_sparse:
+            raise AssertionError("Packed native causal loss did not reach sparse PLE delta")
+        values = grad.coalesce().values()
+        if not bool(torch.isfinite(result.loss)) or not bool(torch.isfinite(values).all()) or not bool((values != 0).any()):
+            raise AssertionError("Packed native causal loss->delta gradient is zero/nonfinite")
+        expected_gradient = grad.coalesce().to_dense()
+        delta.weight.grad = None
+        hidden = model.forward_hidden(ids, ple_history=history, ple_mode="real")
+        chunked = chunked_causal_cross_entropy(hidden, model.lm_head.weight, ids.clone(), chunk_size=3)
+        model.set_ple_window(torch.tensor([[30, 31]]), mode="off")
+        chunked.backward()
+        actual_gradient = delta.weight.grad.coalesce().to_dense()
+        torch.testing.assert_close(chunked.detach(), result.loss.detach(), rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=2e-5, atol=1e-7)
+        chunked_gradient_error = float((actual_gradient - expected_gradient).abs().max())
+        if any(p.grad is not None for p in model.parameters() if p is not delta.weight):
+            raise AssertionError("Original packed-reference weight acquired a gradient")
+        if frozen_digest() != original_tensors or artifact_digest() != original_artifacts:
+            raise AssertionError("Original native tensors or checkpoint/base-table artifacts changed")
+        if not torch.equal(delta.weight.detach(), torch.zeros_like(delta.weight)):
+            raise AssertionError("Backward-only gate mutated the independent delta")
+        return {"loss": float(result.loss.detach()), "delta_gradient_abs_max": float(values.abs().max()),
+                "gradient_rows": int(grad.coalesce().indices().shape[1]), "off_parity_exact": True,
+                "chunked_ce_loss_difference": float((chunked.detach() - result.loss.detach()).abs()),
+                "chunked_ce_delta_gradient_max_difference": chunked_gradient_error,
+                "nonzero_delta_control_max_difference": active_difference,
+                "original_gradients": 0, "original_weights_unchanged": True,
+                "original_artifact_bytes_unchanged": True,
+                "streamed_expert_layers": len(model.model.layers),
+                "fixture_loader": "load_native_ple_training_model",
+                "fixture_weight_encoding": "ModelOpt NVFP4 packed E2M1/E4M3+F32 scales",
+                "optimizer_steps": 0, "device": "cpu", "native_layers": ["GR4", "GDN", "QSA", "PLE"],
+                "hf_source": native.__file__}

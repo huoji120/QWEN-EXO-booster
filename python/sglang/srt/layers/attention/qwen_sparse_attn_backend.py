@@ -42,7 +42,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_paged,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostFP8KVPool
+from sglang.srt.mem_cache.qwen_host_kv_pool import QwenHostKVPool
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +110,9 @@ class QwenSparsePrefillMetadata(msgspec.Struct, frozen=True):
     max_sequence_len: int
     max_query_len: int
     kv_locations: Optional[torch.Tensor] = None
+    staged_lengths: tuple = ()
+    staged_cu_q: Optional[torch.Tensor] = None
+    staged_cu_k: Optional[torch.Tensor] = None
 
 
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
@@ -262,6 +265,94 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._nvfp4_index_scratch = {}
+        # Ordinary prefill reuses one context, never the batch's summed history.
+        # Separate storage keeps decode CUDA-graph scratch addresses unchanged.
+        self._nvfp4_prefill_scratch = None
+        quant_method = (
+            self.token_to_kv_pool.get_kv_cache_quant_method()
+            if self.token_to_kv_pool is not None else None
+        )
+        self.is_nvfp4 = getattr(quant_method, "name", None) == "nvfp4"
+        if quant_method is not None and quant_method.name not in {"unquantized", "nvfp4"}:
+            raise ValueError("QSA supports unquantized/FP8 KV or the NVFP4 recipe")
+
+    def _nvfp4_banks(self, layer):
+        """Packed storage and original-layer scales, including mapped overflow."""
+        pool = self.token_to_kv_pool
+        pool._wait_for_layer(layer.layer_id)
+        full_pool = pool.full_kv_pool
+        local_id = pool._transfer_full_attention_id(layer.layer_id) - full_pool.start_layer
+        k_scale, v_scale = full_pool.quant_method.get_bmm_scales(layer.layer_id)
+        kwargs = {"k_scale": k_scale, "v_scale": v_scale}
+        if isinstance(full_pool, QwenHostKVPool):
+            kwargs.update(
+                host_k=full_pool.k_buffer[local_id],
+                host_v=full_pool.v_buffer[local_id],
+                host_ks=full_pool.k_scale_buffer[local_id],
+                host_vs=full_pool.v_scale_buffer[local_id],
+            )
+            banks = (
+                full_pool.gpu_k_buffer[local_id], full_pool.gpu_v_buffer[local_id],
+                full_pool.gpu_k_scale_buffer[local_id], full_pool.gpu_v_scale_buffer[local_id],
+            )
+        else:
+            k, v, ks, vs = pool.get_raw_kv_buffer(layer.layer_id)
+            banks = (k, v, ks.view(torch.uint8), vs.view(torch.uint8))
+        return banks, kwargs
+
+    def _compact_nvfp4_selection(self, indices, metadata):
+        from sglang.srt.layers.attention.qsa.nvfp4 import compact_nvfp4_indices
+
+        rows, width = indices.shape
+        capacity = max(rows, self._cuda_graph_max_tokens) if metadata.is_cuda_graph else rows
+        key = (width, indices.device)
+        scratch = self._nvfp4_index_scratch.get(key)
+        if scratch is None or scratch.shape[0] < capacity:
+            scratch = torch.empty((capacity, width), dtype=torch.int32, device=indices.device)
+            self._nvfp4_index_scratch[key] = scratch
+        output = scratch[:rows]
+        compact_nvfp4_indices(indices, metadata.sequence_lengths, output)
+        return output
+
+    def _forward_nvfp4_staged_prefill(self, q, layer, metadata, indices):
+        from sglang.srt.layers.attention.qsa.nvfp4 import gather_nvfp4_rows
+
+        prefill = metadata.prefill_metadata
+        if (prefill is None or prefill.kv_locations is None
+                or prefill.staged_cu_q is None or prefill.staged_cu_k is None):
+            raise RuntimeError("NVFP4 prefill staging metadata is incomplete")
+        if self.max_context_len <= 0 or prefill.max_sequence_len > self.max_context_len:
+            raise ValueError("NVFP4 prefill exceeds the per-request context bound")
+        banks, kwargs = self._nvfp4_banks(layer)
+        if self._nvfp4_prefill_scratch is None:
+            shape = (self.max_context_len, layer.tp_k_head_num, layer.head_dim)
+            self._nvfp4_prefill_scratch = (
+                torch.empty(shape, dtype=q.dtype, device=q.device),
+                torch.empty(shape, dtype=q.dtype, device=q.device),
+            )
+        keys, values = self._nvfp4_prefill_scratch
+        if keys.dtype != q.dtype or keys.shape[1:] != (layer.tp_k_head_num, layer.head_dim):
+            raise ValueError("NVFP4 prefill staging geometry changed within one backend")
+        output = torch.empty_like(q)
+        query_start = kv_start = 0
+        for request, (length, query_length) in enumerate(prefill.staged_lengths):
+            query_end = query_start + query_length
+            if query_length:
+                staged_k, staged_v = keys[:length], values[:length]
+                gather_nvfp4_rows(
+                    *banks, prefill.kv_locations[kv_start:kv_start + length],
+                    staged_k, staged_v, **kwargs,
+                )
+                output[query_start:query_end].copy_(sparse_gqa_fwd_interface_triton_ck(
+                    q[query_start:query_end], staged_k, staged_v,
+                    indices[query_start:query_end], prefill.staged_cu_q[request],
+                    prefill.staged_cu_k[request], metadata.sequence_lengths[request:request + 1],
+                    layer.scaling, max_q=query_length, causal_guard=True,
+                ))
+            query_start = query_end
+            kv_start += length
+        return output
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -765,6 +856,16 @@ class QwenSparseAttnBackend(AttentionBackend):
                 max_sequence_len=max(lengths_cpu, default=1),
                 max_query_len=max(extend_cpu, default=0),
                 kv_locations=kv_locations,
+                staged_lengths=tuple(zip(lengths_cpu, extend_cpu)) if self.is_nvfp4 and has_prefix else (),
+                staged_cu_q=(
+                    torch.stack((torch.zeros_like(forward_batch.extend_seq_lens),
+                                 forward_batch.extend_seq_lens), dim=1).to(torch.int32)
+                    if self.is_nvfp4 and has_prefix else None
+                ),
+                staged_cu_k=(
+                    torch.stack((torch.zeros_like(sequence_lengths), sequence_lengths), dim=1)
+                    if self.is_nvfp4 and has_prefix else None
+                ),
             )
             if (
                 self.qsa_profile is None
@@ -1534,12 +1635,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
+        if self.is_nvfp4:
+            output = self._forward_nvfp4_staged_prefill(q, layer, metadata, topk_indices)
+            return self._pad_extend_output(output, num_output_rows)
+
         # Current-chunk K/V was committed above; speculative modes returned
         # before this ordinary-extend path.
         pool = self.token_to_kv_pool
         full_pool = pool.full_kv_pool
         if (
-            isinstance(full_pool, QwenHostFP8KVPool)
+            isinstance(full_pool, QwenHostKVPool)
             and full_pool.gpu_size < full_pool.size
         ):
             # A nonempty host suffix always retains the materialized baseline.
@@ -1568,7 +1673,7 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         # Pure GPU pools read selected slots directly without allocating a
         # dense cached prefix. A GPU-only host-pool instance has no host suffix.
-        if isinstance(full_pool, QwenHostFP8KVPool):
+        if isinstance(full_pool, QwenHostKVPool):
             local_layer_id = (
                 pool._transfer_full_attention_id(layer.layer_id) - full_pool.start_layer
             )
@@ -1641,7 +1746,16 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> None:
         batch, topk = topk_indices.shape
         pool = self.token_to_kv_pool
-        if not isinstance(pool.full_kv_pool, QwenHostFP8KVPool):
+        if self.is_nvfp4:
+            from sglang.srt.layers.attention.qsa.nvfp4 import gather_nvfp4_selected
+
+            banks, kwargs = self._nvfp4_banks(layer)
+            gather_nvfp4_selected(
+                *banks, self.req_to_token_pool.req_to_token, req_indices,
+                topk_indices, sequence_lens, cu_k, packed_k, packed_v, **kwargs,
+            )
+            return
+        if not isinstance(pool.full_kv_pool, QwenHostKVPool):
             qwen_sparse_kv_extraction_compact_triton(
                 k_buffer,
                 v_buffer,
@@ -1666,6 +1780,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool.full_kv_pool.gather_selected_into(
             local_layer_id, self.req_to_token_pool.req_to_token, req_indices,
             topk_indices, sequence_lens, cu_k, packed_k, packed_v,
+            layer_id=layer.layer_id,
         )
 
 
@@ -1724,8 +1839,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
-            k_buffer.shape[1],
-            k_buffer.shape[2],
+            layer.tp_k_head_num,
+            layer.head_dim,
             q.dtype,
             q.device,
         )
@@ -1753,8 +1868,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 packed_k.mul_(layer.k_scale_float)
             if layer.v_scale_float is not None:
                 packed_v.mul_(layer.v_scale_float)
-        num_kv_heads = k_buffer.shape[1]
-        head_dim = k_buffer.shape[2]
+        num_kv_heads = layer.tp_k_head_num
+        head_dim = layer.head_dim
         kc = (
             packed_k.view(-1, page, num_kv_heads, head_dim)
             .permute(0, 2, 1, 3)
@@ -1807,8 +1922,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
+        if self.is_nvfp4:
+            banks, _ = self._nvfp4_banks(layer)
+            k_buffer, v_buffer = banks[:2]
+        elif isinstance(pool.full_kv_pool, QwenHostKVPool):
+            pool._wait_for_layer(layer.layer_id)
+            full_pool = pool.full_kv_pool
+            local_id = pool._transfer_full_attention_id(layer.layer_id) - full_pool.start_layer
+            k_buffer = full_pool.gpu_k_buffer[local_id].view(full_pool.dtype)
+            v_buffer = full_pool.gpu_v_buffer[local_id].view(full_pool.dtype)
+        else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
@@ -1817,6 +1942,8 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        if self.is_nvfp4:
+            topk_indices = self._compact_nvfp4_selection(topk_indices, metadata)
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
@@ -1830,8 +1957,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 trtllm_decode,
             )
 
-        if isinstance(pool.full_kv_pool, QwenHostFP8KVPool):
-            raise RuntimeError("Qwen host FP8 KV requires FlashInfer TRTLLM sparse attention")
+        if isinstance(pool.full_kv_pool, QwenHostKVPool):
+            raise RuntimeError("Qwen host KV requires FlashInfer TRTLLM sparse attention")
         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
         batch, topk = topk_indices.shape
         sequence_lens = metadata.sequence_lengths
@@ -1860,8 +1987,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         packed_k, packed_v = self._get_fa2_scratch(
             scratch_capacity,
-            k_buffer.shape[1],
-            k_buffer.shape[2],
+            layer.tp_k_head_num,
+            layer.head_dim,
             q.dtype,
             q.device,
         )

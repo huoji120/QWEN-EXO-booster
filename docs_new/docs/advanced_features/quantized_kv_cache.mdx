@@ -62,6 +62,52 @@ python3 -m sglang.launch_server \
     --kv-cache-dtype fp4_mx_block16 \
 ```
 
+### Qwen4-Exp / Flash-Next QSA NVFP4
+
+The native QSA path accepts `--kv-cache-dtype nvfp4` on Blackwell SM100/SM120.
+Keep the model's normal attention-backend setting: the model backend factory
+selects QSA before constructing a dense attention backend. The js4090 launcher
+already exposes this setting as `QWEN_EXO_KV_CACHE_DTYPE=nvfp4`; its FP8 default
+is unchanged. Changing precision requires a fresh server and cache allocation,
+not an in-place reinterpretation of an existing FP8 cache.
+
+- Storage uses E2M1 packed pairs, one E4M3 scale per 16 values, and independent
+  per-layer K/V global scales. Original model layer IDs select global scales;
+  compact full-attention pool IDs select storage banks.
+- Prefix-free prefill retains the current BF16/FP16 K/V attention path while
+  storing NVFP4 for reuse. Cached/chunked prefill gathers and dequantizes one
+  request's prefix into reusable GPU BF16/FP16 staging, then performs sparse
+  attention there. Prefixes are processed sequentially, so staging is bounded
+  by one context rather than the sum of a batch's histories, and is shared
+  across layers. Decode and native EAGLE/MTP verification retain selected-row
+  gathering with dequantization into their independent graph scratch.
+  A graph-safe stable compaction removes invalid/future positions before packing,
+  including gaps between a frozen MTP selection and its appended draft tail.
+- `--qwen4-host-kv-cache` supports GPU-first NVFP4 data **and block scales** with
+  pinned host overflow. Cache moves and CPU snapshots retain both byte streams.
+  QSA indexes and GDN/PLE state remain on CUDA at their existing precision.
+- NHD storage is required. Unified-memory pools, page-major/HND layouts,
+  disaggregation and HiCache are not supported by this QSA NVFP4 path. Host KV
+  retains its existing single-device and native top-k-1 MTP restrictions.
+
+Packed payload plus block scales costs 9/16 of FP8 raw K/V bytes. This is not a
+total-memory or throughput claim: QSA indexes, GDN/PLE state, graph scratch,
+weights and transient buffers remain separate. The QSA pool does not allocate
+the dense FlashInfer full-span FP8 dequantization workspace.
+Ordinary-prefill staging requires at most
+`2 * context_length * kv_heads * head_dim * sizeof(query_dtype)` bytes per
+backend that executes cached ordinary prefill (512 MiB for 262144 tokens,
+two KV heads, dimension 256 and BF16). It is allocated lazily and reused without
+growing with the request batch. Changing prefix/gather lengths are runtime
+kernel bounds, not per-length JIT specializations.
+
+Before production use, validate native writes, chunked prefix reuse, CUDA Graph
+replay, MTP accept/reject relocation, GPU/host crossings and long-context output
+quality on the target GPU. Numerical packed-byte tests on another CUDA GPU do
+not establish native Blackwell quantizer compatibility or full-model quality.
+The implementation does not change a running service or its defaults.
+
+
 ### Scaling Factors
 
 FP8 quantization requires scaling factors to properly quantize and dequantize the KV cache.
