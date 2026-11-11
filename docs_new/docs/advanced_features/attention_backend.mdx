@@ -684,6 +684,83 @@ python3 -m sglang.launch_server \
   --attention-backend torch_native
 ```
 
+## Qwen3.8-Flash-Next local optimizations
+
+This fork selectively ports the following upstream changes rather than upgrading
+the entire SGLang runtime:
+
+- [QSA indexer CUDA scoring (#48250)](https://github.com/sgl-project/sglang/pull/48250),
+  pinned to `eef4b4b2bffc981a05bb899d3543862ebbeb2415`: automatically selects a JIT
+  CUDA scorer for BF16 indexer queries/keys, 1–8 query heads, head dimension 128,
+  compressed page size 16, and SM100/SM103/SM120. Graph target verification shares
+  compressed-key loads between consecutive rows of the same request. Eager ragged
+  rows retain independent scoring, and unsupported shapes keep the existing path.
+  Already-padded query storage is reused. This does not change the full-attention
+  KV dtype, including this fork's NVFP4 and Host-KV paths.
+- [Packed PLE prefill (#43032)](https://github.com/sgl-project/sglang/pull/43032),
+  pinned to `723037ce4f52515b9c24ae6326381fe9c34f8bfb`: ordinary `EXTEND`/`MIXED`
+  NVIDIA BF16 prefill uses packed short convolution instead of padding every
+  request to the longest sequence. Working and radix-tracking states are written
+  separately. Decode and target-verify state handling remain unchanged. The
+  existing `SGLANG_ENABLE_QWEN4_PLE_FUSION` switch defaults to enabled; setting it
+  to `0` selects the native path. Unsupported layouts also retain the native path.
+- [Unused FlashInfer workspace release (#48258)](https://github.com/sgl-project/sglang/pull/48258),
+  pinned to `351836e4f07220648250097ac5595dcad017a2a0`: private workspaces no longer
+  also allocate the shared workspace. Before graph capture, an unowned shared
+  buffer can be released, while live backend owners preserve it. Ownership uses
+  this fork's resettable runtime context. QSA already bypasses dense-backend
+  construction here, so the upstream 384 MiB saving is not guaranteed anew.
+
+These PRs were open when ported. Local validation covered Python syntax and
+isolated CPU workspace ownership, QSA fallback/padding, and PLE metadata/state
+transitions. CUDA compilation, numerical equivalence, graph replay, and serving
+performance have **not** been validated in this fork. Upstream speedups are not
+local benchmark results. No training or serving configuration is changed by this
+source-only integration.
+
+### Further local prefill and PLE optimizations
+
+Primary QSA query RoPE maxima are reused across layers within one execution.
+Every rotary instance still extends its own cache, and compressed/history
+positions retain independent bounds checks. ModelRunner resets the cached scalar
+at each forward (and split-prefill start), including when a ForwardBatch or an
+inference-mode position tensor is reused. CUDA graph execution adds no host read.
+
+The PLE `pread` reader coalesces contiguous rows within each shard and scatters
+them back to the original order, including duplicates. Data and per-row-scale
+reads are bounded to 4 MiB; mmap behavior and source identity checks are unchanged.
+Two event-leased staging slots allow a new transfer without always waiting for
+the immediately previous transfer. This can double staging high-water memory,
+not the PLE table size. Slots are not reused before completion; event/stream
+failure poisons the affected slot rather than trusting a stale completion event.
+
+Two new GPU attention paths are implemented but **opt-in**, because they have not
+been GPU-validated in this fork:
+
+- `SGLANG_ENABLE_QSA_COMPACT_PREFILL=1` enables NVFP4 selected-KV union staging
+  only when `4 * query_rows * topk_width <= history_length`. A device bitmap and
+  prefix scan gather/dequantize each selected logical KV row once, then remap
+  indices while preserving original causality, column order, duplicates, and
+  invalid entries. It supports the existing mapped Host-KV banks and scales.
+  Other requests keep full-history staging; FP8 Host-KV is unchanged. Additional
+  scratch is about 1.752 MiB at a 262144-token context, separate from decode graph
+  storage. The existing decoded-KV scratch capacity is not reduced.
+- `SGLANG_ENABLE_QSA_DENSE_PREFILL=1` enables the exhaustive-selection rule from
+  [upstream #47878](https://github.com/sgl-project/sglang/pull/47878)
+  (`fdd4371ba2991bd25068f7ab1bcb231117c5b2a1`). It uses already-available cold-prefill
+  K/V or already-decoded staged K/V when every sequence fits the QSA block budget.
+  No extra full-history gather is introduced for an otherwise direct GPU path.
+  FlashAttention 2.1+ on supported SM8x/SM90, or the FA4 CuTe interface on
+  SM100/SM103/SM120, supplies bottom-right causal attention. Missing backends,
+  unsupported layouts and deterministic mode retain sparse attention. Selection
+  cardinality is checked asynchronously. Floating-point summation order changes.
+
+Both switches default to `false` and are read at backend construction. The
+source integration does not set them in any launcher or live service. Only local
+syntax and isolated CPU control/data-path checks were performed; no test suite,
+CUDA compilation, GPU kernel/replay validation, serving benchmark, or server
+operation was run for these changes. No throughput improvement is claimed.
+
 ## Steps to add a new attention backend
 To add a new attention backend, you can learn from the existing backends
 (`python/sglang/srt/layers/attention/triton_backend.py`, `python/sglang/srt/layers/attention/flashattention_backend.py`)

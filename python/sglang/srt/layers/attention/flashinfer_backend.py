@@ -9,6 +9,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import gc
 import logging
 import os
 from dataclasses import dataclass
@@ -41,7 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer
+from sglang.srt.runtime_context import get_buffer, get_resources, pop_buffer
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -297,6 +298,34 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+def get_workspace_buffer(init_new_workspace: bool, device) -> torch.Tensor:
+    """Private workspaces must not also allocate the process-wide buffer."""
+    def allocate():
+        return torch.empty(
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+            dtype=torch.uint8,
+            device=device,
+        )
+
+    if init_new_workspace:
+        return allocate()
+    return get_buffer("flashinfer_workspace", allocate)
+
+
+def release_unused_global_workspace() -> int:
+    """Release a replaced backend's shared workspace before graph capture."""
+    # Backend helpers can retain their owner through a reference cycle.
+    gc.collect()
+    if get_resources().flashinfer_workspace_users:
+        return 0
+    workspace = pop_buffer("flashinfer_workspace")
+    if workspace is None:
+        return 0
+    nbytes = workspace.numel() * workspace.element_size()
+    logger.info("Released the unused FlashInfer workspace (%.3f GiB).", nbytes / 2**30)
+    return nbytes
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -430,23 +459,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
         # Allocate buffers
-        # different from flashinfer zero_init_global_workspace_buffer
-        global_workspace_buffer = get_buffer(
-            "flashinfer_workspace",
-            lambda: torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            ),
+        self.workspace_buffer = get_workspace_buffer(
+            init_new_workspace=init_new_workspace, device=model_runner.device
         )
-        if init_new_workspace:
-            self.workspace_buffer = torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        else:
-            self.workspace_buffer = global_workspace_buffer
+        if not init_new_workspace:
+            get_resources().flashinfer_workspace_users.add(self)
         max_bs = _cuda_graph_capture_max_bs(
             model_runner.server_args, model_runner.req_to_token_pool.size
         )

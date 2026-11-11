@@ -40,6 +40,7 @@ are plain attribute access, and each group offers a transactional, test-only
 from __future__ import annotations
 
 import dataclasses
+import weakref
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -394,6 +395,10 @@ class Resources(_FlagGroupBase):
     # Accessors with bespoke semantics (grow-only, per-device keys) manage
     # their entries directly.
     buffers: dict = dataclasses.field(default_factory=dict)
+    # Weak owners of the shared FlashInfer attention workspace.
+    flashinfer_workspace_users: weakref.WeakSet = dataclasses.field(
+        default_factory=weakref.WeakSet
+    )
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
@@ -575,6 +580,10 @@ class RuntimeContext:
             self.resources.buffers[name] = buf
         return buf
 
+    def pop_buffer(self, name: str) -> Any:
+        """Forget a named persistent buffer; return it, or None if absent."""
+        return self.resources.buffers.pop(name, None)
+
     @property
     def server_args(self) -> ServerArgs:
         """The process-wide ``ServerArgs`` (context-owned slot)."""
@@ -720,6 +729,10 @@ def set_stream(name: str, stream: Any) -> Any:
 
 def get_buffer(name: str, factory: Any) -> Any:
     return _CONTEXT.get_buffer(name, factory)
+
+
+def pop_buffer(name: str) -> Any:
+    return _CONTEXT.pop_buffer(name)
 
 
 def reset_context() -> None:

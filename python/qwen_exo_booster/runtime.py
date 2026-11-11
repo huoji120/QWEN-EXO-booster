@@ -459,7 +459,7 @@ class QwenExoRuntime:
         self._session_initial_gdn_pins: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._session_initial_gdn_status: dict[str, Any] = {
             "schema": _SESSION_INITIAL_GDN_SCHEMA,
-            "status": "not_started",
+            "status": "not_started" if config.memory_enabled else "disabled",
             "source_digest": None,
             "state_identity": None,
             "memory_count": 0,
@@ -670,6 +670,8 @@ class QwenExoRuntime:
         Records are never cut mid-record: a record that does not fit is
         skipped and older, smaller records may still be included after it.
         """
+        if not self.config.memory_enabled:
+            return None
         transfer_generation = getattr(self, "_session_initial_gdn_generation", 0)
         if None in getattr(self, "_memory_transfer_owners", ()):
             return None
@@ -788,6 +790,8 @@ class QwenExoRuntime:
         generation: dict[str, Any],
     ) -> None:
         """Keep the generated reflection text beside the state for inspection."""
+        if not self.config.memory_enabled:
+            raise RuntimeError("QWEN-EXO memory is disabled")
         path = self._session_initial_gdn_reflection_path(str(prompt["state_identity"]))
         payload = {
             "schema": _SESSION_INITIAL_GDN_SCHEMA,
@@ -967,6 +971,8 @@ class QwenExoRuntime:
     async def _refresh_session_initial_gdn(
         self, *, reason: str
     ) -> dict[str, Any] | None:
+        if not self.config.memory_enabled:
+            return None
         async with self._session_initial_gdn_refresh_lock:
             prompt = await asyncio.to_thread(self._build_session_initial_gdn_prompt)
             if prompt is None:
@@ -1176,7 +1182,7 @@ class QwenExoRuntime:
 
     def _schedule_session_initial_gdn_refresh(
         self, *, reason: str
-    ) -> asyncio.Task[None]:
+    ) -> asyncio.Task[None] | None:
         """Refresh in the background, coalescing bursts of stored memories.
 
         Consolidation prefills every memory and decodes a full reflection, so
@@ -1184,6 +1190,8 @@ class QwenExoRuntime:
         memory. While one refresh runs, later requests fold into a single
         follow-up pass that sees the complete store.
         """
+        if not self.config.memory_enabled:
+            return None
         task = self._session_initial_gdn_refresh_task
         if task is not None and not task.done():
             self._session_initial_gdn_refresh_requested = reason
@@ -1237,6 +1245,8 @@ class QwenExoRuntime:
                 return
 
     async def _run_session_initial_gdn_refresh(self, *, reason: str) -> None:
+        if not self.config.memory_enabled:
+            return
         pending: str | None = reason
         while pending is not None:
             # Reflections publish one memory per segment; consolidating after
@@ -1275,15 +1285,16 @@ class QwenExoRuntime:
             self.state = QwenExoRuntimeState.STARTING
             try:
                 self.config.state_directory.mkdir(parents=True, exist_ok=True)
-                self.config.knowledge_directory.mkdir(parents=True, exist_ok=True)
-                self.config.policy_data_directory.mkdir(parents=True, exist_ok=True)
-                self.config.cognition_directory.mkdir(parents=True, exist_ok=True)
-                self.file_knowledge.refresh()
-                self.knowledge.refresh()
-                self.policy_data.refresh()
-                self.cognition.refresh()
-                self._refresh_memory_hints_if_stale()
-                self._sync_document_categories()
+                if self.config.memory_enabled:
+                    self.config.knowledge_directory.mkdir(parents=True, exist_ok=True)
+                    self.config.policy_data_directory.mkdir(parents=True, exist_ok=True)
+                    self.config.cognition_directory.mkdir(parents=True, exist_ok=True)
+                    self.file_knowledge.refresh()
+                    self.knowledge.refresh()
+                    self.policy_data.refresh()
+                    self.cognition.refresh()
+                    self._refresh_memory_hints_if_stale()
+                    self._sync_document_categories()
                 self.model_identity = ModelIdentity.from_path(self.config.model_path)
                 self.model_identity.validate_qwen_exo_model()
                 tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
@@ -1320,7 +1331,7 @@ class QwenExoRuntime:
                         self.capsule_store,
                         tokenizer,
                     )
-                if tokenizer is not None:
+                if self.config.memory_enabled and tokenizer is not None:
                     self.memory_summaries = MemorySummaryService(
                         runner=self.internal_jobs,
                         tokenizer=tokenizer,
@@ -1555,6 +1566,8 @@ class QwenExoRuntime:
         scope = _memory_scope_for_owner(memory_key_id, memory_scope)
         self._check_response_memory_scope(previous_response_id, memory_key_id, scope)
         self._check_response_memory_scope(response_id, memory_key_id, scope)
+        if not self.config.memory_enabled:
+            return None
         with self._session_initial_gdn_value_lock:
             if None in getattr(self, "_memory_transfer_owners", ()):
                 return None
@@ -1624,6 +1637,8 @@ class QwenExoRuntime:
         return request.model_copy(update={"reasoning": reasoning})
 
     def _cognition_text(self) -> str | None:
+        if not self.config.memory_enabled:
+            return None
         documents = tuple(self.cognition.snapshot.documents)
         tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
         if not documents or tokenizer is None:
@@ -1656,6 +1671,8 @@ class QwenExoRuntime:
         memory pipeline. Chat Completions bypasses that pipeline, so it renders
         the same text into a leading system message instead.
         """
+        if not self.config.memory_enabled:
+            return None
         parts: list[str] = []
         if self.policy_data_enabled:
             self.policy_data.refresh_if_changed()
@@ -1915,7 +1932,7 @@ class QwenExoRuntime:
         instructions when enabled. It is stable for a given document set, so
         it stays byte-identical across turns and keeps the prefix cache hot;
         its own radix namespace keeps it apart from policy-free prefixes."""
-        if not self.policy_data_enabled:
+        if not self.config.memory_enabled or not self.policy_data_enabled:
             return request
         self.policy_data.refresh_if_changed()
         policy = self.policy_data.compile_text_attachment(
@@ -2593,6 +2610,8 @@ class QwenExoRuntime:
         self._check_response_memory_scope(
             trajectory_id, _request_memory_key(request), _request_memory_scope(request)
         )
+        if not self.config.memory_enabled:
+            return request
         record = self.capsule_store.get(trajectory_id)
         if record is None or self.capsules is None:
             return request
@@ -2957,6 +2976,8 @@ class QwenExoRuntime:
         return True
 
     def latent_transplant_payload(self, request: Any) -> dict[str, object] | None:
+        if not self.config.memory_enabled:
+            return None
         if _request_memory_scope(request) == "private_only":
             return None
         metadata = getattr(request, "metadata", None) or {}
@@ -5492,6 +5513,8 @@ class QwenExoRuntime:
     def start_pending_reflections(
         self, conversation_keys: Iterable[str]
     ) -> dict[str, Any]:
+        if not self.config.memory_enabled:
+            raise RuntimeError("QWEN-EXO memory is disabled")
         require_source_admission(self)
         keys = tuple(
             dict.fromkeys(
@@ -5868,6 +5891,8 @@ class QwenExoRuntime:
         verifier_feedback: str,
         expected_document_sha256: str,
     ) -> dict[str, Any]:
+        if not self.config.memory_enabled:
+            raise RuntimeError("QWEN-EXO memory is disabled")
         require_source_admission(self)
         if self.reflection_memory_service is None:
             raise RuntimeError("Reflection memory regeneration is unavailable")
@@ -6100,6 +6125,8 @@ class QwenExoRuntime:
     async def _publish_reflection_memory(
         self, reflection: ReflectionMemory
     ) -> dict[str, Any]:
+        if not self.config.memory_enabled:
+            raise RuntimeError("QWEN-EXO memory is disabled")
         if reflection.memory_action not in {"insert", "update"}:
             raise ValueError("Reflection memory publication action is invalid")
         memory_key_id = _memory_key_from_conversation(reflection.conversation_key)
@@ -6782,6 +6809,8 @@ class QwenExoRuntime:
     ) -> None:
         """Journal one server-side memory tool round for the recall trace:
         full text to the tool log, metadata to telemetry (which redacts text)."""
+        if not self.config.memory_enabled:
+            return
         try:
             await asyncio.to_thread(
                 self.memory_tool_log.record, request_id, round_index, calls
@@ -6843,6 +6872,8 @@ class QwenExoRuntime:
         conversation, and a prompt to search memory."""
         scope = _memory_scope_for_owner(memory_key_id, memory_scope)
         self._check_response_memory_scope(request_id, memory_key_id, scope)
+        if not self.config.memory_enabled:
+            return None
         self._memory_tool_stats["turns"] += 1
         if blocked_reason is not None:
             self._memory_tool_stats[f"not_offered:{blocked_reason}"] += 1
@@ -6923,6 +6954,8 @@ class QwenExoRuntime:
     def _refresh_memory_hints_if_stale(self) -> None:
         """Re-index in the background when the knowledge files changed (any
         upload/delete path); lookups use the previous index meanwhile."""
+        if not self.config.memory_enabled:
+            return
         if None in getattr(self, "_memory_transfer_owners", ()):
             return
         generation = self.memory_hints.generation
@@ -6962,18 +6995,26 @@ class QwenExoRuntime:
 
     @internal_task_scope("maintenance")
     async def _run_memory_summaries(self) -> None:
+        if not self.config.memory_enabled:
+            return
         await self.memory_summaries.run_forever()
 
     @internal_task_scope("maintenance")
     async def _run_memory_dream_schedule(self) -> None:
+        if not self.config.memory_enabled:
+            return
         await self.memory_dream.schedule_forever()
 
     def _dream_service(self) -> MemoryDreamService:
+        if not self.config.memory_enabled:
+            raise RuntimeError("QWEN-EXO memory is disabled")
         if self.memory_dream is None:
             raise RuntimeError("memory dream needs the served model's tokenizer")
         return self.memory_dream
 
     def memory_dream_status(self) -> dict[str, Any]:
+        if not self.config.memory_enabled:
+            return {"available": False, "reason": "memory_disabled"}
         if self.memory_dream is None:
             return {"available": False}
         return {"available": True, **self.memory_dream.status()}
@@ -6991,6 +7032,8 @@ class QwenExoRuntime:
         return self._dream_service().trash.restore(batch, path)
 
     def memory_summary_status(self) -> dict[str, Any]:
+        if not self.config.memory_enabled:
+            return {"available": False, "reason": "memory_disabled"}
         service = self.memory_summaries
         if service is None:
             return {"available": False}
@@ -6998,6 +7041,8 @@ class QwenExoRuntime:
 
     def queue_memory_summaries(self, paths: list[str], *, force: bool) -> dict[str, Any]:
         """Queue summaries for ``paths``, or for every file still missing one."""
+        if not self.config.memory_enabled:
+            raise RuntimeError("QWEN-EXO memory is disabled")
         service = self.memory_summaries
         if service is None:
             raise RuntimeError("memory summaries need the served model's tokenizer")
@@ -7184,6 +7229,9 @@ class QwenExoRuntime:
 
     def policy_data_injection(self) -> dict[str, object]:
         """Whether the persona document is injected, and its full token size."""
+        if not self.config.memory_enabled:
+            return {"enabled": False, "always_on": False, "route": "disabled",
+                    "attached_tokens": 0}
         self.policy_data.refresh_if_changed()
         tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
         attachment = (
@@ -7202,7 +7250,7 @@ class QwenExoRuntime:
 
     def set_policy_data_enabled(self, enabled: bool) -> dict[str, object]:
         """Flip persona injection live; the caller persists it to service config."""
-        self.policy_data_enabled = bool(enabled)
+        self.policy_data_enabled = self.config.memory_enabled and bool(enabled)
         self.telemetry.emit(
             "admin", "policy_data.toggled", {"enabled": self.policy_data_enabled}
         )
@@ -7230,6 +7278,12 @@ class QwenExoRuntime:
             session_initial_gdn["pinned_conversations"] = len(
                 self._session_initial_gdn_pins
             )
+        if not self.config.memory_enabled:
+            session_initial_gdn.update(
+                status="disabled", source_digest=None, state_identity=None,
+                memory_count=0, updated_at=None, refresh_pending=False,
+                pinned_conversations=0,
+            )
         return {
             **self.config.public_dict(),
             "runtime_state": self.state.value,
@@ -7244,7 +7298,9 @@ class QwenExoRuntime:
                 "mamba_strategy": self.hybrid_policy.mamba_strategy,
                 "page_size": self.hybrid_policy.page_size,
                 "atomic_full_gdn_lifecycle": True,
-                "runtime_gdn_route": "global_initial_only",
+                "runtime_gdn_route": (
+                    "global_initial_only" if self.config.memory_enabled else "disabled"
+                ),
             },
             "session_initial_gdn": session_initial_gdn,
             "knowledge": {
@@ -7254,8 +7310,8 @@ class QwenExoRuntime:
             "cognition": {
                 "source_digest": self.cognition.snapshot.source_digest,
                 "document_count": len(self.cognition.snapshot.documents),
-                "always_on": bool(self.cognition.snapshot.documents),
-                "route": "text_instructions",
+                "always_on": self.config.memory_enabled and bool(self.cognition.snapshot.documents),
+                "route": "text_instructions" if self.config.memory_enabled else "disabled",
             },
             "policy_data": {
                 "source_digest": self.policy_data.snapshot.source_digest,
@@ -7264,10 +7320,11 @@ class QwenExoRuntime:
                 "always_on": bool(
                     self.policy_data_enabled and self.policy_data.snapshot.documents
                 ),
-                "route": "text_instructions",
+                "route": "text_instructions" if self.config.memory_enabled else "disabled",
             },
             "latent_transplant": {
                 "mode": (
+                    "disabled" if not self.config.memory_enabled else
                     "default_always_on" if self._latent_default else "request_opt_in"
                 ),
                 "default": self.latent_transplant_default(),
@@ -7286,9 +7343,13 @@ class QwenExoRuntime:
             ),
             "internal_services": {
                 "capsule": self.capsules is not None,
-                "memory_tools": True,
+                "memory_tools": self.config.memory_enabled,
                 "policy_data": self.policy_data_enabled,
-                "cognition": bool(self.cognition.snapshot.documents),
+                "cognition": self.config.memory_enabled and bool(self.cognition.snapshot.documents),
+                "reflection_memory": self.reflection_memory_service is not None,
+                "response_compaction": self.compaction_service is not None,
+                "memory_summaries": self.memory_summaries is not None,
+                "memory_dream": self.memory_dream is not None,
             },
             "memory_tools": dict(sorted(self._memory_tool_stats.items())),
             "telemetry": {

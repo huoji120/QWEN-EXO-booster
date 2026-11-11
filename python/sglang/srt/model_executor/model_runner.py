@@ -1227,6 +1227,8 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         forward_count: int = 1,
     ) -> LogitsProcessorOutput:
+        if forward_batch.split_index == 0:
+            forward_batch.reset_qsa_rope_metadata()
         if forward_batch.split_index == 0 or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(
@@ -1260,6 +1262,10 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        # QSA RoPE cache extension is per execution, not per ForwardBatch
+        # object: speculative and graph paths may reuse/mutate the batch.
+        forward_batch.reset_qsa_rope_metadata()
+
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:

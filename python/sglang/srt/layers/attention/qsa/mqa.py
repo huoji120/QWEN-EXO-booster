@@ -368,6 +368,109 @@ def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
     return _DECODE_CTAS_PER_ROW_LEVELS[-1]
 
 
+def _new_decode_logits(
+    q: torch.Tensor, max_model_len: int, min_scored_len: int
+) -> torch.Tensor:
+    if min_scored_len > 0:
+        return torch.empty(
+            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
+        )
+    return torch.full(
+        (q.shape[0], max_model_len), -float("inf"),
+        dtype=torch.float32, device=q.device,
+    )
+
+
+def _pad_decode_query_heads(q: torch.Tensor) -> tuple[torch.Tensor, int]:
+    # Fused indexer prep already writes the padding; do not allocate it twice.
+    query_heads, head_dim = q.shape[1:]
+    kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
+    q = _as_dtype_contiguous(q, torch.bfloat16, q.device)
+    if kernel_heads != query_heads:
+        q = torch.cat(
+            [q, q.new_zeros(q.shape[0], kernel_heads - query_heads, head_dim)], dim=1
+        )
+    return q, kernel_heads
+
+
+# Upstream #48250: each CTA strides over 64-key groups without changing
+# arithmetic. Keep its measured launch configuration, not speculative tuning.
+_CUDA_DECODE_CTAS_PER_REQUEST = 64
+_CUDA_DECODE_MAX_ROWS_PER_CTA = 8
+_CUDA_DECODE_CAPABILITIES = ((10, 0), (10, 3), (12, 0))
+
+
+@functools.lru_cache(maxsize=None)
+def _cuda_decode_arch_supported(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in _CUDA_DECODE_CAPABILITIES
+
+
+def use_cuda_qsa_mqa_decode(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
+    """Whether the JIT CUDA scorer covers this BF16 indexer shape and device."""
+    return (
+        q.is_cuda
+        and torch.version.hip is None
+        and q.dtype == torch.bfloat16
+        and k_cache.dtype == torch.bfloat16
+        and k_cache.device == q.device
+        and q.ndim == 3
+        and 0 < q.shape[1] <= 8
+        and q.shape[2] == 128
+        and k_cache.ndim == 4
+        and k_cache.shape[1:] == (16, 1, 128)
+        and _cuda_decode_arch_supported(q.device.index or 0)
+    )
+
+
+def cuda_qsa_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+    *,
+    min_scored_len: int = 0,
+    rows_per_request: int = 1,
+) -> torch.Tensor:
+    """Upstream CUDA scorer with the local bounded-logits/short-row contract.
+
+    For ``rows_per_request > 1``, consecutive rows must share page prefixes and
+    have nondecreasing lengths. The last row supplies the group's page table.
+    Only graph target-verify metadata guarantees this layout without a GPU sync;
+    arbitrary callers must establish the same invariant or use the default 1.
+    """
+    from sglang.kernels.ops.attention.qsa_mqa_decode import qsa_mqa_decode_logits
+
+    _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    if not use_cuda_qsa_mqa_decode(q, k_cache):
+        raise ValueError("CUDA QSA decode requires BF16 SM100/103/120 indexer shapes")
+    if is_batch_invariant_mode_enabled():
+        min_scored_len = 0
+    logits = _new_decode_logits(q, max_model_len, min_scored_len)
+    if not q.shape[0] or not max_model_len:
+        return logits
+    q_kernel, _ = _pad_decode_query_heads(q)
+    rows_per_cta = (
+        rows_per_request
+        if 1 < rows_per_request <= _CUDA_DECODE_MAX_ROWS_PER_CTA
+        and q.shape[0] % rows_per_request == 0
+        else 1
+    )
+    qsa_mqa_decode_logits(
+        q_kernel,
+        _as_dtype_contiguous(k_cache, torch.bfloat16, q.device),
+        _as_dtype_contiguous(page_table, torch.int32, q.device),
+        _as_dtype_contiguous(context_lens, torch.int32, q.device).reshape(-1),
+        logits,
+        scale=float(score_scale or math.sqrt(q.shape[-1])),
+        min_scored_len=min_scored_len,
+        rows_per_cta=rows_per_cta,
+        ctas_per_request=_CUDA_DECODE_CTAS_PER_REQUEST,
+    )
+    return logits
+
+
 def tilelang_qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -397,32 +500,11 @@ def tilelang_qsa_mqa_decode(
         )
     if is_batch_invariant_mode_enabled():
         min_scored_len = 0
-    if min_scored_len > 0:
-        logits = torch.empty(
-            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
-        )
-    else:
-        logits = torch.full(
-            (q.shape[0], max_model_len),
-            -float("inf"),
-            dtype=torch.float32,
-            device=q.device,
-        )
+    logits = _new_decode_logits(q, max_model_len, min_scored_len)
     if not q.shape[0] or not max_model_len:
         return logits
-    # The validated MMA layout requires N (the Q-head dimension) to be a
-    # multiple of eight. Zero-padding preserves the weight-free head sum.
-    query_heads, head_dim = q.shape[1:]
-    kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
-    q_kernel = _as_dtype_contiguous(q, torch.bfloat16, q.device)
-    if kernel_heads != query_heads:
-        q_kernel = torch.cat(
-            [
-                q_kernel,
-                q_kernel.new_zeros(q.shape[0], kernel_heads - query_heads, head_dim),
-            ],
-            dim=1,
-        )
+    head_dim = q.shape[2]
+    q_kernel, kernel_heads = _pad_decode_query_heads(q)
     _tilelang_qsa_mqa_decode_kernel(
         heads=kernel_heads,
         head_dim=head_dim,
@@ -566,7 +648,19 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    rows_per_request: int = 1,
 ) -> torch.Tensor:
+    if use_cuda_qsa_mqa_decode(q, k_cache):
+        return cuda_qsa_mqa_decode(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
+            min_scored_len=min_scored_len,
+            rows_per_request=rows_per_request,
+        )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,
@@ -584,10 +678,12 @@ def qsa_mqa_decode(
 
 __all__ = [
     "HAS_TILELANG",
+    "cuda_qsa_mqa_decode",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
     "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
     "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
+    "use_cuda_qsa_mqa_decode",
 ]

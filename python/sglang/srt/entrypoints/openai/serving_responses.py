@@ -47,6 +47,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
 )
 from openai_harmony import Message as OpenAIMessage
 from openai_harmony import Role
+from qwen_exo_booster.config import memory_enabled_from_environment
 from qwen_exo_booster.initial_gdn_request import bind_initial_gdn_request
 from qwen_exo_booster.memory_hints import is_memory_block
 from qwen_exo_booster.memory_tools import MEMORY_TOOL_NAMES
@@ -1646,6 +1647,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         Only under ``tool_choice="auto"``: a forced call would loop on the
         memory tools, and ``none`` must keep the prompt tool-free.
         """
+        if not memory_enabled_from_environment():
+            return "memory_disabled"
         if not isinstance(self.tool_server, FileMemoryToolServer):
             return "no_tool_server"
         if self.use_harmony or not self.tool_call_parser:
@@ -3847,11 +3850,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         memory_scope: str = "shared",
     ) -> list[dict[str, Any]]:
         calls = []
-        executor = self.tool_server.executor_for_memory_scope(memory_key_id, memory_scope)
+        executor = (
+            self.tool_server.executor_for_memory_scope(memory_key_id, memory_scope)
+            if memory_enabled_from_environment() else None
+        )
         for parsed in memory_calls:
             call = new_memory_call(parsed.name, parsed.parameters)
             started = time.perf_counter()
-            ok, output = await executor.run(call["name"], call["arguments"])
+            if executor is None:
+                ok, output = False, "Error: memory_disabled"
+            else:
+                ok, output = await executor.run(call["name"], call["arguments"])
             call["duration_ms"] = (time.perf_counter() - started) * 1000.0
             call["ok"] = ok
             call["output"] = neutralize_control_markers(output)

@@ -719,6 +719,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Position information
     positions: torch.Tensor = None
 
+    # QSA RoPE cache extension is resolved once per forward and reused by every layer.
+    # The signature includes tensor mutation state so reused speculative batches cannot
+    # carry a stale maximum across changed positions.
+    qsa_rope_max_position: Optional[int] = None
+    qsa_rope_position_signature: Optional[tuple] = None
+    def reset_qsa_rope_metadata(self) -> None:
+        """Clear per-forward RoPE extension state before a reused batch runs."""
+        self.qsa_rope_max_position = None
+        self.qsa_rope_position_signature = None
+
+
     # For extend
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None

@@ -13,6 +13,7 @@ except ImportError as e:
     ClientSession = sse_client = ListToolsResult = e
 
 from openai_harmony import ToolDescription, ToolNamespaceConfig
+from qwen_exo_booster.config import memory_enabled_from_environment
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,8 @@ class FileMemoryToolServer(ToolServer):
     """
 
     def __init__(self, root, state_directory):
+        if not memory_enabled_from_environment():
+            raise RuntimeError("memory_disabled")
         import threading
 
         from qwen_exo_booster.file_knowledge import FileKnowledgeIndex
@@ -245,6 +248,8 @@ class FileMemoryToolServer(ToolServer):
 
     def executor_for_memory_scope(self, key_id: str | None, memory_scope: str):
         """Select from authenticated request identity, never model tool arguments."""
+        if not memory_enabled_from_environment():
+            raise RuntimeError("memory_disabled")
         from qwen_exo_booster.memory_tools import MemoryToolExecutor, MemoryWriteWindow
         from qwen_exo_booster.scoped_memory import get_private_memory_index
 
@@ -270,6 +275,8 @@ class FileMemoryToolServer(ToolServer):
             return executor
 
     def chat_tool_schemas_for_memory_scope(self, key_id: str | None, memory_scope: str):
+        if not memory_enabled_from_environment():
+            return ()
         from qwen_exo_booster.api_keys import ApiKeyStoreError, validate_memory_scope
         from qwen_exo_booster.file_knowledge import FileKnowledgeError
         from qwen_exo_booster.scoped_memory import validate_memory_key_id
@@ -285,9 +292,11 @@ class FileMemoryToolServer(ToolServer):
         return self._scoped_chat_tool_schemas[memory_scope]
 
     def has_tool(self, tool_name: str):
-        return tool_name in self._descriptions
+        return memory_enabled_from_environment() and tool_name in self._descriptions
 
     def get_tool_description(self, tool_name: str):
+        if not memory_enabled_from_environment():
+            return None
         return self._descriptions.get(tool_name)
 
     @asynccontextmanager

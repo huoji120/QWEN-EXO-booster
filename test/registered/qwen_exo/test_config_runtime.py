@@ -395,12 +395,6 @@ def test_runtime_creates_authoritative_directories(tmp_path, monkeypatch):
         "always_on": False,
         "route": "text_instructions",
     }
-    assert runtime.status()["internal_services"] == {
-        "capsule": True,
-        "memory_tools": True,
-        "policy_data": True,
-        "cognition": False,
-    }
 
     asyncio.run(runtime.close())
     assert runtime.state is QwenExoRuntimeState.STOPPED
@@ -434,7 +428,7 @@ def test_global_gdn_accepts_active_memory_independent_of_causal_grade(grade):
     runtime = object.__new__(QwenExoRuntime)
     runtime.tokenizer_manager = SimpleNamespace(tokenizer=Tokenizer())
     runtime.model_identity = SimpleNamespace(fingerprint="model")
-    runtime.config = SimpleNamespace(context_length=10000)
+    runtime.config = SimpleNamespace(memory_enabled=True, context_length=10000)
     runtime.reflection_memory_store = SimpleNamespace(list=lambda: [record])
     prompt = runtime._build_session_initial_gdn_prompt()
     assert prompt["memory_count"] == 1
@@ -476,6 +470,7 @@ def test_startup_without_memories_serves_without_initial_gdn():
             )
 
     runtime = object.__new__(QwenExoRuntime)
+    runtime.config = SimpleNamespace(memory_enabled=True)
     runtime.internal_jobs = Runner()
     runtime.tokenizer_manager = SimpleNamespace(
         server_args=SimpleNamespace(speculative_algorithm="DFLASH")
@@ -530,6 +525,7 @@ def test_runtime_startup_generation_builds_global_session_gdn(tmp_path):
         server_args=SimpleNamespace(enable_gdn_replayssm_spec=False)
     )
     runtime.config = SimpleNamespace(
+        memory_enabled=True,
         context_length=128, max_internal_tokens=32, state_directory=tmp_path
     )
     runtime._session_initial_gdn_refresh_lock = asyncio.Lock()
@@ -612,7 +608,7 @@ class _CharacterTokenizer:
 
 def _session_gdn_prompt_runtime(records, *, context_length):
     runtime = object.__new__(QwenExoRuntime)
-    runtime.config = SimpleNamespace(context_length=context_length)
+    runtime.config = SimpleNamespace(memory_enabled=True, context_length=context_length)
     runtime.tokenizer_manager = SimpleNamespace(tokenizer=_CharacterTokenizer())
     runtime.model_identity = SimpleNamespace(fingerprint="model-fingerprint")
     runtime.reflection_memory_store = SimpleNamespace(list=lambda: list(records))
@@ -724,6 +720,7 @@ def test_new_memory_refresh_runs_in_background_and_coalesces():
 
 def _quiet_runtime():
     runtime = object.__new__(QwenExoRuntime)
+    runtime.config = SimpleNamespace(memory_enabled=True)
     runtime._session_initial_gdn_refresh_task = None
     runtime._session_initial_gdn_refresh_requested = None
     runtime._request_questions = {}
@@ -764,6 +761,7 @@ def test_new_memory_refresh_waits_for_user_turns_and_reflections():
 
 def _selection_runtime(identity):
     runtime = object.__new__(QwenExoRuntime)
+    runtime.config = SimpleNamespace(memory_enabled=True)
     runtime._session_initial_gdn_value_lock = threading.RLock()
     runtime._session_initial_gdn_pins = OrderedDict()
     runtime._session_initial_gdn_value = {

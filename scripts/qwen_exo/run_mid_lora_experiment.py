@@ -63,6 +63,7 @@ def main():
     parser.add_argument("--start-sample-index", type=int, default=0, help="Continue the same seeded training order at this attempted-example cursor; Adam state is not restored")
     parser.add_argument("--resume-training-state", help="Restore validated optimizer/RNG companion; requires matching adapter, cumulative step and sample cursor")
     parser.add_argument("--transfer-dataset", action="store_true", help="Explicitly retain saved Adam/RNG on different data; requires --resume-training-state and --start-sample-index 0")
+    parser.add_argument("--override-learning-rate", action="store_true", help="Explicitly change the resumed Adam learning rate while preserving moments, counters and RNG")
     parser.add_argument("--generation-expert-backend", choices=("reference", "nvfp4-gemv"), default="reference",
                         help="Opt-in generation-only packed expert GEMV; prefill/backward remain reference")
     parser.add_argument("--precomputed-think", help="Validated fixed-teacher Think cache JSONL; skips on-the-fly Think generation")
@@ -117,6 +118,7 @@ def main():
         start_sample_index=args.start_sample_index,
         resume_training_state=args.resume_training_state,
         transfer_dataset=args.transfer_dataset,
+        override_learning_rate=args.override_learning_rate,
         generation_expert_backend=args.generation_expert_backend,
         precomputed_think=args.precomputed_think, precomputed_think_source=args.precomputed_think_source,
         config=MidLoraConfig(first_layer=args.first_layer, last_layer=args.last_layer,

@@ -130,6 +130,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     token_offsets: torch.Tensor
     valid_tokens: torch.Tensor
     state_indices: torch.Tensor
+    query_start_loc: Optional[torch.Tensor]
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
 
@@ -168,6 +169,7 @@ def _prepare_ple_batch(
     processed_tokens = _get_processed_token_count(forward_batch, physical_tokens)
     tokens = input_ids[:processed_tokens]
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
+    packed_query_start_loc = None
 
     if mode.is_target_verify():
         assert forward_batch.spec_info is not None
@@ -217,6 +219,8 @@ def _prepare_ple_batch(
         query_start_loc = torch.cat(
             [lengths.new_zeros(1), torch.cumsum(lengths, dim=0)]
         )
+        if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            packed_query_start_loc = query_start_loc
         sequence_count = lengths.shape[0]
         req_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         if processed_tokens:
@@ -297,6 +301,7 @@ def _prepare_ple_batch(
         token_offsets=token_offsets,
         valid_tokens=valid_tokens,
         state_indices=state_indices,
+        query_start_loc=packed_query_start_loc,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
     )
@@ -396,6 +401,44 @@ def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     out = x.new_zeros((total_tokens, *x.shape[1:]))
     out[: x.shape[0]] = x
     return out
+
+
+def _use_qwen4_varlen_prefill(
+    mode: ForwardMode,
+    query_start_loc: Optional[torch.Tensor],
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    req_indices: torch.Tensor,
+    token_offsets: torch.Tensor,
+    dilation: int,
+    *,
+    track: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> bool:
+    if (
+        not envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
+        or mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        or query_start_loc is None
+    ):
+        return False
+    # Tracking tensors normally come from the scheduler as contiguous int64.
+    # Keep the native path for unsupported layouts rather than failing after
+    # convolution has already updated the working states.
+    if track is not None and any(
+        tensor.device != x.device
+        or tensor.dtype != torch.int64
+        or tensor.shape != state_indices.shape
+        or not tensor.is_contiguous()
+        for tensor in track
+    ):
+        return False
+    from sglang.kernels.ops.qwen4_ple import can_fuse_qwen4_varlen_conv
+
+    return can_fuse_qwen4_varlen_conv(
+        x, weight, state, state_indices, query_start_loc,
+        req_indices, token_offsets, dilation,
+    )
 
 
 def _use_attn_tp_ngram() -> bool:
@@ -1035,6 +1078,37 @@ class Qwen4ExpPLELayer(nn.Module):
         pool = get_req_to_token_pool()
         conv_state = pool.short_conv_layer_cache(self.layer_id)
 
+        if batch.mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            track = _ple_track_targets(forward_batch, batch)
+            if _use_qwen4_varlen_prefill(
+                batch.mode,
+                batch.query_start_loc,
+                x,
+                self.conv1d.weight,
+                conv_state,
+                batch.state_indices,
+                batch.req_indices,
+                batch.token_offsets,
+                self.short_conv_dilation,
+                track=track,
+            ):
+                from sglang.kernels.ops.qwen4_ple import fused_qwen4_varlen_conv
+
+                track_indices, track_offsets = track if track is not None else (None, None)
+                conv_output = fused_qwen4_varlen_conv(
+                    x,
+                    self.conv1d.weight,
+                    conv_state,
+                    batch.state_indices,
+                    batch.query_start_loc,
+                    batch.req_indices,
+                    batch.token_offsets,
+                    self.short_conv_dilation,
+                    track_indices=track_indices,
+                    track_offsets=track_offsets,
+                )
+                return F.silu(conv_output)
+
         if batch.use_decode_fast_path:
             # Preserve the native depthwise-convolution and SiLU implementations;
             # only remove decode identities around them.  With row_width=1 the
@@ -1136,7 +1210,8 @@ class Qwen4ExpPLELayer(nn.Module):
             conv_state[batch.state_indices] = next_state.to(dtype=conv_state.dtype)
 
             # Same boundary mamba uses, into the slot the radix tree reads.
-            track = _ple_track_targets(forward_batch, batch)
+            if batch.mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
+                track = _ple_track_targets(forward_batch, batch)
             if track is not None:
                 track_indices, track_offsets = track
                 conv_state[track_indices] = _gather_at(track_offsets).to(

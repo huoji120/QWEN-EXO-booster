@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     QSA_VARIANT_COMPRESSED,
@@ -269,6 +270,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Ordinary prefill reuses one context, never the batch's summed history.
         # Separate storage keeps decode CUDA-graph scratch addresses unchanged.
         self._nvfp4_prefill_scratch = None
+        self._nvfp4_prefill_union_scratch = None
+        self._dense_prefill_enabled = envs.SGLANG_ENABLE_QSA_DENSE_PREFILL.get()
+        self._compact_prefill_enabled = envs.SGLANG_ENABLE_QSA_COMPACT_PREFILL.get()
         quant_method = (
             self.token_to_kv_pool.get_kv_cache_quant_method()
             if self.token_to_kv_pool is not None else None
@@ -315,6 +319,40 @@ class QwenSparseAttnBackend(AttentionBackend):
         compact_nvfp4_indices(indices, metadata.sequence_lengths, output)
         return output
 
+    def _try_dense_prefill(self, q, k, v, indices, cu_q, cu_k, lengths, scale):
+        if (not self._dense_prefill_enabled or self.qsa_profile is None
+                or self.qsa_profile.variant != QSA_VARIANT_COMPRESSED):
+            return None
+        from sglang.srt.layers.attention.qsa.dense_prefill import try_dense_causal_prefill
+
+        return try_dense_causal_prefill(
+            q=q, k=k, v=v, topk_indices=indices,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, staged_lengths=lengths,
+            budget=self.qsa_profile.block_topk * self.qsa_profile.compress_ratio,
+            scale=scale,
+        )
+
+    def _nvfp4_prefill_union(self, indices, locations):
+        from sglang.srt.layers.attention.qsa.nvfp4 import plan_nvfp4_prefill_union
+
+        capacity = indices.numel()
+        if self._nvfp4_prefill_union_scratch is None:
+            # Eligibility caps both slots and remapped columns at context / 4.
+            # This storage never aliases speculative CUDA-graph selection plans.
+            sizes = (self.max_context_len, triton.cdiv(self.max_context_len, 1024),
+                     triton.cdiv(self.max_context_len, 1024),
+                     self.max_context_len // 4, self.max_context_len // 4)
+            self._nvfp4_prefill_union_scratch = tuple(
+                torch.empty(size, dtype=torch.int64 if index == 3 else torch.int32,
+                            device=indices.device) for index, size in enumerate(sizes)
+            )
+        bitmap, counts, offsets, slots, remapped = self._nvfp4_prefill_union_scratch
+        slots = slots[:capacity]
+        remapped = plan_nvfp4_prefill_union(
+            indices, locations, bitmap, counts, offsets, slots, remapped[:capacity],
+        )
+        return slots, remapped
+
     def _forward_nvfp4_staged_prefill(self, q, layer, metadata, indices):
         from sglang.srt.layers.attention.qsa.nvfp4 import gather_nvfp4_rows
 
@@ -339,17 +377,33 @@ class QwenSparseAttnBackend(AttentionBackend):
         for request, (length, query_length) in enumerate(prefill.staged_lengths):
             query_end = query_start + query_length
             if query_length:
-                staged_k, staged_v = keys[:length], values[:length]
-                gather_nvfp4_rows(
-                    *banks, prefill.kv_locations[kv_start:kv_start + length],
-                    staged_k, staged_v, **kwargs,
+                request_indices = indices[query_start:query_end]
+                locations = prefill.kv_locations[kv_start:kv_start + length]
+                capacity = query_length * indices.shape[-1]
+                compact = (self._compact_prefill_enabled and indices.ndim == 2
+                           and capacity > 0 and capacity * 4 <= length)
+                if compact:
+                    locations, request_indices = self._nvfp4_prefill_union(
+                        request_indices, locations,
+                    )
+                staged_length = capacity if compact else length
+                staged_k, staged_v = keys[:staged_length], values[:staged_length]
+                gather_nvfp4_rows(*banks, locations, staged_k, staged_v, **kwargs)
+                request_q = q[query_start:query_end]
+                request_cu_q = prefill.staged_cu_q[request]
+                request_cu_k = prefill.staged_cu_k[request]
+                # A compact union is sparse, not a dense causal KV sequence.
+                result = None if compact else self._try_dense_prefill(
+                    request_q, staged_k, staged_v, request_indices,
+                    request_cu_q, request_cu_k, ((length, query_length),), layer.scaling,
                 )
-                output[query_start:query_end].copy_(sparse_gqa_fwd_interface_triton_ck(
-                    q[query_start:query_end], staged_k, staged_v,
-                    indices[query_start:query_end], prefill.staged_cu_q[request],
-                    prefill.staged_cu_k[request], metadata.sequence_lengths[request:request + 1],
-                    layer.scaling, max_q=query_length, causal_guard=True,
-                ))
+                if result is None:
+                    result = sparse_gqa_fwd_interface_triton_ck(
+                        request_q, staged_k, staged_v, request_indices, request_cu_q,
+                        request_cu_k, metadata.sequence_lengths[request:request + 1],
+                        layer.scaling, max_q=query_length, causal_guard=True,
+                    )
+                output[query_start:query_end].copy_(result)
             query_start = query_end
             kv_start += length
         return output
@@ -856,7 +910,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 max_sequence_len=max(lengths_cpu, default=1),
                 max_query_len=max(extend_cpu, default=0),
                 kv_locations=kv_locations,
-                staged_lengths=tuple(zip(lengths_cpu, extend_cpu)) if self.is_nvfp4 and has_prefix else (),
+                staged_lengths=tuple(zip(lengths_cpu, extend_cpu)),
                 staged_cu_q=(
                     torch.stack((torch.zeros_like(forward_batch.extend_seq_lens),
                                  forward_batch.extend_seq_lens), dim=1).to(torch.int32)
@@ -1624,6 +1678,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise RuntimeError("QSA ordinary extend metadata is incomplete")
         cu_seqlens_q = prefill.cu_seqlens_q
         if prefill.kv_locations is None:
+            output = self._try_dense_prefill(
+                q, k[:num_valid_rows], v[:num_valid_rows], topk_indices,
+                cu_seqlens_q, cu_seqlens_q, prefill.staged_lengths, layer.scaling,
+            )
+            if output is not None:
+                return self._pad_extend_output(output, num_output_rows)
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
                 k[:num_valid_rows].contiguous(),
@@ -1658,6 +1718,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 keys.mul_(layer.k_scale_float)
             if layer.v_scale_float is not None:
                 values.mul_(layer.v_scale_float)
+            output = self._try_dense_prefill(
+                q, keys, values, topk_indices, cu_seqlens_q,
+                prefill.cu_seqlens_k, prefill.staged_lengths, layer.scaling,
+            )
+            if output is not None:
+                return self._pad_extend_output(output, num_output_rows)
             output = sparse_gqa_fwd_interface_triton_ck(
                 q.contiguous(),
                 keys,

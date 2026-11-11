@@ -226,5 +226,102 @@ def test_qsa_decode_graph_replay_crosses_score_free_threshold(monkeypatch):
                 assert (logits[row, selected[row].long()] >= threshold).all()
 
 
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0), (9, 0), (12, 1)])
+def test_cuda_qsa_decode_arch_coverage(monkeypatch, capability):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    mqa._cuda_decode_arch_supported.cache_clear()
+    try:
+        assert mqa._cuda_decode_arch_supported(0) == (capability in ((10, 0), (10, 3), (12, 0)))
+    finally:
+        mqa._cuda_decode_arch_supported.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "q_shape,k_shape,q_dtype,k_dtype,k_device,expected",
+    [
+        ((4, 4, 128), (8, 16, 1, 128), torch.bfloat16, torch.bfloat16, "cuda:0", True),
+        ((4, 8, 128), (8, 16, 1, 128), torch.bfloat16, torch.bfloat16, "cuda:0", True),
+        ((4, 0, 128), (8, 16, 1, 128), torch.bfloat16, torch.bfloat16, "cuda:0", False),
+        ((4, 9, 128), (8, 16, 1, 128), torch.bfloat16, torch.bfloat16, "cuda:0", False),
+        ((4, 4, 64), (8, 16, 1, 64), torch.bfloat16, torch.bfloat16, "cuda:0", False),
+        ((4, 4, 128), (8, 32, 1, 128), torch.bfloat16, torch.bfloat16, "cuda:0", False),
+        ((4, 4, 128), (8, 16, 2, 128), torch.bfloat16, torch.bfloat16, "cuda:0", False),
+        ((4, 4, 128), (8, 16, 1, 128), torch.float16, torch.bfloat16, "cuda:0", False),
+        ((4, 4, 128), (8, 16, 1, 128), torch.bfloat16, torch.float8_e4m3fn, "cuda:0", False),
+        ((4, 4, 128), (8, 16, 1, 128), torch.bfloat16, torch.bfloat16, "cpu", False),
+        ((4, 4, 128), (8, 16, 1, 128), torch.bfloat16, torch.bfloat16, "cuda:1", False),
+    ],
+)
+def test_cuda_qsa_decode_shape_coverage(
+    monkeypatch, q_shape, k_shape, q_dtype, k_dtype, k_device, expected
+):
+    monkeypatch.setattr(mqa, "_cuda_decode_arch_supported", lambda device: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    q = SimpleNamespace(is_cuda=True, device=torch.device("cuda:0"),
+                        dtype=q_dtype, ndim=len(q_shape), shape=q_shape)
+    k = SimpleNamespace(device=torch.device(k_device), dtype=k_dtype,
+                        ndim=len(k_shape), shape=k_shape)
+    assert mqa.use_cuda_qsa_mqa_decode(q, k) is expected
+    q.is_cuda = False
+    assert not mqa.use_cuda_qsa_mqa_decode(q, k)
+
+
+def test_cuda_qsa_decode_padding_reuses_fused_prep_storage():
+    padded = torch.randn(4, 8, 128, dtype=torch.bfloat16)
+    actual, heads = mqa._pad_decode_query_heads(padded)
+    assert actual is padded
+    assert heads == 8
+    unpadded = padded[:, :4].contiguous()
+    actual, heads = mqa._pad_decode_query_heads(unpadded)
+    torch.testing.assert_close(actual[:, :4], unpadded)
+    assert not actual[:, 4:].count_nonzero()
+
+
+@pytest.mark.skipif(not CUDA_TILELANG, reason="CUDA and TileLang required")
+@pytest.mark.parametrize("max_model_len", [0, 1, 511, 513, 1031])
+@pytest.mark.parametrize("min_scored_len", [0, 512])
+def test_cuda_qsa_decode_preserves_local_output_bounds(max_model_len, min_scored_len):
+    args = _inputs([0, 1, 511, 512, 513], 16, 1031, "cuda", head_dim=128)
+    if not mqa.use_cuda_qsa_mqa_decode(args[0], args[1]):
+        pytest.skip("CUDA QSA decode requires SM100/103/120")
+    expected = mqa.tilelang_qsa_mqa_decode(
+        *args, max_model_len, min_scored_len=min_scored_len
+    )
+    actual = mqa.cuda_qsa_mqa_decode(
+        *args, max_model_len, min_scored_len=min_scored_len
+    )
+    if not min_scored_len:
+        assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    else:
+        effective = args[-1].clamp_max(max_model_len)
+        valid = ((torch.arange(max_model_len, device="cuda")[None, :] < effective[:, None])
+                 & (effective[:, None] > min_scored_len))
+        assert torch.equal(actual.view(torch.int32)[valid], expected.view(torch.int32)[valid])
+
+
+@pytest.mark.skipif(not CUDA_TILELANG, reason="CUDA and TileLang required")
+@pytest.mark.parametrize("ctas_per_request", [1, 7, 64])
+def test_cuda_qsa_decode_skip_contract_leaves_poisoned_logits(ctas_per_request):
+    from sglang.kernels.ops.attention.qsa_mqa_decode import qsa_mqa_decode_logits
+
+    args = _inputs([0, 1, 511, 512, 513, 9001], 16, 9003, "cuda", heads=8, head_dim=128)
+    q, cache, table, lens = args
+    if not mqa.use_cuda_qsa_mqa_decode(q, cache):
+        pytest.skip("CUDA QSA decode requires SM100/103/120")
+    expected = mqa.tilelang_qsa_mqa_decode(*args, 9003)
+    logits = torch.full_like(expected, float("nan"))
+    qsa_mqa_decode_logits(
+        q, cache, table, lens, logits, scale=math.sqrt(128),
+        min_scored_len=512, rows_per_cta=1, ctas_per_request=ctas_per_request,
+    )
+    for row, length in enumerate([0, 1, 511, 512, 513, 9001]):
+        if length <= 512:
+            assert torch.isnan(logits[row]).all()
+        else:
+            assert torch.equal(logits[row, :length].view(torch.int32),
+                               expected[row, :length].view(torch.int32))
+            assert torch.isnan(logits[row, length:]).all()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

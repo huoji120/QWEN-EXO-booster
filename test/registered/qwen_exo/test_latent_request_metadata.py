@@ -27,6 +27,7 @@ def _runtime(tmp_path):
         chunk_count=1,
     )
     runtime = object.__new__(QwenExoRuntime)
+    runtime.config = SimpleNamespace(memory_enabled=True)
     runtime._latent_default = None
     runtime._latent_default_warned = set()
     runtime.latent_artifacts = LatentArtifactStore(

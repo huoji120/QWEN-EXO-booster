@@ -51,9 +51,9 @@ def bind_initial_gdn_request(
         raise ValueError("Memory scope does not match authenticated owner")
     params = dict(custom_params)
     disabled = params.pop(DISABLE_INITIAL_GDN_PARAM, None) is True
-    disabled = disabled or scope == "private_only"
+    disabled = disabled or scope == "private_only" or not runtime.config.memory_enabled
     params.pop(INITIAL_GDN_PARAM, None)
-    if scope == "private_only":
+    if scope == "private_only" or not runtime.config.memory_enabled:
         params.pop("qwen_exo_latent_transplant", None)
         params.pop("qwen_exo_activation_editor", None)
         params["qwen_exo_disable_activation_editor"] = True

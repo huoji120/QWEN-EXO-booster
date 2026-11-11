@@ -209,6 +209,106 @@ def gather_nvfp4_rows(k, v, ks, vs, slots, out_k, out_v, *, k_scale: float,
     )
 
 
+@triton.jit(do_not_specialize=["LENGTH", "QUERIES", "WIDTH"])
+def _mark_prefill_union(indices, bitmap, LENGTH, QUERIES, WIDTH,
+                        IS0: tl.constexpr, IS1: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    position = tl.load(indices + row * IS0 + col * IS1, mask=col < WIDTH, other=-1)
+    visible = LENGTH - QUERIES + row + 1
+    valid = (col < WIDTH) & (position >= 0) & (position < visible)
+    # Repeated positions, including repeats across queries, have one bitmap bit.
+    tl.atomic_or(bitmap + position, 1, mask=valid, sem="relaxed")
+
+
+@triton.jit(do_not_specialize=["LENGTH"])
+def _scan_prefill_union(bitmap, counts, LENGTH, BLOCK: tl.constexpr):
+    block = tl.program_id(0)
+    position = block * BLOCK + tl.arange(0, BLOCK)
+    marked = tl.load(bitmap + position, mask=position < LENGTH, other=0)
+    rank = tl.cumsum(marked, 0)
+    # Zero still means absent; positive ranks are block-local and one-based.
+    tl.store(bitmap + position, tl.where(marked != 0, rank, 0), mask=position < LENGTH)
+    tl.store(counts + block, tl.sum(marked, 0))
+
+
+@triton.jit(do_not_specialize=["BLOCKS"])
+def _scan_prefill_blocks(counts, offsets, BLOCKS, BLOCK: tl.constexpr):
+    block = tl.arange(0, BLOCK)
+    count = tl.load(counts + block, mask=block < BLOCKS, other=0)
+    tl.store(offsets + block, tl.cumsum(count, 0) - count, mask=block < BLOCKS)
+
+
+@triton.jit(do_not_specialize=["LENGTH"])
+def _scatter_prefill_union(bitmap, offsets, locations, slots, LENGTH,
+                           LS: tl.constexpr, BLOCK: tl.constexpr):
+    block = tl.program_id(0)
+    position = block * BLOCK + tl.arange(0, BLOCK)
+    local_rank = tl.load(bitmap + position, mask=position < LENGTH, other=0)
+    rank = local_rank + tl.load(offsets + block) - 1
+    present = (position < LENGTH) & (local_rank > 0)
+    slot = tl.load(locations + position * LS, mask=present, other=-1)
+    tl.store(slots + rank, slot, mask=present)
+    tl.store(bitmap + position, tl.where(present, rank, -1), mask=position < LENGTH)
+
+
+@triton.jit(do_not_specialize=["LENGTH", "QUERIES", "WIDTH"])
+def _remap_prefill_union(indices, bitmap, output, LENGTH, QUERIES, WIDTH,
+                         IS0: tl.constexpr, IS1: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    position = tl.load(indices + row * IS0 + col * IS1, mask=col < WIDTH, other=-1)
+    visible = LENGTH - QUERIES + row + 1
+    valid = (col < WIDTH) & (position >= 0) & (position < visible)
+    rank = tl.load(bitmap + position, mask=valid, other=-1)
+    # Preserve column order and duplicates, and mask ORIGINAL logical causality.
+    tl.store(output + row * WIDTH + col, rank, mask=col < WIDTH)
+
+
+def plan_nvfp4_prefill_union(indices, locations, bitmap, counts, offsets, slots, output):
+    """Build a sorted union without device-to-host counts or dynamic allocations.
+
+    Caller-owned scratch is exclusive to ordinary prefill. ``slots`` has the
+    static query-count * top-k capacity; its unused tail remains -1. Sorted
+    ranks never exceed original positions, so decoded attention may retain its
+    original logical lengths and causal guard after the original mask here.
+    """
+    _metadata(indices, locations.device, 2)
+    _metadata(locations, indices.device, 1)
+    for tensor in (bitmap, counts, offsets, slots, output):
+        _metadata(tensor, indices.device, 1)
+        if not tensor.is_contiguous():
+            raise ValueError("NVFP4 union scratch must be contiguous")
+    queries, width = indices.shape
+    length = locations.numel()
+    capacity = queries * width
+    blocks = triton.cdiv(length, 1024)
+    if (not indices.is_cuda or queries > length or bitmap.numel() < length
+            or counts.numel() < blocks or offsets.numel() != counts.numel()
+            or slots.numel() != capacity or output.numel() != capacity):
+        raise ValueError("NVFP4 union scratch does not cover the request")
+    slots.fill_(-1)
+    if not capacity:
+        return output.view(queries, width)
+    bitmap[:length].zero_()
+    grid = (queries, triton.cdiv(width, 256))
+    _mark_prefill_union[grid](
+        indices, bitmap, length, queries, width, *indices.stride(), BLOCK=256,
+    )
+    _scan_prefill_union[(blocks,)](bitmap, counts, length, BLOCK=1024)
+    # Specialize only on the backend's fixed context capacity, never its prefix.
+    _scan_prefill_blocks[(1,)](
+        counts, offsets, blocks, BLOCK=triton.next_power_of_2(counts.numel()),
+    )
+    _scatter_prefill_union[(blocks,)](
+        bitmap, offsets, locations, slots, length, locations.stride(0), BLOCK=1024,
+    )
+    _remap_prefill_union[grid](
+        indices, bitmap, output, length, queries, width, *indices.stride(), BLOCK=256,
+    )
+    return output.view(queries, width)
+
+
 def gather_nvfp4_selected(k, v, ks, vs, req_to_token, req_indices, indices,
                           seq_lens, cu_k, out_k, out_v, *, k_scale: float,
                           v_scale: float, host_k=None, host_v=None, host_ks=None, host_vs=None):

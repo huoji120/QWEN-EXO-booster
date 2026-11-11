@@ -246,6 +246,12 @@ class Envs:
     # Experimental four-query QSA verification tile; keep off until its
     # workload crossover beats the validated TileLang selector on SM120.
     SGLANG_QWEN4_EXP_QSA_SHARED_MTP = EnvBool(False)
+    # Exhaustive short-context QSA attention via dense FlashAttention. Opt in
+    # only after validating numerical behavior/performance for the deployment.
+    SGLANG_ENABLE_QSA_DENSE_PREFILL = EnvBool(False)
+    # Device-only selected-KV union staging for small-query, long-prefix NVFP4.
+    # Keep opt-in until the deployment's CUDA and mapped-host paths are checked.
+    SGLANG_ENABLE_QSA_COMPACT_PREFILL = EnvBool(False)
     # Optional page-aligned GPU raw-KV prefix for Qwen4 host-KV serving.
     # Zero keeps the memory-derived split; positive values override it.
     SGLANG_QWEN4_GPU_KV_TOKENS = EnvInt(0)

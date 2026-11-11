@@ -271,6 +271,8 @@ Flash-Next 原生中层训练检查点使用独立的 `qwen_exo_native_mid_lora`
 
 原生 adapter 为显式可选：加载后的外层配置没有 `qwen_exo_native_mid_lora` 时，不访问本地 adapter profile，普通 Hugging Face 模型 ID 保持可用；字段存在但格式无效、缺少 QWEN-EXO 隔离或磁盘声明消失时明确拒绝。
 
+测试模型本身时，可在启动环境设置 `QWEN_EXO_MEMORY_ENABLED=0` 后重启，临时关闭服务端记忆工具、提示／人格／Cognition 注入、记忆 GDN 初始化、自动反思／摘要／dream 和压缩服务。默认 `1`；仅接受 `0`/`1`。该开关不关闭 QWEN-EXO 运行时、固定 LoRA、普通会话历史或正常前缀缓存，客户端工具仍可调用；管理接口和已有记忆文件保留。`/qwen-exo/status` 的 `memory_enabled` 与各服务状态反映实际生效值，持久化服务配置仍保留恢复时的偏好。改回 `1` 并重启即可恢复；开关不是热切换，A/B 测试请新开会话，客户端已发送的旧记忆文本不会被自动删除。
+
 ### 可选 Engram 外挂表
 
 `QWEN_EXO_ENGRAM_PATH` 指向预先打包的 Engram artifact；这是 Qwen3.5 路径的额外残差注入，与 Flash-Next 的原生 PLE 不同。冻结的基表和 reader 不原地修改；额外训练的稀疏表及 reader 可独立打包，未写入行读取为零。数字、符号和格式 token 不参与注入，字母 token 使用白名单门控。
@@ -316,6 +318,8 @@ QSA 仅接收无 padding、无缓存的完整因果窗口；非因果／非连�
 默认解码可用 fresh 完整前向；`--generation-mode native-cache` 只在 tiny 与当前实际前缀通过 fresh/cached logits 和 greedy 一致性门禁后启用。缓存仅存在于一次 no-grad 生成，原生 NGram/GDN/QSA 状态不跨样本或 adapter 版本复用；训练仍是 fresh 全序列。持久训练模式保留冻结下层以支持下一次生成，其显存不能套用释放下层的准备估算。每次 optimizer step 保存独立 adapter，以及同名 `.training.pt` 优化器状态：包含 AdamW 参数组、动量／方差／步数、参数顺序、Torch CPU/CUDA 与 Python/NumPy RNG、下一数据游标、数据 SHA 和训练参数，并绑定 adapter SHA。两份文件持久化后才发布带状态 SHA 的 checkpoint 事件；不要把孤立 adapter 或 `.partial` 当成完整恢复点。CPU 实测保存／恢复后的下一 AdamW 更新与不中断路径逐位一致。仅指定 `--initial-adapter --initial-optimizer-steps --start-sample-index` 是 adapter-only warm-start；额外指定 `--resume-training-state COMPANION` 才恢复优化器和 RNG，当前限单独的 `self_think_sft` arm。恢复前校验 adapter／数据 SHA、底模路径、训练配置、参数顺序、Adam 超参数／张量／步数和数据游标；CUDA RNG 设备数也必须一致，失败不回退到重新初始化。累计 adapter 步数、延续的 Adam 步数和本次新增更新数分开记录，旧检查点不覆盖。这是训练状态恢复能力，不是跨硬件或不同内核的逐位复现承诺。
 
 换训练集但保留已训练 adapter 和 Adam/RNG 时，显式追加 `--transfer-dataset`，并设置新数据 `--start-sample-index 0`；必须配套 `--resume-training-state`。仅允许数据 SHA 改变及新数据游标归零，底模／训练数值配置／优化器校验仍生效。同一数据 SHA、非零迁移游标或缺少状态文件均拒绝；旧 accepted-index 历史不带入新数据集。迁移事件和后续检查点记录新旧数据 SHA 与父状态文件，累计 adapter/Adam 步数延续。后续在新数据上的普通断点恢复不再加迁移标记。CPU smoke 覆盖实际 Adam 状态一致、迁移后下一步逐位一致、非法迁移拒绝及新数据检查点的普通恢复；这不证明换数据后没有遗忘或质量下降。
+
+恢复 Adam 时默认拒绝学习率变化。经明确授权，可配合 `--resume-training-state` 使用 `--override-learning-rate --learning-rate NEW_RATE`；新值必须与旧值不同、有限且位于 `(0, 1e-3]`。该开关仅允许学习率变化，不放宽其他优化器、权重、数据或 RNG 校验；加载原始动量／方差／计数后才设置新学习率，不改写旧检查点。恢复事件和新检查点记录前后学习率。新检查点正常续训时去掉该开关，使用已保存的新学习率；换数据仍须独立指定 `--transfer-dataset`。
 
 `scripts/qwen_exo/pregenerate_mid_lora_think.py --source PREPARED_JSONL --output PRIVATE_DIR --base-profile PROFILE` 使用在线 SGLang 的 `/generate` 串行预生成 Think（并发固定为1，不改服务线程数）。只发送 `generation_plan` 选定的完整因果前缀：schema1 使用 `question_input_ids`，恢复样本 schema2 使用独立的 `generation_input_ids`，不发送目标答案、标签或未来结果。显式复制当前 `/server_info` 的 Think 压制／软收尾配置，通过 `custom_params.qwen_exo_think_shaping` 生效。逐请求前后校验模型指纹、adapter SHA、tokenizer 和配置，核对实际 prompt IDs，保存原始 output IDs 与真实闭合标记，不用解码再编码或补造 `</think>`。进程锁、逐样本原子保存和 manifest 支持断点续跑；`--limit` 可做小批验收，`stop.json` 在请求边界停止。超预算／边界异常保留 review，不进入 accepted 集。输出 `prepared.jsonl`（接受的原样本）、`think-cache.jsonl`（教师、压制策略和 token 哈希）、`train-ready.jsonl`（完整 input_ids/答案-only labels）及 receipt。输出可能包含私有原文或生成内容，不入 Git。
 

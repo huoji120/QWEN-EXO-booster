@@ -162,6 +162,48 @@ class QSAIndexer(MultiPlatformOp):
         self._rope_axis_map_cache = axis_map.to(device)
         return self._rope_axis_map_cache
 
+    def _ensure_forward_rope_cache(
+        self, positions: torch.Tensor, forward_batch=None, reuse_forward_max=False
+    ) -> None:
+        """Extend the shared RoPE cache for this forward's positions.
+
+        The execution entry resets ForwardBatch state between runs. During one
+        execution, data pointer/shape/stride/device identify the query view;
+        changed views recompute the maximum. No tensor version counter is read,
+        because inference-mode tensors may not have one. CUDA graph capture or
+        replay deliberately performs no host scalar read.
+        """
+        if get_is_capture_mode() or not hasattr(
+            self.rotary_emb, "_ensure_cos_sin_cache_length"
+        ):
+            return
+        if positions.numel() == 0:
+            return
+        if forward_batch is None:
+            self.rotary_emb._ensure_cos_sin_cache_length(
+                int(positions.max().item())
+            )
+            return
+        if reuse_forward_max:
+            signature = (
+                positions.data_ptr(),
+                tuple(positions.shape),
+                tuple(positions.stride()),
+                positions.device.type,
+                positions.device.index,
+            )
+            if (
+                forward_batch.qsa_rope_max_position is None
+                or forward_batch.qsa_rope_position_signature != signature
+            ):
+                forward_batch.qsa_rope_position_signature = signature
+                forward_batch.qsa_rope_max_position = int(positions.max().item())
+            maximum = forward_batch.qsa_rope_max_position
+        else:
+            maximum = int(positions.max().item())
+        self.rotary_emb._ensure_cos_sin_cache_length(maximum)
+        return
+
     def project_qk(
         self,
         hidden_states: torch.Tensor,
@@ -170,6 +212,7 @@ class QSAIndexer(MultiPlatformOp):
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
         is_target_verify: bool = False,
+        forward_batch=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -185,12 +228,9 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_index_q_norm_rope_store,
             )
 
-            if not get_is_capture_mode() and hasattr(
-                self.rotary_emb, "_ensure_cos_sin_cache_length"
-            ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+            self._ensure_forward_rope_cache(
+                positions, forward_batch, reuse_forward_max=True
+            )
             key_state_buffer = (
                 pool.get_qsa_verify_key_state_buffer(self.layer_id)
                 if is_target_verify else pool.get_qsa_key_state_buffer(self.layer_id)
@@ -215,16 +255,23 @@ class QSAIndexer(MultiPlatformOp):
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
         )
-        q = self.apply_rope(positions, q)
+        q = self.apply_rope(
+            positions, q, forward_batch=forward_batch, reuse_forward_max=True
+        )
         return q, token_k, False
 
     def normalize_compressed_keys(
-        self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
+        self,
+        compressed_keys: torch.Tensor,
+        block_positions: torch.Tensor,
+        forward_batch=None,
     ) -> torch.Tensor:
         normalized = self.k_layernorm(
             compressed_keys.reshape(-1, self.index_head_dim)
         ).reshape(-1, self.index_kv_heads, self.index_head_dim)
-        return self.apply_rope(block_positions, normalized)
+        return self.apply_rope(
+            block_positions, normalized, forward_batch=forward_batch
+        )
 
     def _use_fused_compress(self, pool) -> bool:
         return (
@@ -303,6 +350,7 @@ class QSAIndexer(MultiPlatformOp):
         state_slots: torch.Tensor | None = None,
         state_stored: bool = False,
         verify_group_locs: torch.Tensor | None = None,
+        forward_batch=None,
     ) -> None:
         """Compress complete groups; verify writes only isolated candidate rows."""
 
@@ -334,7 +382,7 @@ class QSAIndexer(MultiPlatformOp):
 
         if metadata.is_cuda_graph:
             self._compress_decode_cuda_graph(
-                metadata, verify_group_locs, source_keys, source_rope
+                metadata, forward_batch, verify_group_locs, source_keys, source_rope
             )
             return
 
@@ -387,11 +435,13 @@ class QSAIndexer(MultiPlatformOp):
         compressed_rope_positions = self._rope_from_matrix(
             source_rope[group_locs[:, 0]]
         )
-        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
+        normalized = self.normalize_compressed_keys(
+            pooled, compressed_rope_positions, forward_batch=forward_batch
+        )
         pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
 
     def _compress_decode_cuda_graph(
-        self, metadata, group_locs=None, source_keys=None, source_rope=None
+        self, metadata, forward_batch, group_locs=None, source_keys=None, source_rope=None
     ) -> None:
         """Run a fixed-shape compression step; non-boundaries write slot zero.
 
@@ -424,7 +474,7 @@ class QSAIndexer(MultiPlatformOp):
             source_rope[group_locs[:, 0]]
         )
         compressed = self.normalize_compressed_keys(
-            compressed, compressed_rope_positions
+            compressed, compressed_rope_positions, forward_batch=forward_batch
         )
         pool.set_qsa_compressed_k_buffer(
             self.layer_id, metadata.graph_write_locs, compressed.contiguous()
@@ -437,15 +487,22 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-    def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    def apply_rope(
+        self,
+        positions: torch.Tensor,
+        tensor: torch.Tensor,
+        forward_batch=None,
+        reuse_forward_max=False,
+    ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
         num_positions = positions.shape[-1] if positions.ndim == 2 else positions.numel()
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if not get_is_capture_mode() and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length"):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+        self._ensure_forward_rope_cache(
+            positions, forward_batch, reuse_forward_max=reuse_forward_max
+        )
 
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the
@@ -533,6 +590,7 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         share_mtp_queries: bool = False,
+        rows_per_request: int = 1,
     ) -> torch.Tensor:
         # The local JIT fast_topk's <=512 branch writes every valid index
         # without loading scores; its radix branch reads only [0, length).
@@ -559,6 +617,7 @@ class QSAIndexer(MultiPlatformOp):
                 compressed_lengths,
                 max_model_len,
                 min_scored_len=self.block_topk if use_fast_topk else 0,
+                rows_per_request=rows_per_request,
             )
         if use_fast_topk:
             # Decode rows start at zero, so lengths are the compressed lengths
@@ -687,6 +746,7 @@ class QSAIndexer(MultiPlatformOp):
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
+            forward_batch=forward_batch,
         )
         self.update_key_state_and_compress(
             token_k,
@@ -696,6 +756,7 @@ class QSAIndexer(MultiPlatformOp):
             state_slots=state_slots,
             state_stored=state_stored,
             verify_group_locs=verify_group_locs,
+            forward_batch=forward_batch,
         )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
@@ -710,6 +771,14 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 share_mtp_queries=is_target_verify,
+                # Graph MODE=1 maps row // draft_token_num to its request,
+                # builds the same page prefix, and increases lengths by row.
+                # Ragged eager/draft-extend rows retain independent scoring.
+                rows_per_request=(
+                    int(forward_batch.spec_info.draft_token_num)
+                    if is_target_verify and indexer_metadata.is_cuda_graph
+                    else 1
+                ),
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (

@@ -38,6 +38,7 @@ class PLESourceIdentity(str, Enum):
 _PLE_SHARD_PATTERN = re.compile(r"^(?P<prefix>.+\.ngram_embedding)\.shard_(?P<index>\d+)\.weight$")
 _NATIVE_MARKER = "native-ple.json"
 _GPU_DECODE_MIN_ROWS = 1024
+_PREAD_MAX_BYTES = 4 * 1024 * 1024
 
 
 class PLEShard(msgspec.Struct, frozen=True):
@@ -472,8 +473,14 @@ class PLEFileReader:
                 row_view = scale_view = None
 
     def read_rows(self, rows: list[int]) -> tuple[bytearray, bytearray]:
-        """Return owned writable row/scale buffers, independent of mmap lifetime."""
-        data = bytearray(len(rows) * self.manifest.shards[0].row_bytes)
+        """Return owned writable row/scale buffers, independent of mmap lifetime.
+
+        The pread backend reads sorted contiguous runs, then scatters each row
+        back to every original position. This keeps duplicate and arbitrary
+        input order while bounding each temporary read to ``_PREAD_MAX_BYTES``.
+        """
+        row_bytes = self.manifest.shards[0].row_bytes
+        data = bytearray(len(rows) * row_bytes)
         scale_bytes = 4 if any(s.scale_row_bytes for s in self.manifest.shards) else 0
         scales = bytearray(len(rows) * scale_bytes)
         if not rows:
@@ -481,28 +488,85 @@ class PLEFileReader:
         if self.backend == "mmap":
             self._read_mmap_rows(rows, data, scales)
             return data, scales
-        unique: dict[int, tuple[bytes, bytes]] = {}
-        for i, row in enumerate(rows):
-            item = unique.get(row)
-            if item is None:
-                shard = self.manifest.locate_record(row)
-                delta = row - shard.row_start
-                raw = self._read(shard.path, shard.offset + delta * shard.row_bytes, shard.row_bytes)
-                scale = b""
-                if scale_bytes:
-                    if shard.scale_offset < 0:
-                        scale = struct.pack("<f", 1.0)
-                    elif shard.scale_row_bytes == 4 and self.manifest.scale_is_per_row:
-                        scale = self._read(shard.path, shard.scale_offset + delta * 4, 4)
-                    else:
-                        scale = self._read(shard.path, shard.scale_offset, 4)
-                item = (raw, scale)
-                unique[row] = item
-            data_start = i * len(item[0])
-            data[data_start : data_start + len(item[0])] = item[0]
-            if scale_bytes:
-                scale_start = i * 4
-                scales[scale_start : scale_start + 4] = item[1]
+
+        # Validate the complete request before issuing any read. Apart from
+        # making errors deterministic, this prevents an invalid row from being
+        # silently interpreted as a shard-relative offset.
+        by_shard: dict[int, dict[int, list[int]]] = {}
+        for position, row in enumerate(rows):
+            if not isinstance(row, int):
+                raise IndexError(f"PLE row {row!r} is outside the table")
+            shard_index = min(row // self.manifest.shard_size, len(self.manifest.shards) - 1)
+            shard = self.manifest.locate_record(row)
+            local = row - shard.row_start
+            by_shard.setdefault(shard_index, {}).setdefault(local, []).append(position)
+
+        max_rows = max(1, _PREAD_MAX_BYTES // max(row_bytes, scale_bytes, 1))
+        for shard_index, local_destinations in by_shard.items():
+            shard = self.manifest.shards[shard_index]
+            local_rows = sorted(local_destinations)
+            scalar_scale = None
+            cursor = 0
+            while cursor < len(local_rows):
+                run_end = cursor + 1
+                while (
+                    run_end < len(local_rows)
+                    and local_rows[run_end] == local_rows[run_end - 1] + 1
+                ):
+                    run_end += 1
+                run_start = cursor
+                while run_start < run_end:
+                    chunk_end = min(run_start + max_rows, run_end)
+                    first_local = local_rows[run_start]
+                    chunk_count = chunk_end - run_start
+                    raw = self._read(
+                        shard.path,
+                        shard.offset + first_local * row_bytes,
+                        chunk_count * row_bytes,
+                    )
+                    if len(raw) != chunk_count * row_bytes:
+                        raise OSError(f"incomplete PLE row at {shard.path}:{shard.offset}")
+
+                    chunk_scales = None
+                    per_row = shard.scale_row_bytes == 4 and self.manifest.scale_is_per_row
+                    if scale_bytes:
+                        if shard.scale_offset < 0:
+                            chunk_scales = struct.pack("<f", 1.0) * chunk_count
+                        elif per_row:
+                            chunk_scales = self._read(
+                                shard.path,
+                                shard.scale_offset + first_local * 4,
+                                chunk_count * 4,
+                            )
+                            if len(chunk_scales) != chunk_count * 4:
+                                raise OSError(
+                                    f"incomplete PLE row scale at {shard.path}:{shard.scale_offset}"
+                                )
+                        else:
+                            if scalar_scale is None:
+                                scalar_scale = self._read(shard.path, shard.scale_offset, 4)
+                                if len(scalar_scale) != 4:
+                                    raise OSError(
+                                        f"incomplete PLE row scale at {shard.path}:{shard.scale_offset}"
+                                    )
+                            chunk_scales = scalar_scale * chunk_count
+
+                    for offset, local in enumerate(local_rows[run_start:chunk_end]):
+                        source_start = offset * row_bytes
+                        source_end = source_start + row_bytes
+                        for position in local_destinations[local]:
+                            destination = position * row_bytes
+                            data[destination : destination + row_bytes] = raw[
+                                source_start:source_end
+                            ]
+                            if scale_bytes:
+                                scale_start = offset * 4
+                                scale_destination = position * 4
+                                scales[scale_destination : scale_destination + 4] = chunk_scales[
+                                    scale_start : scale_start + 4
+                                ]
+                    run_start = chunk_end
+                cursor = run_end
         return data, scales
 
     def close(self):
@@ -519,6 +583,21 @@ class _GatherPayload:
     raw_data: bytearray | None = None
     raw_scales: bytearray | None = None
     decoded: torch.Tensor | None = None
+
+@dataclass
+class _StagingSlot:
+    pinned_staging: torch.Tensor | None = None
+    pinned_raw: torch.Tensor | None = None
+    pinned_scales: torch.Tensor | None = None
+    cuda_raw: torch.Tensor | None = None
+    cuda_scales: torch.Tensor | None = None
+    capacity: int = 0
+    device: torch.device | None = None
+    event: torch.cuda.Event | None = None
+    event_recorded: bool = False
+    event_device: torch.device | None = None
+    poisoned: bool = False
+
 
 
 class PendingGather(msgspec.Struct):
@@ -557,19 +636,13 @@ class NVMePLEEmbedding(nn.Module):
         self.register_buffer("weight_scale", torch.ones(1, dtype=torch.bfloat16))
         self.reader = PLEFileReader(self.manifest, envs.SGLANG_QWEN4_PLE_NVME_BACKEND.get())
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple-prefetch")
-        # Host/device leases are reused at high-water capacity and cannot be
-        # overwritten until the stream event after the last decode/copy signals.
+        # Each slot owns its host/device buffers and completion lease. A
+        # second slot lets a new request proceed while the previous stream is
+        # still consuming the first slot; reuse waits only when both are busy.
         self._staging_lock = Lock()
-        self._pinned_staging = None
-        self._pinned_raw = None
-        self._pinned_scales = None
-        self._cuda_raw = None
-        self._cuda_scales = None
-        self._staging_capacity = 0
-        self._staging_device = None
-        self._staging_event = None
-        self._staging_event_recorded = False
-        self._staging_event_device = None
+        self._staging_slots = [_StagingSlot(), _StagingSlot()]
+        self._staging_next = 0
+        self._closed = False
 
     @property
     def source_dtype(self) -> torch.dtype:
@@ -606,57 +679,114 @@ class NVMePLEEmbedding(nn.Module):
             decoded=self._decode_raw(raw_data, raw_scales, len(rows))
         )
 
-    def _release_staging(self):
-        if self._staging_event_recorded:
-            self._staging_event.synchronize()
-            self._staging_event_recorded = False
+    @staticmethod
+    def _clear_slot_device(slot: _StagingSlot, device: torch.device) -> None:
+        if slot.poisoned:
+            raise RuntimeError("native PLE staging slot is poisoned")
+        slot.cuda_raw = None
+        slot.cuda_scales = None
+        slot.device = device
+        slot.event = None
+        slot.event_device = None
+        slot.event_recorded = False
 
-    def _record_staging_event(self, stream):
-        if self._staging_event is None or self._staging_event_device != stream.device:
-            self._staging_event = torch.cuda.Event()
-            self._staging_event_device = stream.device
-        self._staging_event.record(stream)
-        self._staging_event_recorded = True
+    @staticmethod
+    def _wait_slot(slot: _StagingSlot) -> None:
+        if slot.poisoned:
+            raise RuntimeError("native PLE staging slot is poisoned")
+        if slot.event_recorded:
+            if slot.event is None:
+                raise RuntimeError("native PLE staging lease has no completion event")
+            slot.event.synchronize()
+            slot.event_recorded = False
 
-    def _ensure_raw_staging(self, rows: int, device: torch.device):
-        if self._staging_device != device:
-            self._cuda_raw = None
-            self._cuda_scales = None
-            self._staging_device = device
-        if self._pinned_raw is None or self._staging_capacity < rows:
-            self._pinned_raw = torch.empty(
+    def _acquire_staging(self, device: torch.device) -> _StagingSlot:
+        """Acquire a completed slot, waiting only when both leases are busy."""
+        count = len(self._staging_slots)
+        for offset in range(count):
+            index = (self._staging_next + offset) % count
+            slot = self._staging_slots[index]
+            if slot.poisoned:
+                continue
+            if slot.event_recorded:
+                if slot.event is None:
+                    raise RuntimeError("native PLE staging lease has no completion event")
+                if not slot.event.query():
+                    continue
+                slot.event_recorded = False
+            if slot.device != device:
+                self._clear_slot_device(slot, device)
+            self._staging_next = (index + 1) % count
+            return slot
+
+        # Both usable slots are still owned by outstanding streams. Reuse the
+        # oldest usable round-robin slot only after its event completes.
+        for offset in range(count):
+            index = (self._staging_next + offset) % count
+            slot = self._staging_slots[index]
+            if slot.poisoned:
+                continue
+            self._wait_slot(slot)
+            if slot.device != device:
+                self._clear_slot_device(slot, device)
+            self._staging_next = (index + 1) % count
+            return slot
+        raise RuntimeError("all native PLE staging slots are poisoned")
+
+    def _record_staging_event(self, slot: _StagingSlot, stream) -> None:
+        try:
+            if slot.event is None or slot.event_device != stream.device:
+                slot.event = torch.cuda.Event()
+                slot.event_device = stream.device
+            slot.event.record(stream)
+        except BaseException:
+            # If event creation/recording fails after a DMA/kernel was
+            # enqueued, synchronize the stream before releasing the lease.
+            try:
+                stream.synchronize()
+            except BaseException:
+                # Never infer safety from an old or missing event. Keep all
+                # buffers referenced and permanently reject this slot.
+                slot.poisoned = True
+                slot.event_recorded = False
+                raise
+            slot.event_recorded = False
+            raise
+        slot.event_recorded = True
+
+    def _ensure_raw_staging(self, slot: _StagingSlot, rows: int, device: torch.device):
+        if slot.pinned_raw is None or slot.capacity < rows:
+            slot.pinned_raw = torch.empty(
                 (rows, self.embedding_dim), dtype=torch.uint8, pin_memory=True
             )
-            self._pinned_scales = torch.empty(rows, dtype=torch.float32, pin_memory=True)
-            self._cuda_raw = torch.empty(
+            slot.pinned_scales = torch.empty(rows, dtype=torch.float32, pin_memory=True)
+            slot.cuda_raw = torch.empty(
                 (rows, self.embedding_dim), dtype=torch.uint8, device=device
             )
-            self._cuda_scales = torch.empty(rows, dtype=torch.float32, device=device)
-            self._staging_capacity = rows
-        elif self._cuda_raw is None:
-            self._cuda_raw = torch.empty(
-                (self._staging_capacity, self.embedding_dim), dtype=torch.uint8, device=device
+            slot.cuda_scales = torch.empty(rows, dtype=torch.float32, device=device)
+            slot.capacity = rows
+        elif slot.cuda_raw is None:
+            slot.cuda_raw = torch.empty(
+                (slot.capacity, self.embedding_dim), dtype=torch.uint8, device=device
             )
-            self._cuda_scales = torch.empty(
-                self._staging_capacity, dtype=torch.float32, device=device
-            )
+            slot.cuda_scales = torch.empty(slot.capacity, dtype=torch.float32, device=device)
 
     def _copy_decoded(self, decoded: torch.Tensor, output: torch.Tensor, shape, device, stream):
         with self._staging_lock, torch.cuda.device(device):
-            self._release_staging()
+            slot = self._acquire_staging(device)
             rows = decoded.shape[0]
-            if self._pinned_staging is None or self._pinned_staging.shape[0] < rows:
-                self._pinned_staging = torch.empty(
+            if slot.pinned_staging is None or slot.pinned_staging.shape[0] < rows:
+                slot.pinned_staging = torch.empty(
                     (rows, self.embedding_dim), dtype=torch.bfloat16, pin_memory=True
                 )
-            staging = self._pinned_staging[:rows]
+            staging = slot.pinned_staging[:rows]
             staging.copy_(decoded)
             copy_stream = stream if stream is not None else torch.cuda.current_stream(device)
             with torch.cuda.stream(copy_stream):
                 try:
                     output.copy_(staging.view(shape), non_blocking=True)
                 finally:
-                    self._record_staging_event(copy_stream)
+                    self._record_staging_event(slot, copy_stream)
 
     def start_gather(self, input_ids: torch.Tensor) -> PendingGather:
         if get_is_capture_mode():
@@ -708,32 +838,32 @@ class NVMePLEEmbedding(nn.Module):
         from sglang.kernels.ops.qwen4_ple import fused_qwen4_fp8_rowscale
 
         with self._staging_lock, torch.cuda.device(device):
-            self._release_staging()
-            self._ensure_raw_staging(row_count, device)
+            slot = self._acquire_staging(device)
+            self._ensure_raw_staging(slot, row_count, device)
             raw = torch.frombuffer(payload.raw_data, dtype=torch.uint8).view(
                 row_count, self.embedding_dim
             )
             scales = torch.frombuffer(payload.raw_scales, dtype=torch.float32)
-            self._pinned_raw[:row_count].copy_(raw)
-            self._pinned_scales[:row_count].copy_(scales)
+            slot.pinned_raw[:row_count].copy_(raw)
+            slot.pinned_scales[:row_count].copy_(scales)
             copy_stream = stream if stream is not None else torch.cuda.current_stream(device)
             with torch.cuda.stream(copy_stream):
                 try:
-                    self._cuda_raw[:row_count].copy_(
-                        self._pinned_raw[:row_count], non_blocking=True
+                    slot.cuda_raw[:row_count].copy_(
+                        slot.pinned_raw[:row_count], non_blocking=True
                     )
-                    self._cuda_scales[:row_count].copy_(
-                        self._pinned_scales[:row_count], non_blocking=True
+                    slot.cuda_scales[:row_count].copy_(
+                        slot.pinned_scales[:row_count], non_blocking=True
                     )
                     fused_qwen4_fp8_rowscale(
-                        self._cuda_raw[:row_count],
-                        self._cuda_scales[:row_count],
+                        slot.cuda_raw[:row_count],
+                        slot.cuda_scales[:row_count],
                         output.view(row_count, self.embedding_dim),
                     )
                 finally:
                     # Protect both DMA sources and decode inputs if compilation
                     # or launch fails after either transfer has been enqueued.
-                    self._record_staging_event(copy_stream)
+                    self._record_staging_event(slot, copy_stream)
         return output
 
     def gather(self, input_ids, out=None):
@@ -746,18 +876,23 @@ class NVMePLEEmbedding(nn.Module):
         return self.gather(input_ids)
 
     def close(self):
+        with self._staging_lock:
+            if self._closed:
+                return
+            self._closed = True
         self.executor.shutdown(wait=True)
         with self._staging_lock:
-            self._release_staging()
-            self._pinned_staging = None
-            self._pinned_raw = None
-            self._pinned_scales = None
-            self._cuda_raw = None
-            self._cuda_scales = None
-            self._staging_capacity = 0
-            self._staging_device = None
-            self._staging_event = None
-            self._staging_event_device = None
+            for slot in self._staging_slots:
+                self._wait_slot(slot)
+                slot.pinned_staging = None
+                slot.pinned_raw = None
+                slot.pinned_scales = None
+                slot.cuda_raw = None
+                slot.cuda_scales = None
+                slot.capacity = 0
+                slot.device = None
+                slot.event = None
+                slot.event_device = None
         self.reader.close()
 
 

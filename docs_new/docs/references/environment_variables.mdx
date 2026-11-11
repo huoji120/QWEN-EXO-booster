@@ -7,6 +7,8 @@ SGLang supports various environment variables that can be used to configure its 
 
 *Note: The canonical prefix for all SGLang environment variables is `SGLANG_`. The legacy `SGL_` prefix is deprecated: any `SGL_*` variable set in the environment is automatically rewritten to its `SGLANG_*` equivalent at import time with a deprecation warning, and the alias will be removed in a future release. A few variables keep an upstream/vendor prefix (e.g. `MOONCAKE_*`, `ASCEND_*`) because that is their canonical name.*
 
+The QWEN-EXO extension additionally supports startup-only `QWEN_EXO_MEMORY_ENABLED` (`1` by default; strict `0`/`1`). Set `0` and restart to pause model-facing memory tools, injections and automatic memory maintenance without disabling fixed LoRA or client tools. Stored memory/admin access and ordinary conversation caching are retained. Inspect `/qwen-exo/status` for effective state; restore `1` and restart to re-enable memory.
+
 ## General Configuration
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -1591,6 +1593,16 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_QSA_COMPACT_PREFILL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt-in NVFP4 selected-KV union staging for small-query, long-prefix QSA prefill, including mapped Host-KV. Unvalidated GPU path; other shapes retain full-history staging.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_QSA_DENSE_PREFILL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt-in dense causal attention for exhaustive short-context QSA prefill using already-materialized KV. Requires a supported FlashAttention backend; disabled in deterministic mode. Changes floating-point reduction order.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use static KV splits in the Triton decode-attention kernel.</td>

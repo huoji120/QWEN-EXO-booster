@@ -347,11 +347,14 @@ async def lifespan(fast_api_app: FastAPI):
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
     elif server_args.enable_qwen_exo:
-        from sglang.srt.entrypoints.openai.tool_server import FileMemoryToolServer
+        from qwen_exo_booster.config import memory_enabled_from_environment
 
-        tool_server = FileMemoryToolServer(
-            server_args.qwen_exo_knowledge_dir, server_args.qwen_exo_state_dir
-        )
+        if memory_enabled_from_environment():
+            from sglang.srt.entrypoints.openai.tool_server import FileMemoryToolServer
+
+            tool_server = FileMemoryToolServer(
+                server_args.qwen_exo_knowledge_dir, server_args.qwen_exo_state_dir
+            )
     elif envs.EXA_API_KEY.get():
         from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
 

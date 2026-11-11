@@ -14,6 +14,7 @@ import threading
 import time
 from typing import Any, Mapping
 
+from qwen_exo_booster.config import memory_enabled_from_environment
 from qwen_exo_booster.file_knowledge import (
     MAX_CONTEXT_LINES,
     MAX_PER_FILE,
@@ -693,6 +694,8 @@ class MemoryToolExecutor:
     def run_sync(self, name: str, arguments: Any) -> tuple[bool, str]:
         """Return ``(ok, text)``; failures become text the model can act on."""
         try:
+            if not memory_enabled_from_environment():
+                return False, "Error: memory_disabled"
             if isinstance(arguments, str):
                 arguments = json.loads(arguments or "{}")
             if not isinstance(arguments, Mapping):
@@ -715,6 +718,8 @@ class MemoryToolExecutor:
     async def run(self, name: str, arguments: Any) -> tuple[bool, str]:
         # A stuck call must not stall the model's turn (the stream sends
         # nothing while it waits, and the client eventually gives up).
+        if not memory_enabled_from_environment():
+            return False, "Error: memory_disabled"
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(self.run_sync, name, arguments),

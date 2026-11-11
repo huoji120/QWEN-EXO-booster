@@ -75,12 +75,18 @@ def _save_training_state(path, *, optimizer, adapter_path, parameter_names, prog
 
 
 def _load_training_state(path, *, adapter_path, expected_training, optimizer_step, next_sample_index,
-                         transfer_dataset=False):
+                         transfer_dataset=False, override_learning_rate=False):
     state = torch.load(path, map_location="cpu", weights_only=True)
     if state.get("schema") != "native-mid-lora-training-state-v1":
         raise ValueError("Unsupported training-state schema")
     if hashlib.sha256(Path(adapter_path).read_bytes()).hexdigest() != state.get("adapter_sha256"):
         raise ValueError("Training state does not match adapter bytes")
+    if override_learning_rate:
+        requested = expected_training.get("learning_rate")
+        previous = state["training"].get("learning_rate")
+        if (type(requested) not in (int, float) or not math.isfinite(requested)
+                or not 0 < requested <= 1e-3 or requested == previous):
+            raise ValueError("Learning-rate override requires a distinct finite rate in (0, 1e-3]")
     if transfer_dataset:
         old_hash = state["training"].get("prepared_sha256")
         new_hash = expected_training.get("prepared_sha256")
@@ -88,6 +94,8 @@ def _load_training_state(path, *, adapter_path, expected_training, optimizer_ste
             raise ValueError("Dataset transfer requires distinct data hashes and a zero new-data cursor")
     for key, value in expected_training.items():
         if transfer_dataset and key == "prepared_sha256":
+            continue
+        if override_learning_rate and key == "learning_rate":
             continue
         if state["training"].get(key) != value:
             raise ValueError(f"Training-state configuration mismatch: {key}")
@@ -101,7 +109,7 @@ def _load_training_state(path, *, adapter_path, expected_training, optimizer_ste
     return state
 
 
-def _restore_training_state(state, optimizer, parameter_names):
+def _restore_training_state(state, optimizer, parameter_names, *, override_learning_rate=False):
     """Validate all parameter states before mutating the optimizer or RNG."""
     import numpy as np
 
@@ -110,9 +118,19 @@ def _restore_training_state(state, optimizer, parameter_names):
     saved = state["optimizer"]
     if len(saved["param_groups"]) != len(optimizer.param_groups):
         raise ValueError("Optimizer group count mismatch")
+    requested_rates = [group["lr"] for group in optimizer.param_groups]
+    if override_learning_rate:
+        previous_rate = state["training"].get("learning_rate")
+        if any(type(rate) not in (int, float) or not math.isfinite(rate)
+               or not 0 < rate <= 1e-3 or rate == previous_rate for rate in requested_rates):
+            raise ValueError("Learning-rate override requires a distinct finite rate in (0, 1e-3]")
+    if any(group.get("lr") != state["training"].get("learning_rate") for group in saved["param_groups"]):
+        raise ValueError("Saved optimizer learning rate disagrees with training metadata")
     ids = []
     for previous, current in zip(saved["param_groups"], optimizer.param_groups):
         for key in ("lr", "betas", "eps", "weight_decay", "amsgrad", "maximize", "foreach", "capturable", "differentiable", "fused"):
+            if override_learning_rate and key == "lr":
+                continue
             if previous.get(key) != current.get(key):
                 raise ValueError(f"Optimizer configuration mismatch: {key}")
         if len(previous["params"]) != len(current["params"]):
@@ -139,6 +157,9 @@ def _restore_training_state(state, optimizer, parameter_names):
     if len(rng["torch_cuda"]) != cuda_count:
         raise ValueError("CUDA RNG device count mismatch")
     optimizer.load_state_dict(saved)
+    if override_learning_rate:
+        for group, rate in zip(optimizer.param_groups, requested_rates):
+            group["lr"] = rate
     torch.set_rng_state(rng["torch_cpu"])
     if cuda_count:
         torch.cuda.set_rng_state_all(rng["torch_cuda"])
@@ -973,7 +994,7 @@ def run_experiment(*, profile, output, mode, authorize_gpu=False, authorize_trai
                    allow_numeric_drift_research=False, arms=("self_think_sft", "ordinary_sft"),
                    initial_adapter=None, initial_optimizer_steps=0, start_sample_index=0,
                    resume_training_state=None, transfer_dataset=False, generation_expert_backend="reference",
-                   precomputed_think=None, precomputed_think_source=None):
+                   precomputed_think=None, precomputed_think_source=None, override_learning_rate=False):
     """Capacity backward-only or three-snapshot controlled optimizer experiment.
 
     Outputs are private, append-only evidence. Capacity inputs are explicitly
@@ -1019,6 +1040,8 @@ def run_experiment(*, profile, output, mode, authorize_gpu=False, authorize_trai
     resume_state = None
     if transfer_dataset and resume_training_state is None:
         raise ValueError("Dataset transfer requires a saved optimizer companion")
+    if override_learning_rate and resume_training_state is None:
+        raise ValueError("Learning-rate override requires a saved optimizer companion")
     if resume_training_state is not None:
         if mode != "experiment" or tuple(arms) != ("self_think_sft",) or initial_adapter is None or data is None:
             raise ValueError("Full-state resume requires one self_think_sft arm, data and initial adapter")
@@ -1026,7 +1049,7 @@ def run_experiment(*, profile, output, mode, authorize_gpu=False, authorize_trai
             data_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
         resume_state = _load_training_state(resume_training_state, adapter_path=initial_adapter,
             optimizer_step=initial_optimizer_steps, next_sample_index=start_sample_index,
-            transfer_dataset=transfer_dataset,
+            transfer_dataset=transfer_dataset, override_learning_rate=override_learning_rate,
             expected_training={"prepared_sha256": data_sha256, "profile": str(Path(profile).resolve()),
                 "config": asdict(config), "seed": seed, "learning_rate": learning_rate, "clip_norm": clip_norm,
                 "generation_mode": generation_mode, "cache_gate_policy": cache_gate_policy,
@@ -1214,11 +1237,15 @@ def run_experiment(*, profile, output, mode, authorize_gpu=False, authorize_trai
                 restored_optimizer_steps = 0
                 if resume_state is not None:
                     restored_optimizer_steps = _restore_training_state(resume_state, optimizer,
-                        [name + ending for name in suffix.target_names for ending in (".lora_A", ".lora_B")])
+                        [name + ending for name in suffix.target_names for ending in (".lora_A", ".lora_B")],
+                        override_learning_rate=override_learning_rate)
                     emit("training_state_restored", {"path": str(resume_training_state),
                         "optimizer_step": initial_optimizer_steps, "optimizer_session_step": restored_optimizer_steps,
                         "next_sample_index": start_sample_index, "adapter_sha256": resume_state["adapter_sha256"],
                         "dataset_transfer": transfer_dataset,
+                        "learning_rate_override": override_learning_rate,
+                        "previous_learning_rate": resume_state["training"]["learning_rate"],
+                        "learning_rate": learning_rate,
                         "previous_data_sha256": resume_state["training"]["prepared_sha256"],
                         "current_data_sha256": prepared_sha256})
                 if arm == "self_think_sft":
@@ -1301,6 +1328,8 @@ def run_experiment(*, profile, output, mode, authorize_gpu=False, authorize_trai
                                   "initial_adapter": str(initial_adapter) if initial_adapter is not None else None,
                                   "initial_optimizer_steps": initial_optimizer_steps,
                                   "dataset_transfer": transfer_dataset,
+                                  "learning_rate_override": override_learning_rate,
+                                  "previous_learning_rate": resume_state["training"]["learning_rate"] if resume_state is not None else None,
                                   "parent_training_state": str(resume_training_state) if resume_training_state is not None else None,
                                   "previous_data_sha256": resume_state["training"]["prepared_sha256"] if resume_state is not None else None,
                                   "start_sample_index": start_sample_index})

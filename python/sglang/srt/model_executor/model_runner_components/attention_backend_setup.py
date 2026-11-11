@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.attention_registry import (
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.runtime_context import get_resources
 from sglang.srt.utils import init_cublas
 
 if TYPE_CHECKING:
@@ -106,6 +107,17 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         )
         decode_attn_backend = None
         decode_attn_backend_group = []
+
+    if (
+        {"flashinfer", "trtllm_mha"} & {resolved.prefill, resolved.decode}
+        and "flashinfer_workspace" in get_resources().buffers
+    ):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            release_unused_global_workspace,
+        )
+
+        # Model wrappers may discard a dense backend; live users retain it.
+        release_unused_global_workspace()
 
     if (
         model_runner.device == "npu"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import os
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,6 +21,14 @@ _RESPONSE_COMPACTION_MODES = frozenset({"off", "active"})
 _SCORE_BIAS_MODES = frozenset({"off", "trajectory_shadow", "trajectory_active"})
 LATENT_TRANSPLANT_MAX_STRENGTH = 0.5
 
+
+
+def memory_enabled_from_environment() -> bool:
+    """Read the startup-only memory switch; reject ambiguous values."""
+    value = os.environ.get("QWEN_EXO_MEMORY_ENABLED", "1")
+    if value not in {"0", "1"}:
+        raise ValueError("QWEN_EXO_MEMORY_ENABLED must be 0 or 1")
+    return value == "1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,8 +113,22 @@ class QwenExoConfig:
     # Score-bias anchor drift threshold (passed to the model's Q-signal capture).
     observer_q_drift_threshold: float = 0.35
     knowledge_retrieval_mode: Literal["file"] = "file"
+    memory_enabled: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.memory_enabled) is not bool:
+            raise ValueError("memory_enabled must be a boolean")
+        if not self.memory_enabled:
+            # Keep ordinary prefix caching and generation settings unchanged.
+            object.__setattr__(self, "feature_flags", replace(
+                self.feature_flags, capsule=False, observer=False,
+                policy_data=False, score_bias=False, activation_training=False,
+            ))
+            for name in ("observer_mode", "reflection_memory_mode",
+                         "response_compaction_mode", "score_bias_mode"):
+                object.__setattr__(self, name, "off")
+            object.__setattr__(self, "latent_transplant_enabled", False)
+            object.__setattr__(self, "activation_editor_enabled", False)
         if self.policy_data_directory is None:
             object.__setattr__(
                 self,
@@ -266,9 +289,10 @@ class QwenExoConfig:
 
     @classmethod
     def from_server_args(cls, server_args: Any) -> QwenExoConfig:
+        memory_enabled = memory_enabled_from_environment()
         observer_mode = str(server_args.qwen_exo_observer_mode)
         score_bias_mode = str(getattr(server_args, "qwen_exo_score_bias_mode", "off"))
-        score_bias_enabled = score_bias_mode != "off"
+        score_bias_enabled = memory_enabled and score_bias_mode != "off"
         backend = resolve_qwen_exo_backend(server_args)
         if score_bias_enabled and backend != "mlx":
             attention_backends = (
@@ -285,6 +309,7 @@ class QwenExoConfig:
                     "QWEN-EXO CUDA Score Bias requires the Triton attention backend"
                 )
         return cls(
+            memory_enabled=memory_enabled,
             state_directory=Path(server_args.qwen_exo_state_dir).expanduser(),
             knowledge_directory=Path(server_args.qwen_exo_knowledge_dir).expanduser(),
             policy_data_directory=Path(
@@ -505,6 +530,7 @@ class QwenExoConfig:
     def public_dict(self) -> dict[str, Any]:
         flags = asdict(self.feature_flags)
         return {
+            "memory_enabled": self.memory_enabled,
             "project": PROJECT_NAME,
             "api_version": PROJECT_API_VERSION,
             "state_directory": str(self.state_directory),

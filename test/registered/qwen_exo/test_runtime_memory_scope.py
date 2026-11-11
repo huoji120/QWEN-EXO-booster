@@ -48,6 +48,7 @@ class _Tokenizer:
 def _runtime(tmp_path):
     runtime = object.__new__(QwenExoRuntime)
     runtime.config = SimpleNamespace(
+        memory_enabled=True,
         knowledge_directory=tmp_path / "knowledge",
         state_directory=tmp_path / "state",
         context_length=32768,
